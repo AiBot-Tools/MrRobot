@@ -91,8 +91,14 @@ export class EventStore {
       throw new ConfigError(`invalid payload for ${type}: ${parsed.error.message}`)
     }
 
+    // Drop keys whose value is undefined before anything is hashed. A caller
+    // writing `{ reason: maybeUndefined }` and a caller omitting `reason`
+    // describe the same event, so they must produce the same bytes and the
+    // same hash. Without this the first form also fails deep in the
+    // canonicalizer with a TypeError instead of appending.
+    //
     // Redaction runs before anything is measured, canonicalized or hashed.
-    const payloadText = canonicalize(redactValue(parsed.data))
+    const payloadText = canonicalize(redactValue(stripUndefined(parsed.data)))
 
     // The ceiling from CLAUDE.md is enforced here rather than silently
     // truncating: the store cannot know which field of a payload is safe to
@@ -224,6 +230,19 @@ export class EventStore {
     this.#listeners.clear()
     this.#db.close()
   }
+}
+
+/** Recursively remove keys whose value is undefined. Arrays keep their shape. */
+function stripUndefined(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map((item) => stripUndefined(item))
+  if (v !== null && typeof v === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, item] of Object.entries(v as Record<string, unknown>)) {
+      if (item !== undefined) out[k] = stripUndefined(item)
+    }
+    return out
+  }
+  return v
 }
 
 function toEventRow(r: Record<string, unknown>): EventRow {

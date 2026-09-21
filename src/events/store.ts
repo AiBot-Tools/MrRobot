@@ -33,6 +33,7 @@ import { readAnchor, writeAnchor, type Anchor } from './anchor.js'
 import { boundOutput, MAX_LOGGED_OUTPUT } from './bound.js'
 import { canonicalize } from './canonical.js'
 import { GENESIS, hashRow, sequenceCounter, verifyChain, type EventRow, type VerifyResult } from './chain.js'
+import { runScope } from '../runtime/scope.js'
 import { openDb, type Db } from './db.js'
 import { redactValue } from './redact.js'
 import { checkTriggers, createSchema } from './schema.js'
@@ -99,6 +100,18 @@ export class EventStore {
     if (!isEventType(input.type)) {
       throw new ConfigError(`unknown event type: ${input.type}`)
     }
+
+    // Writer claim (invariant 2). Inside a run, every event belongs to that
+    // run: code executing as run A cannot write history under run B's name,
+    // whether by mistake or by a model talking it into passing a different
+    // id. Kernel code outside any run scope is unrestricted — that is how
+    // boot, shutdown and control-plane events get written.
+    const scope = runScope()
+    if (scope !== undefined && input.runId !== undefined && input.runId !== scope.runId) {
+      throw new ConfigError(
+        `writer claim: run ${scope.runId} may not append events for run ${input.runId}`,
+      )
+    }
     const type: EventType = input.type
     const schema = PAYLOAD_SCHEMAS[type]
     const parsed = schema.safeParse(input.payload)
@@ -129,7 +142,7 @@ export class EventStore {
 
     const id = randomUUID()
     const ts = new Date().toISOString()
-    const runId = input.runId ?? null
+    const runId = input.runId ?? scope?.runId ?? null
     const agentId = input.agentId ?? null
 
     const row = this.#db.transaction((): EventRow => {

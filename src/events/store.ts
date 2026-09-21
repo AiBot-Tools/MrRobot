@@ -29,6 +29,7 @@ import { randomUUID } from 'node:crypto'
 
 import { ChainBroken, ConfigError } from '../errors.js'
 import { log } from '../log.js'
+import { readAnchor, writeAnchor, type Anchor } from './anchor.js'
 import { boundOutput, MAX_LOGGED_OUTPUT } from './bound.js'
 import { canonicalize } from './canonical.js'
 import { GENESIS, hashRow, sequenceCounter, verifyChain, type EventRow, type VerifyResult } from './chain.js'
@@ -46,6 +47,13 @@ export interface AppendInput {
 
 export interface StoreOptions {
   readonly readOnly?: boolean
+  /**
+   * Write the anchor every N appends. 0 disables periodic anchoring; the
+   * anchor is still written on close(). Requires headFile.
+   */
+  readonly anchorEvery?: number
+  /** Path to the anchor file, conventionally <dataDir>/events.head. */
+  readonly headFile?: string
 }
 
 export type Listener = (row: EventRow) => void
@@ -54,10 +62,17 @@ export class EventStore {
   readonly #db: Db
   readonly #readOnly: boolean
   readonly #listeners = new Set<Listener>()
+  readonly #headFile: string | undefined
+  readonly #anchorEvery: number
   #closed = false
 
   constructor(path: string, options: StoreOptions = {}) {
     this.#readOnly = options.readOnly ?? false
+    this.#headFile = options.headFile
+    this.#anchorEvery = options.anchorEvery ?? 0
+    if (this.#anchorEvery > 0 && this.#headFile === undefined) {
+      throw new ConfigError('anchorEvery requires headFile: there is nowhere to write the anchor')
+    }
     this.#db = openDb(path, { readOnly: this.#readOnly })
 
     // Order matters: an EXISTING log is validated, never repaired. Running
@@ -153,8 +168,43 @@ export class EventStore {
       return { ...unhashed, hash }
     })
 
+    if (this.#anchorEvery > 0 && row.seq % this.#anchorEvery === 0) {
+      this.writeAnchor(row)
+    }
     this.#notify(row)
     return row
+  }
+
+  /**
+   * Record the current head externally. Called periodically and on close, so
+   * an unclean exit costs at most the rows since the last write — those rows
+   * are ahead of the anchor, which verifyChain treats as normal.
+   */
+  writeAnchor(at?: EventRow): Anchor | undefined {
+    if (this.#headFile === undefined) return undefined
+    const seq = at?.seq ?? this.tailSeq()
+    const hash = at?.hash ?? this.head()
+    const anchor: Anchor = {
+      schemaVersion: 1,
+      genesis: GENESIS,
+      seq,
+      hash,
+      writtenAt: new Date().toISOString(),
+    }
+    writeAnchor(this.#headFile, anchor)
+    return anchor
+  }
+
+  /** The anchor on disk, or undefined when none has been written. */
+  readAnchor(): Anchor | undefined {
+    return this.#headFile === undefined ? undefined : readAnchor(this.#headFile)
+  }
+
+  /** Sequence number of the last row, or 0 when the log is empty. */
+  tailSeq(): number {
+    const row = this.#db.get('SELECT seq FROM events ORDER BY seq DESC LIMIT 1')
+    const seq = row?.['seq']
+    return typeof seq === 'number' ? seq : 0
   }
 
   /** Every listener runs; a throwing listener is logged and skipped. */
@@ -210,8 +260,8 @@ export class EventStore {
     return typeof hash === 'string' ? hash : GENESIS
   }
 
-  verifyChain(): VerifyResult {
-    return verifyChain(this.#db)
+  verifyChain(anchor?: Anchor): VerifyResult {
+    return verifyChain(this.#db, anchor)
   }
 
   /** Escape hatch for tests and boot checks that need the raw connection. */
@@ -226,6 +276,15 @@ export class EventStore {
 
   close(): void {
     if (this.#closed) return
+    // Anchor the verified tail on the way out, so a clean shutdown always
+    // leaves an anchor that matches the log exactly.
+    if (!this.#readOnly && this.#headFile !== undefined) {
+      try {
+        this.writeAnchor()
+      } catch (e) {
+        log.error({ err: e instanceof Error ? e.message : String(e) }, 'failed to write anchor on close')
+      }
+    }
     this.#closed = true
     this.#listeners.clear()
     this.#db.close()

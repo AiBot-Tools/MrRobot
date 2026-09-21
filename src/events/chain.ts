@@ -9,6 +9,7 @@
 // Change-controlled with the canonicalizer: altering GENESIS or the hashed
 // field set invalidates every hash ever written.
 
+import type { Anchor } from './anchor.js'
 import { canonicalize, sha256Hex } from './canonical.js'
 import type { Db } from './db.js'
 
@@ -90,8 +91,14 @@ export function sequenceCounter(db: Db): number {
  *   3. content hashes recomputed from the stored bytes
  *   4. sqlite_sequence ahead of the tail, which is the fingerprint of a
  *      deleted-and-refilled tail
+ *   5. the anchor, if one is supplied
+ *
+ * Anchor semantics: the log is expected to be AHEAD of its anchor, because
+ * rows are appended between anchor writes. Only a log behind its anchor, or a
+ * different hash at the anchored position, is evidence of tampering. Requiring
+ * tail equality instead would fail every boot after a crash or power loss.
  */
-export function verifyChain(db: Db): VerifyResult {
+export function verifyChain(db: Db, anchor?: Anchor): VerifyResult {
   const rows = readAllRows(db)
   let prev = GENESIS
 
@@ -119,6 +126,29 @@ export function verifyChain(db: Db): VerifyResult {
       ok: false,
       at: tail,
       reason: `truncation: sqlite_sequence (${counter}) is ahead of the tail (${tail})`,
+    }
+  }
+
+  if (anchor !== undefined) {
+    if (anchor.genesis !== GENESIS) {
+      return { ok: false, at: 0, reason: 'anchor: belongs to a chain with a different genesis' }
+    }
+    if (tail < anchor.seq) {
+      return {
+        ok: false,
+        at: tail,
+        reason: `truncation: tail (seq ${tail}) is behind the anchored head (seq ${anchor.seq})`,
+      }
+    }
+    if (anchor.seq > 0) {
+      const anchored = rows[anchor.seq - 1]
+      if (anchored === undefined || anchored.hash !== anchor.hash) {
+        return {
+          ok: false,
+          at: anchor.seq,
+          reason: `rewrite: row at anchored seq ${anchor.seq} has a different hash`,
+        }
+      }
     }
   }
 

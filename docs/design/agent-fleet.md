@@ -184,7 +184,13 @@ Domains on the operator's machine: `trusted` and `hostile` are the two Colima VM
 
 ## 5. Full roster
 
-`tier` column reads *capability / isolation / riskCeiling*. Model chains are post-probe intentions; every ref but `anthropic/claude-opus-5` is a placeholder and no chain is bound before `aos probe` reports `toolCalling: true`.
+`tier` column reads *capability / isolation / riskCeiling*. Model chains are post-probe intentions and none is bound before `aos probe` reports `toolCalling: true`.
+
+> **Operator answer, 2026-09-21 (plan D13).** The single real entry in `config/providers.yaml` is
+> **`anthropic/claude-sonnet-5`**, chosen over `claude-opus-5` for its cost/intelligence ratio on
+> orchestration. Every other ref in the chains below, `opus-5` included, is a placeholder with no
+> provider entry yet: it becomes bindable only once it is added to `providers.yaml` and passes a
+> probe. Read a chain as an intention about *model class*, not as a shipped configuration.
 
 ### 5.1 Executive
 

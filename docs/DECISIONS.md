@@ -20,7 +20,7 @@ defaults" and name only what you want changed, for example `D3: better-sqlite3` 
 
 | # | Question | Default if you say nothing | Answer |
 |---|---|---|---|
-| **D1** | What is `node --version` on the Mac, and is the `engines` floor `^22.21.0 \|\| >=24.15.0` acceptable (recommend Node 24 LTS)? | that floor; `@types/node 22.20.4`; switch types to 24.x if the Mac has 24 | ✅ **v24.9.0**. Floor accepted. Switch `@types/node` to 24.x. |
+| **D1** | What is `node --version` on the Mac, and is the `engines` floor `^22.21.0 \|\| >=24.15.0` acceptable (recommend Node 24 LTS)? | that floor; `@types/node 22.20.4`; switch types to 24.x if the Mac has 24 | ✅ **v26.9.0** (was v24.9.0). Floor accepted as written. `@types/node` pins to 26.6.2. |
 | **D2** | Keep the `.js` import-suffix mandate (⇒ `tsx` required) or switch to `.ts` suffixes + native stripping (a CLAUDE.md standards change)? | keep `.js` + tsx; `erasableSyntaxOnly` keeps the door open | ✅ default (`.js`) |
 | **D3** | `node:sqlite` (stdlib, RC API) vs `better-sqlite3@13.0.3` (native N-API addon, +27 MB)? | `node:sqlite` behind `src/events/db.ts` | ✅ default — kernel needs its own SQLite for the hash-chained event log (invariant 5), separate from pmmcp's SQLite |
 | **D5** | Accept the MCP SDK's 94-package footprint (express/hono/jose installed, never loaded)? | accept; recorded in README | ✅ default |
@@ -49,7 +49,7 @@ package is installed.
 
 | # | Question | Default | Answer |
 |---|---|---|---|
-| D1 ★ | What is `node --version` on the Mac, and is the `engines` floor `^22.21.0 \|\| >=24.15.0` acceptable (recommend Node 24 LTS)? | that floor; `@types/node 22.20.4`; switch types to 24.x if the Mac has 24 | ✅ **v24.9.0**; switch `@types/node` to 24.x |
+| D1 ★ | What is `node --version` on the Mac, and is the `engines` floor `^22.21.0 \|\| >=24.15.0` acceptable (recommend Node 24 LTS)? | that floor; `@types/node 22.20.4`; switch types to 24.x if the Mac has 24 | ✅ **v26.9.0**; `@types/node` pins to 26.6.2 |
 | D2 ★ | Keep the `.js` import-suffix mandate (⇒ `tsx` required) or switch to `.ts` suffixes + native stripping (a CLAUDE.md standards change)? | keep `.js` + tsx; `erasableSyntaxOnly` keeps the door open | ✅ default |
 | D3 ★ | `node:sqlite` (stdlib, RC API) vs `better-sqlite3@13.0.3` (native N-API addon, +27 MB)? | `node:sqlite` behind `src/events/db.ts` | ✅ default |
 | D4 | Money encoding in events: integer micro-USD vs decimal string? | integer micro-USD (`costMicroUsd`) | ✅ default |
@@ -120,7 +120,12 @@ Not judgement calls, measurements. Listed as NEEDS VALIDATION in the plan, §7.
 
 ### Resolved ✅
 
-- **`node --version`**: **v24.9.0**. Drives D1: floor accepted, `@types/node` switches to 24.x.
+- **`node --version`**: **v26.9.0** (updated 2026-09-21, supersedes the v24.9.0 first reported). Drives D1:
+  the `^22.21.0 || >=24.15.0` floor is satisfied as written, and `@types/node` pins to **26.6.2**. The whole
+  toolchain was re-verified on v26.9.0 — `node:sqlite` with no experimental warning and SQLite 3.53.4,
+  `RAISE(ABORT)` triggers, tsx plus `node --test` with `.js` suffixes, and a clean strict `tsc --noEmit`.
+  See the Node 26 table in `docs/plan/phase-0-bootstrap.md` §1. One caveat: Node 26 is **Current**, not LTS
+  until 2026-10-28.
 - **pmmcp endpoint**: **`http://127.0.0.1:8766/mcp`**, Streamable HTTP, port 8766 (dashboard on 8765), loopback confirmed, bearer token required.
 - **`get_secret` argument name**: **`label`** (not `key`). Set `kernel.yaml secrets.keyArg` to `'label'`, or update `SecretsBroker` code. Resolves the "unverified" status in CLAUDE.md.
 

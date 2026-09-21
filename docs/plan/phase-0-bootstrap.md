@@ -22,7 +22,20 @@ Rigor tags on every fact: **CONFIRMED** (primary source read, or command run wit
 | `@anthropic-ai/sdk@0.127.0` `client.mjs`: `apiKey` → header `X-Api-Key`; `authToken` → `Authorization: Bearer`. The constructor substitutes the env default **per field and only when that field is `undefined`** (`if (apiKey === undefined) … readEnv('ANTHROPIC_API_KEY') ?? null`, the same for `authToken`; `webhookKey` and `baseURL` default from env in the parameter list), so an explicit `null` opts a field out of the env chain (`ClientOptions` types them `string \| null \| undefined`). `authHeaders()` returns `buildHeaders([apiKeyAuth, bearerAuth])`, i.e. **both** headers go on the wire when both fields are non-null. Only when both are null does it lazily resolve `credentials`/`config`/`profile`. | CONFIRMED | §8 V4 (`client.mjs` l.70, 76–81, 147, 347–375; `client.d.ts` l.39, 43, 78) |
 | `sqlite_master.sql` stores a trigger's `CREATE TRIGGER` text verbatim, so a trigger whose **body** was rewritten under the same name is detectable by comparing `sql`, not just `name`. | CONFIRMED | §8 V6 |
 
-**Node version pin decision (D1 — ANSWERED 2026-09-21: the Mac runs v24.9.0; floor accepted, types on 24.x).** `engines.node` = `^22.21.0 || >=24.15.0`; `.npmrc engine-strict=false`; `@types/node 24.13.6`. Note v24.9.0 is below the 24.15.0 floor, so the operator updates Node 24 to >= 24.15.0 before T01 (the floor buys `node:sqlite` at RC stability and no ExperimentalWarning); until then the `^22.21.0` arm does not match 24.9.0 either, and `engine-strict=false` means npm warns rather than refuses. Rationale: the suite can only be proven here on 22.22.2; 22.21.0 is the first 22.x where `--env-file*` and `util.parseEnv` are non-experimental (nodefacts §5); 24.15.0 is where `node:sqlite` became RC (nodefacts §2). If the Mac reports 24.x, switch `@types/node` to the 24 line and re-run the suite (NEEDS VALIDATION). Recommended target: Node 24 LTS.
+**Node version pin decision (D1 — ANSWERED 2026-09-21, UPDATED 2026-09-21: the Mac now runs **v26.9.0**, superseding the v24.9.0 first reported).** `engines.node` = `^22.21.0 || >=24.15.0` (v26.9.0 satisfies the second arm, so no floor change is needed and the earlier "raise Node before T01" note is withdrawn); `.npmrc engine-strict=false`; `@types/node 26.6.2` (npm `latest`, matching the runtime major). Node 26 is **Current** until it enters LTS on 2026-10-28, which is the one standing caveat: the operator's daily driver is a non-LTS line for roughly five more weeks. The toolchain was verified empirically on v26.9.0 — see the Node 26 block below.
+
+**Node 26 facts, verified on this machine against v26.9.0 (CONFIRMED, commands run 2026-09-21).**
+
+| Fact | Result | Consequence for the plan |
+|---|---|---|
+| `require('node:sqlite')` | loads with **no `ExperimentalWarning`**; docs still read `Stability: 1.2 - Release candidate` (release-candidate since v25.7.0) | D3 holds. `--disable-warning=ExperimentalWarning` is unnecessary on 26 but stays in the scripts for the `^22.21.0` arm, where the warning does print |
+| bundled SQLite | **3.53.4** (22.x ships 3.51.2) | same engine version `better-sqlite3@13.0.3` bundles, so D3 costs nothing in SQLite currency |
+| `BEFORE UPDATE … RAISE(ABORT,'events are append-only')` | throws `code: 'ERR_SQLITE_ERROR'`, `errcode: 1811` (`SQLITE_CONSTRAINT_TRIGGER`), message preserved verbatim | invariant 5's immutability triggers work as specified; T04 may assert on `errcode` as well as `message` |
+| `node --import tsx --test 'test/*.test.ts'` with `.js` import suffixes in `.ts` sources | **passes** (tsx 4.23.13) | D2 holds on 26; the `npm test` script in §3.1 needs no change |
+| `tsc --noEmit` with `strict`, `exactOptionalPropertyTypes`, `noUncheckedIndexedAccess`, `erasableSyntaxOnly`, `verbatimModuleSyntax`, NodeNext, `@types/node 26.6.2`, TypeScript 5.9.3 | **clean** | the §3.2 tsconfig is unchanged by the Node bump |
+| `--experimental-transform-types` | **rejected** on 26.9.0 (removed in 26.0.0, no replacement) | only native *transform* is gone; native *type stripping* is stable, so D2's escape hatch (drop tsx, use `.ts` suffixes) remains open. Never introduce a TypeScript enum or other non-erasable syntax: `erasableSyntaxOnly` is what keeps that door open |
+| `--disable-warning=ExperimentalWarning`, `--experimental-strip-types`, `--no-strip-types`, `--env-file-if-exists` | all accepted | `--no-strip-types` is rejected on 22.x only; scripts must not use it unconditionally |
+| `globalThis.localStorage` | merely touching it prints `ExperimentalWarning: localStorage is not available because --localstorage-file was not provided` | no kernel code may feature-detect this global; it would pollute the operator's console and any log capture |
 
 ---
 
@@ -47,7 +60,7 @@ All versions are `npm view` results from 2026-09-20 (deps §1, §2; CONFIRMED). 
 |---|---|---|---|---|
 | `typescript` | 5.9.3 | `tsc --noEmit` (CLAUDE.md). 6.0.3 and 7.0.2 also pass the strict probe; 7 removes `baseUrl` and its API layer is "not ready" (deps §2). | 1 entry | Apache-2.0 |
 | `tsx` | 4.23.13 | Required by the `.js`-suffix mandate (§1). Single dep `esbuild ~0.28.0`; `@esbuild/darwin-arm64` exists on the registry. | 29 entries (27 optional platform binaries; 1 installs) | MIT |
-| `@types/node` | 24.13.6 | Types for `node:sqlite`, `parseArgs`, `parseEnv`. Major follows D1. | 2 entries | MIT |
+| `@types/node` | 26.6.2 | Types for `node:sqlite`, `parseArgs`, `parseEnv`. Major follows D1. | 2 entries | MIT |
 | `@types/ws` | 8.18.1 | `ws` ships no types. | 3 entries | MIT |
 
 ### 2.3 Rejected (stdlib or existing dep suffices)
@@ -86,7 +99,7 @@ All versions are `npm view` results from 2026-09-20 (deps §1, §2; CONFIRMED). 
     "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": { "@anthropic-ai/sdk": "0.127.0", "@modelcontextprotocol/sdk": "1.30.0", "pino": "10.3.1", "ws": "8.21.3", "yaml": "2.9.1", "zod": "4.6.5" },
-  "devDependencies": { "@types/node": "24.13.6", "@types/ws": "8.18.1", "tsx": "4.23.13", "typescript": "5.9.3" }
+  "devDependencies": { "@types/node": "26.6.2", "@types/ws": "8.18.1", "tsx": "4.23.13", "typescript": "5.9.3" }
 }
 ```
 
@@ -361,8 +374,8 @@ Conventions: one commit, one test file (a docs task may extend `stubs.test.ts`; 
 
 ## 7. Facts still NEEDS VALIDATION, and how each will be validated
 
-> **Three resolved by the operator 2026-09-21** and folded in above: the Mac runs Node **v24.9.0**
-> (D1; it must be raised to >= 24.15.0 to satisfy the floor); pmmcp is **`http://127.0.0.1:8766/mcp`**,
+> **Three resolved by the operator 2026-09-21** and folded in above: the Mac runs Node **v26.9.0**
+> (D1; it satisfies the `>=24.15.0` arm of the floor, and the whole toolchain was re-verified on it); pmmcp is **`http://127.0.0.1:8766/mcp`**,
 > loopback with a bearer token; and `get_secret` takes **`label`**, not `key`. Still open: FSEvents
 > through virtiofs (Phase 2, not a Phase 0 blocker), the llama.cpp build and chat template, and the
 > live Moonshot/OpenRouter model ids (auto-detect via `GET /v1/models` once keys are in the vault).

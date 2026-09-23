@@ -1,0 +1,49 @@
+# A complete, valid kernel.yaml. Holds no secrets: credentials are referenced
+# by environment variable name, never by value.
+version: 1
+dataDir: /var/lib/aos
+control:
+  host: 127.0.0.1
+  port: 7777
+  tokenEnv: AOS_CONTROL_TOKEN
+  allowedOrigins: []
+  maxPayloadBytes: 1048576
+events:
+  anchorEvery: 100
+mcp:
+  servers:
+    pmmcp:
+      url: http://127.0.0.1:8766/mcp
+      tokenEnv: PMMCP_TOKEN
+      heartbeatMs: 240000
+secrets:
+  keyArg: label
+  envFallback: false
+sandbox:
+  driver: docker
+  image: aos-worker:0.0.1
+  domains:
+    trusted:
+      dockerHost: unix:///var/run/colima-trusted.sock
+      network: aos-trusted
+      mountRoot: /var/lib/aos/workspaces/trusted
+    hostile:
+      dockerHost: unix:///var/run/colima-hostile.sock
+      network: aos-hostile
+      mountRoot: /var/lib/aos/workspaces/hostile
+  defaults:
+    user: 65534:65534
+    pidsLimit: 256
+    memory: 2g
+    cpus: 2
+    wallclockMs: 600000
+lanes:
+  main: 4
+  subagent: 8
+budgets:
+  defaultRunMicroUsd: 2000000
+  defaultWallclockMs: 600000
+  maxRetries: 2
+  maxLlmCallsPerRun: 50
+  maxToolCallsPerRun: 100
+  approvalWaitMs: 300000

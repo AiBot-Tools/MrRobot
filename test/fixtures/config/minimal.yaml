@@ -1,0 +1,18 @@
+# Only what has no safe default. Everything else comes from the schema.
+version: 1
+dataDir: /var/lib/aos
+mcp:
+  servers:
+    pmmcp:
+      url: http://127.0.0.1:8766/mcp
+sandbox:
+  image: aos-worker:0.0.1
+  domains:
+    trusted:
+      dockerHost: unix:///var/run/colima-trusted.sock
+      network: aos-trusted
+      mountRoot: /var/lib/aos/workspaces/trusted
+    hostile:
+      dockerHost: unix:///var/run/colima-hostile.sock
+      network: aos-hostile
+      mountRoot: /var/lib/aos/workspaces/hostile

@@ -110,6 +110,12 @@ export interface CallOutcome {
   readonly cacheReadTokens?: number
   readonly cacheWriteTokens?: number
   readonly costMicroUsd: number
+  /**
+   * The model id the SERVER reported, which need not be the one asked for:
+   * an alias, a router's substitution, or a quantisation the card cannot
+   * know about. The probe records it so a silent swap is visible.
+   */
+  readonly modelSeen?: string
   readonly toolCalls?: readonly ToolCall[]
   readonly toolCallErrors?: readonly ToolCallError[]
   /** The raw assistant message, for `caps.preserveAssistantMessage` replay. */

@@ -78,7 +78,7 @@ const ChatChoice = z
   .loose()
 
 const ChatCompletion = z
-  .object({ choices: z.array(ChatChoice).min(1), usage: z.unknown().optional() })
+  .object({ choices: z.array(ChatChoice).min(1), model: z.string().optional(), usage: z.unknown().optional() })
   .loose()
 
 // ── request building ───────────────────────────────────────────────────────
@@ -338,6 +338,7 @@ export class OpenAiChatAdapter implements ModelAdapter {
           outputTokens: usage.outputTokens,
           cacheReadTokens: usage.cacheReadTokens,
           costMicroUsd,
+          ...(parsed.data.model === undefined ? {} : { modelSeen: parsed.data.model }),
           ...(toolCalls.length === 0 ? {} : { toolCalls }),
           ...(toolCallErrors.length === 0 ? {} : { toolCallErrors }),
           ...(raw === undefined ? {} : { raw }),

@@ -7,6 +7,8 @@
 
 import './helpers/guard.js'
 
+import { freshProbe } from './helpers/probe.js'
+
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { parse as parseYaml } from 'yaml'
@@ -278,7 +280,7 @@ test('anthropic inputTokens = input + cache_creation + cache_read', () => {
 test('routable requires probe.toolCalling and an unexpired ttl', () => {
   const now = 1_000_000
   const real = card()
-  const fresh = { ref: 'anthropic/claude-sonnet-5', toolCalling: true, checkedAt: now - 1_000, ttlMs: 60_000 }
+  const fresh = freshProbe('anthropic/claude-sonnet-5', { probedAt: now - 1_000, ttlHours: 1 })
 
   assert.equal(routable(real, fresh, now), true)
   // Never probed: a manifest could otherwise name any string and fail
@@ -287,7 +289,7 @@ test('routable requires probe.toolCalling and an unexpired ttl', () => {
   // Probed and found lacking.
   assert.equal(routable(real, { ...fresh, toolCalling: false }, now), false)
   // Stale: capabilities change under a model id without warning.
-  assert.equal(routable(real, { ...fresh, checkedAt: now - 120_000 }, now), false)
+  assert.equal(routable(real, { ...fresh, probedAt: now - 2 * 3_600_000 }, now), false)
   // A placeholder entry is never bindable, however good its probe.
   assert.equal(routable(card({ placeholder: true }), fresh, now), false)
 })

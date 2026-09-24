@@ -23,12 +23,13 @@ import './helpers/guard.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
+import { freshProbe } from './helpers/probe.js'
 import { withStore } from './helpers/store.js'
 import { chatStop, fakeProvider, http, FAKE_PRICING, type ScriptedResponse } from './helpers/fake-provider.js'
 import { TOKEN_PATTERNS } from '../src/events/redact.js'
 import { toolName } from '../src/mcp/names.js'
 import { costForCard } from '../src/models/cost.js'
-import type { ModelCard, ProbeRecord } from '../src/models/registry.js'
+import type { ModelCard } from '../src/models/registry.js'
 import { normaliseChatUsage } from '../src/models/usage.js'
 import {
   classifyProviderFailure,
@@ -98,12 +99,6 @@ function card(over: Partial<ModelCard> = {}): ModelCard {
 }
 
 /** A probe fresh enough to route, for every ref. */
-const freshProbe = (ref: string): ProbeRecord => ({
-  ref,
-  toolCalling: true,
-  checkedAt: Date.now(),
-  ttlMs: 86_400_000,
-})
 
 /**
  * A minimal Chat Completions adapter.

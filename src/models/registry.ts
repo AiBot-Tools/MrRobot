@@ -177,24 +177,49 @@ export function parseProviders(input: unknown): ProvidersFile {
   return result.data
 }
 
-export interface ProbeRecord {
-  readonly ref: string
-  readonly toolCalling: boolean
-  readonly checkedAt: number
-  readonly ttlMs: number
-}
-
 /**
- * Whether a model may be bound to an agent.
+ * What `aos probe` observed about one model reference.
  *
- * A model is routable only after a probe observed it making a tool call, and
- * only while that observation is fresh. Without this a manifest could name
- * any string and the failure would surface mid-run as a confusing provider
- * error rather than at bind time.
+ * This is the persisted record (T22 writes it under `<dataDir>/probes/`), and
+ * it is also the only thing `routable` consults — one type, so a field cannot
+ * mean one thing on disk and another in the router.
+ *
+ * `probedAt` is epoch milliseconds rather than a Date: the record round-trips
+ * through JSON, and an integer cannot be ambiguous about its timezone.
+ *
+ * `toolChoiceForced` is always null in Phase 0 — no forced second pass is
+ * ever sent — but the field is frozen now so the Phase 1 forced pass needs no
+ * protocol bump.
  */
+export const ProbeRecord = z
+  .object({
+    schemaVersion: z.literal(1),
+    ref: z.string(),
+    probedAt: z.number().int().nonnegative(),
+    /** The model id the server echoed back, which need not be the one asked for. */
+    modelIdSeen: z.string(),
+    serverVersion: z.string().optional(),
+    toolCalling: z.boolean(),
+    toolChoiceForced: z.boolean().nullable(),
+    finishSeen: z.string(),
+    roundTrip: z.boolean(),
+    usage: z
+      .object({ input: z.number().int().nonnegative(), output: z.number().int().nonnegative() })
+      .strict(),
+    costMicroUsd: z.number().int().nonnegative(),
+    latencyMs: z.number().int().nonnegative(),
+    ttlHours: z.number().int().positive(),
+    reason: z.string().optional(),
+  })
+  .strict()
+
+export type ProbeRecord = z.output<typeof ProbeRecord>
+
+const MS_PER_HOUR = 3_600_000
+
 export function routable(card: ModelCard, probe: ProbeRecord | undefined, now: number): boolean {
   if (probe === undefined) return false
   if (!probe.toolCalling) return false
-  if (now - probe.checkedAt > probe.ttlMs) return false
+  if (now - probe.probedAt > probe.ttlHours * MS_PER_HOUR) return false
   return card.placeholder === false
 }

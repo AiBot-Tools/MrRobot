@@ -25,11 +25,12 @@ import './helpers/guard.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
+import { freshProbe } from './helpers/probe.js'
 import { withStore } from './helpers/store.js'
 import { fakeProvider, http, malformedJson, FAKE_PRICING, type ScriptedResponse } from './helpers/fake-provider.js'
 import { TOKEN_PATTERNS } from '../src/events/redact.js'
 import { OpenAiChatAdapter } from '../src/models/openai-chat.js'
-import type { ModelCard, ProbeRecord } from '../src/models/registry.js'
+import type { ModelCard } from '../src/models/registry.js'
 import { ProviderError, Router, type ModelBinding, type RouteRequest } from '../src/models/router.js'
 
 const KEY = 'Rt4yU8iO2pA6sD0fG5hJ9kL3zX7cV1bN'
@@ -81,12 +82,6 @@ function card(over: Partial<ModelCard> = {}): ModelCard {
 const REF = 'openrouter/moonshotai/kimi-k2'
 const BINDING: ModelBinding = { primary: REF, fallbacks: [] }
 
-const freshProbe = (ref: string): ProbeRecord => ({
-  ref,
-  toolCalling: true,
-  checkedAt: Date.now(),
-  ttlMs: 86_400_000,
-})
 
 const REQUEST: RouteRequest = {
   system: 'you are a test',

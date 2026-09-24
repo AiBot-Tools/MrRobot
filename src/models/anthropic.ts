@@ -251,6 +251,7 @@ export class AnthropicAdapter implements ModelAdapter {
           cacheReadTokens: usage.cacheReadTokens,
           cacheWriteTokens: usage.cacheWrite5mTokens + usage.cacheWrite1hTokens,
           costMicroUsd,
+          modelSeen: message.model,
           ...(toolCalls.length === 0 ? {} : { toolCalls }),
           ...(toolCallErrors.length === 0 ? {} : { toolCallErrors }),
           raw: message.content,

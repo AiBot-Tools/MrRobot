@@ -181,6 +181,15 @@ export class McpHub {
     this.#pingTimeoutMs = options.pingTimeoutMs ?? DEFAULT_PING_TIMEOUT_MS
   }
 
+  /**
+   * The live description of one tool, for a kernel component that must check
+   * a server's schema before trusting it (the secrets broker does this at
+   * boot). Read-only: it hands out no client and no session.
+   */
+  describe(serverId: string, tool: string): ToolDescription | undefined {
+    return this.#servers.get(serverId)?.described.get(tool)
+  }
+
   status(serverId: string): 'connected' | 'degraded' | 'absent' {
     return this.#servers.get(serverId)?.status ?? 'absent'
   }

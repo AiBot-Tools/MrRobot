@@ -203,9 +203,9 @@ test('call re-checks exposure and throws on a forged ticket for a kernel-only to
   // ticket is wrong; the tool is. An unforgeable ticket would not help here,
   // because kernel code can mint a real one — only re-deriving exposure at
   // execution time does.
-  const forged = ticketFor('pmmcp.get_secret', { key: 'anthropic-api-key' })
+  const forged = ticketFor('pmmcp.get_secret', { label: 'anthropic-api-key' })
   await assert.rejects(
-    () => hub.call(forged, { key: 'anthropic-api-key' }),
+    () => hub.call(forged, { label: 'anthropic-api-key' }),
     (e: unknown) => e instanceof PolicyDenied && /exposure is kernel-only/.test(e.message),
   )
 
@@ -227,7 +227,7 @@ test('callKernelOnly reaches get_secret and the result is never appended to the 
   const result = await hub.callKernelOnly(
     'pmmcp',
     'get_secret',
-    { key: 'anthropic-api-key' },
+    { label: 'anthropic-api-key' },
     'resolve the anthropic provider credential at boot',
   )
 

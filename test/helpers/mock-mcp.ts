@@ -8,10 +8,11 @@
 // The names were chosen to exercise specific kernel behaviour:
 //
 //   recall                 an ordinary exposed read
-//   get_secret             a kernel-only tool. Its input shape { key } is the
-//                          fixture's GUESS and is UNVERIFIED against the real
-//                          pmmcp, which the operator has since confirmed takes
-//                          `label`. Nothing may infer the live shape from here.
+//   get_secret             a kernel-only tool. Its argument is `label`, which
+//                          the operator CONFIRMED against the live pmmcp
+//                          schema (DECISIONS Q24). `secretArg` overrides it so
+//                          the broker's fail-closed path has a server that
+//                          disagrees to point at.
 //   boom                   throws, to prove a thrown tool resolves isError
 //   coding_agent           stays disabled for agents (nested LLM calls would
 //                          bypass the router, budgets, taint and the log)
@@ -59,7 +60,13 @@ export const MOCK_TOOL_NAMES: readonly string[] = [
   'unclassified_new_tool',
 ]
 
-export async function mockMcp(): Promise<MockMcp> {
+export interface MockMcpOptions {
+  /** The name `get_secret` declares. Defaults to the confirmed live one. */
+  readonly secretArg?: string
+}
+
+export async function mockMcp(options: MockMcpOptions = {}): Promise<MockMcp> {
+  const secretArg = options.secretArg ?? 'label'
   const calls: RecordedCall[] = []
   const record = (tool: string, args: Record<string, unknown>): void => {
     calls.push({ tool, args })
@@ -81,12 +88,16 @@ export async function mockMcp(): Promise<MockMcp> {
 
   server.registerTool(
     'get_secret',
-    // UNVERIFIED fixture shape. The live pmmcp takes `label`, not `key`; this
-    // exists only so a kernel-only classification has something to point at.
-    { description: 'Vault read (fixture; arg name UNVERIFIED)', inputSchema: { key: z.string() } },
-    ({ key }) => {
-      record('get_secret', { key })
-      return { content: [{ type: 'text' as const, text: 'fixture-value-not-a-secret' }] }
+    {
+      description: 'Vault read (fixture)',
+      inputSchema: { [secretArg]: z.string() },
+    },
+    (args: Record<string, unknown>) => {
+      record('get_secret', args)
+      const id = String(args[secretArg] ?? '')
+      // A distinct value per id, so a test can prove the right one came back
+      // without any real secret existing anywhere.
+      return { content: [{ type: 'text' as const, text: `fixture-secret-for-${id}` }] }
     },
   )
 

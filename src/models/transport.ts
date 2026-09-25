@@ -18,7 +18,7 @@
 // event redaction pass censors it by exact substring rather than hoping a
 // pattern matches.
 
-import { boundOutput } from '../events/bound.js'
+import { boundOutput, PAYLOAD_TEXT_BUDGET } from '../events/bound.js'
 import type { EventStore } from '../events/store.js'
 import { SecretMask } from '../events/redact.js'
 import type { ModelCard } from './registry.js'
@@ -251,7 +251,7 @@ export async function withCallEvents(
   // censored by exact substring rather than by a hopeful pattern.
   if (key !== undefined) SecretMask.register(key)
 
-  const prompt = boundOutput(context.prompt)
+  const prompt = boundOutput(context.prompt, PAYLOAD_TEXT_BUDGET)
   store.append({
     type: 'llm.request',
     ...(scope.runId === undefined ? {} : { runId: scope.runId }),
@@ -279,7 +279,7 @@ export async function withCallEvents(
         schemaVersion: 1,
         ref,
         attempt,
-        content: boundOutput(outcome.content).text,
+        content: boundOutput(outcome.content, PAYLOAD_TEXT_BUDGET).text,
         finish: outcome.finish,
         inputTokens: outcome.inputTokens,
         outputTokens: outcome.outputTokens,

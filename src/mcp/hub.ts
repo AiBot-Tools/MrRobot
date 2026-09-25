@@ -32,7 +32,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { McpError } from '@modelcontextprotocol/sdk/types.js'
 
 import { PolicyDenied } from '../errors.js'
-import { boundOutput } from '../events/bound.js'
+import { boundOutput, PAYLOAD_TEXT_BUDGET } from '../events/bound.js'
 import type { EventStore } from '../events/store.js'
 import { log } from '../log.js'
 import { PolicyEngine, type GateTicket } from '../policy/engine.js'
@@ -422,7 +422,7 @@ export class McpHub {
       text = e instanceof Error ? e.message : String(e)
     }
 
-    const bounded = boundOutput(text)
+    const bounded = boundOutput(text, PAYLOAD_TEXT_BUDGET)
     const outcome: ToolOutcome = {
       ok,
       text: bounded.text,

@@ -22,6 +22,23 @@ import { redactString } from './redact.js'
 /** Largest redacted text stored inline, in bytes. */
 export const MAX_LOGGED_OUTPUT = 65_536
 
+/**
+ * Budget for ONE bounded string that will be wrapped in an event payload.
+ *
+ * The store refuses a payload whose canonical JSON exceeds MAX_LOGGED_OUTPUT,
+ * and a payload is never just its text: `tool.result` also carries a ticket
+ * id, a tool ref, a digest and three numbers, and `llm.request` carries a ref,
+ * an attempt and a tool array. Bounding the text to the FULL limit therefore
+ * produces a payload a few hundred bytes over it, and the append throws — so
+ * a tool that returns a large output kills the run instead of being truncated,
+ * which is the exact opposite of what the limit exists to do.
+ *
+ * The reserve is generous rather than computed: an envelope is small and
+ * bounded, and a constant that is obviously large enough needs no maintenance
+ * when a field is added.
+ */
+export const PAYLOAD_TEXT_BUDGET = MAX_LOGGED_OUTPUT - 2_048
+
 export interface BoundedOutput {
   /** Redacted text, truncated on a UTF-8 code point boundary if needed. */
   readonly text: string

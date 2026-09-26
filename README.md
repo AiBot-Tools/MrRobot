@@ -203,7 +203,17 @@ router refuses to serve one.
 
 `SecretsBroker.keyArg` is **unverified** against a live pmmcp until line 2 of
 the checklist below passes. The broker fails closed if the live schema
-disagrees.
+disagrees: `broker.start()` throws on drift, and boot turns that into a DEGRADED
+secrets subsystem whose reason names the argument and the config line to change.
+
+The kernel is tested against a **pmmcp double** (`test/helpers/mock-pmmcp.ts`):
+an in-process MCP server with the goal hierarchy, the validated status
+transitions, `project_id` namespacing, the vault and an idle-expiring session
+all modelled. It is what lets the vault credential path, invariant 7 at 49
+tools, and a reconnect after a `-32001` be tested with no pmmcp anywhere. Its
+tool names and arguments are MODELLED, recorded as such in `PMMCP_TOOLS`, and
+nothing in the kernel may treat one as known-good until a live capture confirms
+it.
 
 ---
 

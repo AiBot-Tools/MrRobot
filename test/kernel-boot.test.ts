@@ -38,25 +38,23 @@ import { parseKernelConfig } from '../src/config.js'
 import { readAnchor } from '../src/events/anchor.js'
 import { CONTROL_PATH } from '../src/control/auth.js'
 import { VERSION } from '../src/version.js'
-import { fixture, REPO_ROOT, TEST_TOKEN, verifyAt, withKernel } from './helpers/kernel.js'
+import {
+  fixture,
+  REPO_ROOT,
+  rows,
+  runThroughControl,
+  TEST_TOKEN,
+  verifyAt,
+  withKernel,
+} from './helpers/kernel.js'
 import { tmpdir } from './helpers/tmpdir.js'
 import { join } from 'node:path'
 import { fakeSandbox } from './helpers/fake-sandbox.js'
 import { anthropicEndTurn, fakeProvider } from './helpers/fake-provider.js'
 import { freshProbe } from './helpers/probe.js'
 import { writeProbeRecord } from '../src/models/probe.js'
-import { connectControl } from '../src/cli/client.js'
 import { mockMcp } from './helpers/mock-mcp.js'
 
-/** Rows of a closed kernel log, read back read-only. */
-function rows(dbPath: string): { seq: number; type: string; payload: string }[] {
-  const store = new EventStore(dbPath, { readOnly: true })
-  try {
-    return store.query().map((r) => ({ seq: r.seq, type: r.type, payload: r.payload }))
-  } finally {
-    store.close()
-  }
-}
 
 /** Rows as bootKernel sees them: read-only reopen, ordered by seq. */
 function allRows(dbPath: string): ReturnType<typeof readAllRows> {
@@ -107,55 +105,6 @@ async function expectBootRefusal(
 
 /** The one non-placeholder ref in the shipped providers.yaml. */
 const REAL_REF = 'anthropic/claude-sonnet-5'
-
-/**
- * Start a run over the real control socket and wait for it to finish.
- *
- * Through the wire rather than through the surface object: this is the path
- * `aos run` takes, so a test that exercises it proves the protocol as well as
- * the loop.
- */
-async function runThroughControl(
-  kernel: Awaited<ReturnType<typeof bootKernel>>,
-  prompt: string,
-): Promise<Record<string, unknown>> {
-  const client = await connectControl({ port: kernel.port, token: TEST_TOKEN, timeoutMs: 120_000 })
-  try {
-    // Buffered, for the same reason the CLI buffers: the daemon broadcasts as
-    // it appends, so a fast run can finish before the reply naming it is
-    // parsed. Matching only on an id we do not yet know loses that event.
-    const early = new Map<string, Record<string, unknown>>()
-    let mine: string | undefined
-    let settle: (payload: Record<string, unknown>) => void = () => undefined
-    const finished = new Promise<Record<string, unknown>>((resolve) => {
-      settle = resolve
-    })
-    client.onEvent((event) => {
-      if (event.type !== 'run.finished') return
-      const payload = event.payload as Record<string, unknown> | null
-      if (payload === null || typeof payload['runId'] !== 'string') return
-      if (payload['runId'] === mine) settle(payload)
-      else early.set(payload['runId'], payload)
-    })
-
-    const started = (await client.call('run.start', { agentId: 'ceo', input: prompt })) as {
-      runId: string
-    }
-    mine = started.runId
-    const alreadyDone = early.get(started.runId)
-    if (alreadyDone !== undefined) settle(alreadyDone)
-
-    // Bounded: a run that never finishes must fail with what the log says, not
-    // hang the file until the runner gives up with no diagnosis.
-    const timeout = new Promise<Record<string, unknown>>((_, reject) => {
-      const timer = setTimeout(() => reject(new Error(`run ${started.runId} did not finish`)), 20_000)
-      timer.unref?.()
-    })
-    return await Promise.race([finished, timeout])
-  } finally {
-    client.close()
-  }
-}
 
 test('boots DEGRADED with hub, secrets and sandbox degraded, each with a reason, and control ok, over a real WS connection', async (t) => {
   const { kernel, fx } = await withKernel(t)
@@ -1047,7 +996,11 @@ test('envFallback:true shows secrets degraded in status.get', async (t) => {
   const status = withVault.kernel.status()
   assert.equal(status.subsystems.hub.state, 'ok', 'the mock hub did not connect')
   assert.equal(status.subsystems.secrets.state, 'degraded')
-  assert.match(status.subsystems.secrets.reason ?? '', /envFallback is on/)
+  // The wording is the broker's, because boot now derives this mark from
+  // broker.start() rather than re-deriving it from config: one place decides
+  // what a degraded vault means, and it is the component that owns the vault.
+  assert.match(status.subsystems.secrets.reason ?? '', /envFallback is ON/)
+  assert.match(status.subsystems.secrets.reason ?? '', /environment/)
   assert.equal(status.state, 'degraded', 'a connected vault made the kernel look ready with fallback on')
 
   // And with fallback OFF and the vault up, secrets is finally ok — so the

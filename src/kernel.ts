@@ -375,14 +375,41 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     })
 
     mark('hub', hubState.ok ? 'ok' : 'degraded', hubState.reason)
-    // D8: env fallback keeps the vault path degraded for as long as it is on.
-    // A kernel reporting ready while a credential may be coming from the
-    // environment would be hiding the thing an operator most needs to know.
-    const secretsReason = !hubState.ok
-      ? `no vault: ${hubState.reason ?? 'pmmcp is not connected'}`
-      : config.secrets.envFallback
-        ? 'envFallback is on: a credential may come from the environment rather than the vault'
-        : undefined
+
+    // The vault's own boot step, and the only thing that confirms
+    // `secrets.keyArg` against the LIVE schema. Boot used to skip it and derive
+    // the secrets mark from config alone, which meant a connected pmmcp
+    // declaring a different argument name booted as `secrets: ok` and then
+    // failed every credential fetch with a message about the vault returning
+    // nothing — pointing at the vault rather than at the one line of
+    // kernel.yaml that was wrong.
+    //
+    // start() THROWS on that drift, deliberately. Boot turns it into a DEGRADED
+    // secrets subsystem rather than a refused boot: the control plane is how an
+    // operator would read the reason, and refusing to start takes it away. The
+    // vault path is closed either way — ref() has nothing to fall back to with
+    // envFallback off, and the throw is recorded before anything asks.
+    //
+    // D8: env fallback keeps the vault path degraded for as long as it is on. A
+    // kernel reporting ready while a credential may be coming from the
+    // environment would be hiding the thing an operator most needs to know;
+    // broker.start() is what declares that standing degradation.
+    let secretsReason: string | undefined
+    try {
+      await broker.start()
+      secretsReason = broker.degradedReason
+    } catch (e) {
+      secretsReason = e instanceof Error ? e.message : String(e)
+      store.append({
+        type: 'secrets.degraded',
+        payload: { schemaVersion: 1, reason: secretsReason },
+      })
+    }
+    if (!hubState.ok) {
+      // Said better than the broker can: the broker knows only that it has no
+      // hub, while boot knows why the hub is not there.
+      secretsReason = `no vault: ${hubState.reason ?? 'pmmcp is not connected'}`
+    }
     mark('secrets', secretsReason === undefined ? 'ok' : 'degraded', secretsReason)
 
     // ── sandbox (degradable) ──────────────────────────────────────────────

@@ -29,6 +29,7 @@ import { parseKernelConfig, type KernelConfig } from '../../src/config.js'
 import { parseProviders, type ProvidersFile } from '../../src/models/registry.js'
 import { parseToolViews, type ToolViewsFile } from '../../src/mcp/tool-views.js'
 import { bootKernel, type BootOptions, type Kernel } from '../../src/kernel.js'
+import { connectControl } from '../../src/cli/client.js'
 import { fakeSandbox } from './fake-sandbox.js'
 import { tmpdir } from './tmpdir.js'
 
@@ -193,5 +194,63 @@ export function verifyAt(dbPath: string): void {
     }
   } finally {
     store.close()
+  }
+}
+
+/** Rows of a kernel log, read back read-only. Safe while the kernel is open. */
+export function rows(dbPath: string): { seq: number; type: string; payload: string }[] {
+  const store = new EventStore(dbPath, { readOnly: true })
+  try {
+    return store.query().map((r) => ({ seq: r.seq, type: r.type, payload: r.payload }))
+  } finally {
+    store.close()
+  }
+}
+
+/**
+ * Start a run over a real control-plane connection and resolve its
+ * `run.finished` payload.
+ *
+ * Buffered, for the same reason the CLI buffers: the daemon broadcasts as it
+ * appends, so a fast run can finish before the reply naming it is parsed.
+ * Matching only on an id we do not yet know loses that event.
+ */
+export async function runThroughControl(
+  kernel: Kernel,
+  prompt: string,
+  agentId = 'ceo',
+): Promise<Record<string, unknown>> {
+  const client = await connectControl({ port: kernel.port, token: TEST_TOKEN, timeoutMs: 120_000 })
+  try {
+    const early = new Map<string, Record<string, unknown>>()
+    let mine: string | undefined
+    let settle: (payload: Record<string, unknown>) => void = () => undefined
+    const finished = new Promise<Record<string, unknown>>((resolve) => {
+      settle = resolve
+    })
+    client.onEvent((event) => {
+      if (event.type !== 'run.finished') return
+      const payload = event.payload as Record<string, unknown> | null
+      if (payload === null || typeof payload['runId'] !== 'string') return
+      if (payload['runId'] === mine) settle(payload)
+      else early.set(payload['runId'], payload)
+    })
+
+    const started = (await client.call('run.start', { agentId, input: prompt })) as {
+      runId: string
+    }
+    mine = started.runId
+    const alreadyDone = early.get(started.runId)
+    if (alreadyDone !== undefined) settle(alreadyDone)
+
+    // Bounded: a run that never finishes must fail with what the log says, not
+    // hang the file until the runner gives up with no diagnosis.
+    const timeout = new Promise<Record<string, unknown>>((_, reject) => {
+      const timer = setTimeout(() => reject(new Error(`run ${started.runId} did not finish`)), 20_000)
+      timer.unref?.()
+    })
+    return await Promise.race([finished, timeout])
+  } finally {
+    client.close()
   }
 }

@@ -32,7 +32,6 @@ import { parse as parseYaml } from 'yaml'
 import { STUBS } from '../src/kernel.js'
 import { NotImplementedError } from '../src/errors.js'
 import { AppleContainerDriver } from '../src/sandbox/apple-container.js'
-import { Scheduler } from '../src/runtime/scheduler.js'
 import { assertEgressEnforced } from '../src/runtime/egress.js'
 import { assertDelegationAvailable } from '../src/runtime/delegate.js'
 import { LANE_NAMES } from '../src/runtime/lanes.js'
@@ -62,7 +61,6 @@ test('every STUBS entry throws NotImplementedError or reports unavailable with a
     { id: 'apple-container-driver', call: () => new AppleContainerDriver().run({} as never) },
     { id: 'apple-container-driver', call: () => new AppleContainerDriver().kill('x') },
     { id: 'egress-proxy', call: () => assertEgressEnforced() },
-    { id: 'scheduler', call: () => new Scheduler().start() },
     { id: 'delegate-tool', call: () => assertDelegationAvailable() },
   ]
 
@@ -194,7 +192,6 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   const NAMES: Record<string, RegExp> = {
     'apple-container-driver': /Apple container driver/,
     'egress-proxy': /egress proxy/i,
-    scheduler: /scheduler/i,
     'delegate-tool': /delegation\/spawn tool|delegation tool/i,
   }
   for (const stub of STUBS) {
@@ -246,19 +243,22 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   assert.equal(/all classified in `config\/tool-views\.yaml`/.test(CLAUDE_MD), false)
 })
 
-test('schedule: in a manifest is refused by the schema', () => {
+test('a manifest schedule must be a cron expression the scheduler can run', () => {
   // Strictness is how an absent feature stays absent. Parsed-and-ignored is
   // indistinguishable from working, and a manifest carrying a cron line would
   // sit on disk looking active while nothing ever fired.
-  assert.throws(
-    () => parseManifest(parseYaml(`${TEMPLATE}\nschedule: "0 * * * *"\n`), 'agent.yaml'),
-    /schedule: not implemented in Phase 0/,
+  // A valid expression is now ACCEPTED and run — the scheduler exists.
+  assert.equal(
+    parseManifest(parseYaml(`${TEMPLATE}\nschedule: "0 * * * *"\n`), 'agent.yaml').schedule,
+    '0 * * * *',
   )
-  // Every shape of it, including the ones that look like "disabled".
-  for (const value of ['"0 * * * *"', 'null', 'false', '""', '{}']) {
+  // What must still be refused is anything the scheduler cannot actually run,
+  // and every shape that looks like "disabled" — a field the schema tolerates but
+  // the scheduler ignores is the failure this test exists for.
+  for (const value of ['"0 9 * * MON-FRI"', '"@daily"', '"* * * *"', 'null', 'false', '""', '{}', '5']) {
     assert.throws(
       () => parseManifest(parseYaml(`${TEMPLATE}\nschedule: ${value}\n`), 'agent.yaml'),
-      /schedule/,
+      /is invalid/,
       value,
     )
   }

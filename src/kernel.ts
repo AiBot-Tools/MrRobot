@@ -113,11 +113,6 @@ export const STUBS: readonly { id: string; where: string; how: string }[] = [
     how: 'assertEgressEnforced() throws NotImplementedError, so no run can reach the network',
   },
   {
-    id: 'scheduler',
-    where: 'src/runtime/scheduler.ts',
-    how: 'Scheduler.start() throws NotImplementedError; a manifest carrying `schedule:` is refused at parse',
-  },
-  {
     id: 'delegate-tool',
     where: 'src/runtime/delegate.ts',
     how: 'assertDelegationAvailable() throws NotImplementedError; no delegation tool is offered to any model',
@@ -126,8 +121,18 @@ export const STUBS: readonly { id: string; where: string; how: string }[] = [
 
 export interface BootOptions {
   readonly config: KernelConfig
-  /** Repository root, for protected-path resolution and the agents/souls dirs. */
+  /** Repository root, for protected-path resolution and the souls directory. */
   readonly repoRoot: string
+  /**
+   * Where agent manifests live. Defaults to `<repoRoot>/agents`.
+   *
+   * Explicit rather than derived so a test can supply a manifest tree without
+   * editing the shipped files, and so the boot path's inputs are visible in one
+   * place. It does not widen what an agent can reach: manifests are
+   * operator-authored config, and what they may GRANT is still bounded by the
+   * tool views.
+   */
+  readonly agentsDir?: string
   readonly providers: ProvidersFile
   readonly toolViews: ToolViewsFile
   readonly env?: NodeJS.ProcessEnv
@@ -160,6 +165,7 @@ export interface Kernel {
   readonly lanes: Lanes
   readonly approvals: Approvals
   readonly quarantine: Quarantine
+  readonly scheduler: Scheduler
   status(): StatusResult
   shutdown(reason?: 'requested' | 'signal' | 'error', signal?: string): Promise<void>
 }
@@ -174,8 +180,11 @@ export const SUBSYSTEM_ORDER: readonly SubsystemName[] = [
   'secrets',
   'sandbox',
   'router',
-  'scheduler',
   'egress',
+  // After egress, because the scheduler is built once the lanes and the run loop
+  // exist — it starts runs through the same path the control plane does, and it
+  // cannot be reported ready before the thing it would start runs with.
+  'scheduler',
   'control',
 ]
 
@@ -343,7 +352,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       toolViews,
       store,
     })
-    agents.load(join(repoRoot, 'agents'))
+    agents.load(options.agentsDir ?? join(repoRoot, 'agents'))
 
     const probes = (ref: string): ProbeRecord | undefined => readProbeRecord(config.dataDir, ref)
 
@@ -480,7 +489,6 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     mark('router', routerReason === undefined ? 'ok' : 'degraded', routerReason)
 
     // ── absent by design, and saying so ──────────────────────────────────
-    mark('scheduler', 'absent', stubReason('scheduler', () => new Scheduler().start()))
     mark('egress', 'absent', stubReason('egress-proxy', assertEgressEnforced))
 
     // ── lanes, policy, loop ──────────────────────────────────────────────
@@ -508,6 +516,28 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
           resolveCaps(config.budgets, agents.get(agent.agentId)?.manifest.budget ?? {}),
           { now },
         ),
+    })
+
+    // ── scheduler ─────────────────────────────────────────────────────────
+    //
+    // Built after the loop, because it starts runs through the same path the
+    // control plane does: a scheduled run is an ordinary run on the agent's own
+    // lane, with the same gate and the same budget. There is no cron lane.
+    const scheduled = (): { agentId: string; schedule: string }[] =>
+      agents
+        .list()
+        .filter((r) => r.status === 'active' && r.manifest.schedule !== undefined)
+        .map((r) => ({ agentId: r.manifest.id, schedule: r.manifest.schedule as string }))
+
+    const scheduler = new Scheduler({
+      store,
+      agents: scheduled,
+      // Read fresh from the live run map rather than a snapshot, so a job whose
+      // previous run is still going is skipped instead of queued behind it.
+      isBusy: (agentId) =>
+        [...runs.values()].some((r) => r.state.agentId === agentId && r.state.status !== 'finished'),
+      startRun: (agentId, input) => surface.startRun({ agentId, input }),
+      now,
     })
 
     // The run projection is read from the LOG, not kept alongside it. One
@@ -547,6 +577,15 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       maxPayloadBytes: config.control.maxPayloadBytes,
       surface,
     })
+    // Started before control binds, so a schedule is live the moment the kernel
+    // is. Marked in SUBSYSTEM_ORDER's position regardless of where it is built.
+    scheduler.start()
+    mark(
+      'scheduler',
+      'ok',
+      scheduled().length === 0 ? 'running; no agent declares a schedule' : undefined,
+    )
+
     await server.listen()
     mark('control', 'ok')
 
@@ -565,11 +604,13 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       lanes,
       approvals,
       quarantine,
+      scheduler,
       status: () => surface.status(),
       async shutdown(reason = 'requested', signal) {
         if (stopped) return
         stopped = true
         unsubscribe()
+        scheduler.stop()
         for (const live of runs.values()) live.controller.abort()
         approvals.close()
         await server.close()

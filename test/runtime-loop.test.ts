@@ -45,7 +45,6 @@ import { Lanes } from '../src/runtime/lanes.js'
 import { RunLoop, type RunAgent, type ToolContext } from '../src/runtime/loop.js'
 import { assertDelegationAvailable } from '../src/runtime/delegate.js'
 import { assertEgressEnforced } from '../src/runtime/egress.js'
-import { Scheduler } from '../src/runtime/scheduler.js'
 import { NotImplementedError } from '../src/errors.js'
 import { MAX_LOGGED_OUTPUT, PAYLOAD_TEXT_BUDGET } from '../src/events/bound.js'
 
@@ -617,11 +616,11 @@ test('the model’s tool list never contains a delegation or spawn tool and asse
   }
 
   // A tool that looked like delegation and quietly did something simpler
-  // would be worse than none. All three Phase 0 stubs throw rather than
-  // returning a plausible answer.
+  // would be worse than none. Both remaining stubs throw rather than returning a
+  // plausible answer. (The scheduler is no longer one of them — it runs, and it
+  // starts runs through this same loop.)
   assert.throws(() => assertDelegationAvailable(), NotImplementedError)
   assert.throws(() => assertEgressEnforced(), NotImplementedError)
-  assert.throws(() => new Scheduler().start(), NotImplementedError)
 })
 
 test('ToolContext keys are exactly [agentId, args, runId, toolRef]', () => {

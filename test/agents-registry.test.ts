@@ -145,12 +145,26 @@ test('rejects a manifest whose tools.allow names a kernel-only or disabled tool'
   }
 })
 
-test("rejects a non-null schedule with 'not implemented in Phase 0'", () => {
-  // Strictness is how an absent feature stays absent. Parsed-and-ignored is
-  // indistinguishable from working until the day it matters.
+test('accepts a runnable schedule and refuses one the scheduler could not run', () => {
+  // Strictness is how a PRESENT feature stays honest. A cron expression the
+  // scheduler cannot run must be refused here, at load, with the file named —
+  // not accepted and then silently never fired, which is the failure an operator
+  // has no way to see.
+  assert.equal(
+    parseManifest(parseYaml(`${TEMPLATE_YAML}\nschedule: "0 9 * * 1-5"\n`), 'agent.yaml').schedule,
+    '0 9 * * 1-5',
+  )
   assert.throws(
-    () => parseManifest(parseYaml(`${TEMPLATE_YAML}\nschedule: "0 * * * *"\n`), 'agent.yaml'),
-    /schedule: not implemented in Phase 0/,
+    () => parseManifest(parseYaml(`${TEMPLATE_YAML}\nschedule: "0 9 * * MON-FRI"\n`), 'agent.yaml'),
+    /is a name; this parser takes numbers only/,
+  )
+  assert.throws(
+    () => parseManifest(parseYaml(`${TEMPLATE_YAML}\nschedule: "@daily"\n`), 'agent.yaml'),
+    // The quotes arrive backslash-escaped inside zod's serialised error, so the
+    // pattern tolerates that. What matters is that the parser's own hint reaches
+    // the manifest error: an operator is told what to write instead, in the file
+    // that refused them.
+    /macros like .+@daily.+ are not supported; write the five fields/,
   )
   // Any unknown key is refused too, so a typo cannot sit in the file looking
   // active.

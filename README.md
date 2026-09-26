@@ -134,12 +134,39 @@ the CLI, and kernel boot.
 |---|---|---|
 | `apple-container-driver` | `src/sandbox/apple-container.ts` | `probe()` reports unavailable with a reason so boot degrades; `run()` and `kill()` throw `NotImplementedError`. macOS 15 has no `container` binary |
 | `egress-proxy` | `src/runtime/egress.ts` | `assertEgressEnforced()` throws `NotImplementedError`, so no run can reach the network |
-| `scheduler` | `src/runtime/scheduler.ts` | `Scheduler.start()` throws `NotImplementedError`; a manifest carrying `schedule:` is refused at parse |
 | `delegate-tool` | `src/runtime/delegate.ts` | `assertDelegationAvailable()` throws `NotImplementedError`; no delegation tool is offered to any model |
 
 One of these deserves spelling out: **no delegation tool is offered to any
 model**. The CEO can plan, but it cannot actually spawn or delegate, so the fleet
 it describes does not exist yet.
+
+### Schedules
+
+An agent manifest may carry a five-field cron expression:
+
+```yaml
+schedule: "0 9 * * 1-5"      # 09:00 local, Monday to Friday
+```
+
+Supported: `*`, `N`, `a-b`, `*/n`, `a-b/n`, and comma-separated lists of those.
+**Refused, by name rather than misread:** macros (`@daily`), six fields (a
+seconds column), names (`MON`, `JAN`), the nonstandard `L`/`W`/`#`/`?`, and
+backwards ranges like `55-5`. Expressions are validated when the manifest loads,
+so a bad one is a refusal naming the file — not a job that silently never fires.
+
+Four rules make a schedule safe to leave running, because a scheduled run spends
+money and takes actions:
+
+- **No catch-up.** Occurrences missed while the kernel was down are skipped and
+  logged, never replayed. The worst moment to launch a backlog is right after an
+  outage, when its cause may still be true.
+- **No overlap.** If the agent still has a run in flight, the tick is skipped, not
+  queued — a job slower than its interval would build a queue that never drains.
+- **No double fire.** Each fire is keyed by the local minute, claimed in the log
+  as `run.scheduled` *before* the run starts. So a repeated hour at the end of
+  daylight saving cannot fire twice, and neither can a restart inside that minute.
+- **No cron lane.** A scheduled run goes on the agent's own lane, with the same
+  gate and the same budget as any other.
 
 ### Crash recovery, and what it deliberately does not do
 

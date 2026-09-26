@@ -173,6 +173,20 @@ export const RunQueuedPayload = z
   .object({ ...V, runId: z.string(), agentId: z.string(), lane: z.string(), goalId: z.string().optional() })
   .strict()
 
+/**
+ * The scheduler decided to fire an agent for a given minute.
+ *
+ * Written BEFORE the run is started, which is the point: it is the durable claim
+ * on that minute. If starting then fails, the minute stays claimed and a restart
+ * does not re-fire it — a job that cannot start must not be retried on every tick
+ * and every reboot.
+ *
+ * It also answers "why did this run start?", which no other row does.
+ */
+export const RunScheduledPayload = z
+  .object({ ...V, agentId: z.string(), schedule: z.string(), minute: z.string() })
+  .strict()
+
 export const RunStartedPayload = z
   .object({
     ...V,
@@ -383,6 +397,7 @@ export const EVENT_TYPES = [
   'agent.promotion.requested',
   'agent.promoted',
   'agent.archived',
+  'run.scheduled',
   'run.queued',
   'run.started',
   'run.parked',
@@ -425,6 +440,7 @@ export const PAYLOAD_SCHEMAS: Readonly<Record<EventType, z.ZodType>> = {
   'agent.promotion.requested': AgentPromotionRequestedPayload,
   'agent.promoted': AgentPromotedPayload,
   'agent.archived': AgentArchivedPayload,
+  'run.scheduled': RunScheduledPayload,
   'run.queued': RunQueuedPayload,
   'run.started': RunStartedPayload,
   'run.parked': RunParkedPayload,

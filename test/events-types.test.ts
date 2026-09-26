@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { EVENT_TYPES, PAYLOAD_SCHEMAS, type EventType } from '../src/events/types.js'
 import { withStore } from './helpers/store.js'
 
-const FROZEN_37: readonly string[] = [
+const FROZEN_38: readonly string[] = [
   'kernel.booted',
   'kernel.shutdown',
   'subsystem.state',
@@ -32,6 +32,7 @@ const FROZEN_37: readonly string[] = [
   'agent.promotion.requested',
   'agent.promoted',
   'agent.archived',
+  'run.scheduled',
   'run.queued',
   'run.started',
   'run.parked',
@@ -83,6 +84,7 @@ const SAMPLES: Record<EventType, Record<string, unknown>> = {
   'agent.promotion.requested': { schemaVersion: 1, agentId: 'scout-1', requestedByRunId: 'r1', rationale: 'useful' },
   'agent.promoted': { schemaVersion: 1, agentId: 'scout-1', fromVersion: 1, toVersion: 2, byConnectionId: 'c1' },
   'agent.archived': { schemaVersion: 1, agentId: 'scout-1', version: 2, byConnectionId: 'c1' },
+  'run.scheduled': { schemaVersion: 1, agentId: 'ceo', schedule: '0 9 * * 1-5', minute: '2026-09-28T09:00' },
   'run.queued': { schemaVersion: 1, runId: 'r1', agentId: 'ceo', lane: 'ceo' },
   'run.started': { schemaVersion: 1, runId: 'r1', agentId: 'ceo', lane: 'ceo', tier: 0, taint: 'clean' },
   'run.parked': { schemaVersion: 1, runId: 'r1', reason: 'approval', approvalId: 'a1' },
@@ -141,14 +143,15 @@ const SAMPLES: Record<EventType, Record<string, unknown>> = {
 }
 
 test('EVENT_TYPES equals the 37 frozen names by literal array equality', () => {
-  // 37 since `quarantine.abandoned` was added for crash recovery. The list is
-  // frozen by literal equality precisely so that growing it is a deliberate act
-  // with a reason, and the reason here is that a restart must be able to end a
-  // hold WITHOUT claiming a human released its content.
-  assert.equal(EVENT_TYPES.length, 37)
-  assert.deepEqual([...EVENT_TYPES], FROZEN_37)
+  // 38: `quarantine.abandoned` for crash recovery, and `run.scheduled` for the
+  // cron scheduler. The list is frozen by literal equality precisely so that
+  // growing it is a deliberate act with a reason — a restart must be able to end
+  // a hold WITHOUT claiming a human released its content, and the scheduler must
+  // be able to claim a minute durably BEFORE it tries to start a run.
+  assert.equal(EVENT_TYPES.length, 38)
+  assert.deepEqual([...EVENT_TYPES], FROZEN_38)
   // No duplicates, and every name is dotted and lowercase.
-  assert.equal(new Set(EVENT_TYPES).size, 37)
+  assert.equal(new Set(EVENT_TYPES).size, 38)
   for (const t of EVENT_TYPES) assert.match(t, /^[a-z]+(\.[a-z]+)+$/)
 })
 
@@ -190,7 +193,7 @@ test('store.append rejects a type outside EVENT_TYPES', (t) => {
     const row = store.append({ type, payload: SAMPLES[type] })
     assert.equal(row.type, type)
   }
-  assert.equal(store.query().length, 37)
+  assert.equal(store.query().length, 38)
   assert.equal(store.verifyChain().ok, true)
 })
 

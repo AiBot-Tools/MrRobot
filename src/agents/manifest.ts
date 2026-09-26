@@ -4,11 +4,12 @@
 // not code, and it is the only place an agent's reach is declared — there is
 // no runtime call that grants an agent a tool it does not list here.
 //
-// The schema is strict, which is how absent features stay absent. `schedule:`
-// is the worked example: cron is Phase 1, so a manifest carrying it is
-// refused with a message saying so, rather than parsed and silently ignored.
-// An ignored field is indistinguishable from a working one until the day it
-// matters.
+// The schema is strict, which is how absent features stay absent, and how a
+// present one stays honest. `schedule:` is the worked example: it is now a cron
+// expression the scheduler really runs, and it is VALIDATED here rather than at
+// fire time — a bad expression must be a refusal at load with the file named, not
+// a job that silently never fires. An unvalidated field is indistinguishable
+// from a working one until the day it matters.
 //
 // Tier meaning (plan D15), enforced by the gate and the sandbox manager:
 //   0  no tools at all
@@ -19,6 +20,7 @@
 import { z } from 'zod'
 
 import { ConfigError } from '../errors.js'
+import { parseCron } from '../runtime/cron.js'
 
 export const AGENT_ID = /^[a-z][a-z0-9-]{1,31}$/
 /** A soul is a basename under souls/, never a path: no separators, no dots. */
@@ -96,6 +98,27 @@ export const AgentManifest = z
     budget: Budget.optional(),
     spawn: Spawn.optional(),
     memory: Memory,
+    /**
+     * A five-field cron expression, or absent.
+     *
+     * Validated HERE rather than by the scheduler, so a bad expression is a
+     * refusal at load with the file named — not a job that silently never fires,
+     * which is the failure an operator cannot see. The parser refuses everything
+     * it does not implement, so an accepted string is one the scheduler can run.
+     */
+    schedule: z
+      .string()
+      .min(1)
+      .superRefine((value, ctx) => {
+        try {
+          parseCron(value)
+        } catch (e) {
+          // The parser's own reason, verbatim: it names what to write instead,
+          // and re-wording it here would lose that.
+          ctx.addIssue({ code: 'custom', message: e instanceof Error ? e.message : String(e) })
+        }
+      })
+      .optional(),
   })
   .strict()
 
@@ -106,9 +129,6 @@ export type AgentManifest = z.output<typeof AgentManifest>
  * is most likely to hit.
  */
 export function parseManifest(input: unknown, source: string): AgentManifest {
-  if (typeof input === 'object' && input !== null && 'schedule' in input) {
-    throw new ConfigError(`${source}: schedule: not implemented in Phase 0`)
-  }
   const result = AgentManifest.safeParse(input)
   if (!result.success) {
     throw new ConfigError(`${source} is invalid: ${result.error.message}`)

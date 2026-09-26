@@ -23,7 +23,7 @@ import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { parse as parseYaml } from 'yaml'
 import { WebSocket } from 'ws'
 
@@ -39,6 +39,8 @@ import { readAnchor } from '../src/events/anchor.js'
 import { CONTROL_PATH } from '../src/control/auth.js'
 import { VERSION } from '../src/version.js'
 import { fixture, REPO_ROOT, TEST_TOKEN, verifyAt, withKernel } from './helpers/kernel.js'
+import { tmpdir } from './helpers/tmpdir.js'
+import { join } from 'node:path'
 import { fakeSandbox } from './helpers/fake-sandbox.js'
 import { anthropicEndTurn, fakeProvider } from './helpers/fake-provider.js'
 import { freshProbe } from './helpers/probe.js'
@@ -175,17 +177,21 @@ test('boots DEGRADED with hub, secrets and sandbox degraded, each with a reason,
   assert.match(status.subsystems.sandbox.reason ?? '', /no container runtime/)
   assert.match(status.subsystems.router.reason ?? '', /no routable model/)
 
-  // Absent is not degraded: these are not built at all, and they say so in
-  // their own words rather than in a status string invented here.
-  assert.equal(status.subsystems.scheduler.state, 'absent')
+  // Absent is not degraded: egress is not built at all, and it says so in its own
+  // words rather than in a status string invented here.
   assert.equal(status.subsystems.egress.state, 'absent')
-  assert.match(status.subsystems.scheduler.reason ?? '', /not implemented/)
   assert.match(status.subsystems.egress.reason ?? '', /not implemented/)
+
+  // The scheduler is real now, and ok even with nothing to run — which it says,
+  // because "ok" alone would leave an operator wondering whether it found their
+  // schedule.
+  assert.equal(status.subsystems.scheduler.state, 'ok')
+  assert.match(status.subsystems.scheduler.reason ?? '', /no agent declares a schedule/)
 
   // The two that must be ok for the kernel to be worth talking to.
   assert.equal(status.subsystems.events.state, 'ok')
   assert.equal(status.subsystems.control.state, 'ok')
-  assert.deepEqual([...kernel.degraded].sort(), ['egress', 'hub', 'router', 'sandbox', 'scheduler', 'secrets'])
+  assert.deepEqual([...kernel.degraded].sort(), ['egress', 'hub', 'router', 'sandbox', 'secrets'])
 
   // And the control plane really serves, over a real socket with a real
   // handshake — not merely "the object was constructed".
@@ -924,6 +930,98 @@ test('recovery is idempotent: a second restart writes no further recovery rows',
       `restart ${String(pass)} wrote a second terminal row for the same run`,
     )
   }
+
+  verifyAt(fx.dbPath)
+})
+
+test('a scheduled agent fires through a real kernel on the minute it matches', async (t) => {
+  // End to end: the manifest's cron expression, the scheduler boot started, and a
+  // run on the agent's OWN lane through the same path the control plane uses.
+  // There is no cron lane, and a scheduled run is an ordinary run.
+  //
+  // The clock is fixed, so both boots below see the same minute and the restart
+  // property is deterministic rather than a race with the wall clock.
+  const FIXED = Date.parse('2026-09-28T09:00:00')
+  const fx = fixture(t)
+
+  // The shipped ceo manifest carries no schedule, so one is added in a temp
+  // agents tree rather than by editing the shipped file.
+  const agentsDir = join(tmpdir(t), 'agents')
+  for (const id of ['ceo', 'worker-template']) {
+    mkdirSync(join(agentsDir, id, 'history'), { recursive: true })
+    const shipped = readFileSync(join(REPO_ROOT, 'agents', id, 'agent.yaml'), 'utf8')
+    writeFileSync(
+      join(agentsDir, id, 'agent.yaml'),
+      id === 'ceo' ? `${shipped}\nschedule: "* * * * *"\n` : shipped,
+    )
+  }
+  writeFileSync(join(agentsDir, 'ceo', 'AGENTS.md'), '# ceo\n')
+
+  const boot = async (): Promise<Awaited<ReturnType<typeof bootKernel>>> =>
+    bootKernel({
+      config: fx.config,
+      repoRoot: REPO_ROOT,
+      agentsDir,
+      providers: fx.providers,
+      toolViews: fx.toolViews,
+      env: { AOS_CONTROL_TOKEN: TEST_TOKEN },
+      sandboxDriver: fakeSandbox(),
+      now: () => FIXED,
+    })
+
+  const kernel = await boot()
+  // Everything observed BEFORE shutdown is captured first and asserted after.
+  // Asserting here would leak a running kernel on failure and hang the file.
+  const schedulerState = kernel.status().subsystems.scheduler
+  const seen = kernel.scheduler.diagnostics().map((d) => [d.agentId, d.schedule])
+  const runningAfterBoot = kernel.scheduler.running
+  const firstTick = kernel.scheduler.tick()
+  const secondTick = kernel.scheduler.tick()
+  await kernel.shutdown()
+  const runningAfterShutdown = kernel.scheduler.running
+
+  // Boot STARTED it. Without this, a kernel that built a scheduler and never
+  // started it would look identical from outside and no schedule would ever fire.
+  assert.equal(runningAfterBoot, true, 'boot did not start the scheduler')
+  // And shutdown stopped it, so a closed store cannot be appended to by a tick.
+  assert.equal(runningAfterShutdown, false, 'shutdown left the scheduler ticking')
+
+  // It is ok and it FOUND the schedule, which the reason must not claim otherwise.
+  assert.equal(schedulerState.state, 'ok')
+  assert.equal(schedulerState.reason, undefined, 'it did not see the ceo schedule')
+  assert.deepEqual(seen, [['ceo', '* * * * *']])
+
+  // One tick, one run. A second tick in the same minute fires nothing.
+  assert.deepEqual(firstTick, ['ceo'])
+  assert.deepEqual(secondTick, [])
+
+  const all = rows(fx.dbPath)
+  const claims = all.filter((r) => r.type === 'run.scheduled')
+  assert.equal(claims.length, 1, 'the minute was claimed more or less than once')
+  const claim = JSON.parse(claims[0]?.payload ?? '{}') as Record<string, unknown>
+  assert.equal(claim['agentId'], 'ceo')
+  assert.equal(claim['schedule'], '* * * * *')
+  assert.equal(claim['minute'], '2026-09-28T09:00')
+
+  const queued = all.filter((r) => r.type === 'run.queued')
+  assert.equal(queued.length, 1)
+  const q = JSON.parse(queued[0]?.payload ?? '{}') as Record<string, unknown>
+  assert.equal(q['agentId'], 'ceo')
+  // The ceo is an orchestrator, so its lane is main — not a lane named for cron.
+  assert.equal(q['lane'], 'main')
+
+  // Restart inside the same minute. start() seeds the claim back from the log, so
+  // the job must NOT run again — a reboot is otherwise the one reliable way to
+  // double-fire a schedule, and an operator restarts the daemon for many reasons.
+  const again = await boot()
+  const afterRestart = again.scheduler.tick()
+  await again.shutdown()
+  assert.deepEqual(afterRestart, [], 'a restart re-fired a minute already claimed')
+  assert.equal(
+    rows(fx.dbPath).filter((r) => r.type === 'run.queued').length,
+    1,
+    'the restart started a second run for the same minute',
+  )
 
   verifyAt(fx.dbPath)
 })

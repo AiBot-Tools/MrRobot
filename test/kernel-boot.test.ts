@@ -28,10 +28,12 @@ import { parse as parseYaml } from 'yaml'
 import { WebSocket } from 'ws'
 
 import { bootKernel, configHash, STUBS, SUBSYSTEM_ORDER } from '../src/kernel.js'
+import { isClean, projectRecovery } from '../src/events/projections.js'
 import { rebuildFromLog as rebuildApprovals } from '../src/policy/approvals.js'
 import { rebuildFromLog as rebuildQuarantine } from '../src/policy/quarantine.js'
 import { NotImplementedError } from '../src/errors.js'
 import { EventStore } from '../src/events/store.js'
+import { readAllRows } from '../src/events/chain.js'
 import { parseKernelConfig } from '../src/config.js'
 import { readAnchor } from '../src/events/anchor.js'
 import { CONTROL_PATH } from '../src/control/auth.js'
@@ -49,6 +51,16 @@ function rows(dbPath: string): { seq: number; type: string; payload: string }[] 
   const store = new EventStore(dbPath, { readOnly: true })
   try {
     return store.query().map((r) => ({ seq: r.seq, type: r.type, payload: r.payload }))
+  } finally {
+    store.close()
+  }
+}
+
+/** Rows as bootKernel sees them: read-only reopen, ordered by seq. */
+function allRows(dbPath: string): ReturnType<typeof readAllRows> {
+  const store = new EventStore(dbPath, { readOnly: true })
+  try {
+    return readAllRows(store.db)
   } finally {
     store.close()
   }
@@ -720,26 +732,200 @@ test('a run with no credential path refuses before the wire', async (t) => {
   assert.equal(provider.requests.length, 0, 'an unauthenticated request was sent')
 })
 
-test('pending approvals are not rebuilt after restart (documented gap)', async (t) => {
-  const { kernel } = await withKernel(t)
+test('a restart mid-run orphans nothing: every run reaches a terminal state and no approval or hold is left open', async (t) => {
+  // The Phase 1 criterion. A kernel that died mid-run left three kinds of
+  // dangling work in the log and nowhere else, because runs, approvals and holds
+  // all live in memory. None of it is RESTORED — run state is not persisted, so a
+  // restored approval would resolve nothing, and held content is not persisted,
+  // so a restored hold has nothing to give back. All of it is closed out.
+  const fx = fixture(t)
 
-  // The gap is REAL and it throws. "Nothing is pending" after a restart would
-  // be a dangerous lie: a run parked on a human decision would look answered,
-  // and the kernel would behave as though someone had said yes.
-  assert.throws(() => rebuildApprovals(), NotImplementedError)
-  assert.throws(() => rebuildQuarantine(), NotImplementedError)
-  assert.deepEqual(kernel.approvals.pending(), [])
+  // Boot once, then write the shape a crash leaves: a run started and never
+  // finished, an approval nobody answered, a hold nobody released.
+  const first = await bootKernel({
+    config: fx.config,
+    repoRoot: REPO_ROOT,
+    providers: fx.providers,
+    toolViews: fx.toolViews,
+    env: { AOS_CONTROL_TOKEN: TEST_TOKEN },
+    sandboxDriver: fakeSandbox(),
+  })
+  const RUN = 'run_crashed_midway'
+  first.store.append({
+    type: 'run.started',
+    runId: RUN,
+    agentId: 'ceo',
+    payload: { schemaVersion: 1, runId: RUN, agentId: 'ceo', lane: 'main', tier: 2, taint: 'clean' },
+  })
+  // Real work, so the recovery row cannot honestly claim zero.
+  first.store.append({
+    type: 'llm.response',
+    runId: RUN,
+    payload: {
+      schemaVersion: 1, ref: 'anthropic/claude-sonnet-5', attempt: 1, content: 'thinking',
+      finish: 'tool_use', inputTokens: 100, outputTokens: 20, costMicroUsd: 4_200, durationMs: 300,
+    },
+  })
+  first.store.append({
+    type: 'tool.result',
+    runId: RUN,
+    payload: {
+      schemaVersion: 1, ticketId: 't1', toolRef: 'web.fetch', ok: true,
+      text: 'page', bytes: 4, truncated: false, durationMs: 10,
+    },
+  })
+  first.store.append({
+    type: 'approval.requested',
+    runId: RUN,
+    payload: {
+      schemaVersion: 1, approvalId: 'apr_unanswered', toolRef: 'github.merge_pull_request',
+      argsPreview: '{"pr":7}', risk: 'irreversible',
+      expiresAt: new Date(Date.now() + 600_000).toISOString(),
+    },
+  })
+  first.store.append({
+    type: 'quarantine.held',
+    runId: RUN,
+    payload: { schemaVersion: 1, holdId: 'hold_unreleased', toolRef: 'web.fetch', reason: 'untrusted page' },
+  })
 
-  // And the gap is named where an operator will look, in its own words.
-  const listed = STUBS.map((s) => s.id)
-  assert.ok(listed.includes('approvals-projection'), listed.join(', '))
-  assert.ok(listed.includes('quarantine-projection'))
-  for (const stub of STUBS) {
-    assert.ok(stub.where.startsWith('src/'), stub.where)
-    assert.ok(stub.how.length > 20, `${stub.id} does not say how it refuses`)
+  // The crash: release the socket and drop the raw handle, so no clean shutdown
+  // and no anchor write. (store.close() would anchor — see the unclean-exit test.)
+  await first.server.close()
+  first.store.db.close()
+
+  // Everything is open at this point, per the projection.
+  const open = projectRecovery(allRows(fx.dbPath))
+  assert.equal(open.orphanRuns.length, 1, 'the crashed run does not read as open')
+  assert.equal(open.unresolvedApprovals.length, 1)
+  assert.equal(open.unreleasedHolds.length, 1)
+
+  // The restart.
+  const second = await bootKernel({
+    config: fx.config,
+    repoRoot: REPO_ROOT,
+    providers: fx.providers,
+    toolViews: fx.toolViews,
+    env: { AOS_CONTROL_TOKEN: TEST_TOKEN },
+    sandboxDriver: fakeSandbox(),
+  })
+  const reported = second.recovered
+  await second.shutdown()
+
+  // Boot said what it found, so an operator is not left to infer it.
+  assert.deepEqual(reported.orphanRuns.map((r) => r.runId), [RUN])
+  assert.deepEqual(reported.unresolvedApprovals.map((a) => a.approvalId), ['apr_unanswered'])
+  assert.deepEqual(reported.unreleasedHolds.map((h) => h.holdId), ['hold_unreleased'])
+
+  const after = rows(fx.dbPath)
+  const payloadsOf = (type: string): Record<string, unknown>[] =>
+    after.filter((r) => r.type === type).map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+
+  // 1. The run reached a terminal state, with the numbers the log actually holds.
+  const finished = payloadsOf('run.finished').filter((p) => p['runId'] === RUN)
+  assert.equal(finished.length, 1, 'the orphaned run has no terminal row')
+  assert.equal(finished[0]?.['status'], 'error')
+  assert.match(String(finished[0]?.['reason']), /orphaned by a kernel restart/)
+  // Counted, not zeroed: the run spent this and the bill has to show it.
+  assert.equal(finished[0]?.['costMicroUsd'], 4_200)
+  assert.equal(finished[0]?.['llmCalls'], 1)
+  assert.equal(finished[0]?.['toolCalls'], 1)
+
+  // 2. The approval reached a decision, and NOT one that implies a person made it.
+  const resolved = payloadsOf('approval.resolved').filter((p) => p['approvalId'] === 'apr_unanswered')
+  assert.equal(resolved.length, 1)
+  assert.equal(resolved[0]?.['decision'], 'expired')
+  assert.equal(resolved[0]?.['byConnectionId'], undefined, 'the recovery named a connection')
+
+  // 3. The hold ended as ABANDONED, not released. The distinction is the point:
+  // released means a human read the content and allowed it; the content did not
+  // survive the crash, so claiming that would be a false audit record.
+  const abandoned = payloadsOf('quarantine.abandoned')
+  assert.equal(abandoned.length, 1)
+  assert.equal(abandoned[0]?.['holdId'], 'hold_unreleased')
+  assert.match(String(abandoned[0]?.['reason']), /restart/)
+  assert.equal(payloadsOf('quarantine.released').length, 0, 'recovery claimed a human release')
+
+  // kernel.booted is STILL the first row of this boot, even though this boot had
+  // work to do. Test 2 only ever proves that on a boot with nothing to recover,
+  // so the case where it could actually break is this one: recovery rows written
+  // before the marker would be attributable to no boot at all, and an auditor
+  // could not tell which restart closed which orphan.
+  const bootMarkers = after.filter((r) => r.type === 'kernel.booted').map((r) => r.seq)
+  assert.equal(bootMarkers.length, 2, 'expected two boots in this log')
+  const secondBootAt = bootMarkers[1]
+  assert.ok(secondBootAt !== undefined)
+  const recoveryRows = after.filter(
+    (r) =>
+      r.seq > (bootMarkers[0] ?? 0) &&
+      (r.type === 'approval.resolved' ||
+        r.type === 'quarantine.abandoned' ||
+        (r.type === 'run.finished' && (JSON.parse(r.payload) as { reason?: string }).reason?.includes('orphaned'))),
+  )
+  assert.equal(recoveryRows.length, 3, 'expected one recovery row per open item')
+  for (const row of recoveryRows) {
+    assert.ok(
+      row.seq > secondBootAt,
+      `${row.type} at seq ${String(row.seq)} was written before this boot's kernel.booted at ${String(secondBootAt)}`,
+    )
   }
-  // Every id is unique, so README cannot list one twice and miss another.
-  assert.equal(new Set(listed).size, listed.length)
+
+  // And nothing is left open, which is the whole claim.
+  const remaining = projectRecovery(allRows(fx.dbPath))
+  assert.equal(isClean(remaining), true, JSON.stringify(remaining))
+
+  verifyAt(fx.dbPath)
+})
+
+test('recovery is idempotent: a second restart writes no further recovery rows', async (t) => {
+  // Idempotence is structural rather than bolted on — a run is open because it
+  // has no terminal row, so writing one closes it. This test is what proves the
+  // structure holds, because the alternative failure is quiet: a kernel that
+  // re-terminated on every boot would append a run.finished per restart and the
+  // log would fill with them.
+  const fx = fixture(t)
+  const boot = async (): Promise<Awaited<ReturnType<typeof bootKernel>>> =>
+    bootKernel({
+      config: fx.config,
+      repoRoot: REPO_ROOT,
+      providers: fx.providers,
+      toolViews: fx.toolViews,
+      env: { AOS_CONTROL_TOKEN: TEST_TOKEN },
+      sandboxDriver: fakeSandbox(),
+    })
+
+  const first = await boot()
+  first.store.append({
+    type: 'run.started',
+    runId: 'run_x',
+    agentId: 'ceo',
+    payload: { schemaVersion: 1, runId: 'run_x', agentId: 'ceo', lane: 'main', tier: 2, taint: 'clean' },
+  })
+  await first.server.close()
+  first.store.db.close()
+
+  // Captured, then shut down, THEN asserted. Asserting first leaks a running
+  // kernel on failure and turns a clear assertion error into a hung test file.
+  const second = await boot()
+  const secondRecovered = second.recovered
+  await second.shutdown()
+  assert.equal(secondRecovered.orphanRuns.length, 1, 'the first restart found nothing to close')
+  assert.equal(rows(fx.dbPath).filter((r) => r.type === 'run.finished').length, 1)
+
+  // Two more clean restarts. Each finds nothing, and writes nothing.
+  for (const pass of [1, 2]) {
+    const again = await boot()
+    const found = again.recovered
+    await again.shutdown()
+    assert.equal(isClean(found), true, `restart ${String(pass)} found work to redo: ${JSON.stringify(found)}`)
+    assert.equal(
+      rows(fx.dbPath).filter((r) => r.type === 'run.finished').length,
+      1,
+      `restart ${String(pass)} wrote a second terminal row for the same run`,
+    )
+  }
+
+  verifyAt(fx.dbPath)
 })
 
 test('envFallback:true shows secrets degraded in status.get', async (t) => {

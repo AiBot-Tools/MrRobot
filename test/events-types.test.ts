@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { EVENT_TYPES, PAYLOAD_SCHEMAS, type EventType } from '../src/events/types.js'
 import { withStore } from './helpers/store.js'
 
-const FROZEN_36: readonly string[] = [
+const FROZEN_37: readonly string[] = [
   'kernel.booted',
   'kernel.shutdown',
   'subsystem.state',
@@ -46,6 +46,7 @@ const FROZEN_36: readonly string[] = [
   'approval.resolved',
   'quarantine.held',
   'quarantine.released',
+  'quarantine.abandoned',
   'sandbox.started',
   'sandbox.killed',
   'secret.accessed',
@@ -123,6 +124,7 @@ const SAMPLES: Record<EventType, Record<string, unknown>> = {
   'approval.resolved': { schemaVersion: 1, approvalId: 'a1', decision: 'approved', byConnectionId: 'c1' },
   'quarantine.held': { schemaVersion: 1, holdId: 'q1', toolRef: 'fs.write', reason: 'tainted run' },
   'quarantine.released': { schemaVersion: 1, holdId: 'q1', byConnectionId: 'c1' },
+  'quarantine.abandoned': { schemaVersion: 1, holdId: 'q1', reason: 'the kernel restarted' },
   'sandbox.started': {
     schemaVersion: 1,
     sandboxId: 's1',
@@ -138,11 +140,15 @@ const SAMPLES: Record<EventType, Record<string, unknown>> = {
   'probe.recorded': { schemaVersion: 1, ref: 'anthropic/claude-sonnet-5', toolCalling: true, toolChoiceForced: null },
 }
 
-test('EVENT_TYPES equals the 36 frozen names by literal array equality', () => {
-  assert.equal(EVENT_TYPES.length, 36)
-  assert.deepEqual([...EVENT_TYPES], FROZEN_36)
+test('EVENT_TYPES equals the 37 frozen names by literal array equality', () => {
+  // 37 since `quarantine.abandoned` was added for crash recovery. The list is
+  // frozen by literal equality precisely so that growing it is a deliberate act
+  // with a reason, and the reason here is that a restart must be able to end a
+  // hold WITHOUT claiming a human released its content.
+  assert.equal(EVENT_TYPES.length, 37)
+  assert.deepEqual([...EVENT_TYPES], FROZEN_37)
   // No duplicates, and every name is dotted and lowercase.
-  assert.equal(new Set(EVENT_TYPES).size, 36)
+  assert.equal(new Set(EVENT_TYPES).size, 37)
   for (const t of EVENT_TYPES) assert.match(t, /^[a-z]+(\.[a-z]+)+$/)
 })
 
@@ -184,7 +190,7 @@ test('store.append rejects a type outside EVENT_TYPES', (t) => {
     const row = store.append({ type, payload: SAMPLES[type] })
     assert.equal(row.type, type)
   }
-  assert.equal(store.query().length, 36)
+  assert.equal(store.query().length, 37)
   assert.equal(store.verifyChain().ok, true)
 })
 

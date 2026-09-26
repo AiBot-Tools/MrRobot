@@ -35,8 +35,6 @@ import { AppleContainerDriver } from '../src/sandbox/apple-container.js'
 import { Scheduler } from '../src/runtime/scheduler.js'
 import { assertEgressEnforced } from '../src/runtime/egress.js'
 import { assertDelegationAvailable } from '../src/runtime/delegate.js'
-import { rebuildFromLog as rebuildApprovals } from '../src/policy/approvals.js'
-import { rebuildFromLog as rebuildQuarantine } from '../src/policy/quarantine.js'
 import { LANE_NAMES } from '../src/runtime/lanes.js'
 import { parseManifest } from '../src/agents/manifest.js'
 
@@ -66,8 +64,6 @@ test('every STUBS entry throws NotImplementedError or reports unavailable with a
     { id: 'egress-proxy', call: () => assertEgressEnforced() },
     { id: 'scheduler', call: () => new Scheduler().start() },
     { id: 'delegate-tool', call: () => assertDelegationAvailable() },
-    { id: 'approvals-projection', call: () => rebuildApprovals() },
-    { id: 'quarantine-projection', call: () => rebuildQuarantine() },
   ]
 
   for (const row of table) {
@@ -200,8 +196,6 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
     'egress-proxy': /egress proxy/i,
     scheduler: /scheduler/i,
     'delegate-tool': /delegation\/spawn tool|delegation tool/i,
-    'approvals-projection': /projections for approvals/i,
-    'quarantine-projection': /approvals\/quarantine|quarantine/i,
   }
   for (const stub of STUBS) {
     const pattern = NAMES[stub.id]
@@ -215,7 +209,6 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   for (const fragment of [
     'assertEgressEnforced',
     'assertDelegationAvailable',
-    'rebuildFromLog',
     'spawnEphemeral',
   ]) {
     assert.ok(section.includes(fragment), `CLAUDE.md does not say how ${fragment} refuses`)

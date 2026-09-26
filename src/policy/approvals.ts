@@ -23,7 +23,9 @@
 import { randomUUID } from 'node:crypto'
 
 import { assertHumanActor, type HumanActor } from '../control/actor.js'
-import { NotImplementedError, PolicyDenied } from '../errors.js'
+import { PolicyDenied } from '../errors.js'
+import type { EventRow } from '../events/chain.js'
+import { projectRecovery, type UnresolvedApproval } from '../events/projections.js'
 
 export type ApprovalDecision = 'approved' | 'denied' | 'expired'
 
@@ -175,13 +177,23 @@ export class Approvals {
 }
 
 /**
- * Rebuild pending approvals from the event log after a restart.
+ * What was awaiting a human when the process stopped.
  *
- * Phase 1. It throws rather than returning an empty projection, because
- * "nothing is pending" is a dangerous lie: a run parked on an approval before
- * the restart would look resolved, and the kernel would behave as though a
- * human had answered when none had.
+ * Read from the log, because pending approvals live in memory and nothing else
+ * survives. It returns the unanswered requests; it does NOT return them as
+ * answerable, and it deliberately does not repopulate this class's pending map.
+ *
+ * The reason is that an approval exists to unblock one run, and run state is not
+ * persisted. Restoring one as pending would offer an operator a decision that
+ * resolves nothing: approving it would mint a ticket no run can consume, while
+ * telling them they had unblocked work. So boot uses this to CLOSE what it finds
+ * — every request reaches a decision, and the fail-closed decision for a request
+ * nobody answered is the same one the timeout would have given it.
+ *
+ * Returning an empty set would be the dangerous answer, which is why this threw
+ * until the projection existed: "nothing is pending" reads as "everything was
+ * handled".
  */
-export function rebuildFromLog(): never {
-  throw new NotImplementedError('approvals.rebuildFromLog')
+export function rebuildFromLog(rows: readonly EventRow[]): readonly UnresolvedApproval[] {
+  return projectRecovery(rows).unresolvedApprovals
 }

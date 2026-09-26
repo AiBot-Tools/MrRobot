@@ -10,11 +10,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { mintHumanActor } from '../src/control/actor.js'
-import { NotImplementedError } from '../src/errors.js'
 import { Approvals, rebuildFromLog } from '../src/policy/approvals.js'
 import { hashArgs, PolicyEngine } from '../src/policy/engine.js'
 import type { GateInput } from '../src/policy/gate.js'
 import { EventStore } from '../src/events/store.js'
+import { readAllRows } from '../src/events/chain.js'
 import { storeFile, withStore } from './helpers/store.js'
 
 function gateInput(overrides: Partial<GateInput> = {}): GateInput {
@@ -236,9 +236,77 @@ test('projections are empty after re-open and rebuildFromLog throws NotImplement
   assert.equal(reopened.query({ type: 'approval.requested' }).length, 1)
   assert.equal(reopened.query({ type: 'approval.resolved' }).length, 1)
 
-  // …but nothing rebuilds the pending set from them yet, and the gap is
-  // explicit. Returning an empty projection would claim "nothing pending",
-  // which after a real crash is a dangerous lie.
-  assert.throws(() => rebuildFromLog(), NotImplementedError)
-  assert.throws(() => rebuildFromLog(), /approvals.rebuildFromLog/)
+  // …and the projection reads them back. This one was RESOLVED before the
+  // restart — it expired — so it is not returned: a decision of any kind closes
+  // a request, and offering an answered one again would ask an operator to
+  // decide something twice.
+  assert.deepEqual(rebuildFromLog(readAllRows(reopened.db)), [])
+})
+
+test('rebuildFromLog returns what was pending at the crash, not an empty set', (t) => {
+  const path = storeFile(t)
+  const store = withStore(t, { path })
+  // A long wait, so the request is still open when the process "dies". The
+  // timeout is what would normally close it, and a crash beats the timeout.
+  // Registered for cleanup IMMEDIATELY, not at the end of the test. The wait is
+  // deliberately long so the request is still open when the process "dies", and
+  // Approvals does not unref its timers — parked runs are real obligations. So an
+  // assertion failure before a manual close() would leave a ten-minute timer
+  // holding the event loop open, and the file would hang instead of failing.
+  const approvals = new Approvals({ waitMs: 600_000, onRequested: () => undefined })
+  t.after(() => {
+    approvals.close()
+  })
+
+  const wired = new Approvals({
+    waitMs: 600_000,
+    onRequested: (request) => {
+      store.append({
+        type: 'approval.requested',
+        ...(request.runId === undefined ? {} : { runId: request.runId }),
+        payload: {
+          schemaVersion: 1,
+          approvalId: request.approvalId,
+          toolRef: request.toolRef ?? 'pmmcp.remember',
+          argsPreview: request.argsPreview,
+          risk: 'irreversible',
+          expiresAt: new Date(request.expiresAt).toISOString(),
+        },
+      })
+    },
+  })
+  t.after(() => {
+    wired.close()
+  })
+  const open = wired.request({
+    runId: 'run-crash',
+    toolRef: 'github.merge_pull_request',
+    risk: 'irreversible',
+    argsPreview: '{"pr":7}',
+  })
+  void open.outcome
+  void approvals
+
+  // The process stops here. No approval.resolved row is ever written, because
+  // nothing got the chance to write one.
+  const recovered = rebuildFromLog(readAllRows(store.db))
+  assert.equal(recovered.length, 1, 'the unanswered request was not recovered')
+  assert.equal(recovered[0]?.approvalId, open.request.approvalId)
+  assert.equal(recovered[0]?.runId, 'run-crash')
+  assert.equal(recovered[0]?.toolRef, 'github.merge_pull_request')
+  assert.equal(recovered[0]?.risk, 'irreversible')
+
+  // An empty answer here is the dangerous one: it reads as "everything was
+  // handled" when a human was mid-decision on an irreversible tool call.
+  assert.notDeepEqual(recovered, [])
+
+  // Once a decision is recorded — any decision — it closes. This is what makes
+  // boot's recovery idempotent rather than re-terminating on every restart.
+  store.append({
+    type: 'approval.resolved',
+    runId: 'run-crash',
+    payload: { schemaVersion: 1, approvalId: open.request.approvalId, decision: 'expired' },
+  })
+  assert.deepEqual(rebuildFromLog(readAllRows(store.db)), [])
+
 })

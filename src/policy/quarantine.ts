@@ -24,7 +24,9 @@
 import { randomUUID } from 'node:crypto'
 
 import { assertHumanActor, type HumanActor } from '../control/actor.js'
-import { ConfigError, NotImplementedError } from '../errors.js'
+import { ConfigError } from '../errors.js'
+import type { EventRow } from '../events/chain.js'
+import { projectRecovery, type UnreleasedHold } from '../events/projections.js'
 import type { BoundedOutput } from '../events/bound.js'
 import type { EventStore } from '../events/store.js'
 
@@ -145,6 +147,22 @@ export class Quarantine {
  * empty projection would proceed as though a human had reviewed content they
  * never saw.
  */
-export function rebuildFromLog(): never {
-  throw new NotImplementedError('quarantine.rebuildFromLog')
+/**
+ * Which holds were still standing when the process stopped.
+ *
+ * Read from the log, and returned as records only — a rebuilt hold can never be
+ * RELEASED. Held content lives in memory and is never written to the log (see
+ * this file's header: the record is what an audit needs, and putting
+ * attacker-chosen text in an immutable log forever is a worse trade). A crash
+ * therefore destroys the content and keeps the record.
+ *
+ * So there is nothing to give a run back, and boot ends each of these with a
+ * `quarantine.abandoned` row rather than a `quarantine.released` one. The
+ * distinction is the point: released means a person read it and allowed it,
+ * abandoned means nobody ever saw it. Recording the first when the second
+ * happened would be a false claim of human review, in the one place that cannot
+ * be edited afterwards.
+ */
+export function rebuildFromLog(rows: readonly EventRow[]): readonly UnreleasedHold[] {
+  return projectRecovery(rows).unreleasedHolds
 }

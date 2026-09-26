@@ -306,6 +306,20 @@ export const QuarantineReleasedPayload = z
   .object({ ...V, holdId: z.string(), byConnectionId: z.string() })
   .strict()
 
+/**
+ * A hold ended without a human ever seeing its content.
+ *
+ * Distinct from `quarantine.released` on purpose. That row carries a
+ * `byConnectionId` and means a person reviewed the content and let the run have
+ * it; writing one for a restart would put a false claim of human review into an
+ * immutable audit log. Held content lives in memory only, so a crash destroys
+ * it — the hold can therefore be ENDED but never released, and the log has to
+ * be able to say which happened.
+ */
+export const QuarantineAbandonedPayload = z
+  .object({ ...V, holdId: z.string(), reason: z.string() })
+  .strict()
+
 // ── sandboxes ──────────────────────────────────────────────────────────────
 
 export const SandboxStartedPayload = z
@@ -383,6 +397,7 @@ export const EVENT_TYPES = [
   'approval.resolved',
   'quarantine.held',
   'quarantine.released',
+  'quarantine.abandoned',
   'sandbox.started',
   'sandbox.killed',
   'secret.accessed',
@@ -424,6 +439,7 @@ export const PAYLOAD_SCHEMAS: Readonly<Record<EventType, z.ZodType>> = {
   'approval.resolved': ApprovalResolvedPayload,
   'quarantine.held': QuarantineHeldPayload,
   'quarantine.released': QuarantineReleasedPayload,
+  'quarantine.abandoned': QuarantineAbandonedPayload,
   'sandbox.started': SandboxStartedPayload,
   'sandbox.killed': SandboxKilledPayload,
   'secret.accessed': SecretAccessedPayload,

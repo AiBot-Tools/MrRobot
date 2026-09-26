@@ -39,6 +39,8 @@ import type { KernelConfig } from './config.js'
 
 import { EventStore } from './events/store.js'
 import { canonicalize } from './events/canonical.js'
+import { readAllRows } from './events/chain.js'
+import { isClean, projectRecovery, type Recovery } from './events/projections.js'
 import { SecretMask } from './events/redact.js'
 
 import { AgentRegistry, type AgentRecord } from './agents/registry.js'
@@ -120,16 +122,6 @@ export const STUBS: readonly { id: string; where: string; how: string }[] = [
     where: 'src/runtime/delegate.ts',
     how: 'assertDelegationAvailable() throws NotImplementedError; no delegation tool is offered to any model',
   },
-  {
-    id: 'approvals-projection',
-    where: 'src/policy/approvals.ts',
-    how: 'rebuildFromLog() throws NotImplementedError rather than returning an empty set after a restart',
-  },
-  {
-    id: 'quarantine-projection',
-    where: 'src/policy/quarantine.ts',
-    how: 'rebuildFromLog() throws NotImplementedError rather than returning an empty set after a restart',
-  },
 ]
 
 export interface BootOptions {
@@ -160,6 +152,8 @@ export interface Kernel {
   readonly port: number
   readonly bootedAt: string
   readonly degraded: readonly string[]
+  /** What this boot found open from a previous process, and closed. */
+  readonly recovered: Recovery
   readonly agents: AgentRegistry
   readonly hub: McpHub
   readonly router: Router
@@ -275,6 +269,71 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       type: 'kernel.booted',
       payload: { schemaVersion: 1, version: VERSION, configHash: hash, degraded: [] },
     })
+    // ── crash recovery: close out what the last process left open ─────────
+    //
+    // Runs, approvals and holds all live in memory, so a kernel that died
+    // mid-run left them dangling in the log and nowhere else. Every one of them
+    // is TERMINATED here rather than restored: run state is not persisted, so a
+    // restored approval would be a decision that resolves nothing, and held
+    // content is not persisted either, so a restored hold has nothing to give
+    // back. See src/events/projections.ts.
+    //
+    // Before the subsystems are marked, because "the event log is in order"
+    // should mean verified AND settled, and after kernel.booted, so every row
+    // written here is attributable to this boot.
+    const recovered = projectRecovery(readAllRows(store.db))
+    for (const run of recovered.orphanRuns) {
+      store.append({
+        type: 'run.finished',
+        runId: run.runId,
+        ...(run.agentId === null ? {} : { agentId: run.agentId }),
+        payload: {
+          schemaVersion: 1,
+          runId: run.runId,
+          status: 'error',
+          reason: 'orphaned by a kernel restart',
+          // Counted from the log rather than zeroed: the run really did spend
+          // this, and a recovery row claiming zero cost would understate the
+          // bill and hide the work.
+          costMicroUsd: run.costMicroUsd,
+          llmCalls: run.llmCalls,
+          toolCalls: run.toolCalls,
+          durationMs: Math.max(0, Math.round(Date.parse(run.lastTs) - Date.parse(run.startedAt))),
+        },
+      })
+    }
+    for (const approval of recovered.unresolvedApprovals) {
+      store.append({
+        type: 'approval.resolved',
+        ...(approval.runId === null ? {} : { runId: approval.runId }),
+        // `expired` and no byConnectionId: nobody answered, and the fail-closed
+        // decision for an unanswered request is the one the timeout would have
+        // given it. Recording `denied` would imply a person said no.
+        payload: { schemaVersion: 1, approvalId: approval.approvalId, decision: 'expired' },
+      })
+    }
+    for (const hold of recovered.unreleasedHolds) {
+      store.append({
+        type: 'quarantine.abandoned',
+        ...(hold.runId === null ? {} : { runId: hold.runId }),
+        payload: {
+          schemaVersion: 1,
+          holdId: hold.holdId,
+          reason: 'the kernel restarted; held content lives in memory and did not survive',
+        },
+      })
+    }
+    if (!isClean(recovered)) {
+      log.warn(
+        {
+          orphanRuns: recovered.orphanRuns.map((r) => r.runId),
+          approvals: recovered.unresolvedApprovals.length,
+          holds: recovered.unreleasedHolds.length,
+        },
+        'closed out work left open by a previous process',
+      )
+    }
+
     mark('events', 'ok')
 
     // ── registries ────────────────────────────────────────────────────────
@@ -499,6 +558,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       port: server.port,
       bootedAt,
       degraded,
+      recovered,
       agents,
       hub,
       router,

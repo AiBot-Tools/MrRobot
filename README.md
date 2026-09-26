@@ -136,16 +136,36 @@ the CLI, and kernel boot.
 | `egress-proxy` | `src/runtime/egress.ts` | `assertEgressEnforced()` throws `NotImplementedError`, so no run can reach the network |
 | `scheduler` | `src/runtime/scheduler.ts` | `Scheduler.start()` throws `NotImplementedError`; a manifest carrying `schedule:` is refused at parse |
 | `delegate-tool` | `src/runtime/delegate.ts` | `assertDelegationAvailable()` throws `NotImplementedError`; no delegation tool is offered to any model |
-| `approvals-projection` | `src/policy/approvals.ts` | `rebuildFromLog()` throws `NotImplementedError` rather than returning an empty set after a restart |
-| `quarantine-projection` | `src/policy/quarantine.ts` | `rebuildFromLog()` throws `NotImplementedError` rather than returning an empty set after a restart |
 
-Two of these deserve spelling out. **Restart-safe projections are absent**: after
-a restart the kernel does not know which approvals were pending, and
-`rebuildFromLog()` throws rather than answering "none" — because "nothing is
-pending" is a dangerous lie that would make a run parked on a human decision
-look answered. And **no delegation tool is offered to any model**: the CEO can
-plan, but in Phase 0 it cannot actually spawn or delegate, so the fleet it
-describes does not exist yet.
+One of these deserves spelling out: **no delegation tool is offered to any
+model**. The CEO can plan, but it cannot actually spawn or delegate, so the fleet
+it describes does not exist yet.
+
+### Crash recovery, and what it deliberately does not do
+
+A kernel that dies mid-run leaves three kinds of unfinished business in the log:
+a run that started and never finished, an approval nobody answered, a hold nobody
+released. All three live in memory, so the log is the only record of them.
+
+Boot **closes them out**. Every run reaches a terminal state
+(`run.finished{status:'error', reason:'orphaned by a kernel restart'}`, carrying
+the cost and call counts read back from the log — the run really did spend that),
+every approval reaches a decision (`expired`, with no connection id, because
+nobody decided it), and every hold ends as `quarantine.abandoned`.
+
+It does **not** resume them, and that is a design decision rather than a gap:
+
+- Held content is never written to the log. That is deliberate — the record is
+  what an audit needs, and putting attacker-chosen text in an immutable log
+  forever is the worse trade. So a recovered hold has nothing to release, and
+  ending it as `abandoned` rather than `released` is the difference between "a
+  person read this and allowed it" and "nobody ever saw it".
+- Run state is not persisted. An approval restored as *pending* would belong to a
+  run that no longer exists: approving it would mint a ticket nothing can consume,
+  while telling you that you had unblocked work. Failing closed is the safer half.
+
+Resuming a run across a restart needs run state and held content persisted, and
+both are their own decisions with their own costs. Neither is pretended here.
 
 Also true, and not stubs so much as scope: `config/tool-views.yaml` classifies
 **9 of pmmcp's 49 tools**, and all nine are pinned closed — nothing is exposed

@@ -247,26 +247,40 @@ async function dispatch(
       const input = positionals.slice(1).join(' ')
       if (agentId === undefined || input === '') return usage(io, 'run needs an agentId and an input')
       return withClient(io, config, async (client) => {
-        // Subscribed BEFORE the run starts, because a fast run can finish
-        // before the reply arrives and the CLI would then wait for an event
-        // that already happened. `mine` is filled in by the reply and read by
-        // the listener, so the wait is scoped to this run without any module
-        // state to leak between invocations.
+        // Subscribing before the call is not enough. The daemon broadcasts as
+        // it appends, so a fast run can finish before the reply frame that
+        // names it is even parsed — and a listener that only matches a runId it
+        // does not yet know would drop that event and wait forever.
+        //
+        // So every run.finished is BUFFERED until the id is known, and the
+        // buffer is consulted once it is. The buffer only holds finishes that
+        // land in the window between subscribing and reading the reply, which
+        // is one round trip.
+        type Outcome = { status: string; reason?: string }
+        const early = new Map<string, Outcome>()
         let mine: string | undefined
-        const finished = new Promise<{ status: string; reason?: string }>((resolve) => {
-          client.onEvent((event) => {
-            if (event.type !== 'run.finished') return
-            const payload = event.payload as { runId?: string; status?: string; reason?: string } | null
-            if (payload === null || payload.runId !== mine) return
-            resolve({
-              status: payload.status ?? 'error',
-              ...(payload.reason === undefined ? {} : { reason: payload.reason }),
-            })
-          })
+        let settle: (outcome: Outcome) => void = () => undefined
+        const finished = new Promise<Outcome>((resolve) => {
+          settle = resolve
         })
+        client.onEvent((event) => {
+          if (event.type !== 'run.finished') return
+          const payload = event.payload as { runId?: string; status?: string; reason?: string } | null
+          if (payload === null || typeof payload.runId !== 'string') return
+          const outcome: Outcome = {
+            status: payload.status ?? 'error',
+            ...(payload.reason === undefined ? {} : { reason: payload.reason }),
+          }
+          if (payload.runId === mine) settle(outcome)
+          else early.set(payload.runId, outcome)
+        })
+
         const { runId } = (await client.call('run.start', { agentId, input })) as { runId: string }
         mine = runId
         io.out(runId)
+        // Already finished while the reply was in flight.
+        const alreadyDone = early.get(runId)
+        if (alreadyDone !== undefined) settle(alreadyDone)
         const outcome = await finished
         io.out(`${runId}\t${outcome.status}${outcome.reason === undefined ? '' : `\t${outcome.reason}`}`)
         return outcome.status === 'ok' ? 0 : 1

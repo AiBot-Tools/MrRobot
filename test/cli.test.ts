@@ -81,6 +81,13 @@ interface Harness {
    * drain while the CLI is still waiting.
    */
   emitAfter(cmd: string, event: EventNotice): void
+  /**
+   * Emit `event` SYNCHRONOUSLY inside the call to `cmd`, before its reply
+   * resolves. This is what the real daemon does: it broadcasts as it appends,
+   * so a fast run's finish can reach the socket before the reply naming that
+   * run is parsed.
+   */
+  emitDuring(cmd: string, event: EventNotice): void
   /** Queue the reply for the next call to `cmd`. */
   reply(cmd: string, result: unknown): void
   fail(cmd: string, code: string, message: string): void
@@ -110,6 +117,7 @@ function harness(
   const replies = new Map<string, unknown[]>()
   const failures = new Map<string, { code: string; message: string }>()
   const afterCall = new Map<string, EventNotice[]>()
+  const duringCall = new Map<string, EventNotice[]>()
 
   const fanout = (event: EventNotice): void => {
     for (const listener of listeners) listener(event)
@@ -155,6 +163,10 @@ function harness(
                     }),
                   )
                 }
+                // Fired NOW, before the reply: the real server broadcasts as it
+                // appends, so this is the ordering a fast run actually produces.
+                for (const event of duringCall.get(cmd) ?? []) fanout(event)
+                duringCall.delete(cmd)
                 // Scheduled, not fired: the caller's `await` continuation is
                 // a microtask and must run first, so that `mine` is set before
                 // any event arrives.
@@ -184,6 +196,11 @@ function harness(
       const queued = afterCall.get(cmd) ?? []
       queued.push(event)
       afterCall.set(cmd, queued)
+    },
+    emitDuring: (cmd, event) => {
+      const queued = duringCall.get(cmd) ?? []
+      queued.push(event)
+      duringCall.set(cmd, queued)
     },
     reply: (cmd, result) => {
       const queued = replies.get(cmd) ?? []
@@ -423,6 +440,33 @@ test('run prints the runId and exits with the run status', async (t) => {
   other.emitAfter('run.start', { type: 'run.finished', payload: { runId: 'run_9', status: 'error', reason: 'boom' } })
   assert.equal(await runCli(['run', 'ceo', 'go', '--config', other.configPath], other.io), 1)
   assert.match(other.out[1] ?? '', /^run_9\terror\tboom$/)
+})
+
+test('run does not lose a finish that arrives before the run.start reply', async (t) => {
+  // The daemon broadcasts as it appends. A run that finishes in milliseconds —
+  // a short prompt, a cached reply, or an immediate refusal — can have its
+  // run.finished on the socket before the reply naming that run is parsed. A
+  // listener matching only an id it does not yet know drops that event, and
+  // `aos run` then waits forever for something that already went past.
+  //
+  // This is the ordering the real server produces, and the reason the finish is
+  // buffered until the id is known.
+  const h = harness(t)
+  h.reply('run.start', { runId: 'run_fast' })
+  h.emitDuring('run.start', { type: 'run.finished', payload: { runId: 'run_fast', status: 'ok' } })
+
+  const code = await runCli(['run', 'ceo', 'go', '--config', h.configPath], h.io)
+  assert.equal(code, 0, `run hung or failed: ${h.errs.join(' | ')}`)
+  assert.equal(h.out[0], 'run_fast')
+  assert.match(h.out[1] ?? '', /^run_fast\tok$/)
+
+  // A buffered finish for a DIFFERENT run must not be mistaken for this one.
+  const other = harness(t)
+  other.reply('run.start', { runId: 'run_mine' })
+  other.emitDuring('run.start', { type: 'run.finished', payload: { runId: 'run_someone_else', status: 'ok' } })
+  other.emitAfter('run.start', { type: 'run.finished', payload: { runId: 'run_mine', status: 'killed', reason: 'wallclock' } })
+  assert.equal(await runCli(['run', 'ceo', 'go', '--config', other.configPath], other.io), 1)
+  assert.match(other.out[1] ?? '', /^run_mine\tkilled\twallclock$/)
 })
 
 test('approve/deny/approvals/kill/probe round-trip', async (t) => {

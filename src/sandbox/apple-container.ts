@@ -16,8 +16,24 @@ import type { ProbeResult, RunningSandbox, SandboxDriver, SandboxSpec } from './
 export class AppleContainerDriver implements SandboxDriver {
   readonly name = 'apple-container'
 
+  /**
+   * Reports unavailable; does not throw.
+   *
+   * The driver contract says availability is never a throw, because a missing
+   * container runtime is a degraded boot and not a dead kernel. Throwing here
+   * made `sandbox.driver: apple-container` — a value kernel.yaml accepts —
+   * refuse the whole boot, which is the opposite of what a stub should do.
+   *
+   * `run` and `kill` still throw: asking an absent runtime to execute something
+   * has no degraded answer.
+   */
   probe(): Promise<ProbeResult> {
-    throw new NotImplementedError('apple-container')
+    return Promise.resolve({
+      ok: false,
+      why:
+        'the apple-container driver is not implemented: macOS 15 has no `container` binary. ' +
+        'Use sandbox.driver: docker with Colima.',
+    })
   }
 
   run(_spec: SandboxSpec): RunningSandbox {

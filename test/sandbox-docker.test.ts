@@ -410,16 +410,35 @@ test('a container name without the kernel prefix is refused', (t) => {
 
 // ── the stub ───────────────────────────────────────────────────────────────
 
-test('apple-container driver throws NotImplemented on every method', () => {
+test('apple-container driver reports unavailable from probe and throws from run and kill', async () => {
   const driver = new AppleContainerDriver()
   assert.equal(driver.name, 'apple-container')
 
-  // probe() throws rather than reporting unavailable: an absent runtime and
-  // unwritten code must not look alike in a degraded-subsystem view.
-  assert.throws(() => driver.probe(), NotImplementedError)
+  // probe() REPORTS rather than throws, and the distinction this test used to
+  // make — that an absent runtime and unwritten code must not look alike — is
+  // kept in the reason instead of in the control flow.
+  //
+  // It threw once, and that broke the driver contract ("Availability, never a
+  // throw: a missing runtime is a degraded boot") with a consequence:
+  // `sandbox.driver: apple-container`, a value kernel.yaml accepts, refused the
+  // whole boot instead of booting degraded. A stub that can stop the kernel
+  // starting is worse than the feature being absent.
+  const probe = await driver.probe()
+  assert.equal(probe.ok, false)
+  assert.ok(!probe.ok && probe.why.includes('not implemented'), 'the reason does not say it is unwritten')
+  assert.ok(!probe.ok && probe.why.includes('container'), 'the reason does not name the missing binary')
+  // It points somewhere useful rather than just refusing.
+  assert.ok(!probe.ok && probe.why.includes('docker'), 'the reason does not name the working driver')
+
+  // run and kill still throw: asking an absent runtime to execute something has
+  // no degraded answer, and a driver that returned a plausible result here would
+  // let a run believe it had been sandboxed.
   assert.throws(
     () => driver.run({} as unknown as SandboxSpec),
     (e: unknown) => e instanceof NotImplementedError && e.feature === 'apple-container',
   )
+  // Synchronously, though the signature returns a promise: the stub never gets
+  // as far as doing anything asynchronous, and a throw at the call site is
+  // louder than a rejection a caller might not be awaiting.
   assert.throws(() => driver.kill('x'), NotImplementedError)
 })

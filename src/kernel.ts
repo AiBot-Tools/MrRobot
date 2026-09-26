@@ -70,7 +70,7 @@ import { Scheduler } from './runtime/scheduler.js'
 import { assertDelegationAvailable } from './runtime/delegate.js'
 import { AppleContainerDriver } from './sandbox/apple-container.js'
 import { realDockerDriver } from './sandbox/docker.js'
-import type { SandboxDriver } from './sandbox/driver.js'
+import type { ProbeResult as SandboxProbe, SandboxDriver } from './sandbox/driver.js'
 import { assertTokenUsable } from './control/auth.js'
 import { ControlServer, type ControlSurface } from './control/server.js'
 import type { HumanActor } from './control/actor.js'
@@ -103,7 +103,7 @@ export const STUBS: readonly { id: string; where: string; how: string }[] = [
   {
     id: 'apple-container-driver',
     where: 'src/sandbox/apple-container.ts',
-    how: 'every method throws NotImplementedError; macOS 15 has no `container` binary',
+    how: 'probe() reports unavailable with a reason so boot degrades; run() and kill() throw NotImplementedError. macOS 15 has no `container` binary',
   },
   {
     id: 'egress-proxy',
@@ -319,9 +319,16 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
 
     // ── sandbox (degradable) ──────────────────────────────────────────────
     const driver = options.sandboxDriver ?? defaultDriver(config, repoRoot)
-    // probe() never throws: a missing container runtime is a degraded boot,
-    // not a dead kernel.
-    const sandboxProbe = await driver.probe()
+    // probe() is contracted never to throw, because a missing container runtime
+    // is a degraded boot and not a dead kernel. Guarded anyway: a driver that
+    // breaks that contract must not be able to refuse the boot, which is
+    // exactly what an earlier apple-container stub did.
+    const sandboxProbe = await driver
+      .probe()
+      .catch((e: unknown): SandboxProbe => ({
+        ok: false,
+        why: `${driver.name} probe threw: ${e instanceof Error ? e.message : String(e)}`,
+      }))
     if (!sandboxProbe.ok) {
       store.append({
         type: 'sandbox.degraded',

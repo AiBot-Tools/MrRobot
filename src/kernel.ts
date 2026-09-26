@@ -41,6 +41,9 @@ import { EventStore } from './events/store.js'
 import { canonicalize } from './events/canonical.js'
 import { readAllRows } from './events/chain.js'
 import { isClean, projectRecovery, type Recovery } from './events/projections.js'
+import { GoalTracker } from './goals/tracker.js'
+import { GoalWriter } from './goals/writer.js'
+import { goalToolsUnusable } from './goals/tools.js'
 import { SecretMask } from './events/redact.js'
 
 import { AgentRegistry, type AgentRecord } from './agents/registry.js'
@@ -290,7 +293,11 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     // Before the subsystems are marked, because "the event log is in order"
     // should mean verified AND settled, and after kernel.booted, so every row
     // written here is attributable to this boot.
-    const recovered = projectRecovery(readAllRows(store.db))
+    // Captured BEFORE recovery closes the orphans out. Recovery appends a
+    // `run.finished` per orphan, so a later read would show them finished and the
+    // goal tracker would never learn which goals those runs had been serving.
+    const rowsAtBoot = readAllRows(store.db)
+    const recovered = projectRecovery(rowsAtBoot)
     for (const run of recovered.orphanRuns) {
       store.append({
         type: 'run.finished',
@@ -411,6 +418,40 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       secretsReason = `no vault: ${hubState.reason ?? 'pmmcp is not connected'}`
     }
     mark('secrets', secretsReason === undefined ? 'ok' : 'degraded', secretsReason)
+
+    // ── goals (degradable, and not a status.get subsystem) ────────────────
+    //
+    // Reported as an EVENT rather than a subsystem key: `StatusResult.subsystems`
+    // is a strict object in protocol v1, which CLAUDE.md freezes, and a new key
+    // there is a version bump plus a migration note. The reason is what matters
+    // and it lands in the log either way.
+    const goalsReason = hubState.ok
+      ? goalToolsUnusable(hub, config.goals)
+      : `pmmcp is not connected: ${hubState.reason ?? 'no vault and no memory'}`
+    if (goalsReason !== undefined) {
+      store.append({ type: 'goals.degraded', payload: { schemaVersion: 1, reason: goalsReason } })
+      log.warn({ reason: goalsReason }, 'no goal tree can be written or read')
+    }
+    const goalWriter = new GoalWriter({
+      store,
+      hub,
+      goals: config.goals,
+      ...(goalsReason === undefined ? {} : { degradedReason: goalsReason }),
+    })
+    const goalTracker = new GoalTracker({
+      store,
+      writer: goalWriter,
+      adoptFromRuns: config.goals.adoptFromRuns,
+      // A manifest's own namespace, never a global one: `aos/ceo` is the CEO's
+      // because its manifest says so, and an agent with no memory block writes
+      // nowhere.
+      projectIdOf: (agentId) => agents.get(agentId)?.manifest.memory.projectId,
+      // Only an orchestrator may have a plan adopted from its result. A worker
+      // emitting plan-shaped JSON must not be able to write the CEO's goal tree.
+      isOrchestrator: (agentId) => agents.get(agentId)?.manifest.role === 'orchestrator',
+      knownTemplates: () => agents.list().map((r) => r.manifest.id),
+    })
+    goalTracker.seedFromLog(rowsAtBoot)
 
     // ── sandbox (degradable) ──────────────────────────────────────────────
     const driver = options.sandboxDriver ?? defaultDriver(config, repoRoot)
@@ -576,6 +617,23 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       live.state = project(live.state, row.type, row.payload, row.seq, row.ts)
     })
 
+    // Attached here, with the run projection, because both read the same stream.
+    // Orphan goals are blocked only now: recovery ran before the hub existed, so
+    // this is the first moment a status update can reach the server at all.
+    const detachGoals = goalTracker.attach()
+    if (recovered.orphanRuns.length > 0 && goalWriter.available) {
+      // Not awaited: boot must not wait on a network round trip per orphan, and a
+      // failure here is a stale goal, which the tracker logs.
+      void goalTracker
+        .blockOrphans(recovered.orphanRuns.map((r) => r.runId))
+        .catch((e: unknown) => {
+          log.warn(
+            { err: e instanceof Error ? e.message : String(e) },
+            'blocking orphaned runs’ goals failed',
+          )
+        })
+    }
+
     // ── control plane: last, and not degradable ──────────────────────────
     const surface = buildSurface({
       store,
@@ -637,10 +695,15 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
         if (stopped) return
         stopped = true
         unsubscribe()
+        detachGoals()
         scheduler.stop()
         for (const live of runs.values()) live.controller.abort()
         approvals.close()
         await server.close()
+        // Before the hub closes: a queued goal update needs the connection it was
+        // going to use, and dropping it silently is the one outcome worse than a
+        // slow shutdown.
+        await goalTracker.drain()
         await hub.close()
         store.append({
           type: 'kernel.shutdown',

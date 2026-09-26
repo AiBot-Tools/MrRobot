@@ -234,6 +234,30 @@ passes. The broker fails closed if the live schema disagrees: `broker.start()`
 throws on drift, and boot turns that into a DEGRADED secrets subsystem whose
 reason names the argument and the config line to change.
 
+### Goals
+
+The CEO's plan becomes a goal tree, and the kernel is the only thing that writes
+it. A finished orchestrator run whose result carries a `ProposedPlan` (schema in
+`src/goals/plan.ts`) is validated — duplicate ids, dangling or cyclic
+`dependsOn`, unknown templates and over-long titles are all refused — and written
+into that agent's own memory namespace as objective → milestone → task, logged as
+`plan.adopted` plus one `goal.created` per goal. The model proposes structure; the
+kernel decides whether it is admissible. Set `goals.adoptFromRuns: false` to watch
+the CEO before it writes anything durable.
+
+A run started with a `goalId` moves that goal: `in_progress` when it starts,
+`review` when it finishes well, `blocked` when it does not, and `blocked` again if
+a restart finds it orphaned. **The kernel never writes `done`** — `review` sits
+between `in_progress` and `done` precisely so that finishing is a decision, and a
+kernel that closed its own goals would make every completion self-reported.
+
+Every pmmcp goal tool name and argument lives in `config/kernel.yaml` under
+`goals:` because none of them is confirmed. Boot compares them against what the
+server declares and, on a disagreement, appends `goals.degraded` naming the tool
+or argument and disables goal writing — so a wrong guess is one line of YAML
+rather than a patch. (It is an event and not a `status.get` subsystem key because
+`StatusResult.subsystems` is a strict object in the frozen protocol v1.)
+
 The kernel is tested against a **pmmcp double** (`test/helpers/mock-pmmcp.ts`):
 an in-process MCP server with the goal hierarchy, the validated status
 transitions, `project_id` namespacing, the vault and an idle-expiring session

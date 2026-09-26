@@ -163,6 +163,38 @@ export async function withKernel(
 }
 
 /**
+ * Boot a kernel on an EXISTING fixture, verified at teardown.
+ *
+ * `withKernel` makes its own fixture, so it cannot express a restart: a second
+ * call would silently get a fresh temp directory and the second kernel would read
+ * an empty log. This takes the fixture, which is what a restart test needs, and
+ * still registers the chain verification — so a test never has to call
+ * `bootKernel` itself to boot twice, and the hygiene rule that allowlists direct
+ * callers stays at one file.
+ */
+export async function bootOn(
+  t: TestContext,
+  fx: KernelFixture,
+  options: Omit<WithKernelOptions, keyof FixtureOptions> = {},
+): Promise<Kernel> {
+  const kernel = await bootKernel({
+    config: fx.config,
+    repoRoot: REPO_ROOT,
+    providers: fx.providers,
+    toolViews: fx.toolViews,
+    env: { AOS_CONTROL_TOKEN: TEST_TOKEN, ...options.env },
+    sandboxDriver: options.sandboxDriver ?? fakeSandbox(),
+    ...(options.clientFactory === undefined ? {} : { clientFactory: options.clientFactory }),
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+    ...(options.now === undefined ? {} : { now: options.now }),
+  })
+  registerVerify(t, fx.dbPath, async () => {
+    await kernel.shutdown()
+  })
+  return kernel
+}
+
+/**
  * Register the same end-of-test verification withStore performs, for a store
  * this test does not own a handle to.
  */

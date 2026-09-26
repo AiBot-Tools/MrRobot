@@ -40,8 +40,21 @@ const TAINT = ['clean', 'tainted'] as const
 
 // ── lifecycle ──────────────────────────────────────────────────────────────
 
+/**
+ * `degraded` is the set known degraded AT THIS INSTANT, which is empty by
+ * construction: this event is appended before any subsystem is built, so that
+ * it is the first row of every boot and a reader can find where a boot began.
+ * The authority on what ended up degraded is the `subsystem.state` row per
+ * subsystem that follows, and `status.get` live. The field is kept because a
+ * future boot may know something is down before it starts.
+ *
+ * `configHash` is what makes two boots comparable: an operator reading the log
+ * after a restart can tell whether the configuration changed under it without
+ * the config itself — which holds hostnames and vault ids — ever entering the
+ * log.
+ */
 export const KernelBootedPayload = z
-  .object({ ...V, version: z.string(), degraded: z.array(z.string()) })
+  .object({ ...V, version: z.string(), configHash: z.string(), degraded: z.array(z.string()) })
   .strict()
 
 export const KernelShutdownPayload = z

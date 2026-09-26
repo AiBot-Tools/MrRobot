@@ -23,7 +23,7 @@ const SCOPE: RunScope = {
   lane: 'ceo',
 }
 
-const BOOT = { schemaVersion: 1 as const, version: '0.0.1', degraded: [] }
+const BOOT = { schemaVersion: 1 as const, version: '0.0.1', configHash: 'h', degraded: [] }
 
 test('scope survives await boundaries', async () => {
   const seen: (string | undefined)[] = []

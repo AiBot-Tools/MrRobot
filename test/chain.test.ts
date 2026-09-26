@@ -21,7 +21,7 @@ import { storeFile, withStore, withStoreUnverified } from './helpers/store.js'
 import { tamper } from './helpers/tamper.js'
 import { tmpdir } from './helpers/tmpdir.js'
 
-const BOOT = { schemaVersion: 1 as const, version: '0.0.1', degraded: [] }
+const BOOT = { schemaVersion: 1 as const, version: '0.0.1', configHash: 'h', degraded: [] }
 
 function seed(store: EventStore, n: number): void {
   for (let i = 0; i < n; i++) {

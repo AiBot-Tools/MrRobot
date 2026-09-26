@@ -15,7 +15,7 @@ import { EventStore } from '../src/events/store.js'
 import { CENSOR } from '../src/events/redact.js'
 import { closeVerified, storeFile, withStore, withStoreUnverified } from './helpers/store.js'
 
-const BOOT = { schemaVersion: 1 as const, version: '0.0.1', degraded: [] }
+const BOOT = { schemaVersion: 1 as const, version: '0.0.1', configHash: 'h', degraded: [] }
 
 function boot(store: EventStore, degraded: string[] = []): ReturnType<EventStore['append']> {
   return store.append({ type: 'kernel.booted', payload: { ...BOOT, degraded } })

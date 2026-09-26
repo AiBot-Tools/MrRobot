@@ -198,7 +198,7 @@ function harness(
 function seedDb(t: TestContext, dataDir: string, extra?: (store: EventStore) => void): string {
   const path = join(dataDir, EVENTS_DB_FILE)
   const store = withStore(t, { path })
-  store.append({ type: 'kernel.booted', payload: { schemaVersion: 1, version: '0.0.1', degraded: [] } })
+  store.append({ type: 'kernel.booted', payload: { schemaVersion: 1, version: '0.0.1', configHash: 'h', degraded: [] } })
   extra?.(store)
   return path
 }
@@ -258,7 +258,7 @@ test('verify-chain runs read-only and reports ok / at+reason on a tampered copy'
   const h = harness(t)
   const path = join(h.dataDir, EVENTS_DB_FILE)
   const store2 = withStore(t, { path })
-  store2.append({ type: 'kernel.booted', payload: { schemaVersion: 1, version: '0.0.1', degraded: [] } })
+  store2.append({ type: 'kernel.booted', payload: { schemaVersion: 1, version: '0.0.1', configHash: 'h', degraded: [] } })
   store2.append({ type: 'kernel.shutdown', payload: { schemaVersion: 1, reason: 'requested', uptimeMs: 1 } })
 
   assert.equal(await runCli(['verify-chain', '--config', h.configPath], h.io), 0)
@@ -316,7 +316,7 @@ test('verify-chain honours AOS_DATA_DIR and never reads AOS_CONTROL_TOKEN', asyn
   const elsewhere = join(tmpdir(t), 'elsewhere')
   mkdirSync(elsewhere, { recursive: true })
   const store = withStore(t, { path: join(elsewhere, EVENTS_DB_FILE) })
-  store.append({ type: 'kernel.booted', payload: { schemaVersion: 1, version: '0.0.1', degraded: [] } })
+  store.append({ type: 'kernel.booted', payload: { schemaVersion: 1, version: '0.0.1', configHash: 'h', degraded: [] } })
 
   const h = harness(t, { env: { AOS_DATA_DIR: elsewhere } })
   // The config's own dataDir has NO database, so finding one proves the

@@ -57,7 +57,7 @@ const FROZEN_36: readonly string[] = [
  * if a schema changes shape, the sample here has to change with it.
  */
 const SAMPLES: Record<EventType, Record<string, unknown>> = {
-  'kernel.booted': { schemaVersion: 1, version: '0.0.1', degraded: ['hub'] },
+  'kernel.booted': { schemaVersion: 1, version: '0.0.1', configHash: 'h', degraded: ['hub'] },
   'kernel.shutdown': { schemaVersion: 1, reason: 'signal', signal: 'SIGTERM', uptimeMs: 1000 },
   'subsystem.state': { schemaVersion: 1, subsystem: 'hub', state: 'degraded', reason: 'no pmmcp' },
   'chain.anchored': { schemaVersion: 1, seq: 7, hash: 'abc' },

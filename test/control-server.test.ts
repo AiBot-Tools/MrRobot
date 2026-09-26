@@ -139,6 +139,12 @@ async function wire(t: TestContext, options: { maxPayloadBytes?: number } = {}):
     providers: new Set(['anthropic/claude-sonnet-5']),
     toolViews: TOOL_VIEWS,
     store,
+    budgets: {
+      defaultRunMicroUsd: 2_000_000,
+      defaultWallclockMs: 600_000,
+      maxLlmCallsPerRun: 50,
+      maxToolCallsPerRun: 100,
+    },
   })
   registry.load(dir)
 

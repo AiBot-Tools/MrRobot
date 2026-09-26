@@ -27,6 +27,7 @@ import { assertHumanActor, type HumanActor } from '../control/actor.js'
 import { ConfigError } from '../errors.js'
 import type { EventStore } from '../events/store.js'
 import { resolveView, type ToolViewsFile } from '../mcp/tool-views.js'
+import { resolveCaps, type KernelBudgets } from '../runtime/budget.js'
 import { parseManifest, type AgentManifest } from './manifest.js'
 
 export interface AgentRecord {
@@ -40,6 +41,34 @@ export interface RegistryDeps {
   readonly providers: ReadonlySet<string>
   readonly toolViews: ToolViewsFile
   readonly store: EventStore
+  /**
+   * The operator's per-run ceilings, so a manifest asking for more is refused
+   * HERE.
+   *
+   * Required rather than optional deliberately. `resolveCaps` already refuses an
+   * over-ceiling budget, but only when a run starts — so a bad manifest loaded
+   * clean and failed at the first run, which is the worst place to find a config
+   * error. An optional dep would let a call site skip the check by omission,
+   * which is the same failure one level up.
+   */
+  readonly budgets: KernelBudgets
+}
+
+/**
+ * The risks a tier may hold, from plan D15.
+ *
+ * Tier is meant to be the gate's posture for an agent, and until now it did no
+ * work at load: a tier 1 manifest could list a `write` tool and the only thing
+ * stopping it was the gate at call time. That is a refusal in the right place but
+ * at the wrong moment — an operator wants to hear it when the file is read, with
+ * the file named, not on the first run that happens to reach for it.
+ */
+const RISKS_BY_TIER: Readonly<Record<number, readonly string[]>> = {
+  0: [],
+  1: ['read'],
+  2: ['read', 'write'],
+  // Tier 3 may REQUEST an irreversible tool. It is still human-gated, always.
+  3: ['read', 'write', 'irreversible'],
 }
 
 export class AgentRegistry {
@@ -51,7 +80,20 @@ export class AgentRegistry {
   }
 
   /** Load every agents/<id>/agent.yaml under `agentsDir`. */
+  /**
+   * Read every manifest, validate every one, and only then register any.
+   *
+   * Two phases on purpose. A single pass registers as it walks, so a fleet with
+   * one bad manifest left the earlier ones registered and their
+   * `agent.registered` rows in the log — from a boot that then refused. The boot
+   * refusal was correct; the half-written record of a fleet that never existed
+   * was not. All-or-nothing means the log says either "this fleet loaded" or
+   * nothing at all.
+   */
   load(agentsDir: string): void {
+    const pending: { manifest: AgentManifest; dir: string }[] = []
+    const seen = new Map<string, string>()
+
     for (const entry of readdirSync(agentsDir)) {
       const dir = join(agentsDir, entry)
       if (!statSync(dir).isDirectory()) continue
@@ -59,14 +101,19 @@ export class AgentRegistry {
       const manifest = parseManifest(parseYaml(readFileSync(file, 'utf8')), file)
       this.#validate(manifest, file)
 
-      if (this.#agents.has(manifest.id)) {
+      const already = seen.get(manifest.id) ?? (this.#agents.has(manifest.id) ? 'a previous load' : undefined)
+      if (already !== undefined) {
         throw new ConfigError(`duplicate agent id ${manifest.id} (second copy at ${file})`)
       }
       if (manifest.id !== entry) {
         throw new ConfigError(`${file}: id "${manifest.id}" does not match its directory "${entry}"`)
       }
+      seen.set(manifest.id, file)
+      pending.push({ manifest, dir })
+    }
 
-      this.#register({ manifest, status: 'active', dir })
+    for (const record of pending) {
+      this.#register({ manifest: record.manifest, status: 'active', dir: record.dir })
     }
   }
 
@@ -92,11 +139,22 @@ export class AgentRegistry {
             'A manifest cannot grant what the tool views withhold.',
         )
       }
+      const allowed = RISKS_BY_TIER[manifest.tier] ?? []
+      if (!allowed.includes(view.risk)) {
+        throw new ConfigError(
+          `${source}: tools.allow names ${ref}, which is ${view.risk} risk, but tier ` +
+            `${String(manifest.tier)} may hold ${allowed.length === 0 ? 'no tools' : allowed.join(' or ')}. ` +
+            'Raise the tier deliberately or drop the tool.',
+        )
+      }
     }
 
     if (manifest.tier === 0 && manifest.tools.allow.length > 0) {
       throw new ConfigError(`${source}: tier 0 means no tools, but tools.allow is not empty`)
     }
+
+    // Throws with the cap it exceeded and by how much. A manifest may only lower.
+    resolveCaps(this.#deps.budgets, manifest.budget ?? {})
   }
 
   #register(record: AgentRecord): void {

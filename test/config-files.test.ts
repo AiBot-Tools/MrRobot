@@ -237,7 +237,14 @@ test('agents/*/agent.yaml parse against the shipped providers and tool-views; ce
 
   // The real load path, against the real files. If a manifest named a tool the
   // views withhold, or a model ref providers.yaml does not carry, this throws.
-  const reg = new AgentRegistry({ providers, toolViews, store })
+  const reg = new AgentRegistry({
+    providers,
+    toolViews,
+    store,
+    // The SHIPPED ceilings, so the shipped manifests are checked against the
+    // numbers the operator actually runs with.
+    budgets: parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO }).budgets,
+  })
   reg.load(join(REPO, 'agents'))
 
   const ceo = reg.get('ceo')

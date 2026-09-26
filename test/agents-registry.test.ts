@@ -17,6 +17,7 @@ import { AgentRegistry } from '../src/agents/registry.js'
 import { parseManifest } from '../src/agents/manifest.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
 import type { EventStore } from '../src/events/store.js'
+import { ConfigError } from '../src/errors.js'
 import { withStore } from './helpers/store.js'
 import { tmpdir } from './helpers/tmpdir.js'
 
@@ -90,8 +91,16 @@ function agentsDir(t: Parameters<typeof withStore>[0], extra: Record<string, str
   return dir
 }
 
+/** The kernel ceilings a manifest may only lower. D30's defaults. */
+const BUDGETS = {
+  defaultRunMicroUsd: 2_000_000,
+  defaultWallclockMs: 600_000,
+  maxLlmCallsPerRun: 50,
+  maxToolCallsPerRun: 100,
+} as const
+
 function registry(store: EventStore): AgentRegistry {
-  return new AgentRegistry({ providers: PROVIDERS, toolViews: TOOL_VIEWS, store })
+  return new AgentRegistry({ providers: PROVIDERS, toolViews: TOOL_VIEWS, store, budgets: BUDGETS })
 }
 
 test('loads ceo and worker-template fixtures and freezes records', (t) => {
@@ -314,4 +323,150 @@ test('archive keeps manifest and history files', (t) => {
   // Still retrievable by id, marked rather than removed.
   assert.equal(reg.get('ceo')?.status, 'archived')
   assert.equal(reg.list().length, 2)
+})
+
+test('a tier 1 manifest may not hold a write tool, and the refusal names the tier and the risk', (t) => {
+  // Tier is supposed to be the gate's posture for an agent, and until this check
+  // it did no work at load: a tier 1 manifest could list a `write` tool and the
+  // only thing stopping it was the gate at call time. That is a refusal in the
+  // right place at the wrong moment — an operator wants it when the file is read,
+  // with the file named, not on the first run that happens to reach for it.
+  const store = withStore(t)
+  const dir = agentsDir(t, {
+    'reads-only': `
+id: reads-only
+version: 1
+kind: standard
+role: worker
+soul: worker.md
+tier: 1
+model:
+  primary: anthropic/claude-sonnet-5
+tools:
+  servers: [pmmcp]
+  allow: [pmmcp.remember]
+memory:
+  projectId: aos/agent/reads-only
+`,
+  })
+  assert.throws(
+    () => registry(store).load(dir),
+    (e: unknown) => {
+      assert.ok(e instanceof ConfigError, `threw ${String(e)}`)
+      assert.match(e.message, /pmmcp\.remember/)
+      assert.match(e.message, /write risk/)
+      assert.match(e.message, /tier 1 may hold read/)
+      // And it says what to do, rather than only what is wrong.
+      assert.match(e.message, /Raise the tier deliberately or drop the tool/)
+      return true
+    },
+  )
+})
+
+test('the same write tool loads at tier 2, and a read tool loads at tier 1', (t) => {
+  // The other half of the claim: the check is about the tier/risk pair, not a
+  // blanket refusal that would make tier 2 unusable.
+  const store = withStore(t)
+  const dir = agentsDir(t, {
+    'can-write': `
+id: can-write
+version: 1
+kind: standard
+role: worker
+soul: worker.md
+tier: 2
+model:
+  primary: anthropic/claude-sonnet-5
+tools:
+  servers: [pmmcp]
+  allow: [pmmcp.remember, pmmcp.recall]
+memory:
+  projectId: aos/agent/can-write
+`,
+    'can-read': `
+id: can-read
+version: 1
+kind: standard
+role: worker
+soul: worker.md
+tier: 1
+model:
+  primary: anthropic/claude-sonnet-5
+tools:
+  servers: [pmmcp]
+  allow: [pmmcp.recall]
+memory:
+  projectId: aos/agent/can-read
+`,
+  })
+  const reg = registry(store)
+  reg.load(dir)
+  assert.deepEqual(reg.get('can-write')?.manifest.tools.allow, ['pmmcp.remember', 'pmmcp.recall'])
+  assert.deepEqual(reg.get('can-read')?.manifest.tools.allow, ['pmmcp.recall'])
+})
+
+test('a manifest budget above a kernel ceiling is refused at LOAD, not at the first run', (t) => {
+  // resolveCaps already refused this — but only when a run started, so a bad
+  // manifest loaded clean and failed later, which is the worst place to find a
+  // config error. The registry now asks the same question when it reads the file.
+  const store = withStore(t)
+  const dir = agentsDir(t, {
+    greedy: `
+id: greedy
+version: 1
+kind: standard
+role: worker
+soul: worker.md
+tier: 1
+model:
+  primary: anthropic/claude-sonnet-5
+budget:
+  maxLlmCalls: 500
+memory:
+  projectId: aos/agent/greedy
+`,
+  })
+  assert.throws(
+    () => registry(store).load(dir),
+    (e: unknown) => {
+      assert.ok(e instanceof ConfigError, `threw ${String(e)}`)
+      assert.match(e.message, /maxLlmCalls is 500/)
+      assert.match(e.message, /A manifest may only lower a cap/)
+      return true
+    },
+  )
+
+  // Nothing was registered: a refused load leaves no half-loaded fleet behind.
+  assert.equal(store.query({ type: 'agent.registered' }).length, 0)
+})
+
+test('a budget that lowers every cap loads and is preserved verbatim', (t) => {
+  const store = withStore(t)
+  const dir = agentsDir(t, {
+    modest: `
+id: modest
+version: 1
+kind: standard
+role: worker
+soul: worker.md
+tier: 1
+model:
+  primary: anthropic/claude-sonnet-5
+budget:
+  maxCostMicroUsd: 500000
+  maxLlmCalls: 12
+  maxToolCalls: 40
+  maxWallclockMs: 300000
+memory:
+  projectId: aos/agent/modest
+`,
+  })
+  const reg = registry(store)
+  reg.load(dir)
+  assert.deepEqual(reg.get('modest')?.manifest.budget, {
+    maxCostMicroUsd: 500_000,
+    maxLlmCalls: 12,
+    maxToolCalls: 40,
+    maxWallclockMs: 300_000,
+  })
 })

@@ -358,6 +358,9 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       providers: new Set(cards.keys()),
       toolViews,
       store,
+      // So a manifest asking for more than the operator allows is refused when the
+      // file is read, not on the first run that reaches for it.
+      budgets: config.budgets,
     })
     agents.load(options.agentsDir ?? join(repoRoot, 'agents'))
 

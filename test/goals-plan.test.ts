@@ -20,6 +20,7 @@ import {
   PlanInvalid,
   ProposedPlan,
   tasksOf,
+  TITLE_MAX,
 } from '../src/goals/plan.js'
 
 /** A minimal plan that must parse, as the baseline every refusal deviates from. */
@@ -164,6 +165,23 @@ test('an unexpected key is refused rather than dropped', () => {
     assert.match(e.message, /budget|unrecognized/i)
     return true
   })
+})
+
+test('an over-long title is refused at parse, not at append', () => {
+  // The bound matters because `goal.created` bounds the title at the same 200. A
+  // plan that got past this would be refused when the event was appended —
+  // AFTER the goal had been created on the server — leaving a tree half written.
+  const plan = good()
+  const ms = plan['milestones'] as { tasks: { title: string }[] }[]
+  ms[0]!.tasks[0]!.title = 'x'.repeat(TITLE_MAX + 1)
+  assert.throws(() => parsePlan(wrap(plan)), (e: unknown) => {
+    assert.ok(e instanceof PlanInvalid)
+    assert.match(e.message, /title/)
+    return true
+  })
+  // Exactly at the bound parses, so the refusal is not off by one.
+  ms[0]!.tasks[0]!.title = 'x'.repeat(TITLE_MAX)
+  assert.equal(parsePlan(wrap(plan)).milestones[0]?.tasks[0]?.title.length, TITLE_MAX)
 })
 
 test('more than three operator questions is refused', () => {

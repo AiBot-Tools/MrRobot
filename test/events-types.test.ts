@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { EVENT_TYPES, PAYLOAD_SCHEMAS, type EventType } from '../src/events/types.js'
 import { withStore } from './helpers/store.js'
 
-const FROZEN_38: readonly string[] = [
+const FROZEN_42: readonly string[] = [
   'kernel.booted',
   'kernel.shutdown',
   'subsystem.state',
@@ -26,6 +26,7 @@ const FROZEN_38: readonly string[] = [
   'sandbox.degraded',
   'router.degraded',
   'secrets.degraded',
+  'goals.degraded',
   'agent.registered',
   'agent.spawned',
   'agent.spawn.rejected',
@@ -52,6 +53,9 @@ const FROZEN_38: readonly string[] = [
   'sandbox.killed',
   'secret.accessed',
   'probe.recorded',
+  'plan.adopted',
+  'goal.created',
+  'goal.status',
 ]
 
 /**
@@ -140,18 +144,55 @@ const SAMPLES: Record<EventType, Record<string, unknown>> = {
   'sandbox.killed': { schemaVersion: 1, sandboxId: 's1', reason: 'wallclock' },
   'secret.accessed': { schemaVersion: 1, id: 'anthropic-api-key', purpose: 'llm', source: 'vault' },
   'probe.recorded': { schemaVersion: 1, ref: 'anthropic/claude-sonnet-5', toolCalling: true, toolChoiceForced: null },
+  'goals.degraded': { schemaVersion: 1, reason: 'pmmcp declares no tool "create_goal"' },
+  'plan.adopted': {
+    schemaVersion: 1,
+    runId: 'run_1',
+    projectId: 'aos/ceo',
+    objectiveGoalId: 'goal-1',
+    title: 'compare two log storage options',
+    milestones: 1,
+    tasks: 2,
+    questions: 0,
+  },
+  'goal.created': {
+    schemaVersion: 1,
+    projectId: 'aos/ceo',
+    goalId: 'goal-2',
+    kind: 'task',
+    parentId: 'goal-1',
+    title: 'write up sqlite',
+    planTaskId: 't1',
+  },
+  'goal.status': {
+    schemaVersion: 1,
+    projectId: 'aos/ceo',
+    goalId: 'goal-2',
+    from: 'pending',
+    to: 'in_progress',
+    by: 'kernel',
+    runId: 'run_2',
+  },
 }
 
-test('EVENT_TYPES equals the 37 frozen names by literal array equality', () => {
-  // 38: `quarantine.abandoned` for crash recovery, and `run.scheduled` for the
-  // cron scheduler. The list is frozen by literal equality precisely so that
-  // growing it is a deliberate act with a reason — a restart must be able to end
-  // a hold WITHOUT claiming a human released its content, and the scheduler must
-  // be able to claim a minute durably BEFORE it tries to start a run.
-  assert.equal(EVENT_TYPES.length, 38)
-  assert.deepEqual([...EVENT_TYPES], FROZEN_38)
+test('EVENT_TYPES equals the 42 frozen names by literal array equality', () => {
+  // The list is frozen by literal equality precisely so that growing it is a
+  // deliberate act with a reason. The reasons, in order of arrival:
+  //
+  //   `quarantine.abandoned` — a restart must end a hold WITHOUT claiming a human
+  //     released its content;
+  //   `run.scheduled` — the scheduler must claim a minute durably BEFORE it tries
+  //     to start a run;
+  //   `goals.degraded` — the configured pmmcp goal tools can disagree with the
+  //     live server, and `StatusResult.subsystems` is a strict object in the
+  //     frozen protocol v1, so this cannot be a subsystem key without a bump;
+  //   `plan.adopted`, `goal.created`, `goal.status` — the kernel writing a goal
+  //     tree and moving it is a side effect on the operator's long-term memory,
+  //     and every one of those writes has to be in the record.
+  assert.equal(EVENT_TYPES.length, 42)
+  assert.deepEqual([...EVENT_TYPES], FROZEN_42)
   // No duplicates, and every name is dotted and lowercase.
-  assert.equal(new Set(EVENT_TYPES).size, 38)
+  assert.equal(new Set(EVENT_TYPES).size, 42)
   for (const t of EVENT_TYPES) assert.match(t, /^[a-z]+(\.[a-z]+)+$/)
 })
 
@@ -193,7 +234,7 @@ test('store.append rejects a type outside EVENT_TYPES', (t) => {
     const row = store.append({ type, payload: SAMPLES[type] })
     assert.equal(row.type, type)
   }
-  assert.equal(store.query().length, 38)
+  assert.equal(store.query().length, 42)
   assert.equal(store.verifyChain().ok, true)
 })
 

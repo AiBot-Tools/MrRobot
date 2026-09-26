@@ -105,6 +105,57 @@ const Secrets = z
   })
   .strict()
 
+/**
+ * The pmmcp goal tools, as CONFIG rather than constants.
+ *
+ * Every name and argument here is MODELLED, not confirmed: nobody has read
+ * pmmcp's live `listTools` on this machine, and CLAUDE.md's Phase 1 says the
+ * typed wrappers come from those schemas. Hardcoding `create_goal` into the
+ * kernel would make it wrong on the operator's Mac in a way only a stack trace
+ * explains, and right again only after a code change.
+ *
+ * So the kernel ships the modelled names as defaults, checks them against the
+ * connected server at boot, and DEGRADES the goals subsystem with a reason
+ * naming the tool or the argument that disagrees. That is the same posture
+ * `secrets.keyArg` already has, and it turns a wrong guess into one line of YAML
+ * instead of a patch. `npm run capture:pmmcp` is how the guesses become facts.
+ */
+const GoalTools = z
+  .object({
+    create: z.string().min(1).default('create_goal'),
+    updateStatus: z.string().min(1).default('update_goal_status'),
+    get: z.string().min(1).default('get_goal'),
+    list: z.string().min(1).default('list_goals'),
+  })
+  .strict()
+
+const GoalArgs = z
+  .object({
+    projectId: z.string().min(1).default('project_id'),
+    goalId: z.string().min(1).default('goal_id'),
+    parentId: z.string().min(1).default('parent_id'),
+    kind: z.string().min(1).default('kind'),
+    title: z.string().min(1).default('title'),
+    status: z.string().min(1).default('status'),
+  })
+  .strict()
+
+const Goals = z
+  .object({
+    /**
+     * Adopt a plan found in a finished orchestrator run and write the tree.
+     *
+     * On by default because it is the designed behaviour, and the write is
+     * confined to the agent's own memory namespace and logged as
+     * `plan.adopted` + `goal.created`. Off is for an operator who wants the CEO
+     * observed before it writes anything durable.
+     */
+    adoptFromRuns: z.boolean().default(true),
+    tools: GoalTools.prefault({}),
+    args: GoalArgs.prefault({}),
+  })
+  .strict()
+
 const SandboxDomain = z
   .object({
     dockerHost: z.string().startsWith('unix://'),
@@ -166,6 +217,7 @@ export const KernelConfig = z
     events: Events.prefault({}),
     mcp: Mcp,
     secrets: Secrets.prefault({}),
+    goals: Goals.prefault({}),
     sandbox: Sandbox,
     lanes: Lanes,
     budgets: Budgets,

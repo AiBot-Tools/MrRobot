@@ -371,6 +371,24 @@ export interface PmmcpMockOptions {
   readonly idleMs?: number
   readonly now?: () => number
   /**
+   * What `create_goal` returns the new id as.
+   *
+   * `json` is an object with an `id`; `bare` is the id alone; `prose` is a
+   * sentence with no readable id, which is what the writer must refuse rather
+   * than guess at. The real shape is UNCONFIRMED, so the kernel has to cope with
+   * the first two and fail loudly on the third.
+   */
+  readonly goalIdShape?: 'json' | 'bare' | 'prose'
+  /**
+   * Fault injection: calls to a tool BEYOND this count return an isError result.
+   *
+   * Named explicitly rather than arranged by timing. Partial failure is the case
+   * a writer gets wrong — it is the difference between "the write failed" and "the
+   * write left three goals on the server" — and a test that provokes it with a
+   * race would pass or fail for reasons unrelated to the code.
+   */
+  readonly failAfter?: Readonly<Record<string, number>>
+  /**
    * Refuse to finish a milestone or objective while a child is not terminal.
    * OFF by default: nothing has confirmed pmmcp does this, and a double that
    * invents a rule makes the kernel depend on it.
@@ -574,6 +592,9 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
       createdAt: at,
       updatedAt: at,
     })
+    const shape = options.goalIdShape ?? 'json'
+    if (shape === 'bare') return ok(id)
+    if (shape === 'prose') return ok(`I have created the ${kind} for you.`)
     return ok({ id, kind, status: 'pending' })
   })
 
@@ -731,6 +752,13 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
       const name = req.params.name
       const args = (req.params.arguments ?? {}) as Record<string, unknown>
       calls.push({ tool: name, args, session: session.index })
+      const budget = options.failAfter?.[name]
+      if (budget !== undefined) {
+        const soFar = calls.filter((c) => c.tool === name).length
+        if (soFar > budget) {
+          return fail(`injected failure: ${name} call ${String(soFar)} exceeds the allowed ${String(budget)}`)
+        }
+      }
       const handler = handlers.get(name)
       if (handler === undefined) {
         // An unscripted tool is a protocol error, not a plausible answer. A

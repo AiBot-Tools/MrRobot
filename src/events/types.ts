@@ -121,6 +121,77 @@ export const RouterDegradedPayload = z.object({ ...V, reason: z.string() }).stri
 
 export const SecretsDegradedPayload = z.object({ ...V, reason: z.string() }).strict()
 
+/**
+ * The configured pmmcp goal tools disagree with what the server declares, so no
+ * goal tree can be written.
+ *
+ * A sibling of hub/router/secrets/sandbox `.degraded`, and deliberately an event
+ * rather than a key in `status.get`: `StatusResult.subsystems` is a strict object
+ * in the frozen protocol v1, and a new key there is a version bump. The reason is
+ * the product — it names the tool or argument that disagrees, which is one line of
+ * kernel.yaml away from fixed.
+ */
+export const GoalsDegradedPayload = z.object({ ...V, reason: z.string() }).strict()
+
+// ── goals ──────────────────────────────────────────────────────────────────
+
+/** Titles are model-authored and reach the log, so they are bounded at parse. */
+const goalTitle = (): z.ZodString => z.string().min(1).max(200)
+
+/**
+ * A plan was validated and written into the agent's own memory namespace.
+ *
+ * Counts rather than the plan itself: the goal ids are each recorded by their own
+ * `goal.created`, and duplicating a whole plan here would put an unbounded
+ * model-authored structure into a chain that cannot be rewritten.
+ */
+export const PlanAdoptedPayload = z
+  .object({
+    ...V,
+    runId: z.string(),
+    projectId: z.string(),
+    objectiveGoalId: z.string(),
+    title: goalTitle(),
+    milestones: nonNegInt(),
+    tasks: nonNegInt(),
+    questions: nonNegInt(),
+  })
+  .strict()
+
+export const GoalCreatedPayload = z
+  .object({
+    ...V,
+    projectId: z.string(),
+    goalId: z.string(),
+    kind: z.enum(['objective', 'milestone', 'task']),
+    parentId: z.string().optional(),
+    title: goalTitle(),
+    /** The plan id this goal came from, so the tree can be traced to its plan. */
+    planTaskId: z.string().optional(),
+  })
+  .strict()
+
+/**
+ * A goal moved.
+ *
+ * `from` is optional because the kernel does not always know it — a status set
+ * from a run lifecycle hook knows where it is going, not necessarily where the
+ * server had it. `by` says who moved it, and `kernel` is the only value the
+ * kernel writes: a model never moves a goal directly.
+ */
+export const GoalStatusPayload = z
+  .object({
+    ...V,
+    projectId: z.string(),
+    goalId: z.string(),
+    from: z.string().optional(),
+    to: z.string(),
+    by: z.enum(['kernel', 'human']),
+    reason: z.string().max(500).optional(),
+    runId: z.string().optional(),
+  })
+  .strict()
+
 // ── agents ─────────────────────────────────────────────────────────────────
 
 export const AgentRegisteredPayload = z
@@ -391,6 +462,7 @@ export const EVENT_TYPES = [
   'sandbox.degraded',
   'router.degraded',
   'secrets.degraded',
+  'goals.degraded',
   'agent.registered',
   'agent.spawned',
   'agent.spawn.rejected',
@@ -417,6 +489,9 @@ export const EVENT_TYPES = [
   'sandbox.killed',
   'secret.accessed',
   'probe.recorded',
+  'plan.adopted',
+  'goal.created',
+  'goal.status',
 ] as const
 
 export type EventType = (typeof EVENT_TYPES)[number]
@@ -434,6 +509,7 @@ export const PAYLOAD_SCHEMAS: Readonly<Record<EventType, z.ZodType>> = {
   'sandbox.degraded': SandboxDegradedPayload,
   'router.degraded': RouterDegradedPayload,
   'secrets.degraded': SecretsDegradedPayload,
+  'goals.degraded': GoalsDegradedPayload,
   'agent.registered': AgentRegisteredPayload,
   'agent.spawned': AgentSpawnedPayload,
   'agent.spawn.rejected': AgentSpawnRejectedPayload,
@@ -460,6 +536,9 @@ export const PAYLOAD_SCHEMAS: Readonly<Record<EventType, z.ZodType>> = {
   'sandbox.killed': SandboxKilledPayload,
   'secret.accessed': SecretAccessedPayload,
   'probe.recorded': ProbeRecordedPayload,
+  'plan.adopted': PlanAdoptedPayload,
+  'goal.created': GoalCreatedPayload,
+  'goal.status': GoalStatusPayload,
 }
 
 export function isEventType(t: string): t is EventType {

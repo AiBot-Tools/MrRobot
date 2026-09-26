@@ -24,11 +24,25 @@
 
 import * as z from 'zod'
 
+/**
+ * Bounds on every model-authored string that reaches the event log.
+ *
+ * Not cosmetic. A goal title is written into `goal.created`, whose schema bounds
+ * it at the same 200 — so without a bound HERE, a long title would be refused at
+ * append, after the goal had already been created on the server, and the failure
+ * would land halfway through writing a tree. Refusing the plan is the cheap end
+ * of that: bounding by refusal rather than truncation, as everywhere else.
+ */
+const TITLE_MAX = 200
+const LINE_MAX = 500
+const title = (): z.ZodString => z.string().min(1).max(TITLE_MAX)
+const line = (): z.ZodString => z.string().min(1).max(LINE_MAX)
+
 /** A task: one owned artifact, at least one acceptance check. */
 export const PlanTask = z
   .object({
-    id: z.string().min(1),
-    title: z.string().min(1),
+    id: z.string().min(1).max(64),
+    title: title(),
     /** The agent or template that runs it. Existence is checked separately. */
     template: z.string().min(1),
     /** Ids of tasks in THIS plan that must finish first. */
@@ -38,14 +52,14 @@ export const PlanTask = z
      * decomposition rubric: a task with no acceptance check cannot be verified
      * and its completion is whatever the worker says it is.
      */
-    acceptance: z.array(z.string().min(1)).min(1),
+    acceptance: z.array(line()).min(1),
     /**
      * The irreversible inventory, NAMED IN ADVANCE. An approval later requested
      * for a tool that is not in some task's inventory is a planner miss, and the
      * eval harness scores it as one.
      */
     irreversible: z
-      .array(z.object({ toolRef: z.string().min(1), why: z.string().min(1) }).strict())
+      .array(z.object({ toolRef: z.string().min(1).max(128), why: line() }).strict())
       .default([]),
   })
   .strict()
@@ -53,8 +67,8 @@ export type PlanTask = z.infer<typeof PlanTask>
 
 export const PlanMilestone = z
   .object({
-    id: z.string().min(1),
-    title: z.string().min(1),
+    id: z.string().min(1).max(64),
+    title: title(),
     tasks: z.array(PlanTask).min(1),
   })
   .strict()
@@ -64,18 +78,20 @@ export const ProposedPlan = z
   .object({
     objective: z
       .object({
-        title: z.string().min(1),
-        successCriteria: z.array(z.string().min(1)).min(1),
+        title: title(),
+        successCriteria: z.array(line()).min(1),
       })
       .strict(),
     milestones: z.array(PlanMilestone).min(1),
-    assumptions: z.array(z.string()).default([]),
-    risks: z.array(z.string()).default([]),
+    assumptions: z.array(line()).default([]),
+    risks: z.array(line()).default([]),
     /** Bounded at parse: a plan that asks twenty questions has not planned. */
-    questionsForOperator: z.array(z.string()).max(3).default([]),
+    questionsForOperator: z.array(line()).max(3).default([]),
   })
   .strict()
 export type ProposedPlan = z.infer<typeof ProposedPlan>
+
+export { TITLE_MAX, LINE_MAX }
 
 /** Refused with the reason a human can act on, never a generic parse error. */
 export class PlanInvalid extends Error {

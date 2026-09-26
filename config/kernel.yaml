@@ -68,6 +68,34 @@ sandbox:
     cpus: 2
     wallclockMs: 600000
 
+# pmmcp goal tools. EVERY NAME AND ARGUMENT HERE IS MODELLED, NOT CONFIRMED —
+# nobody has read pmmcp's live `listTools` on this machine, and CLAUDE.md's Phase
+# 1 says the typed wrappers come from those schemas.
+#
+# They are config rather than constants for exactly that reason: a wrong guess is
+# one line of YAML instead of a patch. At boot the kernel asks the hub what the
+# server declares and compares; a disagreement appends `goals.degraded` naming the
+# tool or argument and disables goal writing, so nothing guesses at a call the
+# server would reject. `npm run capture:pmmcp` turns the guesses into facts.
+goals:
+  # Write the tree from a plan found in a finished orchestrator run. Confined to
+  # that agent's own memory namespace, and every write is logged as `plan.adopted`
+  # plus one `goal.created` per goal. Set false to watch the CEO before it writes
+  # anything durable.
+  adoptFromRuns: true
+  tools:
+    create: create_goal
+    updateStatus: update_goal_status
+    get: get_goal
+    list: list_goals
+  args:
+    projectId: project_id
+    goalId: goal_id
+    parentId: parent_id
+    kind: kind
+    title: title
+    status: status
+
 lanes:
   main: 4
   subagent: 8

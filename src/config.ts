@@ -102,7 +102,17 @@ const SandboxDomain = z
   .object({
     dockerHost: z.string().startsWith('unix://'),
     network: z.string().min(1),
-    mountRoot: z.string().refine(isAbsolute, { message: 'mountRoot must be absolute' }),
+    // Absolute, or a ~ path that becomes absolute. The point of the check is
+    // to refuse a RELATIVE mountRoot — one that would resolve against whatever
+    // directory the daemon happened to start in, putting a container's mount
+    // somewhere nobody chose. `~/...` is anchored, and parseKernelConfig
+    // expands it immediately below; testing the raw string here rejected the
+    // one form an operator actually writes and left that expansion dead.
+    mountRoot: z
+      .string()
+      .refine((p) => isAbsolute(expandHome(p)), {
+        message: 'mountRoot must be absolute, or a ~ path that resolves to one',
+      }),
   })
   .strict()
 

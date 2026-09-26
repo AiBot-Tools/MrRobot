@@ -245,3 +245,29 @@ test('a ~ in sandbox dockerHost is expanded; a relative socket path is refused',
     assert.throws(() => parse(broken), /must resolve to an absolute socket path/, bad)
   }
 })
+
+test('a ~ mountRoot resolves; a relative one is still refused', () => {
+  // The check exists to refuse a RELATIVE mountRoot — one that resolves
+  // against whatever directory the daemon started in, putting a container's
+  // mount somewhere nobody chose. A ~ path is anchored, and the loader expands
+  // it, so rejecting the raw string refused the one form an operator writes.
+  const doc = fixture('valid.yaml') as { sandbox: { domains: Record<string, { mountRoot: string }> } }
+  doc.sandbox.domains['trusted']!.mountRoot = '~/.aos/workspaces/trusted'
+  doc.sandbox.domains['hostile']!.mountRoot = '~/.aos/workspaces/hostile'
+
+  const config = parse(doc)
+  assert.equal(config.sandbox.domains.trusted.mountRoot, join(homedir(), '.aos/workspaces/trusted'))
+  assert.equal(config.sandbox.domains.hostile.mountRoot, join(homedir(), '.aos/workspaces/hostile'))
+
+  for (const bad of ['workspaces/trusted', './trusted', '../outside']) {
+    const broken = fixture('valid.yaml') as { sandbox: { domains: Record<string, { mountRoot: string }> } }
+    broken.sandbox.domains['trusted']!.mountRoot = bad
+    assert.throws(() => parse(broken), /mountRoot must be absolute/, bad)
+  }
+
+  // And ~ itself is still $HOME, which is refused for the usual reason: it
+  // would hand a container everything.
+  const home = fixture('valid.yaml') as { sandbox: { domains: Record<string, { mountRoot: string }> } }
+  home.sandbox.domains['trusted']!.mountRoot = '~'
+  assert.throws(() => parse(home), /must not be \$HOME itself/)
+})

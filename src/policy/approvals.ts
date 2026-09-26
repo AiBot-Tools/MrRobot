@@ -27,13 +27,28 @@ import { NotImplementedError, PolicyDenied } from '../errors.js'
 
 export type ApprovalDecision = 'approved' | 'denied' | 'expired'
 
+/**
+ * What a human is being asked to decide.
+ *
+ * `kind` is not decoration. Protocol v1 gives promotions their own command
+ * (`agent.promote`) so that exactly one call can promote an agent (invariant
+ * 6), and the dispatcher needs to know which kind it is holding to refuse a
+ * promotion presented to `approval.approve`. A `tool` request carries
+ * runId/toolRef/argsHash; a `promotion` carries agentId.
+ *
+ * The id is prefixed `apr_` so the CLI can dispatch on it without guessing,
+ * and can never route a quarantine hold (`hold_…`) down the approval path.
+ */
 export interface ApprovalRequest {
   readonly approvalId: string
-  readonly runId: string
-  readonly toolRef: string
-  readonly argsHash: string
+  readonly kind: 'tool' | 'promotion'
+  readonly runId?: string | undefined
+  readonly toolRef?: string | undefined
+  readonly argsHash?: string | undefined
+  readonly agentId?: string | undefined
   readonly risk: string
   readonly argsPreview: string
+  readonly requestedAt: number
   readonly expiresAt: number
 }
 
@@ -75,21 +90,27 @@ export class Approvals {
    * Ask for a decision. Resolves when a human answers or the wait elapses.
    */
   request(input: {
-    runId: string
-    toolRef: string
-    argsHash: string
+    kind?: 'tool' | 'promotion'
+    runId?: string
+    toolRef?: string
+    argsHash?: string
+    agentId?: string
     risk: string
     argsPreview: string
   }): { request: ApprovalRequest; outcome: Promise<ApprovalOutcome> } {
-    const approvalId = randomUUID()
+    const approvalId = `apr_${randomUUID()}`
+    const now = Date.now()
     const request: ApprovalRequest = {
       approvalId,
-      runId: input.runId,
-      toolRef: input.toolRef,
-      argsHash: input.argsHash,
+      kind: input.kind ?? 'tool',
+      ...(input.runId === undefined ? {} : { runId: input.runId }),
+      ...(input.toolRef === undefined ? {} : { toolRef: input.toolRef }),
+      ...(input.argsHash === undefined ? {} : { argsHash: input.argsHash }),
+      ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
       risk: input.risk,
       argsPreview: input.argsPreview,
-      expiresAt: Date.now() + this.#waitMs,
+      requestedAt: now,
+      expiresAt: now + this.#waitMs,
     }
 
     let settle!: (outcome: ApprovalOutcome) => void

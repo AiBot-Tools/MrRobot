@@ -94,7 +94,7 @@ export class PolicyEngine {
         payload: {
           schemaVersion: 1,
           approvalId: request.approvalId,
-          toolRef: request.toolRef,
+          toolRef: request.toolRef ?? input.toolRef,
           argsPreview: request.argsPreview,
           risk: input.view.risk,
           expiresAt: new Date(request.expiresAt).toISOString(),

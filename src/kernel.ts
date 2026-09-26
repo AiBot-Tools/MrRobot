@@ -51,7 +51,7 @@ import { type ToolViewsFile } from './mcp/tool-views.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 
 import { McpHub, streamableHttpTransport, type ClientFactory } from './mcp/hub.js'
-import { SecretsBroker } from './secrets/broker.js'
+import { SecretsBroker, type SecretRef } from './secrets/broker.js'
 import {
   parseProviders,
   routable,
@@ -60,6 +60,8 @@ import {
   type ProvidersFile,
 } from './models/registry.js'
 import { Router } from './models/router.js'
+import { AnthropicAdapter } from './models/anthropic.js'
+import { OpenAiChatAdapter } from './models/openai-chat.js'
 import { probe, readProbeRecord } from './models/probe.js'
 import { Approvals } from './policy/approvals.js'
 import { Quarantine } from './policy/quarantine.js'
@@ -336,27 +338,80 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       sandboxProbe.ok ? undefined : `${driver.name}: ${sandboxProbe.why}`,
     )
 
+    // ── credentials: resolved ONCE, here, outside any run scope ───────────
+    //
+    // The broker refuses to resolve inside a run (`a run may not resolve a
+    // secret`), and it is right to: a run that can ask for a secret is a run
+    // that can be talked into asking for someone else's. But the router needs a
+    // credential on every provider call, and those calls happen inside the
+    // run's scope — so resolution happens now and the router only ever looks up
+    // what boot already resolved.
+    //
+    // A failure here is not a boot failure. No vault and no env fallback is the
+    // normal state on a machine with pmmcp down; it makes that ref unroutable
+    // and the reason is what the router reports.
+    const credentials = new Map<string, SecretRef>()
+    const credentialFailures = new Map<string, string>()
+    for (const [ref, card] of cards) {
+      // A placeholder is refused by the router regardless (D28), and resolving
+      // its credential would be a vault call for a model nothing can use.
+      if (card.placeholder) continue
+      if (card.auth.value !== undefined || card.auth.vaultId === undefined) continue
+      try {
+        credentials.set(
+          ref,
+          await broker.ref(card.auth.vaultId, `provider credential for ${ref}`, {
+            ...(card.auth.envVar === undefined ? {} : { envVar: card.auth.envVar }),
+          }),
+        )
+      } catch (e) {
+        credentialFailures.set(ref, e instanceof Error ? e.message : String(e))
+      }
+    }
+
     // ── router (degradable per ref) ───────────────────────────────────────
-    const resolveCredential = async (card: ModelCard, ref: string): Promise<string | undefined> => {
-      if (card.auth.value !== undefined) return card.auth.value
-      if (card.auth.vaultId === undefined) return undefined
-      // The broker registers whatever it resolves with the redaction mask, and
-      // hands back a ref whose value lives in a WeakMap rather than a field.
-      const secret = await broker.ref(card.auth.vaultId, `provider credential for ${ref}`, {
-        ...(card.auth.envVar === undefined ? {} : { envVar: card.auth.envVar }),
-      })
-      return broker.use(secret, (value) => value)
+    const resolveCredential = (card: ModelCard, ref: string): Promise<string | undefined> => {
+      // A loopback endpoint's placeholder token, and the no-credential case.
+      if (card.auth.value !== undefined) return Promise.resolve(card.auth.value)
+      if (card.auth.vaultId === undefined) return Promise.resolve(undefined)
+
+      const held = credentials.get(ref)
+      if (held === undefined) {
+        // Refused rather than returning undefined, for the MESSAGE.
+        //
+        // Nothing would reach the wire either way: the anthropic adapter refuses
+        // an absent credential itself ("an Anthropic entry needs a credential"),
+        // and it passes an explicit null for the field it is not using so the
+        // SDK never falls back to an ambient ANTHROPIC_API_KEY. But that refusal
+        // can only say a credential is missing, where this one says WHY — the
+        // vault returned nothing, or envFallback is off, as boot found it. The
+        // reason is what an operator needs, and it exists only here.
+        return Promise.reject(
+          new ConfigError(
+            `${ref}: ${credentialFailures.get(ref) ?? 'no credential was resolved for this ref at boot'}`,
+          ),
+        )
+      }
+      // `use` is the accounted-for door: the access was logged when the ref was
+      // minted, and the value's life is this call. The router's contract needs
+      // the string itself to stamp a header, which is the seam.
+      return Promise.resolve(broker.use(held, (value) => value))
     }
     const router = new Router({
       store,
       cards,
       probes,
       resolveCredential,
+      // The real adapters. Without these the router falls back to
+      // NotImplementedAdapter for both dialects and every run finishes with
+      // `not implemented in this phase: anthropic adapter` and zero cost —
+      // which is the Phase 0 exit criterion failing silently.
+      adapters: { anthropic: new AnthropicAdapter(), 'openai-chat': new OpenAiChatAdapter() },
       maxRetries: config.budgets.maxRetries,
       ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
       now,
     })
-    const routerReason = routerDegradation(cards, probes, now(), hubState.ok, config.secrets.envFallback, env)
+    const routerReason = routerDegradation(cards, probes, now(), credentials, credentialFailures)
     if (routerReason !== undefined) {
       store.append({ type: 'router.degraded', payload: { schemaVersion: 1, reason: routerReason } })
     }
@@ -572,9 +627,8 @@ function routerDegradation(
   cards: ReadonlyMap<string, ModelCard>,
   probes: (ref: string) => ProbeRecord | undefined,
   nowMs: number,
-  vaultUp: boolean,
-  envFallback: boolean,
-  env: NodeJS.ProcessEnv,
+  credentials: ReadonlyMap<string, SecretRef>,
+  failures: ReadonlyMap<string, string>,
 ): string | undefined {
   const usable: string[] = []
   const why: string[] = []
@@ -583,13 +637,13 @@ function routerDegradation(
       why.push(`${ref}: ${card.placeholder ? 'placeholder' : 'no fresh probe reporting toolCalling'}`)
       continue
     }
+    // What boot actually resolved, not a guess about whether it could have.
     const hasCredential =
       card.auth.value !== undefined ||
-      (card.auth.vaultId !== undefined &&
-        (vaultUp || (envFallback && card.auth.envVar !== undefined && env[card.auth.envVar] !== undefined))) ||
-      card.auth.optional === true
+      card.auth.vaultId === undefined ||
+      credentials.has(ref)
     if (!hasCredential) {
-      why.push(`${ref}: no credential path (vault down and no usable env fallback)`)
+      why.push(`${ref}: ${failures.get(ref) ?? 'no credential resolved at boot'}`)
       continue
     }
     usable.push(ref)

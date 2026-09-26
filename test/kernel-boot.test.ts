@@ -38,6 +38,10 @@ import { CONTROL_PATH } from '../src/control/auth.js'
 import { VERSION } from '../src/version.js'
 import { fixture, REPO_ROOT, TEST_TOKEN, verifyAt, withKernel } from './helpers/kernel.js'
 import { fakeSandbox } from './helpers/fake-sandbox.js'
+import { anthropicEndTurn, fakeProvider } from './helpers/fake-provider.js'
+import { freshProbe } from './helpers/probe.js'
+import { writeProbeRecord } from '../src/models/probe.js'
+import { connectControl } from '../src/cli/client.js'
 import { mockMcp } from './helpers/mock-mcp.js'
 
 /** Rows of a closed kernel log, read back read-only. */
@@ -85,6 +89,58 @@ async function expectBootRefusal(
   }
   await booted.shutdown()
   assert.fail(`boot succeeded but should have been refused with ${String(pattern)}`)
+}
+
+/** The one non-placeholder ref in the shipped providers.yaml. */
+const REAL_REF = 'anthropic/claude-sonnet-5'
+
+/**
+ * Start a run over the real control socket and wait for it to finish.
+ *
+ * Through the wire rather than through the surface object: this is the path
+ * `aos run` takes, so a test that exercises it proves the protocol as well as
+ * the loop.
+ */
+async function runThroughControl(
+  kernel: Awaited<ReturnType<typeof bootKernel>>,
+  prompt: string,
+): Promise<Record<string, unknown>> {
+  const client = await connectControl({ port: kernel.port, token: TEST_TOKEN, timeoutMs: 120_000 })
+  try {
+    // Buffered, for the same reason the CLI buffers: the daemon broadcasts as
+    // it appends, so a fast run can finish before the reply naming it is
+    // parsed. Matching only on an id we do not yet know loses that event.
+    const early = new Map<string, Record<string, unknown>>()
+    let mine: string | undefined
+    let settle: (payload: Record<string, unknown>) => void = () => undefined
+    const finished = new Promise<Record<string, unknown>>((resolve) => {
+      settle = resolve
+    })
+    client.onEvent((event) => {
+      if (event.type !== 'run.finished') return
+      const payload = event.payload as Record<string, unknown> | null
+      if (payload === null || typeof payload['runId'] !== 'string') return
+      if (payload['runId'] === mine) settle(payload)
+      else early.set(payload['runId'], payload)
+    })
+
+    const started = (await client.call('run.start', { agentId: 'ceo', input: prompt })) as {
+      runId: string
+    }
+    mine = started.runId
+    const alreadyDone = early.get(started.runId)
+    if (alreadyDone !== undefined) settle(alreadyDone)
+
+    // Bounded: a run that never finishes must fail with what the log says, not
+    // hang the file until the runner gives up with no diagnosis.
+    const timeout = new Promise<Record<string, unknown>>((_, reject) => {
+      const timer = setTimeout(() => reject(new Error(`run ${started.runId} did not finish`)), 20_000)
+      timer.unref?.()
+    })
+    return await Promise.race([finished, timeout])
+  } finally {
+    client.close()
+  }
 }
 
 test('boots DEGRADED with hub, secrets and sandbox degraded, each with a reason, and control ok, over a real WS connection', async (t) => {
@@ -532,6 +588,136 @@ test('a refused boot neither repairs the anchor nor leaks the store handle', asy
     `open descriptors went from ${String(before)} to ${String(after)} across five refused boots; ` +
       'the store is not being closed on the failure path',
   )
+})
+
+test('a run pays for a model call with a credential resolved at boot', async (t) => {
+  // The regression test for a real defect: the router resolves a credential on
+  // every provider call, and those calls happen INSIDE the run's scope — where
+  // the broker refuses to resolve ("a run may not resolve a secret", and it is
+  // right to: a run that can ask for a secret can be talked into asking for
+  // someone else's). Resolution therefore happens at boot and the router only
+  // looks up what boot already resolved. Wired the other way round, no run can
+  // ever make a model call, and the Phase 0 exit criterion is unreachable.
+  //
+  // Offline: the provider is a double and the vault is absent, so the credential
+  // comes from the env fallback (D8). No socket leaves the machine.
+  const provider = fakeProvider([anthropicEndTurn({ text: 'pong', inputTokens: 1_000, outputTokens: 100 })])
+  const KEY = 'offline-fixture-credential-9c1f0b'
+
+  const { kernel, fx } = await withKernel(t, {
+    envFallback: true,
+    env: { ANTHROPIC_API_KEY: KEY },
+    fetch: provider.fetch,
+    // routable() consults the persisted probe record, so it has to be on disk
+    // before boot decides whether anything can be served.
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+
+  // Boot resolved the credential, from the environment, and said so — once, at
+  // boot, not once per call.
+  const accessed = rows(fx.dbPath).filter((r) => r.type === 'secret.accessed')
+  assert.equal(accessed.length, 1, 'the credential was not resolved exactly once at boot')
+  const access = JSON.parse(accessed[0]?.payload ?? '{}') as Record<string, unknown>
+  assert.equal(access['source'], 'env')
+  assert.equal(access['id'], 'anthropic-api-key')
+  assert.match(String(access['purpose']), /provider credential/)
+
+  // With a fresh probe and a resolved credential, the router is servable.
+  assert.equal(
+    kernel.status().subsystems.router.state,
+    'ok',
+    kernel.status().subsystems.router.reason ?? 'router is not servable',
+  )
+
+  const finished = await runThroughControl(kernel, 'reply with the word pong')
+  assert.equal(finished['status'], 'ok', String(finished['reason']))
+  // Non-zero cost is the whole claim: a run that finishes having spent nothing
+  // never reached the provider.
+  assert.ok((finished['costMicroUsd'] as number) > 0, 'the run finished with zero cost')
+  assert.equal(finished['llmCalls'], 1)
+
+  // Exactly one provider call, carrying the credential in the card's header.
+  assert.equal(provider.requests.length, 1)
+  assert.equal(provider.requests[0]?.headers['x-api-key'], KEY)
+  assert.equal(provider.requests[0]?.headers['anthropic-version'], '2023-06-01')
+
+  // Invariant 4: two events per model call, with the cost on the response.
+  const logged = rows(fx.dbPath)
+  assert.equal(logged.filter((r) => r.type === 'llm.request').length, 1)
+  const responses = logged.filter((r) => r.type === 'llm.response')
+  assert.equal(responses.length, 1)
+  const response = JSON.parse(responses[0]?.payload ?? '{}') as Record<string, unknown>
+  assert.ok((response['costMicroUsd'] as number) > 0)
+  assert.equal(response['content'], 'pong')
+
+  // And the key is nowhere in the log, though it went out on the wire.
+  const everything = JSON.stringify(logged)
+  assert.equal(everything.includes(KEY), false, 'the credential reached the event log')
+})
+
+test('boot resolves a credential only for a ref the router can serve', async (t) => {
+  // With a vault that answers for any label, resolving eagerly for every entry
+  // would make a vault call per model — including the four placeholders the
+  // router refuses outright (D28). Those calls cost nothing in a fixture and
+  // real reach on the operator's machine: a credential fetched is a credential
+  // in the process, and fetching one for a model nothing can use is reach taken
+  // for no purpose.
+  const mock = await mockMcp()
+  const { kernel, fx } = await withKernel(t, {
+    clientFactory: () => Promise.resolve(mock.client),
+    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+  })
+  assert.equal(kernel.status().subsystems.hub.state, 'ok')
+
+  const accessed = rows(fx.dbPath)
+    .filter((r) => r.type === 'secret.accessed')
+    .map((r) => (JSON.parse(r.payload) as { id: string; source: string }))
+
+  // Exactly one, for the one non-placeholder entry, out of the vault.
+  assert.equal(
+    accessed.length,
+    1,
+    `resolved ${String(accessed.length)} credentials: ${accessed.map((a) => a.id).join(', ')}`,
+  )
+  assert.equal(accessed[0]?.id, 'anthropic-api-key')
+  assert.equal(accessed[0]?.source, 'vault')
+
+  // And the vault was asked once, for that label and no other.
+  const vaultCalls = mock.calls.filter((c) => c.tool === 'get_secret')
+  assert.equal(vaultCalls.length, 1, `vault calls: ${JSON.stringify(vaultCalls)}`)
+  assert.equal(vaultCalls[0]?.args['label'], 'anthropic-api-key')
+})
+
+test('a run with no credential path refuses before the wire', async (t) => {
+  // No vault and no env fallback. The ref is otherwise servable — the probe is
+  // fresh — so the only thing missing is the credential, and the run must say
+  // so rather than send an unauthenticated request and report whatever 401 the
+  // provider chose to give. A round trip to learn what boot already knew is a
+  // round trip that leaks the attempt to the provider's logs.
+  const provider = fakeProvider([anthropicEndTurn({ text: 'should never be reached' })])
+  const { kernel, fx } = await withKernel(t, {
+    envFallback: false,
+    fetch: provider.fetch,
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+
+  // Boot could not resolve it, and the router says so with the reason.
+  assert.equal(kernel.status().subsystems.router.state, 'degraded')
+  assert.match(kernel.status().subsystems.router.reason ?? '', /envFallback is off|vault/)
+  assert.equal(rows(fx.dbPath).filter((r) => r.type === 'secret.accessed').length, 0)
+
+  const finish = await runThroughControl(kernel, 'reply with the word pong')
+  assert.equal(finish['status'], 'error')
+  assert.equal(finish['costMicroUsd'], 0)
+  assert.match(String(finish['reason']), /credential|envFallback|vault/)
+
+  // Nothing went out. This is the claim: refused at the router, not at the
+  // provider.
+  assert.equal(provider.requests.length, 0, 'an unauthenticated request was sent')
 })
 
 test('pending approvals are not rebuilt after restart (documented gap)', async (t) => {

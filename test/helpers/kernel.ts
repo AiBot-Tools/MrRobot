@@ -115,7 +115,15 @@ export interface WithKernelOptions extends FixtureOptions {
   readonly env?: Record<string, string | undefined>
   readonly sandboxDriver?: BootOptions['sandboxDriver']
   readonly clientFactory?: BootOptions['clientFactory']
+  /** Injected so a test can serve a provider without a socket. */
+  readonly fetch?: BootOptions['fetch']
   readonly now?: () => number
+  /**
+   * Runs after the fixture exists and before the kernel boots, for state boot
+   * READS — a probe record has to be on disk before boot decides what is
+   * routable.
+   */
+  readonly beforeBoot?: (fx: KernelFixture) => void
 }
 
 export interface BootedKernel {
@@ -134,6 +142,7 @@ export async function withKernel(
   options: WithKernelOptions = {},
 ): Promise<BootedKernel> {
   const fx = fixture(t, options)
+  options.beforeBoot?.(fx)
   const kernel = await bootKernel({
     config: fx.config,
     repoRoot: REPO_ROOT,
@@ -142,6 +151,7 @@ export async function withKernel(
     env: { AOS_CONTROL_TOKEN: TEST_TOKEN, ...options.env },
     sandboxDriver: options.sandboxDriver ?? fakeSandbox(),
     ...(options.clientFactory === undefined ? {} : { clientFactory: options.clientFactory }),
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     ...(options.now === undefined ? {} : { now: options.now }),
   })
 

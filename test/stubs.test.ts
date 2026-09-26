@@ -26,7 +26,7 @@ import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { parse as parseYaml } from 'yaml'
 
 import { STUBS } from '../src/kernel.js'
@@ -42,6 +42,7 @@ import { parseManifest } from '../src/agents/manifest.js'
 
 const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
 const README = readFileSync(`${REPO}/README.md`, 'utf8')
+const CLAUDE_MD = readFileSync(`${REPO}/CLAUDE.md`, 'utf8')
 
 const TEMPLATE = `
 id: worker-template
@@ -177,6 +178,79 @@ test("every STUBS entry is named in README's stub section", () => {
   assert.ok(README.includes('npm run cli -- run ceo'))
   // The Node warning that does not look like a version problem.
   assert.ok(README.includes('--disable-warning= is not allowed in NODE_OPTIONS'))
+})
+
+test('CLAUDE.md Current state names every STUBS entry', () => {
+  // CLAUDE.md is the standing contract and the first thing any future session
+  // reads. A "Current state" that has drifted is worse than none: it is read as
+  // authoritative, so a stale claim there is believed rather than checked.
+  //
+  // This is the drift that actually happens — a stub gets built, or a new one
+  // appears, and the paragraph nobody runs stays as it was. It said "19/19
+  // passing" for a long time while the suite grew past 350.
+  const start = CLAUDE_MD.indexOf('## Current state')
+  assert.ok(start > 0, 'CLAUDE.md has no Current state section')
+  const section = CLAUDE_MD.slice(start, CLAUDE_MD.indexOf('## Commands'))
+  assert.ok(section.length > 400, 'the Current state section is suspiciously short')
+
+  // Every absence is named. The ids are kebab-case slugs, so the paragraph is
+  // matched on the words a human would actually write for each.
+  const NAMES: Record<string, RegExp> = {
+    'apple-container-driver': /Apple container driver/,
+    'egress-proxy': /egress proxy/i,
+    scheduler: /scheduler/i,
+    'delegate-tool': /delegation\/spawn tool|delegation tool/i,
+    'approvals-projection': /projections for approvals/i,
+    'quarantine-projection': /approvals\/quarantine|quarantine/i,
+  }
+  for (const stub of STUBS) {
+    const pattern = NAMES[stub.id]
+    assert.ok(pattern, `STUBS has ${stub.id} but this test does not know how CLAUDE.md should name it`)
+    assert.match(section, pattern, `CLAUDE.md Current state does not name the stub ${stub.id}`)
+  }
+  assert.equal(Object.keys(NAMES).length, STUBS.length, 'the name table and STUBS have diverged')
+
+  // The refusal mechanism is named for each, not just the feature — a reader
+  // needs to know it will get an error rather than a silent no-op.
+  for (const fragment of [
+    'assertEgressEnforced',
+    'assertDelegationAvailable',
+    'rebuildFromLog',
+    'spawnEphemeral',
+  ]) {
+    assert.ok(section.includes(fragment), `CLAUDE.md does not say how ${fragment} refuses`)
+  }
+
+  // The counts are real, and they are the numbers this suite actually produces.
+  // A hard-coded pair that nothing checks is how "19/19" survived.
+  const claimed = /(\d+) `node:test` tests passing and (\d+) gated live tests skipped by design across (\d+) files/.exec(
+    section,
+  )
+  assert.ok(claimed, 'CLAUDE.md does not state the test counts in the checkable form')
+  const [, passing = '0', skipped = '0', fileCount = '0'] = claimed
+  const testFiles = readdirSync(`${REPO}/test`).filter((f) => f.endsWith('.test.ts'))
+  assert.equal(Number(fileCount), testFiles.length, 'the claimed file count is wrong')
+  assert.equal(Number(skipped), 2, 'the claimed skip count is wrong')
+  // Not asserted against a live run — that would mean running the suite inside
+  // itself. Asserted as plausible and monotonic: the number cannot be a stale
+  // small one, which is the only drift that has ever actually happened here.
+  assert.ok(Number(passing) > 300, `CLAUDE.md claims only ${passing} passing tests`)
+
+  // And the two things that must not be claimed while they are untrue.
+  assert.match(section, /No real provider call has ever been made/)
+  assert.match(section, /is not claimed until that entry is filled/)
+  assert.equal(/Phase 0 (?:is )?(?:complete|exited|met)\b/i.test(section), false, 'CLAUDE.md claims Phase 0 is exited')
+
+  // The Apple driver's description matches what the code does, which is the
+  // clause this rewrite had to correct: it said "throws", and a throwing probe
+  // refused the whole boot.
+  assert.match(section, /`probe` reports unavailable so boot degrades/)
+  assert.equal(/Apple container driver \(throws\)|Apple container driver \(stub\)/.test(section), false)
+
+  // The tool-view count is stated in both documents and must agree.
+  assert.match(section, /classifies 9 of 49 pmmcp tools/)
+  assert.match(CLAUDE_MD, /9 pinned names classified in `config\/tool-views\.yaml`/)
+  assert.equal(/all classified in `config\/tool-views\.yaml`/.test(CLAUDE_MD), false)
 })
 
 test('schedule: in a manifest is refused by the schema', () => {

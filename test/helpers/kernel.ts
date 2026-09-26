@@ -125,6 +125,12 @@ export interface WithKernelOptions extends FixtureOptions {
    * routable.
    */
   readonly beforeBoot?: (fx: KernelFixture) => void
+  /**
+   * A different fleet. Used by the live runtime tests so an orchestrator that
+   * writes goals writes them into a test namespace rather than the operator's
+   * `aos/ceo` — the one place a live test must never leave anything behind.
+   */
+  readonly agentsDir?: string
 }
 
 export interface BootedKernel {
@@ -154,6 +160,7 @@ export async function withKernel(
     ...(options.clientFactory === undefined ? {} : { clientFactory: options.clientFactory }),
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.agentsDir === undefined ? {} : { agentsDir: options.agentsDir }),
   })
 
   registerVerify(t, fx.dbPath, async () => {
@@ -187,6 +194,7 @@ export async function bootOn(
     ...(options.clientFactory === undefined ? {} : { clientFactory: options.clientFactory }),
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.agentsDir === undefined ? {} : { agentsDir: options.agentsDir }),
   })
   registerVerify(t, fx.dbPath, async () => {
     await kernel.shutdown()

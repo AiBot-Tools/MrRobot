@@ -340,34 +340,61 @@ test('no test is skipped or todo except test/live-*.test.ts', () => {
   const offenders = pathsOf(skips).filter((p) => !/^test\/live-[^/]*\.test\.ts$/.test(p))
   assert.deepEqual(offenders, [], skips.join('\n'))
 
-  // And the one gated file reads its gate from the environment, so it cannot be
-  // switched on by an edit that looks like a constant.
-  const live = TEST.find((f) => f.path === 'test/live-anthropic.test.ts')
-  assert.ok(live)
-  assert.match(
-    live.text,
-    /const LIVE = process\.env\['AOS_LIVE_TESTS'\] === '1'/,
-    'the live gate is no longer read from AOS_LIVE_TESTS',
+  // And EVERY gated file reads its gate from the environment, so none can be
+  // switched on by an edit that looks like a constant. This once checked only
+  // live-anthropic.test.ts by name, which meant the rule admitting `live-*` files
+  // by pattern and the rule checking their gate had quietly diverged: a second
+  // live file would have been admitted to skip and never checked.
+  const liveFiles = TEST.filter((f) => /^test\/live-[^/]*\.test\.ts$/.test(f.path))
+  assert.deepEqual(
+    liveFiles.map((f) => f.path).sort(),
+    ['test/live-anthropic.test.ts', 'test/live-runtime.test.ts'],
+    'the set of gated live files changed; add the new one here deliberately',
   )
+  for (const live of liveFiles) {
+    assert.match(
+      live.text,
+      /const LIVE = process\.env\['AOS_LIVE_TESTS'\] === '1'/,
+      `${live.path} does not read its gate from AOS_LIVE_TESTS`,
+    )
+    // A second gate, where one exists, obeys the same rule.
+    if (live.text.includes('AOS_LIVE_PMMCP_WRITES')) {
+      assert.match(
+        live.text,
+        /const WRITES = process\.env\['AOS_LIVE_PMMCP_WRITES'\] === '1'/,
+        `${live.path} does not read its pmmcp-writes gate from the environment`,
+      )
+    }
+  }
   // Every skip states a reason: "skipped" with no reason is indistinguishable
   // from "passed" in a scroll-back. The reason may sit on the lines below the
-  // `skip:` key, so the whole expression is read rather than the one line.
-  const skipLines = live.lines
-    .map((text, i) => ({ n: i, text }))
-    .filter((l) => /\bskip\s*:/.test(l.text))
-  assert.ok(skipLines.length >= 2, `found ${String(skipLines.length)} skips in the live file`)
-  for (const line of skipLines) {
-    const window = live.lines.slice(line.n, line.n + 8).join('\n')
-    const reasons = [...window.matchAll(/'([^']{12,})'/g)].map((m) => m[1] ?? '')
-    assert.ok(
-      reasons.length > 0,
-      `test/live-anthropic.test.ts:${String(line.n + 1)} skips with no stated reason`,
-    )
-    // And the reason says what to DO, not merely that something is absent.
-    assert.ok(
-      reasons.some((r) => /AOS_LIVE_TESTS|ANTHROPIC_API_KEY|PMMCP_/.test(r)),
-      `test/live-anthropic.test.ts:${String(line.n + 1)} does not name what is missing`,
-    )
+  // `skip:` key, so the whole expression is read rather than the one line. Checked
+  // in EVERY live file, for the same reason the gate is.
+  for (const live of liveFiles) {
+    const skipLines = live.lines
+      .map((text, i) => ({ n: i, text }))
+      .filter((l) => /\bskip\s*:/.test(l.text))
+    assert.ok(skipLines.length >= 2, `found ${String(skipLines.length)} skips in ${live.path}`)
+    for (const line of skipLines) {
+      // The skip EXPRESSION, not a fixed window: from `skip:` to the line that
+      // closes it with `false`. A fixed window let one reasonless branch hide
+      // behind its neighbours' reasons — a falsifier replaced one branch of a
+      // ternary chain with bare `true` and nothing noticed.
+      const end = live.lines.findIndex((l, i) => i >= line.n && /\bfalse\b/.test(l))
+      const window = live.lines.slice(line.n, end === -1 ? line.n + 1 : end + 1).join('\n')
+      assert.doesNotMatch(
+        window,
+        /[?:]\s*true\b/,
+        `${live.path}:${String(line.n + 1)} has a skip branch of bare \`true\` — a skip with no reason`,
+      )
+      const reasons = [...window.matchAll(/'([^']{12,})'/g)].map((m) => m[1] ?? '')
+      assert.ok(reasons.length > 0, `${live.path}:${String(line.n + 1)} skips with no stated reason`)
+      // And the reason says what to DO, not merely that something is absent.
+      assert.ok(
+        reasons.some((r) => /AOS_LIVE_TESTS|AOS_LIVE_PMMCP_WRITES|ANTHROPIC_API_KEY|PMMCP_/.test(r)),
+        `${live.path}:${String(line.n + 1)} does not name what is missing`,
+      )
+    }
   }
 })
 

@@ -298,6 +298,43 @@ it.
 
 ---
 
+## Phase 1 live runtime tests
+
+`test/live-runtime.test.ts` points the Phase 1 machinery at the real things. Each
+test is a BODY in `test/helpers/runtime-bodies.ts` that `test/runtime-bodies.test.ts`
+also runs offline on every `npm test`, against the pmmcp double and a scripted
+provider — so every assertion a live run depends on has already been seen to pass,
+and a live test cannot rot unexercised the way a gated-only one does.
+
+| Test | Needs | What only a live run settles |
+|---|---|---|
+| goal tools round-trip | pmmcp + both opt-ins | whether the MODELLED goal tool names and arguments in `kernel.yaml` match the real server — the first assertion is the boot check, and it names every disagreement |
+| plan → tree | pmmcp, key in the vault, both opt-ins | whether a real model's plan survives the `.strict()` parser; on failure the message carries the parser's own reason and the model's words |
+| eval harness gates | `ANTHROPIC_API_KEY` | whether the harness's own gates — one terminal row, paired LLM events, cost equal to the sum of logged calls — hold against a real provider's accounting |
+
+Two opt-ins, deliberately separate. `AOS_LIVE_TESTS=1` spends money and needs the
+network, as in Phase 0. **`AOS_LIVE_PMMCP_WRITES=1` is required for anything that
+writes to your long-term memory**: spending ends, but a goal written into pmmcp
+stays there. Everything these tests write goes to **`aos/agent/aos-live-test`** —
+never `aos/ceo`; the plan test runs a `live-ceo` orchestrator whose memory is that
+namespace — and nothing is deleted afterwards, because the kernel has no delete
+and a test must not grow one. Inspect or clear that namespace yourself.
+
+```bash
+# model only (cheapest):
+AOS_LIVE_TESTS=1 ANTHROPIC_API_KEY=… npm test
+
+# everything, including pmmcp writes to aos/agent/aos-live-test:
+AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_WRITES=1 \
+  PMMCP_URL=http://127.0.0.1:8766/mcp PMMCP_TOKEN=… ANTHROPIC_API_KEY=… npm test
+```
+
+Run `npm run capture:pmmcp` first if you can: the goal-tools test will name any
+mismatch either way, but the capture names them all at once without writing
+anything.
+
+---
+
 ## Exit-criterion checklist
 
 CLAUDE.md's Phase 0 exit is: *"daemon boots with pmmcp connected and `aos run

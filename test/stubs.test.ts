@@ -220,7 +220,15 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   const [, passing = '0', skipped = '0', fileCount = '0'] = claimed
   const testFiles = readdirSync(`${REPO}/test`).filter((f) => f.endsWith('.test.ts'))
   assert.equal(Number(fileCount), testFiles.length, 'the claimed file count is wrong')
-  assert.equal(Number(skipped), 2, 'the claimed skip count is wrong')
+  // Derived from the gated files rather than written down as a literal: every
+  // test in a `test/live-*.test.ts` file skips in a default run, so that count IS
+  // the number this sentence must claim. A literal here went stale the moment a
+  // second live file appeared, which is the drift this test exists to catch.
+  const gated = readdirSync(`${REPO}/test`)
+    .filter((f) => /^live-.*\.test\.ts$/.test(f))
+    .reduce((n, f) => n + (readFileSync(`${REPO}/test/${f}`, 'utf8').match(/\bskip\s*:/g) ?? []).length, 0)
+  assert.ok(gated >= 2, 'the gated live files hold fewer tests than they did in Phase 0')
+  assert.equal(Number(skipped), gated, 'the claimed skip count is not the number of gated live tests')
   // Not asserted against a live run — that would mean running the suite inside
   // itself. Asserted as plausible and monotonic: the number cannot be a stale
   // small one, which is the only drift that has ever actually happened here.

@@ -389,6 +389,12 @@ export interface PmmcpMockOptions {
    */
   readonly failAfter?: Readonly<Record<string, number>>
   /**
+   * `list_goals` answers ok with an empty list. A server that accepts a create and
+   * then does not recognise the id is the failure the runtime round-trip's
+   * read-back exists to catch, and it cannot be produced by an error result.
+   */
+  readonly listGoalsReturnsNothing?: boolean
+  /**
    * Refuse to finish a milestone or objective while a child is not terminal.
    * OFF by default: nothing has confirmed pmmcp does this, and a double that
    * invents a rule makes the kernel depend on it.
@@ -620,6 +626,7 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
   })
 
   handlers.set('list_goals', (args) => {
+    if (options.listGoalsReturnsNothing === true) return ok({ goals: [] })
     const projectId = need(args, 'project_id')
     if (projectId === undefined) return fail('project_id is required')
     const parentId = need(args, 'parent_id')

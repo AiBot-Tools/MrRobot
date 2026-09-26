@@ -192,7 +192,14 @@ test('config/providers.yaml parses; exactly one non-placeholder entry and it is 
   assert.equal(card.pricing.outMicroUsdPerMTok, 10_000_000)
   // Both adapters need limits: maxOutputTokens is what supplies max_tokens.
   assert.equal(card.limits?.contextTokens, 1_000_000)
-  assert.equal(card.limits?.maxOutputTokens, 128_000)
+  // Deliberately below the model's 128000 ceiling: this is the per-call ask,
+  // and the SDK refuses a non-streaming request that large, while the number
+  // also sets the worst-case turn cost the budget checks (D16).
+  assert.equal(card.limits?.maxOutputTokens, 16_000)
+  assert.ok(
+    (card.limits?.maxOutputTokens ?? 0) < 128_000,
+    'a non-streaming adapter cannot ask for the model ceiling',
+  )
   // Sampling params are rejected by this model, and the schema demands none.
   assert.equal(card.caps.sampling, 'none')
   // orchestrator is set by a human after the eval harness, never by code.

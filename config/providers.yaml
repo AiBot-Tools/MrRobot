@@ -54,8 +54,23 @@ entries:
       asOf: "2026-09-26"
       url: https://platform.claude.com/docs/en/about-claude/pricing
     limits:
+      # The model's context window.
       contextTokens: 1000000
-      maxOutputTokens: 128000
+      # NOT the model's ceiling, which is 128000. This is what the kernel ASKS
+      # for on every call, and two things constrain it:
+      #
+      #   The SDK refuses a non-streaming request whose max_tokens implies more
+      #   than ten minutes of output ("Streaming is required for operations that
+      #   may take longer than 10 minutes"). Phase 0's adapter does not stream,
+      #   so 128000 fails before a request is even sent.
+      #
+      #   It feeds the worst-case turn cost the budget checks against (D16). At
+      #   128000 output tokens a single turn's worst case is $1.28, against a $2
+      #   run budget — a cap that leaves room for one turn is not a cap.
+      #
+      # Raise it only together with a streaming adapter and a run budget that
+      # can afford it.
+      maxOutputTokens: 16000
     caps:
       # The kernel only ever sends tool_choice auto (src/models/anthropic.ts).
       # The endpoint supports forced tool use; the kernel does not use it, and

@@ -28,13 +28,9 @@
 // plane, and says precisely what is missing — because the alternative is an
 // operator who cannot ask the kernel why it will not start.
 
-import { execFile, spawn } from 'node:child_process'
 import { mkdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { promisify } from 'node:util'
 import { join } from 'node:path'
-
-const execFileAsync = promisify(execFile)
 
 import { VERSION } from './version.js'
 import { log } from './log.js'
@@ -73,11 +69,11 @@ import { assertEgressEnforced } from './runtime/egress.js'
 import { Scheduler } from './runtime/scheduler.js'
 import { assertDelegationAvailable } from './runtime/delegate.js'
 import { AppleContainerDriver } from './sandbox/apple-container.js'
-import { DockerDriver } from './sandbox/docker.js'
+import { realDockerDriver } from './sandbox/docker.js'
 import type { SandboxDriver } from './sandbox/driver.js'
 import { assertTokenUsable } from './control/auth.js'
 import { ControlServer, type ControlSurface } from './control/server.js'
-import { mintHumanActor, type HumanActor } from './control/actor.js'
+import type { HumanActor } from './control/actor.js'
 import type {
   AgentSummary,
   ModelSummary,
@@ -567,10 +563,10 @@ function stubReason(id: string, call: () => unknown): string {
 function defaultDriver(config: KernelConfig, repoRoot: string): SandboxDriver {
   if (config.sandbox.driver === 'apple-container') return new AppleContainerDriver()
   // The driver is constructed, not used: nothing spawns until a run asks for a
-  // container, and in Phase 0 nothing does. Boot only probes it.
-  return new DockerDriver({
-    spawn: (command, args, options) => spawn(command, [...args], options),
-    execFile: (command, args, options) => execFileAsync(command, [...args], options),
+  // container, and in Phase 0 nothing does. Boot only probes it. The process
+  // wiring lives in the docker module, which is the one place allowed to import
+  // node:child_process.
+  return realDockerDriver({
     domains: config.sandbox.domains,
     defaults: config.sandbox.defaults,
     repoRoot,
@@ -884,6 +880,3 @@ function buildSurface(d: SurfaceDeps): ControlSurface {
     },
   }
 }
-
-/** Re-exported so callers need not reach into control/actor. */
-export { mintHumanActor, type HumanActor }

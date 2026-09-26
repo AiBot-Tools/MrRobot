@@ -29,6 +29,11 @@
 // (invariant 2), which is the failure the egress proxy exists to prevent in
 // Phase 2 and which must not be possible before it ships.
 
+import { execFile, spawn } from 'node:child_process'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
+
 import { ConfigError } from '../errors.js'
 import { confineWorkspace } from './confine.js'
 import type {
@@ -347,4 +352,24 @@ export class DockerDriver implements SandboxDriver {
     }
     return killed
   }
+}
+
+/**
+ * The real driver, wired to the real process APIs.
+ *
+ * This is the ONLY place in the kernel that imports node:child_process, and so
+ * the only place that can spawn anything at all. The class above takes its
+ * `spawn` and `execFile` as options precisely so that every test can drive it
+ * without a process; this factory is where the production wiring lives, next to
+ * the code that knows what a docker invocation must look like rather than in the
+ * composer that merely asks for a driver.
+ */
+export function realDockerDriver(
+  options: Omit<DockerDriverOptions, 'spawn' | 'execFile'>,
+): DockerDriver {
+  return new DockerDriver({
+    ...options,
+    spawn: (command, args, opts) => spawn(command, [...args], opts),
+    execFile: (command, args, opts) => execFileAsync(command, [...args], opts),
+  })
 }

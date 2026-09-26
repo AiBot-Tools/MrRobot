@@ -93,7 +93,25 @@ npm run dev              # daemon on 127.0.0.1:7777
 npm run build            # emits dist/
 npm run cli -- <cmd>
 npm run capture:pmmcp    # operator-only: record pmmcp's live tool schemas
+npm run eval             # operator-only: score the orchestration suite (SPENDS MONEY)
 ```
+
+`eval` needs a running daemon (`npm run dev`) and `AOS_CONTROL_TOKEN`. It runs
+the orchestration suite in `src/eval/suite.ts` as real runs against whatever
+model each agent is bound to, under that agent's real budget, and prints a
+scorecard. Flags: `--port`, `--case <id>`, `--json <path>`, `--config`. It exists
+for one decision CLAUDE.md reserves to a human — whether a model card may carry
+`orchestrator: true` — and it produces evidence for that decision only: it writes
+no config, sets no flag and changes no manifest.
+
+Two things about reading its output. Every check is scored **from the event log**,
+never from what the model said it did; the model's own summary is examined only to
+be contradicted by the log. And a check that could not run reports `n/a`, which is
+not a pass — the summary always prints how many checks did not run beside the
+score, because a 1.00 covering two of sixteen checks is not a good result. The
+shipped fan-out case **fails today**: it requires two child runs and delegation is
+a stub, so the failing gate names the stub. A suite pruned to what the kernel can
+already do would score 1.00 forever and measure nothing.
 
 `capture:pmmcp` needs `PMMCP_TOKEN` and a running pmmcp. It calls `tools/list`
 and nothing else — no tool is invoked, so no memory and no vault entry is read —

@@ -209,3 +209,34 @@ test('npm run dev boots the daemon, serves the CLI over the socket, and shuts do
   assert.equal(verify.status, 0, verify.stderr)
   assert.match(verify.stdout, /^ok\t\d+ events\thead [0-9a-f]{64}\n$/)
 })
+
+test('the operator scripts are programs: each refuses with usage rather than doing nothing', (t) => {
+  // The same blindness this file exists for. `scripts/eval.ts` and
+  // `scripts/capture-pmmcp.ts` are only ever reached through npm, so nothing in
+  // the suite would notice an entry guard that never fires — the module would
+  // load, define main, and exit 0 having run no eval and captured nothing.
+  //
+  // Both are driven with their credential ABSENT, which is the one path that
+  // touches no network and no daemon: each must name what is missing and exit
+  // non-zero.
+  const env = { PATH: process.env['PATH'] ?? '/usr/bin:/bin' }
+
+  const evalRun = spawnSync('npx', ['tsx', 'scripts/eval.ts'], {
+    cwd: REPO,
+    env,
+    encoding: 'utf8',
+    timeout: 60_000,
+  })
+  assert.equal(evalRun.status, 2, `eval.ts exited ${String(evalRun.status)}: ${evalRun.stderr}`)
+  assert.match(evalRun.stderr, /AOS_CONTROL_TOKEN is not set/)
+
+  const capture = spawnSync('npx', ['tsx', 'scripts/capture-pmmcp.ts'], {
+    cwd: REPO,
+    env,
+    encoding: 'utf8',
+    timeout: 60_000,
+  })
+  assert.equal(capture.status, 1, `capture-pmmcp.ts exited ${String(capture.status)}: ${capture.stderr}`)
+  assert.match(capture.stderr, /PMMCP_TOKEN is not set/)
+  t.diagnostic('both scripts refused as programs rather than exiting 0 silently')
+})

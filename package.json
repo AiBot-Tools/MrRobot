@@ -10,7 +10,8 @@
     "dev": "node --import tsx src/main.ts",
     "cli": "node --import tsx src/cli/index.ts",
     "build": "tsc -p tsconfig.build.json",
-    "capture:pmmcp": "node --import tsx scripts/capture-pmmcp.ts"
+    "capture:pmmcp": "node --import tsx scripts/capture-pmmcp.ts",
+    "eval": "node --import tsx scripts/eval.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.127.0",

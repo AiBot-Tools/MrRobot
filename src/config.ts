@@ -164,6 +164,28 @@ export function expandHome(p: string): string {
   return p
 }
 
+/**
+ * Expand a leading `~` inside a `unix://` docker host.
+ *
+ * DOCKER_HOST is handed to the docker CLI, which the driver spawns WITHOUT a
+ * shell, so nothing downstream would ever expand it: a literal
+ * `unix://~/.colima/...` arrives at the daemon lookup as a relative path whose
+ * first segment is the character `~`, and the connection simply fails. Colima
+ * keeps its sockets under $HOME, so the `~` form is the one an operator
+ * actually writes — which makes expanding it here the difference between a
+ * config that works and one that looks right and does not.
+ */
+export function expandDockerHost(value: string): string {
+  const real = expandHome(value.slice('unix://'.length))
+  if (!isAbsolute(real)) {
+    throw new ConfigError(
+      `sandbox dockerHost "${value}" must resolve to an absolute socket path, got "${real}". ` +
+        'DOCKER_HOST is passed to the docker CLI without a shell, so a relative path never resolves.',
+    )
+  }
+  return `unix://${real}`
+}
+
 /** Walk every key in the document; reject anything that looks like a secret. */
 export function assertNoSecretKeys(value: unknown, path: string[] = []): void {
   if (Array.isArray(value)) {
@@ -214,8 +236,16 @@ export function parseKernelConfig(input: unknown, options: LoadOptions): KernelC
     sandbox: {
       ...config.sandbox,
       domains: {
-        trusted: { ...config.sandbox.domains.trusted, mountRoot: resolve(expandHome(config.sandbox.domains.trusted.mountRoot)) },
-        hostile: { ...config.sandbox.domains.hostile, mountRoot: resolve(expandHome(config.sandbox.domains.hostile.mountRoot)) },
+        trusted: {
+          ...config.sandbox.domains.trusted,
+          dockerHost: expandDockerHost(config.sandbox.domains.trusted.dockerHost),
+          mountRoot: resolve(expandHome(config.sandbox.domains.trusted.mountRoot)),
+        },
+        hostile: {
+          ...config.sandbox.domains.hostile,
+          dockerHost: expandDockerHost(config.sandbox.domains.hostile.dockerHost),
+          mountRoot: resolve(expandHome(config.sandbox.domains.hostile.mountRoot)),
+        },
       },
     },
   }

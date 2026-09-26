@@ -213,3 +213,35 @@ test('envFallback defaults to false', () => {
   // keyArg carries the operator-confirmed argument name.
   assert.equal(parse(fixture('minimal.yaml')).secrets.keyArg, 'label')
 })
+
+test('a ~ in sandbox dockerHost is expanded; a relative socket path is refused', () => {
+  // DOCKER_HOST goes to the docker CLI, which the driver spawns without a
+  // shell. Nothing downstream expands ~, so an unexpanded value is a config
+  // that reads correctly and cannot connect — the exact failure this repo
+  // refuses to ship. Colima keeps its sockets under $HOME, so ~ is the form an
+  // operator writes.
+  const doc = fixture('valid.yaml') as {
+    sandbox: { domains: Record<string, { dockerHost: string }> }
+  }
+  doc.sandbox.domains['trusted']!.dockerHost = 'unix://~/.colima/trusted/docker.sock'
+  doc.sandbox.domains['hostile']!.dockerHost = 'unix://~/.colima/hostile/docker.sock'
+
+  const config = parse(doc)
+  assert.equal(config.sandbox.domains.trusted.dockerHost, `unix://${join(homedir(), '.colima/trusted/docker.sock')}`)
+  assert.equal(config.sandbox.domains.hostile.dockerHost, `unix://${join(homedir(), '.colima/hostile/docker.sock')}`)
+  // Three slashes, not two: the expanded form is an absolute path.
+  assert.match(config.sandbox.domains.trusted.dockerHost, /^unix:\/\/\//)
+  assert.equal(config.sandbox.domains.trusted.dockerHost.includes('~'), false)
+
+  // An absolute socket is passed through unchanged.
+  const plain = fixture('valid.yaml')
+  assert.equal(parse(plain).sandbox.domains.trusted.dockerHost, 'unix:///var/run/colima-trusted.sock')
+
+  // A relative path would never resolve, so it is refused rather than handed
+  // to docker to fail on.
+  for (const bad of ['unix://relative/docker.sock', 'unix://./docker.sock', 'unix://']) {
+    const broken = fixture('valid.yaml') as { sandbox: { domains: Record<string, { dockerHost: string }> } }
+    broken.sandbox.domains['trusted']!.dockerHost = bad
+    assert.throws(() => parse(broken), /must resolve to an absolute socket path/, bad)
+  }
+})

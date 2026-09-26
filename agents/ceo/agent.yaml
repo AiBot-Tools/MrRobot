@@ -1,0 +1,48 @@
+# The CEO: the one orchestrator. Versioned — every change bumps `version` and
+# the prior file is frozen under history/.
+#
+# This manifest is read-only to agents (invariant 8): no code path lets a run
+# write it, and `config/`, `agents/` and `souls/` are protected roots.
+id: ceo
+version: 1
+kind: standard
+role: orchestrator
+soul: ceo.md
+
+# T2: write tools, and sandboxed execution in the trusted domain. Phase 0 runs
+# the CEO loop in-process — the sandbox driver is probed and reported, never
+# used by a run — so no `sandbox:` block is claimed here.
+tier: 2
+
+model:
+  primary: anthropic/claude-sonnet-5
+  # Empty on purpose. The only non-placeholder entry in providers.yaml is the
+  # primary; every other ref is a placeholder the router refuses to serve
+  # (D28), so a fallback chain naming one would be a chain that cannot run. A
+  # short honest chain beats a long decorative one.
+  fallbacks: []
+
+tools:
+  servers: [pmmcp]
+  # Empty, and honestly so. tool-views.yaml exposes NOTHING to agents in Phase
+  # 0 — all nine classified pmmcp tools are pinned kernel-only or disabled, and
+  # the other 40 are kernel-only by the literal default. A manifest cannot
+  # grant what the tool views withhold, so any entry here would be refused at
+  # load. This fills in once the operator classifies tools from the
+  # `hub.tools.classified` event; each such change is an ask-before.
+  allow: []
+
+egress:
+  # Empty until the Phase 2 proxy exists. `assertEgressEnforced` throws, so
+  # nothing can reach the network from a run regardless; listing a host here
+  # would imply an allowance that no proxy is present to enforce.
+  allow: []
+
+spawn:
+  templates: [worker-template]
+  maxChildren: 4
+  # An ephemeral agent may not spawn. A literal, not a setting.
+  maxDepth: 1
+
+memory:
+  projectId: aos/ceo

@@ -1,0 +1,177 @@
+# Model catalogue: how to reach each model, what it costs, what it can do.
+#
+# This file holds NO secrets. A non-local entry references its credential by
+# vault id; `auth.envVar` beside it is a per-entry SECONDARY consulted ONLY
+# after a vault failure and ONLY when kernel.yaml sets secrets.envFallback
+# true. A literal credential is refused by key name and by value shape, and an
+# envVar without a vaultId is refused outright — that combination is how a
+# production key quietly leaves the vault and moves into the environment.
+#
+# Phase 0 ships exactly ONE real entry. Every other entry is
+# `placeholder: true`, which the schema enforces for any non-anthropic ref, and
+# the router refuses to route to a placeholder or to an unprobed ref: a
+# manifest may name one, the router will not serve it (D28). Clearing a
+# placeholder is an operator action that means "I have verified this id, this
+# endpoint and this price" — and config-files.test.ts fails if a non-placeholder
+# hosted entry still carries zero pricing, so clearing the flag without filling
+# the numbers cannot pass silently.
+#
+# `orchestrator` is set by a human after the eval harness, never by code, and
+# is absent here for the same reason.
+version: 1
+
+entries:
+  # The one real entry (D13: sonnet-5 for its cost/intelligence ratio on
+  # orchestration). Prices and limits below are Anthropic's published
+  # first-party API rates for claude-sonnet-5 as of 2026-09-26:
+  # $2.00 / MTok input, $10.00 / MTok output, 1M context, 128K max output.
+  # Cache multipliers are the documented 1.25x write / 0.1x read. The 1h cache
+  # write multiplier is deliberately ABSENT rather than guessed: an unverified
+  # number here would be frozen into every event log as a real cost.
+  anthropic/claude-sonnet-5:
+    dialect: anthropic
+    baseUrl: https://api.anthropic.com
+    path: /v1/messages
+    auth:
+      header: x-api-key
+      scheme: none
+      # Both are present on purpose: the vault is the credential path, and the
+      # envVar exists so the env-fallback path has something to resolve when
+      # the operator opts into it and the vault is down.
+      vaultId: anthropic-api-key
+      envVar: ANTHROPIC_API_KEY
+    headers:
+      anthropic-version: "2023-06-01"
+    model: claude-sonnet-5
+    local: false
+    placeholder: false
+    pricing:
+      inMicroUsdPerMTok: 2000000
+      outMicroUsdPerMTok: 10000000
+      cacheWrite5mMicroUsdPerMTok: 2500000
+      cacheReadMicroUsdPerMTok: 200000
+      source: table
+      asOf: "2026-09-26"
+      url: https://platform.claude.com/docs/en/about-claude/pricing
+    limits:
+      contextTokens: 1000000
+      maxOutputTokens: 128000
+    caps:
+      # The kernel only ever sends tool_choice auto (src/models/anthropic.ts).
+      # The endpoint supports forced tool use; the kernel does not use it, and
+      # this field records what the kernel asks for.
+      toolChoice: auto
+      parallelToolCalls: true
+      # Anthropic supports strict tool schemas; this adapter does not send
+      # them, so the honest value is "not used" rather than false.
+      strictSchema: null
+      # Sampling parameters are rejected with a 400 on this model, and the
+      # schema requires `none` for every anthropic entry.
+      sampling: none
+      streamUsage: true
+      # Assistant prefill was removed on this model family.
+      preserveAssistantMessage: false
+
+  # ── placeholders ─────────────────────────────────────────────────────────
+  # Model ids, endpoints and prices below are UNVERIFIED. Pricing is 0 because
+  # a fabricated price is worse than an obvious one: the router refuses every
+  # placeholder, so the zero can never be billed, and the test named above
+  # stops a cleared flag from shipping with it.
+
+  openrouter/moonshotai/kimi-k3:
+    dialect: openai-chat
+    baseUrl: https://openrouter.ai
+    path: /api/v1/chat/completions
+    auth:
+      header: Authorization
+      scheme: "Bearer"   # quoted so a whole-file TOKEN_PATTERNS scan cannot read the next line as a bearer value
+      vaultId: openrouter-api-key
+    model: moonshotai/kimi-k3
+    local: false
+    placeholder: true
+    pricing:
+      inMicroUsdPerMTok: 0
+      outMicroUsdPerMTok: 0
+      source: table
+    caps:
+      toolChoice: auto
+      parallelToolCalls: null
+      strictSchema: null
+      sampling: temperature
+      streamUsage: null
+      preserveAssistantMessage: true
+
+  moonshot/kimi-k3:
+    dialect: openai-chat
+    baseUrl: https://api.moonshot.ai
+    path: /v1/chat/completions
+    auth:
+      header: Authorization
+      scheme: "Bearer"   # quoted so a whole-file TOKEN_PATTERNS scan cannot read the next line as a bearer value
+      vaultId: moonshot-api-key
+    model: kimi-k3
+    local: false
+    placeholder: true
+    pricing:
+      inMicroUsdPerMTok: 0
+      outMicroUsdPerMTok: 0
+      source: table
+    caps:
+      toolChoice: auto
+      parallelToolCalls: null
+      strictSchema: null
+      sampling: temperature
+      streamUsage: null
+      preserveAssistantMessage: true
+
+  # Bonsai behind llama.cpp's OpenAI-compatible server. No credential: a
+  # loopback llama.cpp server has none to give, and `optional: true` says so
+  # rather than leaving the absence to be inferred.
+  llamacpp/local:
+    dialect: openai-chat
+    baseUrl: http://127.0.0.1:8080
+    path: /v1/chat/completions
+    auth:
+      header: Authorization
+      scheme: "Bearer"   # quoted so a whole-file TOKEN_PATTERNS scan cannot read the next line as a bearer value
+      optional: true
+    model: local
+    local: true
+    placeholder: true
+    pricing:
+      inMicroUsdPerMTok: 0
+      outMicroUsdPerMTok: 0
+      source: table
+    caps:
+      toolChoice: auto
+      parallelToolCalls: null
+      strictSchema: null
+      sampling: temperature
+      streamUsage: null
+      preserveAssistantMessage: true
+
+  # Ollama runs natively for Metal. Its endpoint wants a placeholder token, not
+  # a secret; `value: ollama` is the one literal this file admits, and only on
+  # a local entry.
+  ollama/qwen3:8b:
+    dialect: openai-chat
+    baseUrl: http://127.0.0.1:11434
+    path: /v1/chat/completions
+    auth:
+      header: Authorization
+      scheme: "Bearer"   # quoted so a whole-file TOKEN_PATTERNS scan cannot read the next line as a bearer value
+      value: ollama
+    model: qwen3:8b
+    local: true
+    placeholder: true
+    pricing:
+      inMicroUsdPerMTok: 0
+      outMicroUsdPerMTok: 0
+      source: table
+    caps:
+      toolChoice: none
+      parallelToolCalls: null
+      strictSchema: null
+      sampling: temperature
+      streamUsage: null
+      preserveAssistantMessage: true

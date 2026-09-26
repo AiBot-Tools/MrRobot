@@ -1,0 +1,82 @@
+# aos-kernel — kernel configuration.
+#
+# This file holds NO secrets. Credentials are referenced by environment
+# variable name (control.tokenEnv, mcp.servers.*.tokenEnv) or by vault id in
+# providers.yaml; a key whose name looks like a secret is refused at parse and
+# the path is named. See src/config.ts.
+#
+# control.host is a literal in the schema: there is no spelling of this file
+# that binds the control plane to a public interface (invariant 1).
+version: 1
+
+# Outside the repository and never $HOME itself — both refused at parse. The
+# event log must not live where repository tooling can reach it.
+dataDir: ~/.aos
+
+control:
+  host: 127.0.0.1
+  port: 7777
+  tokenEnv: AOS_CONTROL_TOKEN
+  # Empty until the Tauri prototype exists (Phase 3). An Origin header, if
+  # present, must still be loopback; this list is the additional allowance.
+  allowedOrigins: []
+  maxPayloadBytes: 1048576
+
+events:
+  anchorEvery: 100
+
+mcp:
+  servers:
+    pmmcp:
+      # Streamable HTTP on loopback, bearer required. 8765 is the pmmcp
+      # dashboard; 8766 is the MCP endpoint.
+      url: http://127.0.0.1:8766/mcp
+      tokenEnv: PMMCP_TOKEN
+      # pmmcp sessions idle-expire, so the hub heartbeats inside that window.
+      heartbeatMs: 240000
+      requestTimeoutMs: 30000
+      pingTimeoutMs: 10000
+      listToolsTimeoutMs: 15000
+
+secrets:
+  # Confirmed against the live get_secret schema (2026-09-21): the argument is
+  # `label`, not `key`. The broker still asserts it at runtime and fails closed
+  # if the server disagrees.
+  keyArg: label
+  # Off: the vault is the credential path. Turning this on lets a per-entry
+  # auth.envVar be consulted AFTER a vault failure, and nothing else.
+  envFallback: false
+
+sandbox:
+  driver: docker
+  image: aos-worker:0.0.1
+  domains:
+    trusted:
+      # Colima keeps its sockets under $HOME; the ~ is expanded at parse,
+      # because DOCKER_HOST reaches the docker CLI without a shell.
+      dockerHost: unix://~/.colima/trusted/docker.sock
+      network: aos-trusted
+      mountRoot: ~/.aos/workspaces/trusted
+    hostile:
+      dockerHost: unix://~/.colima/hostile/docker.sock
+      network: aos-hostile
+      mountRoot: ~/.aos/workspaces/hostile
+  defaults:
+    user: 65534:65534
+    pidsLimit: 256
+    memory: 2g
+    cpus: 2
+    wallclockMs: 600000
+
+lanes:
+  main: 4
+  subagent: 8
+
+# D30. A manifest may only LOWER these; none of them admits "unlimited".
+budgets:
+  defaultRunMicroUsd: 2000000
+  defaultWallclockMs: 600000
+  maxRetries: 2
+  maxLlmCallsPerRun: 50
+  maxToolCallsPerRun: 100
+  approvalWaitMs: 300000

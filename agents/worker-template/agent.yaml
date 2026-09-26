@@ -1,0 +1,28 @@
+# Template for ephemeral workers. A template is never run itself: the registry
+# spawns from it, and a child may only ever take LESS than this file offers —
+# tier, tools and egress are all clamped against it, and a request for more is
+# refused and logged as `agent.spawn.rejected` (invariant 6).
+id: worker-template
+version: 1
+kind: template
+role: worker
+soul: worker.md
+
+# T1: read-only MCP tools. The ceiling for anything spawned from this template.
+tier: 1
+
+model:
+  primary: anthropic/claude-sonnet-5
+  fallbacks: []
+
+tools:
+  servers: [pmmcp]
+  # Empty for the same reason as the CEO's: nothing is exposed to agents yet,
+  # and a manifest cannot grant what the tool views withhold.
+  allow: []
+
+egress:
+  allow: []
+
+memory:
+  projectId: aos/shared

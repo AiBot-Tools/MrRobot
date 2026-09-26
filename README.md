@@ -92,7 +92,16 @@ npm test                 # node --import tsx --test test/*.test.ts
 npm run dev              # daemon on 127.0.0.1:7777
 npm run build            # emits dist/
 npm run cli -- <cmd>
+npm run capture:pmmcp    # operator-only: record pmmcp's live tool schemas
 ```
+
+`capture:pmmcp` needs `PMMCP_TOKEN` and a running pmmcp. It calls `tools/list`
+and nothing else — no tool is invoked, so no memory and no vault entry is read —
+and writes `test/fixtures/pmmcp-listtools.json`. Everything this repo believes
+about pmmcp's tool surface apart from `get_secret`'s `label` is a guess made on
+Linux; that file is what turns `test/pmmcp-drift.test.ts` from a self-test of
+its own comparison into a check against the real schemas, and it is the fastest
+way to settle `secrets.keyArg` without a full exit run.
 
 The console, `npm run cli -- <cmd>`:
 
@@ -201,10 +210,11 @@ until the operator classifies them from the `hub.tools.classified` event. Every
 non-Anthropic entry in `config/providers.yaml` is `placeholder: true` and the
 router refuses to serve one.
 
-`SecretsBroker.keyArg` is **unverified** against a live pmmcp until line 2 of
-the checklist below passes. The broker fails closed if the live schema
-disagrees: `broker.start()` throws on drift, and boot turns that into a DEGRADED
-secrets subsystem whose reason names the argument and the config line to change.
+`SecretsBroker.keyArg` is **unverified** against a live pmmcp until either
+`npm run capture:pmmcp` records the live schema or line 2 of the checklist below
+passes. The broker fails closed if the live schema disagrees: `broker.start()`
+throws on drift, and boot turns that into a DEGRADED secrets subsystem whose
+reason names the argument and the config line to change.
 
 The kernel is tested against a **pmmcp double** (`test/helpers/mock-pmmcp.ts`):
 an in-process MCP server with the goal hierarchy, the validated status
@@ -212,7 +222,7 @@ transitions, `project_id` namespacing, the vault and an idle-expiring session
 all modelled. It is what lets the vault credential path, invariant 7 at 49
 tools, and a reconnect after a `-32001` be tested with no pmmcp anywhere. Its
 tool names and arguments are MODELLED, recorded as such in `PMMCP_TOOLS`, and
-nothing in the kernel may treat one as known-good until a live capture confirms
+nothing in the kernel may treat one as known-good until the capture confirms
 it.
 
 ---

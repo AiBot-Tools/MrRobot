@@ -26,6 +26,7 @@
 import { parseArgs } from 'node:util'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { parse as parseYaml } from 'yaml'
 
 import { ConfigError } from '../errors.js'
@@ -408,4 +409,37 @@ function search(io: CliIo, config: KernelConfig, values: Values): number {
   } finally {
     store.close()
   }
+}
+
+// The entry point.
+//
+// Without this the module exported `runCli` and nothing called it: `npm run cli
+// -- verify-chain` loaded the file, ran no command, printed nothing and exited
+// 0. Every test drives runCli() in process, so none of them could notice — the
+// same shape of bug as a router with no adapters, and found the same way, by
+// running the thing for real.
+//
+// Compared as resolved paths rather than by suffix, so importing this module
+// from a test does not execute a command.
+const entry = process.argv[1]
+if (entry !== undefined && fileURLToPath(import.meta.url) === resolve(entry)) {
+  runCli(process.argv.slice(2), {
+    out: (line) => {
+      process.stdout.write(`${line}\n`)
+    },
+    err: (line) => {
+      process.stderr.write(`${line}\n`)
+    },
+    env: process.env,
+    cwd: process.cwd(),
+  })
+    .then((code) => {
+      process.exit(code)
+    })
+    .catch((e: unknown) => {
+      // runCli already maps every expected failure to an exit code, so reaching
+      // here is a bug rather than a refusal. It still must not be silent.
+      process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`)
+      process.exit(1)
+    })
 }

@@ -315,7 +315,7 @@ Conventions: one commit, one test file (a docs task may extend `stubs.test.ts`; 
 
 | Stub / gap | How it is explicit | Task / test |
 |---|---|---|
-| Apple `container` driver | every method throws `NotImplementedError('apple-container')` | T25, T36 |
+| Apple `container` driver | `probe()` reports unavailable with a reason so boot DEGRADES; `run()`/`kill()` throw `NotImplementedError('apple-container')`. It threw from `probe()` until T36, which made `sandbox.driver: apple-container` refuse the whole boot | T25, T36 |
 | Egress proxy sidecar (absent) | `assertEgressEnforced()` throws; sandbox spec has no `egress` field; router attaches provider auth in-process and `secret.accessed` says so; status shows `egress: absent` | T27a, T36 |
 | Cron scheduler (absent) | `schedule:` refused by `.strict()` at parse; `Scheduler.start()` throws; status `scheduler: absent` | T15, T27a, T36 |
 | CEO delegation/spawn tool (absent) | `registry.spawnEphemeral` is registry-only and unit-tested (T15); no tool ref reaches it in Phase 0, the model's tool list never contains one, and `assertDelegationAvailable()` throws; `agent.spawned` is producible only by tests; Phase 1 item (Hermes-style `delegate_task`) | T15, T27a, T36 |

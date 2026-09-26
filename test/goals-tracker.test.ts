@@ -54,8 +54,8 @@ const PLAN_TEXT = `Here is the plan.
       "id": "m1",
       "title": "research both options",
       "tasks": [
-        { "id": "t1", "title": "write up sqlite", "template": "ceo", "acceptance": ["docs/sqlite.md exists"] },
-        { "id": "t2", "title": "write up append-only", "template": "ceo", "acceptance": ["docs/append.md exists"] }
+        { "id": "t1", "title": "write up sqlite", "template": "researcher", "acceptance": ["docs/sqlite.md exists"] },
+        { "id": "t2", "title": "write up append-only", "template": "writer", "acceptance": ["docs/append.md exists"] }
       ]
     }
   ]
@@ -229,7 +229,7 @@ test('a result that is not a plan, and one that is a broken plan, write nothing'
 })
 
 test('a plan whose task names an unregistered template is refused, and nothing is written', async (t) => {
-  const broken = PLAN_TEXT.replace(/"template": "ceo"/g, '"template": "nonexistent-agent"')
+  const broken = PLAN_TEXT.replace(/"template": "(researcher|writer)"/g, '"template": "nonexistent-agent"')
   const { mock, kernel, dbPath } = await bootWithGoals(t, [
     anthropicEndTurn({ text: broken, inputTokens: 1_200, outputTokens: 300 }),
   ])
@@ -272,7 +272,7 @@ test('only an orchestrator may have a plan adopted from its result', async (t) =
     projectIdOf: () => CEO_PROJECT,
     // The whole point of the test: this agent is not an orchestrator.
     isOrchestrator: (agentId) => agentId === 'ceo',
-    knownTemplates: () => ['ceo', 'worker'],
+    knownTemplates: () => ['researcher', 'writer', 'worker'],
   })
   const detach = tracker.attach()
   t.after(() => {
@@ -289,7 +289,7 @@ test('only an orchestrator may have a plan adopted from its result', async (t) =
         schemaVersion: 1,
         ref: 'anthropic/x',
         attempt: 0,
-        content: PLAN_TEXT.replace(/"template": "ceo"/g, '"template": "worker"'),
+        content: PLAN_TEXT,
         finish: 'end_turn',
         inputTokens: 10,
         outputTokens: 10,
@@ -351,7 +351,7 @@ test('a non-plan result is quiet; a plan that did not parse is loud', async (t) 
     adoptFromRuns: true,
     projectIdOf: () => CEO_PROJECT,
     isOrchestrator: () => true,
-    knownTemplates: () => ['ceo'],
+    knownTemplates: () => ['researcher', 'writer'],
     logger: createLogger({ level: 'warn', destination: stream }),
   })
   const detach = tracker.attach()

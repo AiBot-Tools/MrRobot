@@ -1,0 +1,58 @@
+# writer — a standard worker that produces prose.
+#
+# Versioned: every change bumps `version` and the prior file is frozen under
+# history/. Read-only to agents (invariant 8).
+#
+# It differs from `researcher` where it counts, and in code rather than in prose
+# (see that file's header for the rule this satisfies):
+#
+#   GATE POSTURE. tier 2 — it may hold `write` tools once any are exposed, which
+#   tier 1 may not. Every call still goes gate → (human) → (quarantine) → execute
+#   → log, and `irreversible` is above this tier entirely.
+#
+#   CONTEXT BOUNDARY. `aos/agent/writer` is its own memory namespace, disjoint
+#   from the researcher's and from `aos/ceo`.
+#
+#   BUDGET SHAPE. Fewer model calls than the researcher and far fewer tool calls:
+#   drafting is one or two long turns over material already gathered, not a loop
+#   of lookups. The caps are what the kernel enforces, so the difference is real.
+id: writer
+version: 1
+kind: standard
+role: worker
+soul: writer.md
+
+# T2: write tools, once any exist. Not 3: this agent may never REQUEST an
+# irreversible tool, which is what tier 3 means — publishing, sending and merging
+# are decisions a human makes, and the tier is where that is stated.
+tier: 2
+
+model:
+  primary: anthropic/claude-sonnet-5
+  fallbacks: []
+
+tools:
+  servers: [pmmcp]
+  # Empty for the same reason as every other manifest: nothing is exposed to
+  # agents, and the registry refuses what the tool views withhold. `remember`
+  # scoped to this agent's own namespace is the first entry this line should gain.
+  allow: []
+
+egress:
+  allow: []
+
+# Lower than the kernel ceilings (D30). A higher cost allowance than the
+# researcher's because drafting spends its tokens on output, and a much lower tool
+# allowance because it is not the one doing lookups.
+budget:
+  maxCostMicroUsd: 750000
+  maxLlmCalls: 8
+  maxToolCalls: 10
+  maxWallclockMs: 300000
+
+# No `sandbox:` and no `schedule:`, for the reasons the researcher's manifest
+# gives: the loop runs in process in this phase, and the only routable model is a
+# frontier one.
+
+memory:
+  projectId: aos/agent/writer

@@ -234,6 +234,35 @@ passes. The broker fails closed if the live schema disagrees: `broker.start()`
 throws on drift, and boot turns that into a DEGRADED secrets subsystem whose
 reason names the argument and the config line to change.
 
+### The fleet
+
+Four manifests ship: `ceo` (the only `role: orchestrator`), `worker-template` (a
+template, never run — the registry spawns from it and clamps every child against
+it), and the pair `researcher` / `writer`.
+
+The pair earns two manifests rather than one with two souls, on axes the kernel
+enforces:
+
+| | `researcher` | `writer` |
+|---|---|---|
+| tier (gate posture) | 1 — read-only | 2 — may hold `write` tools |
+| memory namespace | `aos/agent/researcher` | `aos/agent/writer` |
+| budget | 12 model calls, 40 tool calls, $0.50 | 8 model calls, 10 tool calls, $0.75 |
+
+Tier is checked at load as well as at call time: a manifest naming a tool whose
+risk exceeds its tier is refused with the file named. Budgets are checked at load
+too — a manifest may only lower a kernel ceiling. Neither agent declares a
+`sandbox:` (the loop runs in process in this phase, so a domain would claim an
+isolation that does not happen), an `egress.allow` host (no proxy exists to enforce
+one), or a `schedule:` (the only routable model is a frontier one, and an
+unattended run that can reach it can empty an envelope).
+
+Both carry `tools.allow: []`, which is the honest state and not an oversight:
+`tool-views.yaml` exposes nothing to agents, and the registry refuses a manifest
+that names a tool the views withhold. So today the difference between the two is
+enforced in three places and observable in none — each agent's `AGENTS.md` says so
+rather than implying a capability that is not wired.
+
 ### Goals
 
 The CEO's plan becomes a goal tree, and the kernel is the only thing that writes

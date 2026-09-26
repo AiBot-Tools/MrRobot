@@ -290,9 +290,65 @@ test('agents/*/agent.yaml parse against the shipped providers and tool-views; ce
     assert.equal(soul.truncated, false, `${record.manifest.soul} exceeds the soul budget`)
   }
 
+  // ── the researcher/writer pair ──────────────────────────────────────────
+  //
+  // The fleet design's first rule is that an agent earns its manifest through a
+  // distinct tool surface, taint posture, model binding, context boundary or gate
+  // posture — otherwise it is a template or a tool view wearing a persona. With
+  // nothing exposed to agents these two have the same (empty) tool surface, so the
+  // distinctness has to come from somewhere the kernel enforces, and this asserts
+  // it does.
+  const researcher = reg.get('researcher')
+  const writer = reg.get('writer')
+  assert.ok(researcher, 'researcher did not load')
+  assert.ok(writer, 'writer did not load')
+  for (const record of [researcher, writer]) {
+    assert.equal(record.manifest.kind, 'standard')
+    assert.equal(record.manifest.role, 'worker', 'only the CEO is an orchestrator')
+    assert.equal(record.manifest.model.primary, 'anthropic/claude-sonnet-5')
+    assert.deepEqual(record.manifest.tools.allow, [])
+    assert.deepEqual(record.manifest.egress.allow, [])
+    assert.equal(record.manifest.spawn, undefined, 'a worker must not spawn')
+    // No sandbox: the loop runs in process in this phase, so a domain here would
+    // claim an isolation that does not happen.
+    assert.equal(record.manifest.sandbox, undefined)
+    // No schedule: the only routable model is a frontier one, and an unattended
+    // run that can reach it is an unattended run that can empty an envelope.
+    assert.equal(record.manifest.schedule, undefined)
+  }
+
+  // GATE POSTURE: read-only versus may-hold-write. Enforced by the gate at call
+  // time and by the registry at load.
+  assert.equal(researcher.manifest.tier, 1)
+  assert.equal(writer.manifest.tier, 2)
+  assert.notEqual(researcher.manifest.tier, writer.manifest.tier)
+
+  // CONTEXT BOUNDARY: disjoint memory namespaces, and neither is the CEO's.
+  assert.equal(researcher.manifest.memory.projectId, 'aos/agent/researcher')
+  assert.equal(writer.manifest.memory.projectId, 'aos/agent/writer')
+  const namespaces = reg.list().map((r) => r.manifest.memory.projectId)
+  assert.equal(new Set(namespaces).size, namespaces.length, 'two agents share a memory namespace')
+
+  // BUDGET: both lower the kernel ceilings, and differently. A pair with
+  // identical caps would be one agent with two souls.
+  const ceilings = parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO }).budgets
+  for (const record of [researcher, writer]) {
+    const budget = record.manifest.budget
+    assert.ok(budget, `${record.manifest.id} declares no budget`)
+    assert.ok((budget.maxCostMicroUsd ?? 0) > 0)
+    assert.ok(
+      (budget.maxCostMicroUsd ?? Infinity) < ceilings.defaultRunMicroUsd,
+      `${record.manifest.id} does not lower the cost ceiling`,
+    )
+    assert.ok((budget.maxLlmCalls ?? Infinity) < ceilings.maxLlmCallsPerRun)
+  }
+  assert.notDeepEqual(researcher.manifest.budget, writer.manifest.budget)
+
   // Invariant 8: AGENTS.md sits beside the manifest and no code path writes it.
-  assert.ok(read('agents/ceo/AGENTS.md').length > 0)
-  assert.equal(store.query({ type: 'agent.registered' }).length, 2)
+  for (const id of ['ceo', 'researcher', 'writer']) {
+    assert.ok(read(`agents/${id}/AGENTS.md`).length > 0, `${id} has no AGENTS.md`)
+  }
+  assert.equal(store.query({ type: 'agent.registered' }).length, 4)
 })
 
 test('no file under config/, agents/, souls/ contains a value matching TOKEN_PATTERNS or a DENY_KEYS key', () => {

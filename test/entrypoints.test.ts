@@ -176,8 +176,13 @@ test('npm run dev boots the daemon, serves the CLI over the socket, and shuts do
   const agents = cli(['agents', '--config', configPath], { ...env })
   assert.equal(agents.status, 0, agents.stderr)
   const listed = agents.stdout.trim().split('\n').map((l) => l.split('\t')[0])
-  assert.deepEqual(listed.sort(), ['ceo', 'worker-template'], agents.stdout)
+  // The whole shipped fleet, over a real socket. Listed explicitly rather than by
+  // count: an agent that silently stopped loading is the failure this catches.
+  assert.deepEqual(listed.sort(), ['ceo', 'researcher', 'worker-template', 'writer'], agents.stdout)
   assert.match(agents.stdout, /ceo\tstandard\tT2\tactive\tanthropic\/claude-sonnet-5/)
+  // The pair's tiers survive the round trip, which is where the gate reads them.
+  assert.match(agents.stdout, /researcher\tstandard\tT1\tactive\t/)
+  assert.match(agents.stdout, /writer\tstandard\tT2\tactive\t/)
 
   // SIGTERM must run the clean shutdown, not just die: the anchor and the
   // kernel.shutdown row depend on it.

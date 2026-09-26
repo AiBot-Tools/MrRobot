@@ -271,3 +271,18 @@ test('a ~ mountRoot resolves; a relative one is still refused', () => {
   home.sandbox.domains['trusted']!.mountRoot = '~'
   assert.throws(() => parse(home), /must not be \$HOME itself/)
 })
+
+test('control.port refuses a privileged port but allows the literal 0', () => {
+  // 0 means "ask the OS for an ephemeral port", which is how parallel test
+  // processes avoid colliding. It is not a privileged port; the floor exists to
+  // refuse 1-1023, where a bind would need privileges the daemon must not have.
+  const doc = fixture('valid.yaml') as { control: { port: number } }
+  doc.control.port = 0
+  assert.equal(parse(doc).control.port, 0)
+
+  for (const port of [1, 22, 80, 443, 1023, 65_536, -1, 1.5]) {
+    const broken = fixture('valid.yaml') as { control: { port: number } }
+    broken.control.port = port
+    assert.throws(() => parse(broken), /is invalid/, String(port))
+  }
+})

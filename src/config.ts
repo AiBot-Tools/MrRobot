@@ -59,7 +59,14 @@ const Control = z
   .object({
     // Literal, not a choice. See the file header.
     host: z.literal('127.0.0.1').default('127.0.0.1'),
-    port: z.number().int().min(1024).max(65_535).default(7777),
+    // A privileged port is refused; the literal 0 is allowed and means "let
+    // the OS pick an ephemeral one", which is how parallel test processes avoid
+    // colliding and why ControlServer reads its bound port back from the
+    // socket. 0 is not a privileged port — it is a request, and the OS answers
+    // with something well above the floor.
+    port: z
+      .union([z.literal(0), z.number().int().min(1024).max(65_535)])
+      .default(7777),
     tokenEnv: z.literal('AOS_CONTROL_TOKEN').default('AOS_CONTROL_TOKEN'),
     allowedOrigins: z
       .array(z.string())

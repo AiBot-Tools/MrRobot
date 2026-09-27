@@ -1,10 +1,13 @@
+# FROZEN: version 1 of the CEO manifest, superseded by agents/ceo/agent.yaml v2
+# (which gained kernel.adopt_plan and kernel.delegate). Never loaded; kept so the
+# history of what this agent was allowed to do is on disk, not only in git.
 # The CEO: the one orchestrator. Versioned — every change bumps `version` and
 # the prior file is frozen under history/.
 #
 # This manifest is read-only to agents (invariant 8): no code path lets a run
 # write it, and `config/`, `agents/` and `souls/` are protected roots.
 id: ceo
-version: 2
+version: 1
 kind: standard
 role: orchestrator
 soul: ceo.md
@@ -24,16 +27,13 @@ model:
 
 tools:
   servers: [pmmcp]
-  # v2: the two kernel-native tools, and nothing from pmmcp. tool-views.yaml
-  # still exposes no pmmcp tool to agents — all nine classified names are pinned
-  # kernel-only or disabled and the other 40 are kernel-only by default — so the
-  # CEO can plan and delegate but not read memory. Each pmmcp addition is an
-  # ask-before, and needs a namespaceArg the gate pins to aos/ceo.
-  #
-  # kernel.adopt_plan writes the goal tree into aos/ceo; kernel.delegate runs one
-  # task of it on the worker the plan names. Both `write`, both refused by the
-  # registry in any manifest that is not role: orchestrator.
-  allow: [kernel.adopt_plan, kernel.delegate]
+  # Empty, and honestly so. tool-views.yaml exposes NOTHING to agents in Phase
+  # 0 — all nine classified pmmcp tools are pinned kernel-only or disabled, and
+  # the other 40 are kernel-only by the literal default. A manifest cannot
+  # grant what the tool views withhold, so any entry here would be refused at
+  # load. This fills in once the operator classifies tools from the
+  # `hub.tools.classified` event; each such change is an ask-before.
+  allow: []
 
 egress:
   # Empty until the Phase 2 proxy exists. `assertEgressEnforced` throws, so

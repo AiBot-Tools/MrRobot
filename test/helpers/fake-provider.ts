@@ -197,12 +197,22 @@ export function malformedJson(): ScriptedResponse {
 
 // ── the provider ───────────────────────────────────────────────────────────
 
-export function fakeProvider(script: readonly ScriptedResponse[]): FakeProvider {
+/**
+ * A script entry: a fixed response, or one built from the request that asked.
+ *
+ * The function form exists for replies that depend on what the kernel sent — a
+ * model's closing summary citing the run ids it was handed in tool results, which
+ * are minted at run time and cannot be written into a static script.
+ */
+export type ScriptEntry = ScriptedResponse | ((request: RecordedRequest) => ScriptedResponse)
+
+export function fakeProvider(script: readonly ScriptEntry[]): FakeProvider {
   const requests: RecordedRequest[] = []
   let index = 0
 
-  const nextResponse = (): ScriptedResponse => {
-    const scripted = script[index]
+  const nextResponse = (request: RecordedRequest): ScriptedResponse => {
+    const entry = script[index]
+    const scripted = typeof entry === 'function' ? entry(request) : entry
     index++
     if (scripted === undefined) {
       throw new Error(
@@ -236,16 +246,17 @@ export function fakeProvider(script: readonly ScriptedResponse[]): FakeProvider 
         parsed = rawRequestBody
       }
     }
-    requests.push({
+    const recorded: RecordedRequest = {
       method: init?.method ?? (input instanceof Request ? input.method : 'GET'),
       url,
       headers,
       body: parsed,
-    })
+    }
+    requests.push(recorded)
 
     // Throwing here surfaces as a rejected fetch, which is what a caller that
     // over-loops deserves to see.
-    const scripted = nextResponse()
+    const scripted = nextResponse(recorded)
     return new Response(bodyText(scripted), {
       status: scripted.status,
       headers: { 'content-type': 'application/json', ...scripted.headers },
@@ -273,11 +284,12 @@ export function fakeProvider(script: readonly ScriptedResponse[]): FakeProvider 
           for (const [k, v] of Object.entries(req.headers)) {
             if (typeof v === 'string') headers[k] = v
           }
-          requests.push({ method: req.method ?? 'GET', url: req.url ?? '/', headers, body: parsed })
+          const recorded: RecordedRequest = { method: req.method ?? 'GET', url: req.url ?? '/', headers, body: parsed }
+          requests.push(recorded)
 
           let scripted: ScriptedResponse
           try {
-            scripted = nextResponse()
+            scripted = nextResponse(recorded)
           } catch (e) {
             res.writeHead(599, { 'content-type': 'text/plain' })
             res.end(e instanceof Error ? e.message : 'unscripted call')

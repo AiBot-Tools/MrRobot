@@ -22,10 +22,25 @@ can.
   execute → log, default deny. An `irreversible` tool always waits for a human.
   Nothing this agent says changes that.
 
-## Phase 0 reality
+## What it can do now
 
-`tools.allow` is empty and that is not an oversight: no pmmcp tool is exposed
-to agents yet. Delegation and spawning are registry-only —
-`assertDelegationAvailable` throws — so in Phase 0 this agent plans and calls
-the LLM, and the fleet it describes does not exist yet. The gap is visible
-here rather than papered over in the soul.
+Two kernel-native tools, both gated as `write` (a tainted CEO needs a human to use
+either), and nothing from pmmcp:
+
+- `kernel.adopt_plan({ plan })` — the kernel validates a ProposedPlan and writes
+  it into `aos/ceo` as objective → milestone → task, returning task → goal ids.
+- `kernel.delegate({ taskId, brief })` — one task of that plan, run on the worker
+  the plan named, with a budget slice carved from this run and charged back to it.
+
+The kernel decides what is admissible: no plan, an unknown task, a task already
+delegated, a task whose `dependsOn` has not finished `ok`, more than
+`spawn.maxChildren`, a target above this agent's tier, and a delegated child
+trying to delegate are all refused with the reason. None of those rules lives in
+the soul, so none of them can be argued with.
+
+## What is still absent
+
+No pmmcp tool is exposed, so this agent cannot read memory; the first one needs a
+`namespaceArg` the gate pins to `aos/ceo`. Ephemeral spawning is registry-only:
+`spawnEphemeral` exists but no tool mints an agent. The workers it delegates to
+have no tools either, so today a child returns prose, not research.

@@ -74,3 +74,20 @@ servers:
         exposure: disabled
         risk: read
         note: nested LLM calls bypass router, budgets, taint and the log
+
+  # Kernel-native tools. Not an MCP server: the kernel implements these itself,
+  # and they run through the same gate, the same re-check at execution and the
+  # same tool.call / tool.result logging as any MCP tool. `write`, so a TAINTED
+  # orchestrator needs a human to adopt a plan or delegate (invariant 3). The
+  # registry refuses them in any manifest that is not role: orchestrator.
+  kernel:
+    default: kernel-only
+    tools:
+      adopt_plan:
+        exposure: agent
+        risk: write
+        note: validates a ProposedPlan and writes the goal tree into the caller's own namespace
+      delegate:
+        exposure: agent
+        risk: write
+        note: runs one task of the adopted plan on the worker it names; spend charged to the caller

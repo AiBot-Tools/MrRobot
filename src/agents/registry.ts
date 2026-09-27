@@ -28,6 +28,7 @@ import { ConfigError } from '../errors.js'
 import type { EventStore } from '../events/store.js'
 import { resolveView, type ToolViewsFile } from '../mcp/tool-views.js'
 import { resolveCaps, type KernelBudgets } from '../runtime/budget.js'
+import { KERNEL_SERVER } from '../runtime/kernel-tools.js'
 import { parseManifest, type AgentManifest } from './manifest.js'
 
 export interface AgentRecord {
@@ -137,6 +138,16 @@ export class AgentRegistry {
         throw new ConfigError(
           `${source}: tools.allow names ${ref}, which is ${view.exposure}. ` +
             'A manifest cannot grant what the tool views withhold.',
+        )
+      }
+      // Kernel tools start runs and write goal trees. They are the orchestrator's
+      // alone: a worker that could delegate would make depth 1 a matter of which
+      // manifest happened to list the tool. The loop refuses to OFFER them to a
+      // worker as well; this refuses to LOAD the manifest that asks.
+      if (serverId === KERNEL_SERVER && manifest.role !== 'orchestrator') {
+        throw new ConfigError(
+          `${source}: tools.allow names ${ref}, a kernel tool, but ${manifest.id} is role: ` +
+            `${manifest.role}. Kernel tools are for the orchestrator only.`,
         )
       }
       const allowed = RISKS_BY_TIER[manifest.tier] ?? []

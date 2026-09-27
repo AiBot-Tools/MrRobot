@@ -179,6 +179,48 @@ export const GoalCreatedPayload = z
  * server had it. `by` says who moved it, and `kernel` is the only value the
  * kernel writes: a model never moves a goal directly.
  */
+// ── delegation ─────────────────────────────────────────────────────────────
+
+/**
+ * A delegation was admitted: a child run exists, serving one task of a plan the
+ * parent adopted. The tie between a child's spend and its parent's lives here.
+ */
+export const DelegationAdmittedPayload = z
+  .object({
+    ...V,
+    parentRunId: z.string(),
+    childRunId: z.string(),
+    agentId: z.string(),
+    taskId: z.string(),
+    goalId: z.string(),
+    /** The ceiling the child ran under, carved from what the parent had left. */
+    ceilingMicroUsd: nonNegInt(),
+    ceilingWallclockMs: nonNegInt(),
+  })
+  .strict()
+
+/** The child finished; its cost was charged to the parent. */
+export const DelegationResultPayload = z
+  .object({
+    ...V,
+    parentRunId: z.string(),
+    childRunId: z.string(),
+    status: z.enum(['ok', 'error', 'killed', 'denied']),
+    costMicroUsd: nonNegInt(),
+    taint: z.enum(TAINT),
+  })
+  .strict()
+
+/** A delegation the kernel refused, with the reason the model was told. */
+export const DelegationRefusedPayload = z
+  .object({
+    ...V,
+    parentRunId: z.string(),
+    taskId: z.string().max(64).optional(),
+    reason: z.string().max(500),
+  })
+  .strict()
+
 export const GoalStatusPayload = z
   .object({
     ...V,
@@ -492,6 +534,9 @@ export const EVENT_TYPES = [
   'plan.adopted',
   'goal.created',
   'goal.status',
+  'delegation.admitted',
+  'delegation.result',
+  'delegation.refused',
 ] as const
 
 export type EventType = (typeof EVENT_TYPES)[number]
@@ -539,6 +584,9 @@ export const PAYLOAD_SCHEMAS: Readonly<Record<EventType, z.ZodType>> = {
   'plan.adopted': PlanAdoptedPayload,
   'goal.created': GoalCreatedPayload,
   'goal.status': GoalStatusPayload,
+  'delegation.admitted': DelegationAdmittedPayload,
+  'delegation.result': DelegationResultPayload,
+  'delegation.refused': DelegationRefusedPayload,
 }
 
 export function isEventType(t: string): t is EventType {

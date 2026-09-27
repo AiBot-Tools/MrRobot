@@ -7,11 +7,12 @@
 // whole point of the harness, because the decision it feeds ("may this model
 // orchestrate?") cannot be answered by a fixture.
 //
-// EXPECT THE FIRST CASE TO FAIL TODAY. It requires two child runs, and
-// delegation is a stub in this phase: `assertDelegationAvailable` throws. The
-// case ships anyway, and failing is the correct output — a suite pruned to what
-// the kernel can already do would score 1.00 forever and measure nothing. The
-// failing gate names the missing capability.
+// The first case requires two child runs. The kernel can now produce them —
+// `kernel.adopt_plan` then `kernel.delegate`, see src/runtime/delegate.ts — so
+// whether it passes is a question about the MODEL: does it plan, adopt, and
+// delegate both write-ups rather than answering alone? That is exactly the
+// question `orchestrator: true` turns on, and a model that answers alone fails
+// `child-runs` with the count in the detail.
 
 import type { EvalCase } from './types.js'
 

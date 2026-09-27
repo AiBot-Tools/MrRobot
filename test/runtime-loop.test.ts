@@ -43,7 +43,7 @@ import { mintHumanActor } from '../src/control/actor.js'
 import { Budget } from '../src/runtime/budget.js'
 import { Lanes } from '../src/runtime/lanes.js'
 import { RunLoop, type RunAgent, type ToolContext } from '../src/runtime/loop.js'
-import { assertDelegationAvailable } from '../src/runtime/delegate.js'
+import { KernelTools } from '../src/runtime/kernel-tools.js'
 import { assertEgressEnforced } from '../src/runtime/egress.js'
 import { NotImplementedError } from '../src/errors.js'
 import { MAX_LOGGED_OUTPUT, PAYLOAD_TEXT_BUDGET } from '../src/events/bound.js'
@@ -136,6 +136,8 @@ interface Wired {
   readonly budget: Budget
   readonly agent: RunAgent
   readonly provider: ReturnType<typeof fakeProvider>
+  readonly router: Router
+  readonly agentView: () => ReturnType<McpHub['agentView']>
   advance(ms: number): void
 }
 
@@ -209,6 +211,8 @@ async function wire(
     budget,
     agent,
     provider,
+    router,
+    agentView: () => hub.agentView(),
     advance(ms) {
       clock += ms
     },
@@ -605,30 +609,58 @@ test('tool output larger than MAX_LOGGED_OUTPUT is bounded identically for the l
   assert.ok(Buffer.byteLength(String(toModel), 'utf8') <= PAYLOAD_TEXT_BUDGET)
 })
 
-test('the model’s tool list never contains a delegation or spawn tool and assertDelegationAvailable throws NotImplemented', async (t) => {
+test('a worker is never offered a kernel tool, even with a runner configured and a manifest that names one', async (t) => {
+  // Delegation exists now, so "no delegation tool anywhere" is no longer the
+  // claim. The claim is narrower and stronger: kernel tools reach an
+  // ORCHESTRATOR only. This agent is a worker whose tool allow-list names
+  // kernel.delegate — which the registry would refuse at load — and the loop must
+  // still not offer it, because the offer is the last place that can say no
+  // before a model sees the tool.
+  const kernelViews = parseToolViews({
+    version: 1,
+    servers: {
+      pmmcp: { default: 'kernel-only', tools: { recall: { exposure: 'agent', risk: 'read', namespaceArg: 'none' } } },
+      kernel: { default: 'kernel-only', tools: { delegate: { exposure: 'agent', risk: 'write' } } },
+    },
+  })
   const w = await wire(t, {
-    views: views({
-      recall: { exposure: 'agent', risk: 'read' },
-      'weird.name': { exposure: 'agent', risk: 'write' },
-    }),
-    toolAllow: ['pmmcp.recall', 'pmmcp.weird.name'],
+    views: kernelViews,
+    toolAllow: ['pmmcp.recall', 'kernel.delegate'],
     script: [done()],
   })
+  const runner = new KernelTools({
+    store: w.store,
+    views: kernelViews,
+    handlers: [
+      {
+        name: 'delegate',
+        description: 'would delegate',
+        inputSchema: { type: 'object', properties: {} },
+        run: () => Promise.resolve({ ok: true, text: 'must never run for a worker' }),
+      },
+    ],
+  })
+  const loop = new RunLoop({
+    store: w.store,
+    lanes: new Lanes({ main: 4, subagent: 8 }),
+    router: w.router,
+    engine: new PolicyEngine({ store: w.store, approvals: w.approvals }),
+    quarantine: w.quarantine,
+    views: kernelViews,
+    agentView: w.agentView,
+    budgetFor: () => w.budget,
+    kernelTools: runner,
+  })
 
-  await w.loop.start({ runId: 'run_1', agent: w.agent, prompt: 'go' })
+  await loop.start({ runId: 'run_1', agent: { ...w.agent, role: 'worker' }, prompt: 'go' })
 
   const body = w.provider.requests[0]?.body as { tools?: { function: { name: string } }[] }
   const offered = (body.tools ?? []).map((x) => x.function.name)
-  assert.deepEqual(offered.sort(), ['pmmcp__recall', 'pmmcp__weird__name'])
+  assert.deepEqual(offered, ['pmmcp__recall'])
   for (const name of offered) {
-    assert.equal(/deleg|spawn|subagent|child|task/i.test(name), false, name)
+    assert.equal(/deleg|spawn|subagent|child|kernel/i.test(name), false, name)
   }
-
-  // A tool that looked like delegation and quietly did something simpler
-  // would be worse than none. Both remaining stubs throw rather than returning a
-  // plausible answer. (The scheduler is no longer one of them — it runs, and it
-  // starts runs through this same loop.)
-  assert.throws(() => assertDelegationAvailable(), NotImplementedError)
+  // The one remaining stub still throws rather than answering plausibly.
   assert.throws(() => assertEgressEnforced(), NotImplementedError)
 })
 

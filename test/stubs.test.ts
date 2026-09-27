@@ -33,7 +33,6 @@ import { STUBS } from '../src/kernel.js'
 import { NotImplementedError } from '../src/errors.js'
 import { AppleContainerDriver } from '../src/sandbox/apple-container.js'
 import { assertEgressEnforced } from '../src/runtime/egress.js'
-import { assertDelegationAvailable } from '../src/runtime/delegate.js'
 import { LANE_NAMES } from '../src/runtime/lanes.js'
 import { parseManifest } from '../src/agents/manifest.js'
 
@@ -54,14 +53,13 @@ memory:
   projectId: aos/shared
 `
 
-test('every STUBS entry throws NotImplementedError or reports unavailable with a reason (table-driven: AppleContainerDriver, Scheduler.start, assertEgressEnforced, assertDelegationAvailable, Approvals.rebuildFromLog, Quarantine.rebuildFromLog)', async () => {
+test('every STUBS entry throws NotImplementedError or reports unavailable with a reason (table-driven: AppleContainerDriver, assertEgressEnforced)', async () => {
   // Each row is a stub id and every way to reach it. A call that RETURNS is the
   // failure: a stub that answers is a feature that does not work.
   const table: { id: string; call: () => unknown }[] = [
     { id: 'apple-container-driver', call: () => new AppleContainerDriver().run({} as never) },
     { id: 'apple-container-driver', call: () => new AppleContainerDriver().kill('x') },
     { id: 'egress-proxy', call: () => assertEgressEnforced() },
-    { id: 'delegate-tool', call: () => assertDelegationAvailable() },
   ]
 
   for (const row of table) {
@@ -192,7 +190,6 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   const NAMES: Record<string, RegExp> = {
     'apple-container-driver': /Apple container driver/,
     'egress-proxy': /egress proxy/i,
-    'delegate-tool': /delegation\/spawn tool|delegation tool/i,
   }
   for (const stub of STUBS) {
     const pattern = NAMES[stub.id]
@@ -203,9 +200,11 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
 
   // The refusal mechanism is named for each, not just the feature — a reader
   // needs to know it will get an error rather than a silent no-op.
+  // Delegation left this list when it was built; ephemeral spawning stays named
+  // because it is still registry-only, and a reader must not infer from
+  // "delegation exists" that an agent can mint a new one.
   for (const fragment of [
     'assertEgressEnforced',
-    'assertDelegationAvailable',
     'spawnEphemeral',
   ]) {
     assert.ok(section.includes(fragment), `CLAUDE.md does not say how ${fragment} refuses`)

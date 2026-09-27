@@ -42,6 +42,8 @@ import { canonicalize } from './events/canonical.js'
 import { readAllRows } from './events/chain.js'
 import { isClean, projectRecovery, type Recovery } from './events/projections.js'
 import { GoalTracker } from './goals/tracker.js'
+import { Delegation } from './runtime/delegate.js'
+import { KernelTools } from './runtime/kernel-tools.js'
 import { GoalWriter } from './goals/writer.js'
 import { goalToolsUnusable } from './goals/tools.js'
 import { SecretMask } from './events/redact.js'
@@ -68,11 +70,10 @@ import { Approvals } from './policy/approvals.js'
 import { Quarantine } from './policy/quarantine.js'
 import { PolicyEngine } from './policy/engine.js'
 import { Lanes } from './runtime/lanes.js'
-import { Budget, resolveCaps } from './runtime/budget.js'
-import { RunLoop, type RunAgent } from './runtime/loop.js'
+import { Budget, resolveCaps, type BudgetCaps } from './runtime/budget.js'
+import { RunLoop, type RunAgent, type RunOutcome } from './runtime/loop.js'
 import { assertEgressEnforced } from './runtime/egress.js'
 import { Scheduler } from './runtime/scheduler.js'
-import { assertDelegationAvailable } from './runtime/delegate.js'
 import { AppleContainerDriver } from './sandbox/apple-container.js'
 import { realDockerDriver } from './sandbox/docker.js'
 import type { ProbeResult as SandboxProbe, SandboxDriver } from './sandbox/driver.js'
@@ -114,11 +115,6 @@ export const STUBS: readonly { id: string; where: string; how: string }[] = [
     id: 'egress-proxy',
     where: 'src/runtime/egress.ts',
     how: 'assertEgressEnforced() throws NotImplementedError, so no run can reach the network',
-  },
-  {
-    id: 'delegate-tool',
-    where: 'src/runtime/delegate.ts',
-    how: 'assertDelegationAvailable() throws NotImplementedError; no delegation tool is offered to any model',
   },
 ]
 
@@ -574,6 +570,28 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       },
     })
     const engine = new PolicyEngine({ store, approvals })
+    // ── delegation: kernel-native tools, offered to an orchestrator only ──
+    //
+    // `launch` and `kill` close over `surface`, which is built last — the same
+    // late binding the scheduler uses. Children start through the control plane's
+    // own run path, so a delegated run is an ordinary run: same registry checks,
+    // same lane, same gate, same log.
+    const delegation = new Delegation({
+      store,
+      agents,
+      writer: goalWriter,
+      launch: (input) =>
+        surface.launch({ agentId: input.agentId, input: input.input, goalId: input.goalId, ceiling: input.ceiling }),
+      kill: (runId, reason) => {
+        try {
+          surface.killRun(runId, reason)
+        } catch {
+          // Already finished and gone: nothing left to stop.
+        }
+      },
+    })
+    const kernelTools = new KernelTools({ store, views: toolViews, handlers: delegation.handlers() })
+
     const loop = new RunLoop({
       store,
       lanes,
@@ -582,11 +600,21 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       quarantine,
       views: toolViews,
       agentView: () => hub.agentView(),
-      budgetFor: (agent) =>
-        new Budget(
-          resolveCaps(config.budgets, agents.get(agent.agentId)?.manifest.budget ?? {}),
+      budgetFor: (agent, ceiling) => {
+        const caps = resolveCaps(config.budgets, agents.get(agent.agentId)?.manifest.budget ?? {})
+        // A ceiling only ever LOWERS: the budget is the intersection of the
+        // kernel's caps, the manifest's, and the slice a parent handed down.
+        return new Budget(
+          {
+            usdMax: Math.min(caps.usdMax, ceiling?.usdMax ?? caps.usdMax),
+            maxLlmCalls: Math.min(caps.maxLlmCalls, ceiling?.maxLlmCalls ?? caps.maxLlmCalls),
+            maxToolCalls: Math.min(caps.maxToolCalls, ceiling?.maxToolCalls ?? caps.maxToolCalls),
+            wallclockMs: Math.min(caps.wallclockMs, ceiling?.wallclockMs ?? caps.wallclockMs),
+          },
           { now },
-        ),
+        )
+      },
+      kernelTools,
     })
 
     // ── scheduler ─────────────────────────────────────────────────────────
@@ -615,6 +643,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     // source of truth means status can never disagree with history.
     const unsubscribe = store.subscribe((row) => {
       if (row.runId === null) return
+      if (row.type === 'run.finished') delegation.forget(row.runId)
       const live = runs.get(row.runId)
       if (live === undefined) return
       live.state = project(live.state, row.type, row.payload, row.seq, row.ts)
@@ -920,7 +949,25 @@ interface SurfaceDeps {
   readonly fetch?: typeof globalThis.fetch
 }
 
-function buildSurface(d: SurfaceDeps): ControlSurface {
+/**
+ * The control surface, plus one method the protocol never sees.
+ *
+ * `launch` is `startRun` that also hands back the run's outcome. Delegation needs
+ * it — a parent waits on its child's result, cost and taint — and the protocol does
+ * not: `run.start` stays exactly as v1 froze it. Both share one body, so a child
+ * run is started by precisely the code that starts an operator's run.
+ */
+type KernelSurface = ControlSurface & {
+  readonly launch: (input: {
+    agentId: string
+    input: string
+    goalId?: string | undefined
+    taint?: 'clean' | 'tainted' | undefined
+    ceiling?: Partial<BudgetCaps> | undefined
+  }) => { runId: string; outcome: Promise<RunOutcome> }
+}
+
+function buildSurface(d: SurfaceDeps): KernelSurface {
   const souls: SoulBudgetTracker = { used: 0 }
 
   const runAgent = (record: AgentRecord): RunAgent => {
@@ -934,7 +981,65 @@ function buildSurface(d: SurfaceDeps): ControlSurface {
       toolAllow: m.tools.allow,
       system: soul.text,
       projectId: m.memory.projectId,
+      role: m.role,
     }
+  }
+
+  const launch: KernelSurface['launch'] = (input) => {
+    const record = d.agents.get(input.agentId)
+    if (record === undefined || record.status !== 'active') {
+      throw new ConfigError(`no active agent ${input.agentId}`)
+    }
+    if (record.manifest.kind === 'template') {
+      throw new ConfigError(`${input.agentId} is a template: spawn from it, do not run it`)
+    }
+    const runId = `run_${String(d.now())}_${Math.random().toString(36).slice(2, 8)}`
+    const controller = new AbortController()
+    d.runs.set(runId, {
+      controller,
+      state: {
+        runId,
+        agentId: input.agentId,
+        status: 'queued',
+        taint: input.taint ?? 'clean',
+        llmCalls: 0,
+        toolCalls: 0,
+        costMicroUsd: 0,
+        lastEventSeq: d.store.tailSeq(),
+      },
+    })
+
+    // Not awaited here: run.start returns a runId and the run's progress is the
+    // event stream. The outcome is handed back for the one in-process caller that
+    // waits on it (delegation). The catch is not optional — an unhandled
+    // rejection would take the daemon down with it — and a failure becomes an
+    // error outcome rather than a rejection, so a waiting parent is never left
+    // holding a promise that throws.
+    const outcome = d.loop
+      .start({
+        runId,
+        agent: runAgent(record),
+        prompt: input.input,
+        signal: controller.signal,
+        ...(input.taint === undefined ? {} : { taint: input.taint }),
+        ...(input.goalId === undefined ? {} : { goalId: input.goalId }),
+        ...(input.ceiling === undefined ? {} : { ceiling: input.ceiling }),
+      })
+      .catch((e: unknown): RunOutcome => {
+        const reason = e instanceof Error ? e.message : String(e)
+        log.error({ runId, err: reason }, 'run failed')
+        return {
+          runId,
+          status: 'error',
+          reason,
+          costMicroUsd: 0,
+          llmCalls: 0,
+          toolCalls: 0,
+          finalText: '',
+          taint: 'clean',
+        }
+      })
+    return { runId, outcome }
   }
 
   return {
@@ -990,47 +1095,8 @@ function buildSurface(d: SurfaceDeps): ControlSurface {
       d.agents.archive(agentId, actor)
     },
 
-    startRun: (input) => {
-      const record = d.agents.get(input.agentId)
-      if (record === undefined || record.status !== 'active') {
-        throw new ConfigError(`no active agent ${input.agentId}`)
-      }
-      if (record.manifest.kind === 'template') {
-        throw new ConfigError(`${input.agentId} is a template: spawn from it, do not run it`)
-      }
-      const runId = `run_${String(d.now())}_${Math.random().toString(36).slice(2, 8)}`
-      const controller = new AbortController()
-      d.runs.set(runId, {
-        controller,
-        state: {
-          runId,
-          agentId: input.agentId,
-          status: 'queued',
-          taint: input.taint ?? 'clean',
-          llmCalls: 0,
-          toolCalls: 0,
-          costMicroUsd: 0,
-          lastEventSeq: d.store.tailSeq(),
-        },
-      })
-
-      // Deliberately not awaited: run.start returns a runId and the run's
-      // progress is the event stream. The catch is not optional — an unhandled
-      // rejection here would take the daemon down with it.
-      void d.loop
-        .start({
-          runId,
-          agent: runAgent(record),
-          prompt: input.input,
-          signal: controller.signal,
-          ...(input.taint === undefined ? {} : { taint: input.taint }),
-          ...(input.goalId === undefined ? {} : { goalId: input.goalId }),
-        })
-        .catch((e: unknown) => {
-          log.error({ runId, err: e instanceof Error ? e.message : String(e) }, 'run failed')
-        })
-      return runId
-    },
+    startRun: (input) => launch(input).runId,
+    launch: (input) => launch(input),
 
     killRun: (runId, reason) => {
       const live = d.runs.get(runId)

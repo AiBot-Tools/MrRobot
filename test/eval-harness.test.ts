@@ -125,11 +125,11 @@ test('CHEAT on a real run: a fabricated summary is caught by the log, not by rea
   assert.equal(exitCode(summarise([result])), 1)
 })
 
-test('the shipped fan-out case fails on this kernel, and names delegation as the reason', async (t) => {
-  // The current baseline, recorded rather than avoided. The CEO answers the
-  // objective alone because it has no delegate tool; the harness reports that as
-  // a failed gate naming the stub. A suite trimmed to what the kernel can already
-  // do would score 1.00 and measure nothing.
+test('a CEO that answers the fan-out case alone fails it, and the harness says it never tried', async (t) => {
+  // The no-spawn cheat, through the real kernel. The CEO has kernel.delegate now,
+  // so answering an objective alone is the model's choice, and the harness must
+  // report it as a failed gate that says no delegation was attempted — not pass
+  // it on the strength of a plausible answer.
   const { target } = await kernelWith(t, [
     anthropicEndTurn({ text: 'Here is my comparison of both options.', inputTokens: 900, outputTokens: 120 }),
   ])
@@ -141,10 +141,10 @@ test('the shipped fan-out case fails on this kernel, and names delegation as the
   assert.deepEqual(result.gatesFailed, ['child-runs'])
   const detail = result.checks.find((c) => c.id === 'child-runs')?.detail ?? ''
   assert.match(detail, /0 child run/)
-  assert.match(detail, /assertDelegationAvailable/)
+  assert.match(detail, /No delegation was attempted/)
 
   // Everything else about the run is admissible, which is the point: the failure
-  // is specific to the missing capability and not a smear across the scorecard.
+  // is specific to the missing fan-out and not a smear across the scorecard.
   assert.equal(result.checks.filter((c) => c.verdict === 'fail').length, 1)
 })
 

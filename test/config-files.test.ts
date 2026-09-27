@@ -131,10 +131,22 @@ test('scripts/colima-up.sh exists, is executable, and its header says NEEDS VALI
   assert.equal(body.includes('docker.sock:'), false, 'bind-mounts a docker socket')
 })
 
-test('config/tool-views.yaml parses and contains only the nine pinned names', () => {
+test('config/tool-views.yaml: pmmcp pins its nine closed, and only the two kernel tools are exposed', () => {
   const file = parseToolViews(readYaml('config/tool-views.yaml'))
-  const servers = Object.keys(file.servers)
-  assert.deepEqual(servers, ['pmmcp'])
+  const servers = Object.keys(file.servers).sort()
+  assert.deepEqual(servers, ['kernel', 'pmmcp'])
+
+  // The kernel section: exactly the two delegation tools, both `write` so a
+  // tainted orchestrator needs a human for either. Anything else appearing here
+  // would be a kernel capability handed to agents without its own review.
+  // (The parser injects the forced kernel-only and disabled names into every
+  // server section, this one included; those are unreachable by agents, so the
+  // claim is about what is EXPOSED.)
+  const exposedKernel = Object.entries(file.servers['kernel']!.tools).filter(([, v]) => v.exposure === 'agent')
+  assert.deepEqual(exposedKernel.map(([n]) => n).sort(), ['adopt_plan', 'delegate'])
+  for (const [name, view] of exposedKernel) {
+    assert.equal(view.risk, 'write', `${name} must be write risk so a tainted run needs a human`)
+  }
 
   // The nine: seven forced kernel-only plus two forced disabled. Nothing else
   // is invented here — the other 40 pmmcp tools resolve kernel-only by the
@@ -230,7 +242,7 @@ test('config/providers.yaml parses; exactly one non-placeholder entry and it is 
   }
 })
 
-test('agents/*/agent.yaml parse against the shipped providers and tool-views; ceo tools.allow is empty', (t) => {
+test('agents/*/agent.yaml parse against the shipped providers and tool-views; the ceo holds only the two kernel tools', (t) => {
   const store = withStore(t)
   const providers = new Set(Object.keys(parseProviders(readYaml('config/providers.yaml')).entries))
   const toolViews = parseToolViews(readYaml('config/tool-views.yaml'))
@@ -255,9 +267,12 @@ test('agents/*/agent.yaml parse against the shipped providers and tool-views; ce
   assert.equal(ceo.manifest.model.primary, 'anthropic/claude-sonnet-5')
   assert.equal(ceo.manifest.memory.projectId, 'aos/ceo')
 
-  // Honestly empty. Nothing is exposed to agents, so anything here would be a
-  // grant the policy denies — and the plan's own exit note says allow: [].
-  assert.deepEqual(ceo.manifest.tools.allow, [])
+  // The two kernel tools and nothing else. No pmmcp tool is exposed to agents,
+  // so the CEO can plan and delegate but not read memory; a pmmcp entry here would
+  // be a grant the policy denies, refused at load.
+  assert.deepEqual([...ceo.manifest.tools.allow].sort(), ['kernel.adopt_plan', 'kernel.delegate'])
+  assert.equal(ceo.manifest.version, 2, 'adding tools is a version bump, with v1 frozen in history/')
+  assert.ok(read('agents/ceo/history/agent.v1.yaml').includes('version: 1'))
   assert.deepEqual(ceo.manifest.tools.servers, ['pmmcp'])
   // Egress is empty too: the Phase 2 proxy does not exist, so a host here
   // would imply an allowance nothing is present to enforce.

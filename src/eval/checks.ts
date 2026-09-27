@@ -19,7 +19,12 @@
 // today because the kernel emits no delegation events and `run.started` carries
 // no goalId; that is a statement about the kernel, and the report makes it.
 
-import { AgentSpawnedPayload, RunQueuedPayload, RunStartedPayload } from '../events/types.js'
+import {
+  AgentSpawnedPayload,
+  DelegationResultPayload,
+  RunQueuedPayload,
+  RunStartedPayload,
+} from '../events/types.js'
 import {
   finishedOf,
   gates,
@@ -169,24 +174,35 @@ export const llmEventsPaired: Check = {
 export const costReconciles: Check = {
   id: 'cost-reconciles-with-log',
   kind: 'gate',
-  title: 'the run’s cost is the sum of its logged model calls',
+  title: 'the run’s cost is its logged model calls plus its delegated children',
   why:
-    'The reported cost is what a budget is enforced against. If it is not the ' +
-    'sum of the logged calls, one of the two is wrong and neither can be trusted.',
+    'The reported cost is what a budget is enforced against. A delegating run is ' +
+    'charged for its children, so its cost is its own calls plus each child’s ' +
+    '`delegation.result`; if the report is not that sum, one of them is wrong and ' +
+    'neither can be trusted.',
   run(o) {
     const finished = finishedOf(o.rows)
     if (finished === undefined) return fail('no run.finished')
     const responses = llmResponses(o.rows)
-    if (responses.length === 0) {
+    const children = o.rows
+      .filter((r) => r.type === 'delegation.result')
+      .map((r) => DelegationResultPayload.parse(JSON.parse(r.payload)).costMicroUsd)
+    if (responses.length === 0 && children.length === 0) {
       return finished.costMicroUsd === 0
         ? na('the run made no model call and cost nothing')
         : fail(`cost ${String(finished.costMicroUsd)} with no llm.response in the log`)
     }
-    const summed = responses.reduce((total, r) => total + r.costMicroUsd, 0)
+    const own = responses.reduce((total, r) => total + r.costMicroUsd, 0)
+    const delegated = children.reduce((total, c) => total + c, 0)
+    const summed = own + delegated
     return summed === finished.costMicroUsd
-      ? pass(`${String(summed)} µUSD across ${String(responses.length)} calls`)
+      ? pass(
+          `${String(summed)} µUSD: ${String(own)} across ${String(responses.length)} own call(s)` +
+            (children.length === 0 ? '' : ` + ${String(delegated)} across ${String(children.length)} child run(s)`),
+        )
       : fail(
-          `run.finished says ${String(finished.costMicroUsd)} µUSD; the log sums to ${String(summed)}`,
+          `run.finished says ${String(finished.costMicroUsd)} µUSD; the log sums to ${String(summed)} ` +
+            `(${String(own)} own + ${String(delegated)} delegated)`,
         )
   },
 }
@@ -309,13 +325,18 @@ export const childRuns: Check = {
     const wanted = o.expect.minChildRuns
     if (wanted === undefined) return na('the case declared no child-run floor')
     const children = childRunIds(o)
-    return children.length >= wanted
-      ? pass(`${String(children.length)} child run(s): ${children.join(', ')}`)
-      : fail(
-          `${String(children.length)} child run(s); the case requires ${String(wanted)}. ` +
-            'Delegation is a stub in this phase (assertDelegationAvailable throws), so this ' +
-            'is expected to fail until the delegate tool lands.',
-        )
+    if (children.length >= wanted) {
+      return pass(`${String(children.length)} child run(s): ${children.join(', ')}`)
+    }
+    // Say which of the two it was: the kernel refusing what the model asked for,
+    // or the model never asking. They need different fixes.
+    const refused = o.rows.filter((r) => r.type === 'delegation.refused').length
+    return fail(
+      `${String(children.length)} child run(s); the case requires ${String(wanted)}. ` +
+        (refused > 0
+          ? `The kernel refused ${String(refused)} delegation attempt(s); delegation.refused says why.`
+          : 'No delegation was attempted: the orchestrator answered without calling kernel.delegate.'),
+    )
   },
 }
 

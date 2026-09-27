@@ -161,11 +161,36 @@ the CLI, and kernel boot.
 |---|---|---|
 | `apple-container-driver` | `src/sandbox/apple-container.ts` | `probe()` reports unavailable with a reason so boot degrades; `run()` and `kill()` throw `NotImplementedError`. macOS 15 has no `container` binary |
 | `egress-proxy` | `src/runtime/egress.ts` | `assertEgressEnforced()` throws `NotImplementedError`, so no run can reach the network |
-| `delegate-tool` | `src/runtime/delegate.ts` | `assertDelegationAvailable()` throws `NotImplementedError`; no delegation tool is offered to any model |
 
-One of these deserves spelling out: **no delegation tool is offered to any
-model**. The CEO can plan, but it cannot actually spawn or delegate, so the fleet
-it describes does not exist yet.
+Not a stub, but not a tool either: **ephemeral spawning** (`spawnEphemeral` in the
+registry) exists only as a registry capability. No tool mints a new agent;
+delegation, below, runs tasks on the standing workers.
+
+### Delegation
+
+The CEO holds two kernel-native tools, both gated as `write` (so a tainted CEO
+needs a human to use them) and both refused by the registry in any manifest that
+is not `role: orchestrator`:
+
+- **`kernel.adopt_plan({ plan })`** validates a `ProposedPlan` and writes it as the
+  goal tree NOW, returning each task id with its goal id.
+- **`kernel.delegate({ taskId, brief })`** runs one task of that plan on the worker
+  the plan named, waits for it, and returns its run id, status, cost and result.
+
+The model never supplies a goal id or chooses a target outside its adopted plan.
+The kernel refuses, each time with a `delegation.refused` naming the reason: no
+plan adopted, an unknown task, a task already delegated (double dispatch is
+impossible rather than scored), a task whose `dependsOn` has not finished `ok`,
+more children than the manifest's `spawn.maxChildren`, a target that is not an
+active standard worker or has a higher tier than the caller, a caller that is
+itself a delegated child (depth 1), and a parent with no budget left.
+
+A child runs under a **ceiling carved from what the parent has left** and its
+spend is **charged to the parent** when it finishes — so a parent's reported cost
+is its own model calls plus its children's, and `delegation.admitted` /
+`delegation.result` tie each child's spend and taint to the parent that caused it.
+A child that finished tainted taints the parent. Killing the parent kills its
+children.
 
 ### Schedules
 

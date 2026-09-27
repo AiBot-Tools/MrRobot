@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { EVENT_TYPES, PAYLOAD_SCHEMAS, type EventType } from '../src/events/types.js'
 import { withStore } from './helpers/store.js'
 
-const FROZEN_42: readonly string[] = [
+const FROZEN_45: readonly string[] = [
   'kernel.booted',
   'kernel.shutdown',
   'subsystem.state',
@@ -56,6 +56,9 @@ const FROZEN_42: readonly string[] = [
   'plan.adopted',
   'goal.created',
   'goal.status',
+  'delegation.admitted',
+  'delegation.result',
+  'delegation.refused',
 ]
 
 /**
@@ -164,6 +167,25 @@ const SAMPLES: Record<EventType, Record<string, unknown>> = {
     title: 'write up sqlite',
     planTaskId: 't1',
   },
+  'delegation.admitted': {
+    schemaVersion: 1,
+    parentRunId: 'run_1',
+    childRunId: 'run_2',
+    agentId: 'researcher',
+    taskId: 't1',
+    goalId: 'goal-3',
+    ceilingMicroUsd: 500_000,
+    ceilingWallclockMs: 300_000,
+  },
+  'delegation.result': {
+    schemaVersion: 1,
+    parentRunId: 'run_1',
+    childRunId: 'run_2',
+    status: 'ok',
+    costMicroUsd: 4_200,
+    taint: 'clean',
+  },
+  'delegation.refused': { schemaVersion: 1, parentRunId: 'run_1', taskId: 't2', reason: 't2 depends on t1' },
   'goal.status': {
     schemaVersion: 1,
     projectId: 'aos/ceo',
@@ -175,7 +197,7 @@ const SAMPLES: Record<EventType, Record<string, unknown>> = {
   },
 }
 
-test('EVENT_TYPES equals the 42 frozen names by literal array equality', () => {
+test('EVENT_TYPES equals the 45 frozen names by literal array equality', () => {
   // The list is frozen by literal equality precisely so that growing it is a
   // deliberate act with a reason. The reasons, in order of arrival:
   //
@@ -188,11 +210,14 @@ test('EVENT_TYPES equals the 42 frozen names by literal array equality', () => {
   //     frozen protocol v1, so this cannot be a subsystem key without a bump;
   //   `plan.adopted`, `goal.created`, `goal.status` — the kernel writing a goal
   //     tree and moving it is a side effect on the operator's long-term memory,
-  //     and every one of those writes has to be in the record.
-  assert.equal(EVENT_TYPES.length, 42)
-  assert.deepEqual([...EVENT_TYPES], FROZEN_42)
+  //     and every one of those writes has to be in the record;
+  //   `delegation.admitted`, `.result`, `.refused` — a child run's spend and taint
+  //     must be traceable to the parent that caused it, and a refusal to the reason
+  //     the model was given.
+  assert.equal(EVENT_TYPES.length, 45)
+  assert.deepEqual([...EVENT_TYPES], FROZEN_45)
   // No duplicates, and every name is dotted and lowercase.
-  assert.equal(new Set(EVENT_TYPES).size, 42)
+  assert.equal(new Set(EVENT_TYPES).size, 45)
   for (const t of EVENT_TYPES) assert.match(t, /^[a-z]+(\.[a-z]+)+$/)
 })
 
@@ -234,7 +259,7 @@ test('store.append rejects a type outside EVENT_TYPES', (t) => {
     const row = store.append({ type, payload: SAMPLES[type] })
     assert.equal(row.type, type)
   }
-  assert.equal(store.query().length, 42)
+  assert.equal(store.query().length, 45)
   assert.equal(store.verifyChain().ok, true)
 })
 

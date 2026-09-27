@@ -18,10 +18,12 @@
 // and from that point a write needs a human. Freezing taint at run start
 // would make both of those silently ineffective.
 //
-// The model is never offered a delegation or spawn tool. There is no branch
-// here that creates a run; `assertDelegationAvailable` throws, and the tool
-// array the router sees comes from the hub's agent view filtered by the
-// manifest, so there is nothing to offer even by accident.
+// Delegation is offered to orchestrators only. The kernel-native tools
+// (`kernel.adopt_plan`, `kernel.delegate`) join the tool array when the agent's
+// role is `orchestrator` AND its manifest allows them; a worker is never offered
+// one, and a worker that names one anyway is refused by the gate and the kernel
+// runner. There is no branch here that creates a run: the delegate tool asks
+// the kernel to launch one, under a ceiling carved from this run's budget.
 
 import { canonicalize, sha256Hex } from '../events/canonical.js'
 import { boundOutput, type BoundedOutput } from '../events/bound.js'
@@ -34,7 +36,8 @@ import { resolveView, type ToolViewsFile } from '../mcp/tool-views.js'
 import type { AgentView } from '../mcp/hub.js'
 import type { ModelBinding, Router } from '../models/router.js'
 import type { ToolCall, ToolSchema, TurnMessage } from '../models/transport.js'
-import { Budget, type StopReason } from './budget.js'
+import { Budget, type BudgetCaps, type StopReason } from './budget.js'
+import type { KernelTools } from './kernel-tools.js'
 import type { Lanes, LaneName } from './lanes.js'
 import { withRunScope } from './scope.js'
 
@@ -74,6 +77,8 @@ export interface RunAgent {
   readonly system: string
   /** The manifest's memory namespace, which the gate pins namespaced tools to. */
   readonly projectId?: string
+  /** From the manifest. Only an orchestrator is ever offered kernel tools. */
+  readonly role?: 'orchestrator' | 'worker'
 }
 
 export interface RunRequest {
@@ -84,6 +89,12 @@ export interface RunRequest {
   readonly taint?: 'clean' | 'tainted'
   readonly signal?: AbortSignal | undefined
   readonly goalId?: string
+  /**
+   * A ceiling below the agent's own caps — how a delegated child runs on a slice
+   * of what its parent had left rather than on a fresh allowance of its own. It
+   * can only lower: the budget is the intersection, never the ceiling alone.
+   */
+  readonly ceiling?: Partial<BudgetCaps>
 }
 
 export interface LoopOptions {
@@ -94,7 +105,9 @@ export interface LoopOptions {
   readonly quarantine: Quarantine
   readonly views: ToolViewsFile
   readonly agentView: () => AgentView
-  readonly budgetFor: (agent: RunAgent) => Budget
+  readonly budgetFor: (agent: RunAgent, ceiling?: Partial<BudgetCaps>) => Budget
+  /** Kernel-native tools (delegation). Absent: none are offered. */
+  readonly kernelTools?: KernelTools
   /** Hard ceiling on turns, independent of the budget's call caps. */
   readonly maxTurns?: number
 }
@@ -116,7 +129,7 @@ export class RunLoop {
 
   async start(request: RunRequest): Promise<RunOutcome> {
     const { runId, agent } = request
-    const budget = this.#o.budgetFor(agent)
+    const budget = this.#o.budgetFor(agent, request.ceiling)
 
     this.#o.store.append({
       type: 'run.queued',
@@ -312,12 +325,19 @@ export class RunLoop {
   /**
    * The tool array the model sees.
    *
-   * The hub's agent view intersected with the manifest — default deny, and no
-   * delegation or spawn tool exists to be offered even by accident.
+   * The hub's agent view plus the kernel's own tools, intersected with the
+   * manifest — default deny. Kernel tools are offered to an orchestrator only:
+   * the registry already refuses them in any other manifest, and this refuses
+   * them again at the point of offer, so a worker cannot be shown a delegation
+   * tool even if a manifest somehow listed one.
    */
   #toolsFor(agent: RunAgent): ToolSchema[] {
     const allowed = new Set(agent.toolAllow)
-    return this.#o.agentView().tools.filter((t) => allowed.has(t.ref))
+    const kernel =
+      agent.role === 'orchestrator' && this.#o.kernelTools !== undefined
+        ? this.#o.kernelTools.schemas()
+        : []
+    return [...this.#o.agentView().tools, ...kernel].filter((t) => allowed.has(t.ref))
   }
 
   async #handleToolCall(
@@ -407,8 +427,24 @@ export class RunLoop {
       return { text: '[denied] arguments changed after the decision', isError: true, taints: false }
     }
 
-    const view2 = this.#o.agentView()
-    const executed = await view2.call(ticket, context.args)
+    // Kernel tools execute through the kernel's own runner, which logs and
+    // re-checks exactly as the hub does; everything else through the hub. Either
+    // way the gate above has already ruled and the ticket is bound to these args.
+    const kernelTools = this.#o.kernelTools
+    const isKernel = kernelTools?.isKernelRef(call.ref) === true
+    if (isKernel && agent.role !== 'orchestrator') {
+      return { text: '[denied] kernel tools are for the orchestrator only', isError: true, taints: false }
+    }
+    const executed =
+      isKernel && kernelTools !== undefined
+        ? await kernelTools.call(ticket, context.args, {
+            runId,
+            agent,
+            budget,
+            signal: request.signal,
+          })
+        : await this.#o.agentView().call(ticket, context.args)
+    const resultTaints = view.taints || ('taints' in executed && executed.taints === true)
     const charged = budget.charge('tool')
 
     const bounded: BoundedOutput = {
@@ -425,7 +461,7 @@ export class RunLoop {
       return {
         text: quarantinePlaceholder(hold.holdId, call.ref),
         isError: false,
-        taints: view.taints,
+        taints: resultTaints,
         ...(charged.ok ? {} : { stop: charged.stop }),
       }
     }
@@ -434,7 +470,7 @@ export class RunLoop {
     return {
       text: bounded.text,
       isError: !executed.ok,
-      taints: view.taints,
+      taints: resultTaints,
       ...(charged.ok ? {} : { stop: charged.stop }),
     }
   }

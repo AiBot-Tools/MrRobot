@@ -233,8 +233,22 @@ test('CHEAT: no-spawn — an objective that required children and produced none 
   const outcome = childRuns.run(observationOf(alone, { minChildRuns: 2 }))
   assert.equal(outcome.verdict, 'fail')
   assert.match(outcome.detail, /0 child run/)
-  // The failure names the missing capability rather than blaming the model.
-  assert.match(outcome.detail, /assertDelegationAvailable/)
+  // The failure says which kind it was. Here the model never asked.
+  assert.match(outcome.detail, /No delegation was attempted/)
+
+  // When the kernel refused what the model asked for, the detail points at the
+  // refusals instead, because the fix is in the plan, not the prompt.
+  resetSeq()
+  const refused = withChildren(parentRun({ llm: [{ cost: 1_000, content: 'tried' }] }), [
+    [
+      row('delegation.refused', { parentRunId: 'run_parent', taskId: 't2', reason: 't2 depends on t1' }),
+      row('delegation.refused', { parentRunId: 'run_parent', taskId: 't9', reason: 'not in the plan' }),
+    ],
+  ])
+  const refusedOutcome = childRuns.run(observationOf(refused, { minChildRuns: 2 }))
+  assert.equal(refusedOutcome.verdict, 'fail')
+  assert.match(refusedOutcome.detail, /refused 2 delegation attempt\(s\)/)
+  assert.doesNotMatch(refusedOutcome.detail, /No delegation was attempted/)
 
   resetSeq()
   const delegated = withChildren(parentRun(), [

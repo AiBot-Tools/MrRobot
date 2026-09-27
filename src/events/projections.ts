@@ -26,6 +26,14 @@
 // every approval reaches a decision, every hold reaches an end. That is what
 // "a restart orphans nothing" means.
 //
+// Delegation adds one more kind. A parent that delegated waits inside its
+// `kernel.delegate` call for the child's outcome, and only then writes
+// `delegation.result` and charges the child's spend to itself. A crash in that
+// window leaves an admission with no result: the parent's accounting has a hole
+// and the child's spend is charged to nobody. Recovery closes it the same way —
+// a result row, from what the log says the child did — and an orphaned parent's
+// bill counts every child it paid for, exactly as its live `run.finished` would.
+//
 // Idempotence is structural rather than bolted on: a run is open because it has
 // no `run.finished` row, so once recovery writes one it is no longer open. The
 // second restart finds nothing to do because the first one recorded what it
@@ -68,10 +76,35 @@ export interface UnreleasedHold {
   readonly seq: number
 }
 
+/**
+ * A delegation admitted and never given a result, with the result the log
+ * supports.
+ */
+export interface DanglingDelegation {
+  readonly parentRunId: string
+  readonly childRunId: string
+  /**
+   * The child's own terminal status when it reached one before the crash, and
+   * `error` when it did not — which is what recovery records for the child too.
+   */
+  readonly status: 'ok' | 'error' | 'killed' | 'denied'
+  /** The child's spend, from its terminal row or counted from its rows. */
+  readonly costMicroUsd: number
+  /**
+   * Fail closed. `clean` only when the log PROVES it: the child started clean,
+   * executed no tool, and had no hold released. A `taints: true` tool on the
+   * child's last turn leaves no row saying so before a crash, so anything short
+   * of that proof is `tainted`.
+   */
+  readonly taint: 'clean' | 'tainted'
+  readonly seq: number
+}
+
 export interface Recovery {
   readonly orphanRuns: readonly OrphanRun[]
   readonly unresolvedApprovals: readonly UnresolvedApproval[]
   readonly unreleasedHolds: readonly UnreleasedHold[]
+  readonly danglingDelegations: readonly DanglingDelegation[]
 }
 
 /** True when a recovery has nothing to do. */
@@ -79,7 +112,8 @@ export function isClean(recovery: Recovery): boolean {
   return (
     recovery.orphanRuns.length === 0 &&
     recovery.unresolvedApprovals.length === 0 &&
-    recovery.unreleasedHolds.length === 0
+    recovery.unreleasedHolds.length === 0 &&
+    recovery.danglingDelegations.length === 0
   )
 }
 
@@ -128,6 +162,14 @@ export function projectRecovery(rows: readonly EventRow[]): Recovery {
   const open = new Map<string, OpenRun>()
   const approvals = new Map<string, UnresolvedApproval>()
   const holds = new Map<string, UnreleasedHold>()
+  // Keyed by child run id. An admission leaves this map only on its result.
+  const admitted = new Map<string, { parentRunId: string; seq: number }>()
+  const finished = new Map<string, { status: string; costMicroUsd: number }>()
+  // Evidence against a clean child, per run: a tool that executed, or a hold a
+  // human released (D17). Kept for every run, since which ones are children is
+  // known only once their admission is read.
+  const startedTainted = new Set<string>()
+  const touchedUntrusted = new Set<string>()
 
   for (const row of rows) {
     const payload = parse(row.payload)
@@ -157,12 +199,32 @@ export function projectRecovery(rows: readonly EventRow[]): Recovery {
           toolCalls: 0,
           costMicroUsd: 0,
         })
+        if (stringAt(payload, 'taint') !== 'clean') startedTainted.add(runId)
         break
       }
       case 'run.finished': {
         // Terminal, however it got there — including a terminal row a previous
         // recovery wrote. This is what makes recovery idempotent.
-        open.delete(stringAt(payload, 'runId', row.runId ?? ''))
+        const runId = stringAt(payload, 'runId', row.runId ?? '')
+        open.delete(runId)
+        finished.set(runId, {
+          status: stringAt(payload, 'status'),
+          costMicroUsd: numberAt(payload, 'costMicroUsd'),
+        })
+        break
+      }
+      case 'delegation.admitted': {
+        const childRunId = stringAt(payload, 'childRunId')
+        if (childRunId === '') break
+        admitted.set(childRunId, { parentRunId: stringAt(payload, 'parentRunId', row.runId ?? ''), seq: row.seq })
+        break
+      }
+      case 'delegation.result': {
+        admitted.delete(stringAt(payload, 'childRunId'))
+        // The parent paid for this child: its live run.finished counts it, so an
+        // orphaned parent's recovered bill has to as well.
+        const run = row.runId === null ? undefined : open.get(row.runId)
+        if (run !== undefined) run.costMicroUsd += numberAt(payload, 'costMicroUsd')
         break
       }
       case 'llm.response': {
@@ -175,6 +237,7 @@ export function projectRecovery(rows: readonly EventRow[]): Recovery {
       case 'tool.result': {
         const run = row.runId === null ? undefined : open.get(row.runId)
         if (run !== undefined) run.toolCalls += 1
+        if (row.runId !== null) touchedUntrusted.add(row.runId)
         break
       }
       case 'approval.requested': {
@@ -210,6 +273,9 @@ export function projectRecovery(rows: readonly EventRow[]): Recovery {
         break
       }
       case 'quarantine.released':
+        if (row.runId !== null) touchedUntrusted.add(row.runId)
+        holds.delete(stringAt(payload, 'holdId'))
+        break
       case 'quarantine.abandoned': {
         holds.delete(stringAt(payload, 'holdId'))
         break
@@ -219,11 +285,39 @@ export function projectRecovery(rows: readonly EventRow[]): Recovery {
     }
   }
 
+  const dangling: DanglingDelegation[] = []
+  for (const [childRunId, admission] of admitted) {
+    const done = finished.get(childRunId)
+    const orphan = open.get(childRunId)
+    const costMicroUsd = done?.costMicroUsd ?? orphan?.costMicroUsd ?? 0
+    dangling.push({
+      parentRunId: admission.parentRunId,
+      childRunId,
+      status: done === undefined ? 'error' : resultStatus(done.status),
+      costMicroUsd,
+      // A child admitted but never started has no run.started row to prove it
+      // clean, and nothing to prove it tainted either; it ran nothing, so clean.
+      taint:
+        startedTainted.has(childRunId) || touchedUntrusted.has(childRunId) ? 'tainted' : 'clean',
+      seq: admission.seq,
+    })
+    // The child's spend lands on the parent's bill here, because the result
+    // row that would have carried it there is the one recovery is about to write.
+    const parent = open.get(admission.parentRunId)
+    if (parent !== undefined) parent.costMicroUsd += costMicroUsd
+  }
+
   // Ordered by the log, so recovery writes its rows in the order the things it
   // is closing happened. An audit reads in one direction.
   return {
     orphanRuns: [...open.values()].sort((a, b) => a.lastSeq - b.lastSeq),
     unresolvedApprovals: [...approvals.values()].sort((a, b) => a.seq - b.seq),
     unreleasedHolds: [...holds.values()].sort((a, b) => a.seq - b.seq),
+    danglingDelegations: dangling.sort((a, b) => a.seq - b.seq),
   }
+}
+
+/** A child's terminal status, as a delegation result can state it. */
+function resultStatus(status: string): DanglingDelegation['status'] {
+  return status === 'ok' || status === 'killed' || status === 'denied' ? status : 'error'
 }

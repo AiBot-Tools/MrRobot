@@ -254,3 +254,157 @@ test('the projection writes nothing and survives a log it cannot fully read', (t
   // must not be read as closing everything.
   assert.deepEqual(result.unresolvedApprovals.map((x) => x.approvalId), ['apr_1'])
 })
+
+// ── delegation ─────────────────────────────────────────────────────────────
+//
+// A parent waits inside kernel.delegate for its child, and only then writes
+// delegation.result and charges the child to itself. A crash in that window is
+// the delegation-shaped orphan: an admission with no result, and a parent whose
+// recovered bill would silently omit what it paid its children.
+
+function admitted(store: Store, parentRunId: string, childRunId: string, taskId = 't1'): void {
+  store.append({
+    type: 'delegation.admitted',
+    runId: parentRunId,
+    agentId: 'ceo',
+    payload: {
+      schemaVersion: 1, parentRunId, childRunId, agentId: 'researcher', taskId, goalId: `g_${taskId}`,
+      ceilingMicroUsd: 1_000_000, ceilingWallclockMs: 60_000,
+    },
+  })
+}
+
+function resulted(store: Store, parentRunId: string, childRunId: string, costMicroUsd: number): void {
+  store.append({
+    type: 'delegation.result',
+    runId: parentRunId,
+    agentId: 'ceo',
+    payload: { schemaVersion: 1, parentRunId, childRunId, status: 'ok', costMicroUsd, taint: 'clean' },
+  })
+}
+
+test('an orphaned parent’s bill counts every child it paid for, finished or in flight', (t) => {
+  const store = withStore(t)
+  store.append({ type: 'kernel.booted', payload: BOOT })
+  started(store, 'run_parent')
+  spent(store, 'run_parent', 1_000)
+  // Child 1 finished and was charged to the parent before the crash.
+  admitted(store, 'run_parent', 'run_child_1', 't1')
+  started(store, 'run_child_1', 'researcher')
+  spent(store, 'run_child_1', 300)
+  finished(store, 'run_child_1', 300)
+  resulted(store, 'run_parent', 'run_child_1', 300)
+  // Child 2 was mid-call when the process died.
+  admitted(store, 'run_parent', 'run_child_2', 't2')
+  started(store, 'run_child_2', 'writer')
+  spent(store, 'run_child_2', 200)
+
+  const recovery = projectRecovery(readAllRows(store.db))
+  assert.deepEqual(recovery.orphanRuns.map((r) => r.runId), ['run_parent', 'run_child_2'])
+  const parent = recovery.orphanRuns.find((r) => r.runId === 'run_parent')
+  // Own 1_000 + child 1's 300 (from its result) + child 2's 200 (from its rows).
+  // The live parent's run.finished would have said the same; recovery must not
+  // report less than was spent on the parent's account.
+  assert.equal(parent?.costMicroUsd, 1_500)
+  assert.equal(parent?.llmCalls, 1, 'a child’s model calls were counted as the parent’s own')
+  assert.equal(recovery.orphanRuns.find((r) => r.runId === 'run_child_2')?.costMicroUsd, 200)
+
+  // Exactly one admission is dangling — child 1 has its result.
+  assert.deepEqual(recovery.danglingDelegations, [
+    { parentRunId: 'run_parent', childRunId: 'run_child_2', status: 'error', costMicroUsd: 200, taint: 'clean', seq: recovery.danglingDelegations[0]?.seq },
+  ])
+  assert.equal(isClean(recovery), false)
+})
+
+test('a child that finished before the crash keeps its own status and cost in the recovered result', (t) => {
+  // The narrower window: the child's run.finished landed, the parent died before
+  // writing delegation.result. The child is not an orphan, but the admission is.
+  const store = withStore(t)
+  started(store, 'run_parent')
+  admitted(store, 'run_parent', 'run_child')
+  started(store, 'run_child', 'researcher')
+  store.append({
+    type: 'run.finished',
+    runId: 'run_child',
+    payload: {
+      schemaVersion: 1, runId: 'run_child', status: 'killed', reason: 'usdMax', costMicroUsd: 61_000,
+      llmCalls: 1, toolCalls: 0, durationMs: 9,
+    },
+  })
+
+  const recovery = projectRecovery(readAllRows(store.db))
+  assert.deepEqual(recovery.orphanRuns.map((r) => r.runId), ['run_parent'])
+  const [dangling] = recovery.danglingDelegations
+  assert.equal(dangling?.status, 'killed', 'the child’s true ending was replaced by a guess')
+  assert.equal(dangling?.costMicroUsd, 61_000)
+  assert.equal(recovery.orphanRuns[0]?.costMicroUsd, 61_000)
+})
+
+test('a recovered delegation result is clean only when the log proves it', (t) => {
+  // A taints:true tool on the child's last turn leaves no row saying so before a
+  // crash. So: started clean, no tool executed, no hold released — or tainted.
+  const store = withStore(t)
+  started(store, 'run_parent')
+  const kids = ['run_llm_only', 'run_used_a_tool', 'run_released_a_hold', 'run_started_tainted', 'run_never_started']
+  for (const kid of kids) admitted(store, 'run_parent', kid, kid)
+  started(store, 'run_llm_only', 'researcher')
+  spent(store, 'run_llm_only', 5)
+  started(store, 'run_used_a_tool', 'researcher')
+  store.append({
+    type: 'tool.result',
+    runId: 'run_used_a_tool',
+    payload: { schemaVersion: 1, ticketId: 'k', toolRef: 'web.fetch', ok: true, text: 'p', bytes: 1, truncated: false, durationMs: 1 },
+  })
+  started(store, 'run_released_a_hold', 'researcher')
+  held(store, 'run_released_a_hold', 'hold_r')
+  store.append({
+    type: 'quarantine.released',
+    runId: 'run_released_a_hold',
+    payload: { schemaVersion: 1, holdId: 'hold_r', byConnectionId: 'c1' },
+  })
+  store.append({
+    type: 'run.started',
+    runId: 'run_started_tainted',
+    agentId: 'researcher',
+    payload: { schemaVersion: 1, runId: 'run_started_tainted', agentId: 'researcher', lane: 'subagent', tier: 1, taint: 'tainted' },
+  })
+
+  const taint = new Map(projectRecovery(readAllRows(store.db)).danglingDelegations.map((d) => [d.childRunId, d.taint]))
+  assert.deepEqual(Object.fromEntries(taint), {
+    run_llm_only: 'clean',
+    run_used_a_tool: 'tainted',
+    run_released_a_hold: 'tainted',
+    run_started_tainted: 'tainted',
+    // Admitted, never started: it ran nothing, so there is nothing to carry.
+    run_never_started: 'clean',
+  })
+})
+
+test('recovery’s own rows close every delegation-shaped orphan, so a second restart does nothing', (t) => {
+  const store = withStore(t)
+  started(store, 'run_parent')
+  spent(store, 'run_parent', 10)
+  admitted(store, 'run_parent', 'run_child')
+  started(store, 'run_child', 'researcher')
+  spent(store, 'run_child', 7)
+  const first = projectRecovery(readAllRows(store.db))
+  assert.equal(first.danglingDelegations.length, 1)
+
+  // What boot writes, in the order it writes it: child closed, result, parent.
+  store.append({
+    type: 'run.finished',
+    runId: 'run_child',
+    payload: { schemaVersion: 1, runId: 'run_child', status: 'error', reason: 'orphaned by a kernel restart', costMicroUsd: 7, llmCalls: 1, toolCalls: 0, durationMs: 1 },
+  })
+  store.append({
+    type: 'delegation.result',
+    runId: 'run_parent',
+    payload: { schemaVersion: 1, parentRunId: 'run_parent', childRunId: 'run_child', status: 'error', costMicroUsd: 7, taint: 'clean' },
+  })
+  store.append({
+    type: 'run.finished',
+    runId: 'run_parent',
+    payload: { schemaVersion: 1, runId: 'run_parent', status: 'error', reason: 'orphaned by a kernel restart', costMicroUsd: 17, llmCalls: 1, toolCalls: 0, durationMs: 1 },
+  })
+  assert.equal(isClean(projectRecovery(readAllRows(store.db))), true)
+})

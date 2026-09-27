@@ -42,6 +42,7 @@ import { toolName } from '../mcp/names.js'
 import { costForCard } from './cost.js'
 import { classifyProviderFailure, ProviderError } from './router.js'
 import { normaliseAnthropicUsage } from './usage.js'
+import { replayInput, replayName } from './transport.js'
 import type {
   AdapterRequest,
   CallOutcome,
@@ -112,6 +113,11 @@ function toMessages(
     if (message.content !== '') blocks.push({ type: 'text', text: message.content })
     for (const call of message.toolCalls ?? []) {
       blocks.push({ type: 'tool_use', id: call.id, name: nameOf(call.ref), input: call.args })
+    }
+    // Rejected calls go back as the calls they were, so the is_error results
+    // that answer them pair by id as the API requires. Never executed.
+    for (const call of message.rejectedCalls ?? []) {
+      blocks.push({ type: 'tool_use', id: call.id, name: replayName(call.name), input: replayInput(call.rawArgs) })
     }
     if (blocks.length === 0) {
       throw new ConfigError('an assistant turn must carry text or at least one tool call')
@@ -231,6 +237,7 @@ export class AnthropicAdapter implements ModelAdapter {
                 id: block.id,
                 name: block.name,
                 reason: 'the model named a tool that was not offered on this call',
+                rawArgs: block.input,
               })
               continue
             }

@@ -30,7 +30,8 @@ import { parse as parseYaml } from 'yaml'
 import { withStore } from './helpers/store.js'
 import { freshProbe } from './helpers/probe.js'
 import { mockMcp, type MockMcp } from './helpers/mock-mcp.js'
-import { fakeProvider, http, FAKE_PRICING, type ScriptedResponse } from './helpers/fake-provider.js'
+import { fakeProvider, http, FAKE_PRICING, type ScriptEntry, type ScriptedResponse } from './helpers/fake-provider.js'
+import { strictly } from './helpers/wire-rules.js'
 import { McpHub } from '../src/mcp/hub.js'
 import { parseToolViews, type ToolViewsFile } from '../src/mcp/tool-views.js'
 import { OpenAiChatAdapter } from '../src/models/openai-chat.js'
@@ -144,7 +145,7 @@ interface Wired {
 async function wire(
   t: TestContext,
   options: {
-    script: readonly ScriptedResponse[]
+    script: readonly ScriptEntry[]
     views: ToolViewsFile
     toolAllow?: readonly string[]
     caps?: Partial<{ usdMax: number; maxLlmCalls: number; maxToolCalls: number; wallclockMs: number }>
@@ -322,6 +323,7 @@ test('every event in the run carries the run’s runId', async (t) => {
 // ── the branches that do not execute ───────────────────────────────────────
 
 test('a denied call never reaches the executor (mock records zero calls)', async (t) => {
+  const rejected: string[][] = []
   const w = await wire(t, {
     // Exposed to agents, but this manifest does not list it. Default deny is
     // structural here: the offered list is the hub's agent view INTERSECTED
@@ -330,11 +332,15 @@ test('a denied call never reaches the executor (mock records zero calls)', async
     // The gate's own manifest rule stays as defence in depth behind that.
     views: views({ recall: { exposure: 'agent', risk: 'read' } }),
     toolAllow: [],
-    script: [turn(toolCall('pmmcp.recall', { query: 'x' })), done()],
+    // The follow-up is answered the way a real server would answer it: a 400 if
+    // the history pairs a tool message with no call. The model's call carried no
+    // text, so without the replay that turn would also be empty.
+    script: [turn(toolCall('pmmcp.recall', { query: 'x' })), strictly('openai-chat', done(), rejected)],
   })
 
   const out = await w.loop.start({ runId: 'run_1', agent: w.agent, prompt: 'go' })
 
+  assert.deepEqual(rejected, [], 'the replayed history is one a real server refuses')
   assert.equal(w.mock.calls.length, 0)
   assert.deepEqual(types(w).filter((x) => x.startsWith('tool.')), [])
   assert.equal((w.provider.requests[0]?.body as { tools?: unknown[] }).tools, undefined)
@@ -346,6 +352,42 @@ test('a denied call never reaches the executor (mock records zero calls)', async
   const toolMessage = second.messages.find((m) => m.role === 'tool')
   assert.ok(toolMessage !== undefined, 'the model received no answer for its call')
   assert.match(toolMessage.content, /^\[error\] .*not offered/)
+})
+
+test('a call with unparseable arguments is replayed verbatim and answered, never executed', async (t) => {
+  // The common local-model failure: an OFFERED tool, arguments that are not
+  // JSON, no text. The call must go back on the wire exactly as sent — the
+  // model reads its own mistake next to the error — and nothing may run it.
+  const rejected: string[][] = []
+  const broken = '{"query": "unterminated'
+  const w = await wire(t, {
+    views: views({ recall: { exposure: 'agent', risk: 'read' } }),
+    script: [
+      turn({
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call_bad', type: 'function', function: { name: 'pmmcp__recall', arguments: broken } }],
+      }),
+      strictly('openai-chat', done(), rejected),
+    ],
+  })
+
+  const out = await w.loop.start({ runId: 'run_1', agent: w.agent, prompt: 'go' })
+
+  assert.deepEqual(rejected, [], 'the replayed history is one a real server refuses')
+  assert.equal(out.status, 'ok')
+  assert.equal(w.mock.calls.length, 0, 'a call with unparseable arguments reached the executor')
+  assert.deepEqual(types(w).filter((x) => x.startsWith('tool.')), [])
+
+  const second = w.provider.requests[1]?.body as {
+    messages: { role: string; tool_calls?: { id: string; function: { arguments: string } }[]; tool_call_id?: string; content: unknown }[]
+  }
+  const replayed = second.messages.find((m) => m.role === 'assistant')?.tool_calls?.[0]
+  assert.equal(replayed?.id, 'call_bad')
+  assert.equal(replayed?.function.arguments, broken, 'the replay rewrote what the model sent')
+  const answer = second.messages.find((m) => m.role === 'tool')
+  assert.equal(answer?.tool_call_id, 'call_bad')
+  assert.match(String(answer?.content), /^\[error\] arguments are not valid JSON/)
 })
 
 test('a tool call whose args resolve under souls/ is denied protected-path before any executor call', async (t) => {

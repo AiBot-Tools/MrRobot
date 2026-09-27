@@ -247,6 +247,8 @@ export class RunLoop {
           role: 'assistant',
           content: result.outcome.content,
           ...(calls.length === 0 ? {} : { toolCalls: calls }),
+          // Replayed, never executed: only `calls` reaches the gate below.
+          ...(callErrors.length === 0 ? {} : { rejectedCalls: callErrors }),
           ...(result.outcome.raw === undefined ? {} : { raw: result.outcome.raw }),
         })
 

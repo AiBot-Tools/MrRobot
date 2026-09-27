@@ -34,6 +34,7 @@ import { toolName } from '../mcp/names.js'
 import { costForCard } from './cost.js'
 import { classifyProviderFailure, ProviderError } from './router.js'
 import { normaliseChatUsage } from './usage.js'
+import { replayArguments, replayName } from './transport.js'
 import type {
   AdapterRequest,
   CallOutcome,
@@ -159,19 +160,25 @@ function toMessages(
       continue
     }
 
-    const calls = message.toolCalls ?? []
+    // Rejected calls go back as the calls they were: a `tool` message must
+    // answer a tool_call in the assistant message before it, and the error
+    // result for a rejected call is one. Never executed.
+    const calls = [
+      ...(message.toolCalls ?? []).map((call) => ({
+        id: call.id,
+        type: 'function' as const,
+        function: { name: toolName(call.ref), arguments: JSON.stringify(call.args ?? {}) },
+      })),
+      ...(message.rejectedCalls ?? []).map((call) => ({
+        id: call.id,
+        type: 'function' as const,
+        function: { name: replayName(call.name), arguments: replayArguments(call.rawArgs) },
+      })),
+    ]
     out.push({
       role: 'assistant',
       content: message.content === '' ? null : message.content,
-      ...(calls.length === 0
-        ? {}
-        : {
-            tool_calls: calls.map((call) => ({
-              id: call.id,
-              type: 'function' as const,
-              function: { name: toolName(call.ref), arguments: JSON.stringify(call.args ?? {}) },
-            })),
-          }),
+      ...(calls.length === 0 ? {} : { tool_calls: calls }),
     } satisfies WireMessage)
   }
 
@@ -303,6 +310,7 @@ export class OpenAiChatAdapter implements ModelAdapter {
               id: call.id,
               name: call.function.name,
               reason: 'the model named a tool that was not offered on this call',
+              rawArgs: call.function.arguments,
             })
             continue
           }
@@ -316,6 +324,7 @@ export class OpenAiChatAdapter implements ModelAdapter {
               id: call.id,
               name: call.function.name,
               reason: `arguments are not valid JSON: ${e instanceof Error ? e.message : String(e)}`,
+              rawArgs: call.function.arguments,
             })
             continue
           }

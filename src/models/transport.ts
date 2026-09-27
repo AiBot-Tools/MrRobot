@@ -22,6 +22,7 @@ import { boundOutput, PAYLOAD_TEXT_BUDGET } from '../events/bound.js'
 import type { EventStore } from '../events/store.js'
 import { SecretMask } from '../events/redact.js'
 import type { ModelCard } from './registry.js'
+import { PROVIDER_TOOL_NAME } from '../mcp/names.js'
 
 export type Dialect = ModelCard['dialect']
 
@@ -60,6 +61,12 @@ export interface ToolCallError {
   /** The name as the provider spelled it, which may not map to any ref. */
   readonly name: string
   readonly reason: string
+  /**
+   * The arguments exactly as the model emitted them: an object from the
+   * Anthropic dialect, the raw (possibly unparseable) string from Chat
+   * Completions. Kept only so the call can be REPLAYED — never executed.
+   */
+  readonly rawArgs: unknown
 }
 
 export type TurnMessage =
@@ -74,6 +81,15 @@ export type TurnMessage =
        * reconstructed one (reasoning traces must round-trip untouched).
        */
       readonly raw?: unknown
+      /**
+       * Calls the kernel refused to execute (an un-offered name, arguments that
+       * are not JSON). They go back on the wire as the calls they were, because
+       * both dialects answer a call by its id: the error result the model reads
+       * next is only valid if the call it answers is in the turn before it.
+       * Dropping them left a result pointing at nothing — and, when the model
+       * wrote no text, an assistant turn with no content at all.
+       */
+      readonly rejectedCalls?: readonly ToolCallError[]
     }
   | {
       readonly role: 'tool'
@@ -314,4 +330,43 @@ export async function withCallEvents(
     })
     throw e
   }
+}
+
+/**
+ * A rejected call's name, made safe to put back on the wire.
+ *
+ * It is never mapped to a ref and never executed, so rewriting it loses
+ * nothing; what it must not do is fail the whole request. A name the model
+ * emitted in this dialect already fits, but a run that fell back across
+ * dialects replays a name one provider accepted to another that may not.
+ */
+export function replayName(name: string): string {
+  if (PROVIDER_TOOL_NAME.test(name)) return name
+  const cleaned = name.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64)
+  return cleaned === '' ? 'invalid_tool' : cleaned
+}
+
+/** A rejected call's arguments as an object, for a dialect that needs one. */
+export function replayInput(rawArgs: unknown): Record<string, unknown> {
+  const asObject = (v: unknown): Record<string, unknown> | undefined =>
+    typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined
+  const direct = asObject(rawArgs)
+  if (direct !== undefined) return direct
+  if (typeof rawArgs === 'string') {
+    try {
+      const parsed = asObject(JSON.parse(rawArgs))
+      if (parsed !== undefined) return parsed
+    } catch {
+      // Unparseable arguments are why the call was rejected. The error result
+      // says so; the replayed call only has to be well-formed.
+    }
+  }
+  return {}
+}
+
+/** A rejected call's arguments as a string, for a dialect that sends one. */
+export function replayArguments(rawArgs: unknown): string {
+  // Verbatim when it is already a string: the model should see exactly what
+  // it sent next to the error explaining what was wrong with it.
+  return typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs ?? {})
 }

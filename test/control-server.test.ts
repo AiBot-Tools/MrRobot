@@ -50,7 +50,7 @@ servers:
   pmmcp:
     default: kernel-only
     tools:
-      recall: { exposure: agent, risk: read }
+      recall: { exposure: agent, risk: read, namespaceArg: none }
 `),
 )
 

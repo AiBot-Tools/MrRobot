@@ -249,6 +249,13 @@ enforces:
 | memory namespace | `aos/agent/researcher` | `aos/agent/writer` |
 | budget | 12 model calls, 40 tool calls, $0.50 | 8 model calls, 10 tool calls, $0.75 |
 
+Memory is per agent, and the gate enforces it: a tool view may declare a
+`namespaceArg`, and the gate denies any call whose value for it is not the calling
+agent's own `memory.projectId` — including a call that omits it — before any
+approval could be asked for. `tool-views.yaml` refuses to expose a pmmcp tool
+without that decision written down, so the first `recall` exposure cannot open
+every namespace by accident.
+
 Tier is checked at load as well as at call time: a manifest naming a tool whose
 risk exceeds its tier is refused with the file named. Budgets are checked at load
 too — a manifest may only lower a kernel ceiling. Neither agent declares a

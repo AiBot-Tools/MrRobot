@@ -72,6 +72,8 @@ export interface RunAgent {
   /** Dotted refs this manifest allows. Default deny: absent means no. */
   readonly toolAllow: readonly string[]
   readonly system: string
+  /** The manifest's memory namespace, which the gate pins namespaced tools to. */
+  readonly projectId?: string
 }
 
 export interface RunRequest {
@@ -336,11 +338,18 @@ export class RunLoop {
     const view = resolveView(this.#o.views, serverId, toolName)
 
     const gateInput = {
-      view: { exposure: view.exposure, risk: view.risk, taints: view.taints, quarantine: view.quarantine },
+      view: {
+        exposure: view.exposure,
+        risk: view.risk,
+        taints: view.taints,
+        quarantine: view.quarantine,
+        ...(view.namespaceArg === undefined ? {} : { namespaceArg: view.namespaceArg }),
+      },
       scope: {
         runId,
         agentId: agent.agentId,
         taint: this.#taintOf(request, state),
+        ...(agent.projectId === undefined ? {} : { projectId: agent.projectId }),
       },
       manifestAllows: agent.toolAllow.includes(call.ref),
       toolRef: call.ref,

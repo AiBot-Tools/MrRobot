@@ -933,6 +933,7 @@ function buildSurface(d: SurfaceDeps): ControlSurface {
       model: m.model,
       toolAllow: m.tools.allow,
       system: soul.text,
+      projectId: m.memory.projectId,
     }
   }
 

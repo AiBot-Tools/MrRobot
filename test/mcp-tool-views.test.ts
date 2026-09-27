@@ -34,6 +34,7 @@ servers:
       recall:
         exposure: agent
         risk: read
+        namespaceArg: none
 `
 
 test('unclassified tool resolves to kernel-only', () => {
@@ -214,9 +215,11 @@ servers:
       recall:
         exposure: agent
         risk: read
+        namespaceArg: none
       remember:
         exposure: agent
         risk: write
+        namespaceArg: none
         taints: true
         quarantine: true
         note: writes to shared memory

@@ -84,7 +84,16 @@ const CARD: ModelCard = {
 type ViewSpec = Record<string, { exposure: string; risk?: string; taints?: boolean; quarantine?: boolean }>
 
 function views(tools: ViewSpec): ToolViewsFile {
-  return parseToolViews({ version: 1, servers: { pmmcp: { default: 'kernel-only', tools } } })
+  // The fixture tools here take no namespace argument (recall(query), weird.name),
+  // so an agent-exposed one declares `none` explicitly — the file refuses an
+  // exposed pmmcp tool that makes no namespace decision at all.
+  const decided = Object.fromEntries(
+    Object.entries(tools).map(([name, view]) => [
+      name,
+      view.exposure === 'agent' && !('namespaceArg' in view) ? { ...view, namespaceArg: 'none' } : view,
+    ]),
+  )
+  return parseToolViews({ version: 1, servers: { pmmcp: { default: 'kernel-only', tools: decided } } })
 }
 
 /** One Chat Completions turn. 1_000 in + 100 out = 4_500 micro-USD exactly. */

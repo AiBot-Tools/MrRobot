@@ -46,9 +46,9 @@ servers:
   pmmcp:
     default: kernel-only
     tools:
-      recall: { exposure: agent, risk: read }
-      boom: { exposure: agent, risk: read }
-      weird.name: { exposure: agent, risk: read }
+      recall: { exposure: agent, risk: read, namespaceArg: none }
+      boom: { exposure: agent, risk: read, namespaceArg: none }
+      weird.name: { exposure: agent, risk: read, namespaceArg: none }
       get_secret: { exposure: kernel-only }
       coding_agent: { exposure: disabled }
   paged:

@@ -32,9 +32,11 @@ servers:
     tools:
       recall:
         exposure: agent
+        namespaceArg: none
         risk: read
       remember:
         exposure: agent
+        namespaceArg: none
         risk: write
 `),
 )

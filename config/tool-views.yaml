@@ -12,6 +12,13 @@
 # can classify them from what the server actually reports rather than from a
 # guess written on a Linux box.
 #
+# Exposing a pmmcp tool to agents also needs a `namespaceArg`: the argument that
+# names a memory namespace, which the gate then pins to the calling agent's own
+# `memory.projectId` (or `none`, written out, for a tool that takes no
+# namespace). The file is REFUSED without it. pmmcp namespaces by project_id and
+# the model chooses that argument, so without the pin an exposed `recall` would
+# read `aos/ceo` or any other agent's memory on request.
+#
 # Changing any tool's `exposure` is an ask-before under CLAUDE.md change
 # control. The two forced sets below are not merely defaults: a file that tries
 # to widen either is REFUSED at parse, which is what makes that rule

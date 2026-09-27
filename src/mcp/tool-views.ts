@@ -66,9 +66,25 @@ const ToolView = z
     risk: z.enum(RISKS).default('write'),
     taints: z.boolean().default(false),
     quarantine: z.boolean().default(false),
+    /**
+     * The argument that names a memory namespace, which the gate pins to the
+     * calling agent's own `memory.projectId` — or `none`, written out, for a
+     * tool that takes no namespace.
+     *
+     * pmmcp namespaces by project_id and the MODEL chooses the argument, so
+     * without this an exposed `recall` would read `aos/ceo` or any other agent's
+     * memory on request, and the per-agent namespaces would exist on paper only.
+     */
+    namespaceArg: z.string().min(1).optional(),
     note: z.string().optional(),
   })
   .strict()
+
+/**
+ * Servers that namespace memory by an argument the model supplies. Exposing one
+ * of their tools to agents REQUIRES a `namespaceArg` decision in the file.
+ */
+export const NAMESPACED_SERVERS: readonly string[] = ['pmmcp']
 
 const ServerViews = z
   .object({
@@ -109,6 +125,26 @@ export const ToolViewsFile = z
             message:
               `${serverId}.${toolName_} must be disabled, but the file says "${view.exposure}". ` +
               'It makes nested model calls that bypass the router, budgets, taint and the log.',
+          })
+        }
+
+        if (
+          view.exposure === 'agent' &&
+          NAMESPACED_SERVERS.includes(serverId) &&
+          view.namespaceArg === undefined
+        ) {
+          // A refusal rather than a default, because both defaults are wrong
+          // somewhere: pinning an argument a tool does not take breaks the tool,
+          // and pinning nothing hands an agent every namespace. The operator
+          // decides per tool, in the file, where an audit can see it.
+          ctx.addIssue({
+            code: 'custom',
+            path: at,
+            message:
+              `${serverId}.${toolName_} is exposed to agents but declares no namespaceArg. ` +
+              `${serverId} namespaces memory by an argument the model chooses; set namespaceArg to ` +
+              'that argument (so the gate pins it to the agent\'s own namespace) or to "none" if ' +
+              'the tool takes no namespace.',
           })
         }
 

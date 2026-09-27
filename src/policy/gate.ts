@@ -19,6 +19,8 @@
 //   2. not in the agent's manifest       deny      default deny
 //   3. an argument points at souls or
 //      an AGENTS.md                      deny      invariant 8, read-only personas
+//   3b. the tool's namespace argument
+//      is not the agent's own namespace  deny      memory is per agent
 //   4. risk is 'irreversible'            needs-human   always, no exceptions
 //   5. tainted run, risk is not 'read'   needs-human   invariant 3
 //   6. the tool-view says quarantine     quarantine
@@ -41,6 +43,8 @@ const ViewInput = z
     risk: z.enum(RISKS),
     taints: z.boolean(),
     quarantine: z.boolean(),
+    /** From tool-views.yaml: the argument to pin, or 'none'. Absent: not namespaced. */
+    namespaceArg: z.string().min(1).optional(),
   })
   .strict()
 
@@ -50,6 +54,8 @@ const ScopeInput = z
     runId: z.string().min(1),
     agentId: z.string().min(1),
     taint: z.enum(['clean', 'tainted']),
+    /** The agent's `memory.projectId`, from its manifest. Never from the model. */
+    projectId: z.string().min(1).optional(),
   })
   .strict()
 
@@ -110,6 +116,30 @@ export function decide(input: GateInput): GateVerdict {
     return {
       decision: 'deny',
       reason: 'protected-path: souls and AGENTS.md are read-only to agents',
+    }
+  }
+
+  // Memory is per agent. The model chooses this argument, so it is used here
+  // the only way the gate uses arguments: to refuse. Absent is refused too — a
+  // tool that defaulted to some namespace server-side would otherwise be a way
+  // around the pin. Deny rather than needs-human, for the same reason as rule 3:
+  // widening an agent's memory is a manifest change, not a per-call approval.
+  const pinned = view.namespaceArg
+  if (pinned !== undefined && pinned !== 'none') {
+    const asked = args[pinned]
+    if (scope.projectId === undefined) {
+      return {
+        decision: 'deny',
+        reason: `${toolRef} reads a memory namespace and agent ${scope.agentId} has none`,
+      }
+    }
+    if (asked !== scope.projectId) {
+      return {
+        decision: 'deny',
+        reason:
+          `namespace: ${toolRef} may only address ${scope.projectId}, ` +
+          `not ${typeof asked === 'string' ? asked : 'an unnamed namespace'}`,
+      }
     }
   }
 

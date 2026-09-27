@@ -66,6 +66,22 @@ export class EventStore {
   readonly #headFile: string | undefined
   readonly #anchorEvery: number
   #closed = false
+  /**
+   * Whether this store may vouch for its tail by writing an anchor.
+   *
+   * An anchor is a CLAIM: "the log up to here is the one that was written". A
+   * store that opened an existing log and never checked it has no basis for that
+   * claim, and making it anyway is how a tampered or truncated log gets blessed —
+   * the next verifier finds a fresh anchor matching the damage and passes. The
+   * kernel always verified before appending, so it never did this; but the store
+   * would have let any other writer do it, on close and every `anchorEvery` rows.
+   *
+   * True when this store created the database (there was nothing to tamper
+   * with), or once `verifyChain` has passed AGAINST THE ON-DISK ANCHOR. A pass
+   * without the anchor is not enough: a truncated log is internally consistent,
+   * and re-anchoring it would erase the only evidence of the truncation.
+   */
+  #trusted = false
 
   constructor(path: string, options: StoreOptions = {}) {
     this.#readOnly = options.readOnly ?? false
@@ -83,6 +99,8 @@ export class EventStore {
       this.#db.get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'events'") ===
       undefined
     if (fresh && !this.#readOnly) createSchema(this.#db)
+    // A database this store created has no history anyone could have altered.
+    this.#trusted = fresh && !this.#readOnly
 
     const triggers = checkTriggers(this.#db)
     if (!triggers.ok) {
@@ -181,7 +199,7 @@ export class EventStore {
       return { ...unhashed, hash }
     })
 
-    if (this.#anchorEvery > 0 && row.seq % this.#anchorEvery === 0) {
+    if (this.#anchorEvery > 0 && row.seq % this.#anchorEvery === 0 && this.#trusted) {
       this.writeAnchor(row)
     }
     this.#notify(row)
@@ -274,7 +292,24 @@ export class EventStore {
   }
 
   verifyChain(anchor?: Anchor): VerifyResult {
-    return verifyChain(this.#db, anchor)
+    const result = verifyChain(this.#db, anchor)
+    // Trust is earned only by a pass that consulted the anchor actually on disk
+    // (or by there being none). Checked by value, so a caller cannot earn it by
+    // passing an old or forged anchor that happens to match a damaged log.
+    if (result.ok && !this.#trusted) {
+      const onDisk = this.readAnchor()
+      const consultedDisk =
+        onDisk === undefined
+          ? true
+          : anchor !== undefined && anchor.seq === onDisk.seq && anchor.hash === onDisk.hash
+      if (consultedDisk) this.#trusted = true
+    }
+    return result
+  }
+
+  /** True once this store may write an anchor. See `#trusted`. */
+  get trusted(): boolean {
+    return this.#trusted
   }
 
   /** Escape hatch for tests and boot checks that need the raw connection. */
@@ -290,8 +325,10 @@ export class EventStore {
   close(): void {
     if (this.#closed) return
     // Anchor the verified tail on the way out, so a clean shutdown always
-    // leaves an anchor that matches the log exactly.
-    if (!this.#readOnly && this.#headFile !== undefined) {
+    // leaves an anchor that matches the log exactly — and ONLY a verified tail.
+    // A store that never earned trust closes without touching the anchor, so a
+    // log that failed (or skipped) verification keeps the anchor that exposes it.
+    if (!this.#readOnly && this.#headFile !== undefined && this.#trusted) {
       try {
         this.writeAnchor()
       } catch (e) {

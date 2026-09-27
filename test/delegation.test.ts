@@ -69,6 +69,7 @@ function childIdsIn(request: RecordedRequest): string[] {
 async function boot(
   t: TestContext,
   script: readonly ScriptEntry[],
+  options: { readonly now?: () => number } = {},
 ): Promise<{ mock: PmmcpMock; kernel: Awaited<ReturnType<typeof withKernel>>['kernel']; dbPath: string; requests: RecordedRequest[] }> {
   const mock = pmmcpMock({ secrets: { [VAULT_ID]: 'vault-fixture-credential-delegation' } })
   t.after(async () => {
@@ -79,6 +80,7 @@ async function boot(
     clientFactory: mock.connect,
     env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
     fetch: provider.fetch,
+    ...(options.now === undefined ? {} : { now: options.now }),
     beforeBoot: (f) => {
       writeProbeRecord(f.dataDir, freshProbe(REF))
     },
@@ -257,4 +259,42 @@ test('the kernel enforces the ceiling it hands a child, not the child’s own ca
   // And what it spent was still charged upward.
   const [result] = payloads(dbPath, 'delegation.result')
   assert.equal(result?.['costMicroUsd'], 61_000)
+})
+
+test('the kernel enforces the wallclock slice it hands a child, not the child’s own cap', async (t) => {
+  // The time half of the ceiling, made to bite the same way. The kernel's clock
+  // is injected and advanced from inside scripted replies, so "a call took ten
+  // minutes" costs no real time. The CEO burns 595_000 of its 600_000 ms default
+  // on its first call, so delegate hands down a 5_000 ms slice; the researcher's
+  // first call then takes 10_000 ms — nothing against its own 300_000 ms cap,
+  // double its slice. A kernel that built the child's budget from the manifest
+  // alone would let it take another turn, and the script has none to give it.
+  let offsetMs = 0
+  const now = (): number => Date.now() + offsetMs
+  const after = (ms: number, reply: ScriptEntry): ScriptEntry => (request) => {
+    offsetMs += ms
+    return typeof reply === 'function' ? reply(request) : reply
+  }
+  const { kernel, dbPath } = await boot(
+    t,
+    [
+      after(595_000, anthropicToolUse({ name: 'kernel__adopt_plan', input: { plan: PLAN }, inputTokens: 100, outputTokens: 10 })),
+      anthropicToolUse({ name: 'kernel__delegate', input: { taskId: 't1', brief: 'research' }, inputTokens: 100, outputTokens: 10 }),
+      after(10_000, anthropicToolUse({ name: 'pmmcp__recall', input: { query: 'x' }, inputTokens: 100, outputTokens: 10 })),
+    ],
+    { now },
+  )
+
+  await runThroughControl(kernel, 'go')
+  await kernel.shutdown()
+
+  const [admitted] = payloads(dbPath, 'delegation.admitted')
+  const slice = Number(admitted?.['ceilingWallclockMs'])
+  // Real milliseconds pass too, so the slice is at most 5_000, never more.
+  assert.ok(slice > 0 && slice <= 5_000, `the slice handed down is not what the parent had left: ${String(slice)}`)
+  const childId = String(admitted?.['childRunId'])
+  const childEnd = payloads(dbPath, 'run.finished').find((p) => p['runId'] === childId)
+  assert.equal(childEnd?.['status'], 'killed', `the child ran past its wallclock slice: ${JSON.stringify(childEnd)}`)
+  assert.equal(childEnd?.['reason'], 'wallclock')
+  assert.equal(childEnd?.['llmCalls'], 1)
 })

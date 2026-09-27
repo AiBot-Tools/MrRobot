@@ -203,6 +203,48 @@ export async function bootOn(
 }
 
 /**
+ * Boot on an existing fixture a kernel that can DIE instead of shutting down.
+ *
+ * `shutdown()` is the clean path: it aborts live runs, which then finish as
+ * `killed`, drains the goal queue and anchors the tail. A crash does none of
+ * that, and a restart test driven through `shutdown()` would prove recovery of
+ * a log that never needed it. `crash()` releases the socket and drops the raw
+ * database handle — the SIGKILL shape kernel-boot.test.ts uses — leaving every
+ * in-flight run open in the log. Teardown then verifies the chain without
+ * calling `shutdown()`, which would write to the closed handle.
+ */
+export async function bootCrashable(
+  t: TestContext,
+  fx: KernelFixture,
+  options: Omit<WithKernelOptions, keyof FixtureOptions> = {},
+): Promise<{ kernel: Kernel; crash: () => Promise<void> }> {
+  const kernel = await bootKernel({
+    config: fx.config,
+    repoRoot: REPO_ROOT,
+    providers: fx.providers,
+    toolViews: fx.toolViews,
+    env: { AOS_CONTROL_TOKEN: TEST_TOKEN, ...options.env },
+    sandboxDriver: options.sandboxDriver ?? fakeSandbox(),
+    ...(options.clientFactory === undefined ? {} : { clientFactory: options.clientFactory }),
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+    ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.agentsDir === undefined ? {} : { agentsDir: options.agentsDir }),
+  })
+  let crashed = false
+  const crash = async (): Promise<void> => {
+    if (crashed) return
+    crashed = true
+    kernel.scheduler.stop()
+    await kernel.server.close()
+    kernel.store.db.close()
+  }
+  registerVerify(t, fx.dbPath, async () => {
+    if (!crashed) await kernel.shutdown()
+  })
+  return { kernel, crash }
+}
+
+/**
  * Register the same end-of-test verification withStore performs, for a store
  * this test does not own a handle to.
  */

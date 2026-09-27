@@ -294,7 +294,12 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     // goal tracker would never learn which goals those runs had been serving.
     const rowsAtBoot = readAllRows(store.db)
     const recovered = projectRecovery(rowsAtBoot)
-    for (const run of recovered.orphanRuns) {
+    // Children before parents, with each dangling admission's result between:
+    // the order the live kernel writes them in (child finishes, parent records
+    // the result, parent finishes), so the log reads the same way after a crash
+    // as it would have without one.
+    const childIds = new Set(recovered.danglingDelegations.map((d) => d.childRunId))
+    const closeOrphan = (run: (typeof recovered.orphanRuns)[number]): void => {
       store.append({
         type: 'run.finished',
         runId: run.runId,
@@ -314,6 +319,22 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
         },
       })
     }
+    for (const run of recovered.orphanRuns) if (childIds.has(run.runId)) closeOrphan(run)
+    for (const d of recovered.danglingDelegations) {
+      store.append({
+        type: 'delegation.result',
+        runId: d.parentRunId,
+        payload: {
+          schemaVersion: 1,
+          parentRunId: d.parentRunId,
+          childRunId: d.childRunId,
+          status: d.status,
+          costMicroUsd: d.costMicroUsd,
+          taint: d.taint,
+        },
+      })
+    }
+    for (const run of recovered.orphanRuns) if (!childIds.has(run.runId)) closeOrphan(run)
     for (const approval of recovered.unresolvedApprovals) {
       store.append({
         type: 'approval.resolved',
@@ -339,6 +360,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       log.warn(
         {
           orphanRuns: recovered.orphanRuns.map((r) => r.runId),
+          delegations: recovered.danglingDelegations.map((d) => d.childRunId),
           approvals: recovered.unresolvedApprovals.length,
           holds: recovered.unreleasedHolds.length,
         },

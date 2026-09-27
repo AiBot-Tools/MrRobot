@@ -15,9 +15,8 @@
 //   silent-drop        a child's outcome missing from the summary → child-outcomes-accounted
 //
 // `n/a` is used only where the run genuinely contained nothing to examine, and
-// each one says what would make it runnable. Four of these cannot pass or fail
-// today because the kernel emits no delegation events and `run.started` carries
-// no goalId; that is a statement about the kernel, and the report makes it.
+// each one says what would make it runnable — a run with no children, say, has
+// no child outcomes to account for.
 
 import {
   AgentSpawnedPayload,

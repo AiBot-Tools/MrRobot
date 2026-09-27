@@ -232,6 +232,16 @@ the cost and call counts read back from the log — the run really did spend tha
 every approval reaches a decision (`expired`, with no connection id, because
 nobody decided it), and every hold ends as `quarantine.abandoned`.
 
+Delegation adds a fourth: a parent that died waiting inside `kernel.delegate`
+leaves a `delegation.admitted` with no `delegation.result`. Boot writes the
+missing result — the child's own terminal status and cost if it reached one,
+`error` and its counted cost if it did not, taint `clean` only when the log proves
+it — between the child's terminal row and the parent's, the order the live kernel
+uses. An orphaned parent's recovered cost counts every child it paid for, as its
+live `run.finished` would have. `test/delegation-restart.test.ts` crashes a real
+kernel with a child mid-call and checks all of it, plus that a second restart
+finds nothing left.
+
 It does **not** resume them, and that is a design decision rather than a gap:
 
 - Held content is never written to the log. That is deliberate — the record is

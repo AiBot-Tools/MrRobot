@@ -415,9 +415,10 @@ and add a mutant whenever a new test exists to catch a specific bug. Chain
 hashing, redaction and the immutability triggers have no mutants yet: the tool
 would edit them on every run, and CLAUDE.md puts touching them behind an ask.
 
-Last full run, against commit `4b9a62e`: 37 of 37 mutants killed (delegation 18,
-recovery 12, replay 7), 3 of 3 controls survived, exit 0. A result is a fact
-about that commit only; rerun it rather than trusting this line after a change.
+Last full run, against commit `e125c93`: 71 of 71 mutants killed (delegation 18,
+recovery 12, replay 7, namespace 7, goals 10, anchor 6, eval 11), 7 of 7
+controls survived, exit 0. A result is a fact about that commit only; rerun it
+rather than trusting this line after a change.
 
 ---
 

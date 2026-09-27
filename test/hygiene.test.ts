@@ -257,7 +257,7 @@ test("'as Transport' appears only in src/mcp/hub.ts", () => {
   assert.equal(hits(SRC, /\bas Transport\b/).length, 1)
 })
 
-test('node:child_process is imported only by src/sandbox/docker.ts, test/env.test.ts and test/entrypoints.test.ts', () => {
+test('node:child_process is imported only by src/sandbox/docker.ts and three test files that need real processes', () => {
   // The only module that may spawn a process is the one that knows what a
   // docker invocation must look like — the argv audit, the two-key environment,
   // the wallclock kill. A second importer is a second way to run something, and
@@ -270,11 +270,16 @@ test('node:child_process is imported only by src/sandbox/docker.ts, test/env.tes
   // way. env.test.ts proves Node's own behaviour (it spawns a node to check a
   // flag). entrypoints.test.ts runs the CLI and the daemon AS PROGRAMS, which is
   // the only way to catch a file that is not wired as one — and one was not:
-  // src/cli/index.ts exported runCli and nothing called it.
+  // src/cli/index.ts exported runCli and nothing called it. falsify.test.ts
+  // proves the mutation runner's safety properties, and each one is about a
+  // real process: a hung test's whole process GROUP is killed, a runner that is
+  // SIGKILLed mid-mutant is recovered from its journal, and the script refuses
+  // bad input as a program.
   assert.deepEqual(importersOf([...SRC, ...TEST], 'node:child_process'), [
     'src/sandbox/docker.ts',
     'test/entrypoints.test.ts',
     'test/env.test.ts',
+    'test/falsify.test.ts',
   ])
   // The composer asks for a driver and does not wire processes itself.
   assert.equal(importersOf(SRC, 'node:child_process').includes('src/kernel.ts'), false)

@@ -94,6 +94,7 @@ npm run build            # emits dist/
 npm run cli -- <cmd>
 npm run capture:pmmcp    # operator-only: record pmmcp's live tool schemas
 npm run eval             # operator-only: score the orchestration suite (SPENDS MONEY)
+npm run falsify          # mutation catalog: does the suite catch the bugs it claims to? (slow, offline)
 ```
 
 `eval` needs a running daemon (`npm run dev`) and `AOS_CONTROL_TOKEN`. It runs
@@ -374,6 +375,42 @@ AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_WRITES=1 \
 Run `npm run capture:pmmcp` first if you can: the goal-tools test will name any
 mismatch either way, but the capture names them all at once without writing
 anything.
+
+---
+
+## Mutation catalog (`npm run falsify`)
+
+A test that passes proves little until it has been seen to fail against the bug
+it claims to catch. `scripts/falsify/catalog.ts` writes those bugs down: each
+mutant is one exact edit to a source file that reintroduces a specific failure
+(a task delegated twice, a child's spend not charged upward, a rejected tool
+call dropped from the replay), grouped into suites with the tests that must
+catch them. `npm run falsify` applies each, runs its suite's tests, and puts the
+file back.
+
+```bash
+npm run falsify                    # every suite (delegation, recovery, replay)
+npm run falsify -- recovery        # one suite
+npm run falsify -- --only D13,W3   # named mutants
+npm run falsify -- --list          # the catalog, touching nothing
+```
+
+It exits 0 only when every mutant is **killed**, every suite's comment-only
+**control** survives, and every suite's unmutated baseline is green. **Hung** is
+not a kill (a hang is a test with no bound), and a mutant that leaves the file
+unparseable or stops the test files loading is **invalid**, never a kill.
+
+It edits the working tree, so: it refuses a file with uncommitted changes
+(`--allow-dirty` to override), writes the original bytes to `.falsify/` before
+every edit and restores them from there at the next start if a run was killed
+outright, restores on SIGINT/SIGTERM, and kills a hung test's whole process
+group. `test/falsify.test.ts` proves each of those against real processes, and
+checks on every `npm test` that every catalog anchor still matches exactly once
+— a refactor that moves one fails the suite instead of silently disabling its
+mutant.
+
+Run it after changing delegation, crash recovery or tool-call replay, and add a
+mutant whenever a new test exists to catch a specific bug.
 
 ---
 

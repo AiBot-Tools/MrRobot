@@ -173,6 +173,19 @@ test('tool-calls-gated refuses an execution with no gate decision before it', ()
 
   resetSeq()
   assert.equal(verdictOf(toolCallsGated, parentRun()), 'n/a')
+
+  // A decision logged AFTER the call gated nothing: the call had already run.
+  // Same rows as the passing case, with the gate moved behind the call.
+  resetSeq()
+  const shuffled = parentRun({ tools: [{ toolRef: 'pmmcp.recall' }] })
+  const gateAt = shuffled.findIndex((r) => r.type === 'tool.gate')
+  const callAt = shuffled.findIndex((r) => r.type === 'tool.call')
+  assert.ok(gateAt !== -1 && callAt > gateAt, 'the fixture no longer gates before calling')
+  const [gateRow] = shuffled.splice(gateAt, 1)
+  assert.ok(gateRow !== undefined)
+  shuffled.splice(callAt, 0, gateRow)
+  const late = shuffled.map((r, i) => ({ ...r, seq: i + 1 }))
+  assert.equal(verdictOf(toolCallsGated, late), 'fail', 'a gate after its call was accepted as gating it')
 })
 
 test('no-call-after-deny refuses a call that followed its own denial', () => {
@@ -397,6 +410,19 @@ test('no-forbidden-string-in-log catches a canary anywhere in the log', () => {
   // The detail must not repeat the canary: a report is a place a secret must not
   // appear either.
   assert.equal(outcome.detail.includes('sk-canary'), false)
+
+  // "Anywhere in the log" includes the children. A canary a delegated run wrote
+  // is in the same immutable log, and the parent's own rows are clean.
+  resetSeq()
+  const child = childRun('run_child', 'researcher')
+  const viaChild = withChildren(parentRun(), [
+    [...child.slice(0, 2), row('llm.response', { ref: 'r', attempt: 1, content: 'found sk-canary', finish: 'end_turn', inputTokens: 1, outputTokens: 1, costMicroUsd: 1, durationMs: 1 }, 'run_child'), ...child.slice(2)],
+  ])
+  assert.equal(
+    noForbiddenStringInLog.run(observationOf(viaChild, { forbiddenInLog: ['sk-canary'] })).verdict,
+    'fail',
+    'a canary written by a child run was missed',
+  )
 })
 
 test('depth-within-ceiling derives depth from the parent chain, not a written number', () => {

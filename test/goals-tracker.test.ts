@@ -27,7 +27,7 @@ import { GoalTracker } from '../src/goals/tracker.js'
 import { GoalWriter } from '../src/goals/writer.js'
 import { parsePlan } from '../src/goals/plan.js'
 import { writeProbeRecord } from '../src/models/probe.js'
-import { anthropicEndTurn, fakeProvider, type ScriptedResponse } from './helpers/fake-provider.js'
+import { anthropicEndTurn, anthropicToolUse, fakeProvider, type ScriptedResponse } from './helpers/fake-provider.js'
 import { bootOn, fixture, REPO_ROOT, rows, TEST_TOKEN, withKernel } from './helpers/kernel.js'
 import type { Kernel } from '../src/kernel.js'
 import { pmmcpMock, type PmmcpMock } from './helpers/mock-pmmcp.js'
@@ -217,6 +217,29 @@ test('a plan in a finished CEO result becomes a goal tree in the CEO’s namespa
   assert.equal(payload['tasks'], 2)
   assert.equal(payload['projectId'], CEO_PROJECT)
   assert.equal(payload['objectiveGoalId'], objective?.id)
+})
+
+test('a CEO that adopted its plan through the tool and then restates it gets ONE tree, not two', async (t) => {
+  // Both adoption paths are live on the shipped kernel: kernel.adopt_plan
+  // mid-run, and the tracker reading a plan out of a finished CEO's final
+  // message. A model that does the first and then summarises with the plan —
+  // which is what a model tends to do — must not have it written twice: a
+  // second tree is a second set of task goals no run will ever serve, sitting
+  // `pending` forever next to the real ones.
+  const planJson = PLAN_TEXT.slice(PLAN_TEXT.indexOf('{'), PLAN_TEXT.lastIndexOf('}') + 1)
+  const { mock, kernel, dbPath } = await bootWithGoals(t, [
+    anthropicToolUse({ name: 'kernel__adopt_plan', input: { plan: JSON.parse(planJson) as unknown } }),
+    anthropicEndTurn({ text: PLAN_TEXT, inputTokens: 1_200, outputTokens: 300 }),
+  ])
+
+  const finished = await runWithGoal(kernel, 'plan the comparison')
+  assert.equal(finished['status'], 'ok', String(finished['reason']))
+  await kernel.shutdown()
+
+  const logged = rows(dbPath)
+  assert.equal(logged.filter((r) => r.type === 'plan.adopted').length, 1, 'the plan was adopted twice')
+  assert.equal(logged.filter((r) => r.type === 'goal.created').length, 4)
+  assert.equal(mock.state.goals.size, 4)
 })
 
 test('a result that is not a plan, and one that is a broken plan, write nothing', async (t) => {

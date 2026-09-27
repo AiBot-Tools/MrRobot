@@ -35,10 +35,23 @@ import { Quarantine } from '../src/policy/quarantine.js'
 import { Budget } from '../src/runtime/budget.js'
 import { Lanes } from '../src/runtime/lanes.js'
 import { RunLoop, type RunAgent } from '../src/runtime/loop.js'
-import { FAKE_PRICING, fakeProvider, http, type ScriptedResponse } from './helpers/fake-provider.js'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+
+import { writeProbeRecord } from '../src/models/probe.js'
+import {
+  anthropicEndTurn,
+  anthropicToolUse,
+  FAKE_PRICING,
+  fakeProvider,
+  http,
+  type ScriptedResponse,
+} from './helpers/fake-provider.js'
+import { bootOn, fixture, REPO_ROOT, rows, runThroughControl } from './helpers/kernel.js'
 import { pmmcpMock } from './helpers/mock-pmmcp.js'
 import { freshProbe } from './helpers/probe.js'
 import { withStore } from './helpers/store.js'
+import { tmpdir } from './helpers/tmpdir.js'
 
 const OWN = 'aos/agent/researcher'
 
@@ -307,4 +320,67 @@ servers:
   assert.equal(everything.includes('acquisition plan'), false, 'the CEO’s memory reached the researcher’s run')
   assert.equal(JSON.stringify(provider.requests).includes('acquisition plan'), false)
   assert.equal(everything.includes('sqlite comparisons'), true, 'the researcher’s own memory did not come back')
+})
+
+test('a real kernel pins each agent to ITS OWN manifest namespace, not one the loop was handed', async (t) => {
+  // The loop-level test above builds its RunAgent by hand, so it cannot see the
+  // one step that decides which namespace a real run is pinned to: the kernel
+  // mapping each manifest's memory.projectId onto the run. Were that mapping to
+  // hand every agent the CEO's namespace, the gate would faithfully pin the
+  // researcher to aos/ceo — the exact read the pin exists to prevent — and every
+  // gate-level test would still pass.
+  //
+  // Nothing in the shipped fleet can call a namespaced tool (tool-views.yaml
+  // exposes nothing), so this boots the real kernel on a fixture whose views
+  // expose recall with its namespace argument, and a researcher allowed to use it.
+  const mock = pmmcpMock({ secrets: { 'anthropic-api-key': 'vault-fixture-credential-namespace' } })
+  t.after(async () => {
+    await mock.close()
+  })
+  const shipped = parseYaml(readFileSync(join(REPO_ROOT, 'config', 'tool-views.yaml'), 'utf8')) as {
+    servers: { pmmcp: { tools: Record<string, unknown> } }
+  }
+  shipped.servers.pmmcp.tools['recall'] = { exposure: 'agent', risk: 'read', namespaceArg: 'project_id' }
+  const base = fixture(t)
+  const fx = { ...base, toolViews: parseToolViews(shipped) }
+  writeProbeRecord(fx.dataDir, freshProbe('anthropic/claude-sonnet-5'))
+
+  const agentsDir = join(tmpdir(t), 'agents')
+  for (const id of ['ceo', 'researcher', 'writer']) {
+    mkdirSync(join(agentsDir, id, 'history'), { recursive: true })
+    const yaml = readFileSync(join(REPO_ROOT, 'agents', id, 'agent.yaml'), 'utf8')
+    writeFileSync(
+      join(agentsDir, id, 'agent.yaml'),
+      id === 'researcher' ? yaml.replace(/^  allow: \[\]$/m, '  allow: [pmmcp.recall]') : yaml,
+    )
+    writeFileSync(join(agentsDir, id, 'AGENTS.md'), `# ${id}\n`)
+  }
+
+  const provider = fakeProvider([
+    anthropicToolUse({ name: 'pmmcp__recall', input: { project_id: OWN, query: 'plan' } }),
+    anthropicToolUse({ name: 'pmmcp__recall', input: { project_id: 'aos/ceo', query: 'plan' } }),
+    anthropicEndTurn({ text: 'done' }),
+  ])
+  const kernel = await bootOn(t, fx, {
+    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    clientFactory: mock.connect,
+    fetch: provider.fetch,
+    agentsDir,
+  })
+  const finished = await runThroughControl(kernel, 'recall the plan', 'researcher')
+  await kernel.shutdown()
+  assert.equal(finished['status'], 'ok', JSON.stringify(finished))
+
+  const decisions = rows(fx.dbPath)
+    .filter((r) => r.type === 'tool.gate')
+    .map((r) => JSON.parse(r.payload) as { decision: string; reason: string })
+  assert.deepEqual(
+    decisions.map((d) => d.decision),
+    ['allow', 'deny'],
+    `the researcher's own namespace must pass and the CEO's must not: ${JSON.stringify(decisions)}`,
+  )
+  assert.match(decisions[1]?.reason ?? '', /may only address aos\/agent\/researcher, not aos\/ceo/)
+  // And what reached pmmcp was the researcher's namespace, once.
+  const reached = mock.calls.filter((c) => c.tool === 'recall').map((c) => c.args['project_id'])
+  assert.deepEqual(reached, [OWN])
 })

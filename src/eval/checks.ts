@@ -358,8 +358,8 @@ export const childGoalAncestry: Check = {
       ? pass(`${String(children.length)} child run(s), each naming its goal`)
       : fail(
           `child run(s) with no goalId on run.queued: ${missing.join(', ')}. ` +
-            'The kernel records goalId when the request carries one; nothing supplies it ' +
-            'until the Phase 1 goals item lands.',
+            'kernel.delegate always supplies one, so a child without it was started some ' +
+            'other way than from the adopted plan.',
         )
   },
 }

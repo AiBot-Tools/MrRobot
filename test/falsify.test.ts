@@ -263,7 +263,7 @@ test('npm run falsify is a program: bad input is refused with usage, --list runs
   const bogus = run(['no-such-suite'])
   assert.equal(bogus.status, 2, bogus.stderr)
   assert.match(bogus.stderr, /unknown suite: no-such-suite/)
-  assert.match(bogus.stderr, /suites: delegation, recovery, replay/)
+  assert.match(bogus.stderr, /suites: delegation, recovery, replay, namespace, goals, anchor, eval/)
 
   const badOnly = run(['--only', 'D99'])
   assert.equal(badOnly.status, 2)

@@ -3,8 +3,8 @@
 // Every entry was a real falsifier pass when its feature landed — each one was
 // seen killed, and the ones that first SURVIVED are why some of these tests
 // exist at all (D13, D15, W1, W3). Keeping them as data means the next change
-// to delegation, recovery or replay can prove the suite still bites without
-// anyone rebuilding the mutants from memory.
+// to any of these areas can prove the suite still bites without anyone
+// rebuilding the mutants from memory.
 //
 // Anchors are exact text and must match exactly once; test/falsify.test.ts
 // checks that on every `npm test`, so a refactor that moves an anchor fails the
@@ -111,4 +111,111 @@ const replay: Suite = {
   },
 }
 
-export const CATALOG: readonly Suite[] = [delegation, recovery, replay]
+const GATE = 'src/policy/gate.ts'
+const TRACKER = 'src/goals/tracker.ts'
+const WRITER = 'src/goals/writer.ts'
+const STORE = 'src/events/store.ts'
+const CHECKS = 'src/eval/checks.ts'
+
+const namespace: Suite = {
+  name: 'namespace',
+  tests: [
+    'test/policy-namespace.test.ts',
+    'test/mcp-tool-views.test.ts',
+    'test/runtime-loop.test.ts',
+    'test/goals-tracker.test.ts',
+  ],
+  mutants: [
+    { id: 'N1', file: GATE, from: "  if (pinned !== undefined && pinned !== 'none') {", to: '  if (false) {', why: 'the gate does not pin memory namespaces at all' },
+    { id: 'N2', file: GATE, from: '    if (scope.projectId === undefined) {', to: '    if (false) {', why: 'an agent with no namespace may call a namespaced tool' },
+    { id: 'N3', file: GATE, from: '    if (asked !== scope.projectId) {', to: "    if (typeof asked === 'string' && asked !== scope.projectId) {", why: 'an absent namespace argument lets the server default it' },
+    { id: 'N4', file: 'src/mcp/tool-views.ts', from: '          view.namespaceArg === undefined\n', to: '          false\n', why: 'an exposed pmmcp tool loads without a namespace decision' },
+    { id: 'N5', file: 'src/runtime/loop.ts', from: '        ...(view.namespaceArg === undefined ? {} : { namespaceArg: view.namespaceArg }),', to: '', why: 'the loop never tells the gate which argument to pin' },
+    { id: 'N6', file: KERNEL, from: '      projectId: m.memory.projectId,', to: "      projectId: 'aos/ceo',", why: 'the kernel gives every agent the CEO’s namespace' },
+    { id: 'N7', file: TRACKER, from: '    return this.#namespaceOf.get(goalId) ?? this.#o.projectIdOf(agentId)', to: '    return this.#o.projectIdOf(agentId)', why: 'a child’s goal is moved in the child’s namespace, not where it was written' },
+  ],
+  control: {
+    id: 'C',
+    file: GATE,
+    from: '// The policy gate (invariant 3).',
+    to: '// The policy gate (invariant 3). (control)',
+    why: 'comment only',
+  },
+}
+
+const goals: Suite = {
+  name: 'goals',
+  tests: [
+    'test/goals-writer.test.ts',
+    'test/goals-tracker.test.ts',
+    'test/goals-plan.test.ts',
+    'test/delegation.test.ts',
+    'test/delegation-restart.test.ts',
+  ],
+  mutants: [
+    { id: 'G1', file: WRITER, from: '    if (!(KERNEL_SETTABLE as readonly string[]).includes(to)) {', to: '    if (false) {', why: 'the kernel may mark a goal done' },
+    { id: 'G2', file: WRITER, from: '    return /\\s/.test(text) ? undefined : text', to: '    return text', why: 'a sentence is accepted as a goal id' },
+    { id: 'G3', file: WRITER, from: "      for (const key of ['id', 'goal_id', 'goalId']) {", to: "      for (const key of ['id']) {", why: 'a server that spells it goal_id yields no id' },
+    { id: 'G4', file: TRACKER, from: "        const to = finished.status === 'ok' ? 'review' : 'blocked'", to: "        const to = 'review'", why: 'a failed run moves its goal to review' },
+    { id: 'G5', file: TRACKER, from: "          await this.#o.writer.trySetStatus(goalId, 'in_progress', {", to: "          await this.#o.writer.trySetStatus(goalId, 'review', {", why: 'a starting run does not mark its goal in_progress' },
+    { id: 'G6', file: TRACKER, from: "    if (rows.some((r) => r.type === 'plan.adopted')) return", to: '', why: 'a run that adopted a plan mid-run gets a second tree' },
+    { id: 'G7', file: TRACKER, from: '    if (!looksLikePlan(claims)) return', to: '', why: 'every orchestrator message is parsed as a plan' },
+    { id: 'G8', file: TRACKER, from: '        this.#o.isOrchestrator(agentId)\n', to: '        true\n', why: 'a worker’s final message is adopted as a plan' },
+    { id: 'G9', file: TRACKER, from: '    for (const row of rows) this.#learnNamespace(row)', to: '', why: 'after a restart the tracker forgets where goals were written' },
+    { id: 'G10', file: KERNEL, from: '        .blockOrphans(recovered.orphanRuns.map((r) => r.runId))', to: '        .blockOrphans([])', why: 'orphaned runs leave their goals in_progress' },
+  ],
+  control: {
+    id: 'C',
+    file: TRACKER,
+    from: '// Keeping a goal tree in step with the runs that serve it.',
+    to: '// Keeping a goal tree in step with the runs that serve it. (control)',
+    why: 'comment only',
+  },
+}
+
+const anchor: Suite = {
+  name: 'anchor',
+  tests: ['test/store-anchor-trust.test.ts', 'test/store.test.ts', 'test/kernel-boot.test.ts'],
+  mutants: [
+    { id: 'A1', file: STORE, from: '    this.#trusted = fresh && !this.#readOnly', to: '    this.#trusted = !this.#readOnly', why: 'an existing log is trusted before it is verified' },
+    { id: 'A2', file: STORE, from: '    if (result.ok && !this.#trusted) {', to: '    if (!this.#trusted) {', why: 'a FAILED verification earns trust' },
+    { id: 'A3', file: STORE, from: '          : anchor !== undefined && anchor.seq === onDisk.seq && anchor.hash === onDisk.hash', to: '          : anchor !== undefined', why: 'any anchor earns trust, not the one on disk' },
+    { id: 'A4', file: STORE, from: '      if (consultedDisk) this.#trusted = true', to: '      this.#trusted = true', why: 'a pass without the on-disk anchor earns trust' },
+    { id: 'A5', file: STORE, from: '    if (!this.#readOnly && this.#headFile !== undefined && this.#trusted) {', to: '    if (!this.#readOnly && this.#headFile !== undefined) {', why: 'an untrusted store anchors its tail on close' },
+    { id: 'A6', file: STORE, from: '    if (this.#anchorEvery > 0 && row.seq % this.#anchorEvery === 0 && this.#trusted) {', to: '    if (this.#anchorEvery > 0 && row.seq % this.#anchorEvery === 0) {', why: 'an untrusted store moves the anchor while appending' },
+  ],
+  control: {
+    id: 'C',
+    file: STORE,
+    from: '// The append-only event store.',
+    to: '// The append-only event store. (control)',
+    why: 'comment only',
+  },
+}
+
+const evalChecks: Suite = {
+  name: 'eval',
+  tests: ['test/eval-checks.test.ts', 'test/eval-harness.test.ts'],
+  mutants: [
+    { id: 'E1', file: CHECKS, from: '    if (children.length >= wanted) {', to: '    if (true) {', why: 'no-spawn: an objective answered alone passes' },
+    { id: 'E2', file: CHECKS, from: '    const repeated = [...byAgent.entries()].filter(([, ids]) => ids.length > 1)', to: '    const repeated = [...byAgent.entries()].filter(([, ids]) => ids.length > 2)', why: 'double-spawn: a task dispatched twice passes' },
+    { id: 'E3', file: CHECKS, from: '    const minted = mintedIds(o)', to: "    const minted = new Set(o.log.flatMap((r) => r.payload.match(REF_PATTERN) ?? []))", why: 'fabricated-answer: ids resolve against log text, which holds the model’s own claim' },
+    { id: 'E4', file: CHECKS, from: '    const unmentioned = children.filter((id) => !o.claims.includes(id))', to: '    const unmentioned: string[] = []', why: 'silent-drop: a child missing from the summary passes' },
+    { id: 'E5', file: CHECKS, from: '    if (row.seq > first && row.seq < last) ids.push(row.runId)', to: '    ids.push(row.runId)', why: 'another run’s children are counted as this run’s' },
+    { id: 'E6', file: CHECKS, from: '    const missing = children.filter((id) => goalIdOf(o, id) === undefined)', to: '    const missing: string[] = []', why: 'a child with no goal passes ancestry' },
+    { id: 'E7', file: CHECKS, from: '      if (parentAgent !== undefined && spawnedAgents.has(parentAgent)) {', to: '      if (false) {', why: 'depth 2 passes the depth check' },
+    { id: 'E8', file: CHECKS, from: '      (call) => !decisions.some((g) => g.seq < call.seq && g.toolRef === call.toolRef),', to: '      (call) => !decisions.some((g) => g.toolRef === call.toolRef),', why: 'a gate decision AFTER the call counts as gating it' },
+    { id: 'E9', file: CHECKS, from: '      calls.filter((c) => c.seq > d.seq && c.toolRef === d.toolRef).map((c) => c.toolRef),', to: '      calls.filter(() => false).map((c) => c.toolRef),', why: 'a call after its own denial passes' },
+    { id: 'E10', file: CHECKS, from: '    if (finished !== undefined && finished.llmCalls !== responses.length) {', to: '    if (false) {', why: 'run.finished may miscount model calls' },
+    { id: 'E11', file: CHECKS, from: "    const text = o.log.map((r) => `${r.type} ${r.payload}`).join('\\n')", to: "    const text = o.rows.map((r) => `${r.type} ${r.payload}`).join('\\n')", why: 'a canary leaked by a child run is missed' },
+  ],
+  control: {
+    id: 'C',
+    file: CHECKS,
+    from: '// The check library.',
+    to: '// The check library. (control)',
+    why: 'comment only',
+  },
+}
+
+export const CATALOG: readonly Suite[] = [delegation, recovery, replay, namespace, goals, anchor, evalChecks]

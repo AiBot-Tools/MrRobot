@@ -389,7 +389,7 @@ catch them. `npm run falsify` applies each, runs its suite's tests, and puts the
 file back.
 
 ```bash
-npm run falsify                    # every suite (delegation, recovery, replay)
+npm run falsify                    # every suite (delegation, recovery, replay, namespace, goals, anchor, eval)
 npm run falsify -- recovery        # one suite
 npm run falsify -- --only D13,W3   # named mutants
 npm run falsify -- --list          # the catalog, touching nothing
@@ -409,8 +409,11 @@ checks on every `npm test` that every catalog anchor still matches exactly once
 — a refactor that moves one fails the suite instead of silently disabling its
 mutant.
 
-Run it after changing delegation, crash recovery or tool-call replay, and add a
-mutant whenever a new test exists to catch a specific bug.
+Run it after changing delegation, crash recovery, tool-call replay, the memory
+namespace pin, goal tracking, anchor trust or the eval checks — the seven suites —
+and add a mutant whenever a new test exists to catch a specific bug. Chain
+hashing, redaction and the immutability triggers have no mutants yet: the tool
+would edit them on every run, and CLAUDE.md puts touching them behind an ask.
 
 Last full run, against commit `4b9a62e`: 37 of 37 mutants killed (delegation 18,
 recovery 12, replay 7), 3 of 3 controls survived, exit 0. A result is a fact

@@ -412,6 +412,10 @@ mutant.
 Run it after changing delegation, crash recovery or tool-call replay, and add a
 mutant whenever a new test exists to catch a specific bug.
 
+Last full run, against commit `4b9a62e`: 37 of 37 mutants killed (delegation 18,
+recovery 12, replay 7), 3 of 3 controls survived, exit 0. A result is a fact
+about that commit only; rerun it rather than trusting this line after a change.
+
 ---
 
 ## Exit-criterion checklist

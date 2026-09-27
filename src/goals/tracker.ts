@@ -24,7 +24,12 @@ import type pino from 'pino'
 import type { EventRow } from '../events/chain.js'
 import type { EventStore } from '../events/store.js'
 import { log as defaultLog } from '../log.js'
-import { RunFinishedPayload, RunQueuedPayload, RunStartedPayload } from '../events/types.js'
+import {
+  GoalCreatedPayload,
+  RunFinishedPayload,
+  RunQueuedPayload,
+  RunStartedPayload,
+} from '../events/types.js'
 import { claimsOf } from '../eval/observe.js'
 import { looksLikePlan, parsePlan, PlanInvalid } from './plan.js'
 import type { GoalWriter } from './writer.js'
@@ -57,6 +62,17 @@ export class GoalTracker {
   readonly #log: pino.Logger
   /** runId → the goal it serves, for runs that have not finished. */
   readonly #goalOf = new Map<string, string>()
+  /**
+   * goalId → the namespace the KERNEL created it in, from `goal.created`.
+   *
+   * A goal's namespace is where it was written, not where the run serving it
+   * lives. A delegated researcher works a task goal in `aos/ceo`; addressing its
+   * status updates to `aos/agent/researcher` fails on the server and would leave
+   * the goal stale with only a log line to show for it. So the kernel's own
+   * record of where it wrote each goal is the authority, and the running agent's
+   * namespace is only the fallback for goals the kernel did not create.
+   */
+  readonly #namespaceOf = new Map<string, string>()
   /** Serial, so two updates to one goal cannot race each other. */
   #queue: Promise<void> = Promise.resolve()
   #unsubscribe: (() => void) | undefined
@@ -68,6 +84,7 @@ export class GoalTracker {
 
   /** Rebuild the runId → goalId map for runs the log shows still open. */
   seedFromLog(rows: readonly EventRow[]): void {
+    for (const row of rows) this.#learnNamespace(row)
     const finished = new Set<string>()
     for (const row of rows) {
       if (row.type === 'run.finished' && row.runId !== null) finished.add(row.runId)
@@ -115,7 +132,20 @@ export class GoalTracker {
     })
   }
 
+  #learnNamespace(row: EventRow): void {
+    if (row.type !== 'goal.created') return
+    const p = GoalCreatedPayload.parse(JSON.parse(row.payload))
+    this.#namespaceOf.set(p.goalId, p.projectId)
+  }
+
+  /** Where a goal lives: where the kernel wrote it, else the running agent's own. */
+  #projectFor(goalId: string, agentId: string): string | undefined {
+    return this.#namespaceOf.get(goalId) ?? this.#o.projectIdOf(agentId)
+  }
+
   #observe(row: EventRow): void {
+    // Before the runId check: goal.created carries no run.
+    this.#learnNamespace(row)
     if (row.runId === null) return
     const runId = row.runId
 
@@ -129,7 +159,7 @@ export class GoalTracker {
       const goalId = this.#goalOf.get(runId)
       if (goalId === undefined) return
       const agentId = RunStartedPayload.parse(JSON.parse(row.payload)).agentId
-      const projectId = this.#o.projectIdOf(agentId)
+      const projectId = this.#projectFor(goalId, agentId)
       if (projectId === undefined) return
       this.#enqueue(
         async () => {
@@ -150,10 +180,9 @@ export class GoalTracker {
       this.#goalOf.delete(runId)
       const agentId = row.agentId
       if (agentId === null) return
-      const projectId = this.#o.projectIdOf(agentId)
-      if (projectId === undefined) return
 
-      if (goalId !== undefined) {
+      const goalProject = goalId === undefined ? undefined : this.#projectFor(goalId, agentId)
+      if (goalId !== undefined && goalProject !== undefined) {
         // `review` and never `done`: a run finishing is evidence, not a verdict.
         // Anything other than ok is `blocked`, which is a state something can act
         // on, rather than `abandoned`, which would be the kernel giving up on the
@@ -162,7 +191,7 @@ export class GoalTracker {
         this.#enqueue(
           async () => {
             await this.#o.writer.trySetStatus(goalId, to, {
-              projectId,
+              projectId: goalProject,
               runId,
               reason: `run ${runId} finished ${finished.status}`,
             })
@@ -171,7 +200,13 @@ export class GoalTracker {
         )
       }
 
-      if (this.#o.adoptFromRuns && finished.status === 'ok' && this.#o.isOrchestrator(agentId)) {
+      const projectId = this.#o.projectIdOf(agentId)
+      if (
+        projectId !== undefined &&
+        this.#o.adoptFromRuns &&
+        finished.status === 'ok' &&
+        this.#o.isOrchestrator(agentId)
+      ) {
         this.#enqueue(
           async () => {
             await this.#adopt(runId, projectId)
@@ -195,6 +230,9 @@ export class GoalTracker {
   async #adopt(runId: string, projectId: string): Promise<void> {
     if (!this.#o.writer.available) return
     const rows = this.#o.store.query({ runId })
+    // A run that already adopted a plan mid-run (kernel.adopt_plan) must not get
+    // a second tree because its final message restated the plan.
+    if (rows.some((r) => r.type === 'plan.adopted')) return
     const claims = claimsOf(rows)
     if (!looksLikePlan(claims)) return
 
@@ -225,7 +263,7 @@ export class GoalTracker {
       this.#goalOf.delete(runId)
       const queued = this.#o.store.query({ runId }).find((r) => r.type === 'run.queued')
       const agentId = queued?.agentId ?? null
-      const projectId = agentId === null ? undefined : this.#o.projectIdOf(agentId)
+      const projectId = agentId === null ? this.#namespaceOf.get(goalId) : this.#projectFor(goalId, agentId)
       if (projectId === undefined) continue
       await this.#o.writer.trySetStatus(goalId, 'blocked', {
         projectId,

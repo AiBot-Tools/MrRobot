@@ -25,6 +25,7 @@ import test, { type TestContext } from 'node:test'
 import { connectControl } from '../src/cli/client.js'
 import { GoalTracker } from '../src/goals/tracker.js'
 import { GoalWriter } from '../src/goals/writer.js'
+import { parsePlan } from '../src/goals/plan.js'
 import { writeProbeRecord } from '../src/models/probe.js'
 import { anthropicEndTurn, fakeProvider, type ScriptedResponse } from './helpers/fake-provider.js'
 import { bootOn, fixture, REPO_ROOT, rows, TEST_TOKEN, withKernel } from './helpers/kernel.js'
@@ -479,4 +480,81 @@ test('a restart blocks the goals of runs it orphaned, and re-executes nothing', 
   )
   // Nothing was re-executed: the orphan produced no new model call.
   assert.equal(logged.filter((r) => r.type === 'llm.request').length, 0)
+})
+
+test('a run serving a goal in ANOTHER namespace moves it there, not in its own', async (t) => {
+  // The delegation shape: the CEO's plan puts task goals in aos/ceo, and a
+  // researcher run serves one. The tracker used to address the update to the
+  // RUNNING agent's namespace — aos/agent/researcher — where the server has no
+  // such goal, so the goal stayed pending and the only trace was a log line.
+  const mock = pmmcpMock()
+  t.after(async () => {
+    await mock.close()
+  })
+  const store = withStore(t)
+  const hub = new McpHub({
+    store,
+    views: parseToolViews(parseYaml(readFileSync(`${REPO_ROOT}/config/tool-views.yaml`, 'utf8'))),
+  })
+  t.after(async () => {
+    await hub.close()
+  })
+  await hub.connect('pmmcp', mock.connect)
+  const goals = parseKernelConfig(parseYaml(readFileSync(`${REPO_ROOT}/config/kernel.yaml`, 'utf8')), {
+    repoRoot: REPO_ROOT,
+  }).goals
+  const writer = new GoalWriter({ store, hub, goals })
+  const tree = await writer.materialise(
+    parsePlan(PLAN_TEXT, { knownTemplates: ['researcher', 'writer'] }),
+    CEO_PROJECT,
+    'run_ceo',
+  )
+  const task = tree.tasks.get('t1')
+  assert.ok(task)
+
+  const tracker = new GoalTracker({
+    store,
+    writer,
+    adoptFromRuns: false,
+    projectIdOf: (agentId) => (agentId === 'researcher' ? 'aos/agent/researcher' : CEO_PROJECT),
+    isOrchestrator: (agentId) => agentId === 'ceo',
+    knownTemplates: () => ['researcher', 'writer'],
+  })
+  // Seeded from the log so far, which holds the goal.created rows — the same
+  // path a restarted kernel takes.
+  tracker.seedFromLog(store.query())
+  const detach = tracker.attach()
+  t.after(() => {
+    detach()
+  })
+
+  const runId = 'run_child'
+  store.append({
+    type: 'run.queued',
+    runId,
+    agentId: 'researcher',
+    payload: { schemaVersion: 1, runId, agentId: 'researcher', lane: 'subagent', goalId: task },
+  })
+  store.append({
+    type: 'run.started',
+    runId,
+    agentId: 'researcher',
+    payload: { schemaVersion: 1, runId, agentId: 'researcher', lane: 'subagent', tier: 1, taint: 'clean' },
+  })
+  store.append({
+    type: 'run.finished',
+    runId,
+    agentId: 'researcher',
+    payload: { schemaVersion: 1, runId, status: 'ok', costMicroUsd: 1, llmCalls: 1, toolCalls: 0, durationMs: 1 },
+  })
+  await tracker.drain()
+
+  assert.equal(mock.state.goals.get(task)?.status, 'review', 'the goal did not move in its own namespace')
+  const moves = store
+    .query({ type: 'goal.status' })
+    .map((r) => JSON.parse(r.payload) as { projectId: string; to: string })
+  assert.deepEqual(
+    moves.map((m) => `${m.to}@${m.projectId}`),
+    [`in_progress@${CEO_PROJECT}`, `review@${CEO_PROJECT}`],
+  )
 })

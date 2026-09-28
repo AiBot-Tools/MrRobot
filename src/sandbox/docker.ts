@@ -35,6 +35,7 @@ import { promisify } from 'node:util'
 const execFileAsync = promisify(execFile)
 
 import { ConfigError } from '../errors.js'
+import { realpathNearest } from '../agents/protected.js'
 import { confineWorkspace } from './confine.js'
 import type {
   ProbeResult,
@@ -167,13 +168,22 @@ export function auditRunArgs(args: readonly string[], home: string, workspace: s
   // The home directory, never — not as the workspace and not smuggled into a
   // command argument. An empty HOME would make this vacuous, so it is skipped
   // rather than compared against ''.
+  //
+  // Checked under EVERY spelling of home: as given and fully resolved. The
+  // workspace is a resolved path (confineWorkspace), so comparing it with an
+  // unresolved HOME misses whenever a component of HOME is a symlink — which on
+  // macOS includes anything under /var, /tmp and /etc. A command argument can
+  // use either spelling, so both are refused.
   if (home !== '') {
-    if (workspace === home) {
-      throw new ConfigError('the workspace may never be the home directory')
-    }
-    for (const arg of args) {
-      if (arg.includes(`source=${home},`) || arg === home || arg.startsWith(`${home}/`)) {
-        throw new ConfigError(`docker args reference the home directory (${home})`)
+    const spellings = [...new Set([home, realpathNearest(home)])]
+    for (const h of spellings) {
+      if (workspace === h) {
+        throw new ConfigError('the workspace may never be the home directory')
+      }
+      for (const arg of args) {
+        if (arg.includes(`source=${h},`) || arg === h || arg.startsWith(`${h}/`)) {
+          throw new ConfigError(`docker args reference the home directory (${h})`)
+        }
       }
     }
   }

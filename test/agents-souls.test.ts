@@ -8,7 +8,7 @@ import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { assertNotProtected, isUnder, PROTECTED_ROOTS, realpathNearest } from '../src/agents/protected.js'
@@ -168,5 +168,7 @@ test('assertNotProtected allows a path outside the roots', (t) => {
   assert.throws(() => assertNotProtected('souls/ceo.md', root), /needs an absolute path/)
 
   assert.deepEqual([...PROTECTED_ROOTS], ['souls', 'agents', 'config'])
-  assert.equal(realpathNearest(join(root, 'workspace')), join(root, 'workspace'))
+  // Compared with the resolved root: on macOS the temp root is under
+  // /var -> /private/var, and resolving that is realpathNearest's whole job.
+  assert.equal(realpathNearest(join(root, 'workspace')), join(realpathSync(root), 'workspace'))
 })

@@ -380,6 +380,20 @@ const restart: Suite = {
   },
 }
 
+const DOCKER = 'src/sandbox/docker.ts'
+
+const sandbox: Suite = {
+  name: 'sandbox',
+  tests: ['test/sandbox-docker.test.ts'],
+  mutants: [
+    { id: 'Z1', file: DOCKER, from: '    const spellings = [...new Set([home, realpathNearest(home)])]', to: '    const spellings = [home]', why: 'a HOME reached through a symlink passes the never-$HOME check (found on macOS)' },
+    { id: 'Z2', file: DOCKER, from: '  if (mounts !== 1 || volumes !== 0) {', to: '  if (false) {', why: 'a second bind mount or a -v reaches docker' },
+    { id: 'Z3', file: DOCKER, from: '      if (arg === bad || arg.startsWith(`${bad}=`)) {', to: '      if (false) {', why: '--privileged and friends reach docker' },
+    { id: 'Z4', file: DOCKER, from: '      if (arg.includes(bad)) {', to: '      if (false) {', why: 'the docker socket can be mounted into a container' },
+  ],
+  control: { id: 'C', file: DOCKER, from: '    // Invariant 9, one flag at a time.', to: '    // Invariant 9, one flag at a time. (control)', why: 'comment only' },
+}
+
 export const CATALOG: readonly Suite[] = [
   delegation,
   recovery,
@@ -393,4 +407,5 @@ export const CATALOG: readonly Suite[] = [
   schedule,
   registry,
   restart,
+  sandbox,
 ]

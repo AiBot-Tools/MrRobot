@@ -26,7 +26,7 @@ import './helpers/guard.js'
 
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { tmpdir } from './helpers/tmpdir.js'
@@ -50,6 +50,7 @@ interface Fixture {
   readonly root: string
   readonly mountRoot: string
   readonly workspace: string
+  readonly realWorkspace: string
   readonly repoRoot: string
   readonly domain: DomainConfig
 }
@@ -79,6 +80,10 @@ function fixture(t: TestContext): Fixture {
     root,
     mountRoot,
     workspace: join(mountRoot, 'proj'),
+    // What confinement hands docker: the workspace with every symlink resolved.
+    // Requests stay unresolved, as they are in real use; on macOS the temp root
+    // itself sits under /var -> /private/var, so the two differ there.
+    realWorkspace: realpathSync(join(mountRoot, 'proj')),
     repoRoot,
     domain: { dockerHost: 'unix:///tmp/colima-trusted.sock', network: 'aos-internal', mountRoot },
   }
@@ -167,13 +172,30 @@ test('never --privileged, never docker.sock, never $HOME', (t) => {
   assert.throws(() => argsFor(f, {}, f.workspace), ConfigError, 'workspace === home')
 })
 
+test('a HOME reached through a symlink is still refused, under either spelling', (t) => {
+  // Found on the operator's Mac: the audit compared the RESOLVED workspace with
+  // an UNRESOLVED HOME, so "the workspace is home" went unnoticed whenever a
+  // component of HOME was a symlink (on macOS, /var -> /private/var). Built with
+  // an explicit link here so it fails on every OS, not only where the temp root
+  // happens to sit under one.
+  const f = fixture(t)
+  const linkedHome = join(f.root, 'home-link')
+  symlinkSync(join(f.mountRoot, 'proj'), linkedHome)
+
+  // The workspace resolves to proj; HOME names the same directory through a link.
+  assert.throws(() => argsFor(f, {}, linkedHome), /the workspace may never be the home directory/)
+  // And a command argument naming home is refused whichever way it is spelled.
+  assert.throws(() => argsFor(f, { command: [join(linkedHome, 'creds')] }, linkedHome), ConfigError)
+  assert.throws(() => argsFor(f, { command: [join(f.realWorkspace, 'creds')] }, linkedHome), ConfigError)
+})
+
 test('run args contain exactly one --mount and no -v, and it is the confined workspace', (t) => {
   const f = fixture(t)
   const args = argsFor(f)
 
   assert.equal(args.filter((a) => a === '--mount').length, 1)
   assert.equal(args.filter((a) => a === '-v' || a === '--volume').length, 0)
-  assert.equal(valueOf(args, '--mount'), `type=bind,source=${f.workspace},target=${WORKSPACE_TARGET}`)
+  assert.equal(valueOf(args, '--mount'), `type=bind,source=${f.realWorkspace},target=${WORKSPACE_TARGET}`)
 
   // A spec field cannot smuggle a second bind past the audit.
   assert.throws(
@@ -200,8 +222,8 @@ test('symlink escaping mountRoot, sibling prefix, .. and /etc are refused; proj/
 
   // A path that merely LOOKS like an escape but resolves back inside is fine:
   // the rule is about where it lands, not how it is spelled.
-  assert.equal(ok(join(f.mountRoot, 'proj', '..', 'proj')), f.workspace)
-  assert.equal(ok(f.workspace), f.workspace)
+  assert.equal(ok(join(f.mountRoot, 'proj', '..', 'proj')), f.realWorkspace)
+  assert.equal(ok(f.workspace), f.realWorkspace)
 
   // A workspace that does not exist would be created by the runtime as root,
   // outside the kernel's control.
@@ -230,7 +252,7 @@ test('a workspace resolving under a protected root is refused', (t) => {
   mkdirSync(join(f.repoRoot, 'scratch'), { recursive: true })
   assert.equal(
     confineWorkspace(join(f.repoRoot, 'scratch'), f.repoRoot, f.repoRoot),
-    join(f.repoRoot, 'scratch'),
+    realpathSync(join(f.repoRoot, 'scratch')),
   )
 })
 
@@ -242,7 +264,7 @@ test('resolved real path, not the request string, is passed to docker', (t) => {
   symlinkSync(join(f.mountRoot, 'proj'), join(f.mountRoot, 'alias'))
 
   const args = argsFor(f, { workspace: join(f.mountRoot, 'alias') })
-  assert.equal(valueOf(args, '--mount'), `type=bind,source=${f.workspace},target=${WORKSPACE_TARGET}`)
+  assert.equal(valueOf(args, '--mount'), `type=bind,source=${f.realWorkspace},target=${WORKSPACE_TARGET}`)
   assert.equal(args.some((a) => a.includes('alias')), false, 'the request string reached docker')
 })
 

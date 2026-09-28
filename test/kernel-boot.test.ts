@@ -524,7 +524,9 @@ test('a refused boot neither repairs the anchor nor leaks the store handle', asy
   const forged = readAnchor(fx.headFile)?.hash
   assert.equal(forged, 'e'.repeat(64))
 
-  const openFds = (): number => readdirSync('/proc/self/fd').length
+  // /dev/fd, not /proc/self/fd: macOS has no /proc. On Linux /dev/fd is a link
+  // to /proc/self/fd, so both count the same thing.
+  const openFds = (): number => readdirSync('/dev/fd').length
   // One refusal first, so any one-off allocation is already made and the
   // measurement below is about the repeated leak rather than about startup.
   await expectBootRefusal(fx, { AOS_CONTROL_TOKEN: TEST_TOKEN }, /rewrite/)

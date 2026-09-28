@@ -399,7 +399,7 @@ catch them. `npm run falsify` applies each, runs its suite's tests, and puts the
 file back.
 
 ```bash
-npm run falsify                    # every suite (twelve: see --list)
+npm run falsify                    # every suite (thirteen: see --list)
 npm run falsify -- recovery        # one suite
 npm run falsify -- --only D13,W3   # named mutants
 npm run falsify -- --list          # the catalog, touching nothing
@@ -422,7 +422,8 @@ mutant.
 Run it after changing delegation, crash recovery, tool-call replay, the memory
 namespace pin, goal tracking, anchor trust, the eval checks, the chain /
 canonicalizer / triggers (`integrity`), redaction, the cron scheduler, the agent
-registry or restart recovery of approvals and holds — the twelve suites — and add a
+registry, restart recovery of approvals and holds, or the container audit (`sandbox`)
+— the thirteen suites — and add a
 mutant whenever a new test exists to catch a specific bug. The `integrity` and
 `redaction` suites edit change-controlled files (chain hashing, the triggers,
 the redaction pass) and restore them; the operator approved keeping them in the

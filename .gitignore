@@ -8,3 +8,8 @@ dist/
 *.db-shm
 events.head
 .falsify/
+.DS_Store
+agents/.DS_Store
+docs/.DS_Store
+src/.DS_Store
+test/.DS_Store

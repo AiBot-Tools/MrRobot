@@ -29,6 +29,11 @@ import { REPO_ROOT, TEST_TOKEN, withKernel, type BootedKernel } from './helpers/
 import { fakeSandbox } from './helpers/fake-sandbox.js'
 import { parseProviders } from '../src/models/registry.js'
 import { parse as parseYaml } from 'yaml'
+import { AnthropicAdapter } from '../src/models/anthropic.js'
+import { Router } from '../src/models/router.js'
+import { freshProbe } from './helpers/probe.js'
+import { rejectedCallReplays } from './helpers/replay-body.js'
+import { withStore } from './helpers/store.js'
 
 /**
  * The ref actually shipped in providers.yaml, read rather than hard-coded.
@@ -287,5 +292,44 @@ test(
       false,
       'the poisoned env value reached the log',
     )
+  },
+)
+
+// ── 3. a rejected tool call, replayed to the real API ─────────────────────
+
+test(
+  'a rejected tool call replayed to the real Messages API is accepted, with a tools field that omits it and with no tools field at all',
+  { skip: !LIVE ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)' : process.env['ANTHROPIC_API_KEY'] === undefined ? 'ANTHROPIC_API_KEY is not set' : false },
+  async (t) => {
+    // Settles the one rule the docs leave open (test/helpers/replay-body.ts):
+    // whether history may carry a tool_use for a tool the request does not
+    // offer. The kernel does this on every rejected call, and for a worker
+    // offered nothing it sends no tools field at all. A 400 is a kernel bug.
+    //
+    // Straight through the router, not a whole kernel: nothing else is under
+    // test, and two small calls are the whole cost. The probe record is a
+    // fixture — D28 gates BINDING a model, which test 1 exercises for real; it
+    // is not what this request shape depends on.
+    const revoke = allowHost(ANTHROPIC_HOST)
+    t.after(revoke)
+
+    const ref = realRef()
+    const card = parseProviders(parseYaml(readFileSync(`${REPO_ROOT}/config/providers.yaml`, 'utf8'))).entries[ref]
+    assert.ok(card, `${ref} is not in providers.yaml`)
+    const key = process.env['ANTHROPIC_API_KEY'] ?? ''
+    const store = withStore(t)
+    const router = new Router({
+      store,
+      cards: new Map([[ref, card]]),
+      probes: freshProbe,
+      resolveCredential: () => Promise.resolve(key),
+      maxRetries: 1,
+      adapters: { anthropic: new AnthropicAdapter() },
+    })
+
+    await rejectedCallReplays({ router, store, ref })
+
+    // The key went out on the wire and must be nowhere in what was logged.
+    assert.equal(JSON.stringify(store.query()).includes(key), false, 'the credential reached the event log')
   },
 )

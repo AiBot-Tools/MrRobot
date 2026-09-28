@@ -355,6 +355,16 @@ and a live test cannot rot unexercised the way a gated-only one does.
 | plan → tree | pmmcp, key in the vault, both opt-ins | whether a real model's plan survives the `.strict()` parser; on failure the message carries the parser's own reason and the model's words |
 | eval harness gates | `ANTHROPIC_API_KEY` | whether the harness's own gates — one terminal row, paired LLM events, cost equal to the sum of logged calls — hold against a real provider's accounting |
 
+`test/live-anthropic.test.ts` carries one more of these: **rejected-call replay**
+(needs `ANTHROPIC_API_KEY`). When a model calls a tool the kernel will not run, the
+loop replays the call as a `tool_use` and answers it with an `is_error` result. The
+Messages API docs confirm the pairing rules but not whether history may carry a
+`tool_use` for a tool the request does not offer — nor any `tool_use` when the
+request has no `tools` field, which is what the shipped writer sends. Two small
+calls settle both; a 400 is a kernel bug, not a flake. Its body
+(`test/helpers/replay-body.ts`) runs offline in `test/wire-replay.test.ts` against
+a fake that enforces the documented rules.
+
 Two opt-ins, deliberately separate. `AOS_LIVE_TESTS=1` spends money and needs the
 network, as in Phase 0. **`AOS_LIVE_PMMCP_WRITES=1` is required for anything that
 writes to your long-term memory**: spending ends, but a goal written into pmmcp

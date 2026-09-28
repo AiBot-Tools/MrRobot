@@ -37,6 +37,7 @@ import { pmmcpMock } from './helpers/mock-pmmcp.js'
 import { freshProbe } from './helpers/probe.js'
 import { withStore } from './helpers/store.js'
 import { anthropicHistoryViolations, chatHistoryViolations, strictly } from './helpers/wire-rules.js'
+import { rejectedCallReplays } from './helpers/replay-body.js'
 
 const PRICES = {
   inMicroUsdPerMTok: FAKE_PRICING.inMicroUsdPerMTok,
@@ -255,4 +256,39 @@ test('a real kernel: a worker that names a tool it was not offered is told, and 
   const logged = rows(fx.dbPath)
   assert.deepEqual(logged.filter((r) => r.type.startsWith('tool.')), [])
   assert.equal(mock.calls.filter((c) => c.tool === 'recall').length, 0)
+})
+
+test('the live replay body, offline: both shapes reach the wire well-formed, and each is logged', async (t) => {
+  // The same body test/live-anthropic.test.ts sends to the real API. Here it
+  // proves the assertions can pass and fail, and pins the two request shapes the
+  // live run is there to settle: a tools field that does not name the replayed
+  // call, and no tools field at all — the shipped writer's exact request.
+  const rejected: string[][] = []
+  const provider = fakeProvider([
+    strictly('anthropic', anthropicEndTurn({ text: 'ok' }), rejected),
+    strictly('anthropic', anthropicEndTurn({ text: 'ok' }), rejected),
+  ])
+  const store = withStore(t)
+  const router = new Router({
+    store,
+    cards: new Map([[ANTHROPIC_REF, ANTHROPIC_CARD]]),
+    probes: freshProbe,
+    resolveCredential: () => Promise.resolve('Hn5rT8wQ2xZ6vB9mK3pL7dG1sA4fJ0cY'),
+    maxRetries: 0,
+    adapters: { anthropic: new AnthropicAdapter() },
+    fetch: provider.fetch,
+    sleep: () => Promise.resolve(),
+  })
+
+  await rejectedCallReplays({ router, store, ref: ANTHROPIC_REF })
+
+  assert.deepEqual(rejected, [])
+  type Body = { tools?: { name: string }[]; messages: { content: unknown }[] }
+  const [withTools, withoutTools] = provider.requests.map((r) => r.body as Body)
+  assert.deepEqual(withTools?.tools?.map((tool) => tool.name), ['kernel__echo'])
+  assert.equal(withoutTools !== undefined && 'tools' in withoutTools, false, 'an empty tool list still sent a tools field')
+  for (const body of [withTools, withoutTools]) {
+    const replayed = (body?.messages[1]?.content as { type: string; name: string }[])[0]
+    assert.deepEqual([replayed?.type, replayed?.name], ['tool_use', 'web__search'])
+  }
 })

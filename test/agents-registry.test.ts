@@ -228,6 +228,58 @@ test('spawn with egress outside the template is rejected', (t) => {
   assert.equal(store.query({ type: 'agent.spawn.rejected' }).length, 2)
 })
 
+test('a manifest filed under a directory that is not its id is refused, naming both', (t) => {
+  // The directory is how an operator finds an agent and how history/ is kept
+  // beside it. A worker-template manifest sitting in agents/scout/ would load
+  // as worker-template while every edit went to the wrong folder.
+  const store = withStore(t)
+  const reg = registry(store)
+  // `scout` sorts before `worker-template`, so the mismatch is met before the
+  // real template's copy could make it a duplicate instead.
+  assert.throws(
+    () => reg.load(agentsDir(t, { scout: TEMPLATE_YAML })),
+    /id "worker-template" does not match its directory "scout"/,
+  )
+  assert.equal(store.query({ type: 'agent.registered' }).length, 0, 'a refused fleet left registrations behind')
+})
+
+test('an id already registered by an earlier load is refused, not replaced', (t) => {
+  // Within one load two directories cannot share a name, so the duplicate that
+  // can actually happen is a second load naming an agent the first registered.
+  // Replacing it would swap a live agent's manifest out from under its runs.
+  const store = withStore(t)
+  const reg = registry(store)
+  reg.load(agentsDir(t))
+  const before = reg.get('ceo')
+  assert.throws(() => reg.load(agentsDir(t)), /duplicate agent id ceo/)
+  assert.equal(reg.get('ceo'), before, 'the second load replaced the registered record')
+  assert.equal(store.query({ type: 'agent.registered' }).length, 2)
+})
+
+test('an ephemeral agent may be spawned only from a template, and never over an existing id', (t) => {
+  // Invariant 6 bounds an ephemeral agent by its TEMPLATE. Spawning from a
+  // standing agent would copy an orchestrator's reach — kernel tools included —
+  // into something the CEO minted; spawning onto an existing id would replace
+  // that agent's record outright.
+  const store = withStore(t)
+  const reg = registry(store)
+  reg.load(agentsDir(t))
+
+  assert.throws(
+    () => reg.spawnEphemeral({ templateId: 'ceo', childId: 'scout-1' }),
+    /spawn rejected: no template named ceo/,
+  )
+  assert.equal(reg.get('scout-1'), undefined)
+
+  const ceo = reg.get('ceo')
+  assert.throws(
+    () => reg.spawnEphemeral({ templateId: 'worker-template', childId: 'ceo' }),
+    /spawn rejected: agent id ceo already exists/,
+  )
+  assert.equal(reg.get('ceo'), ceo, 'a spawn replaced the CEO')
+  assert.equal(store.query({ type: 'agent.spawn.rejected' }).length, 2)
+})
+
 test('spawn within limits registers an ephemeral agent', (t) => {
   const store = withStore(t)
   const reg = registry(store)

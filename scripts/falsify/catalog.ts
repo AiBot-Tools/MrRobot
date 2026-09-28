@@ -306,6 +306,80 @@ const redaction: Suite = {
   },
 }
 
+const SCHEDULER = 'src/runtime/scheduler.ts'
+const CRON = 'src/runtime/cron.ts'
+const REGISTRY = 'src/agents/registry.ts'
+
+const schedule: Suite = {
+  name: 'schedule',
+  tests: ['test/runtime-scheduler.test.ts', 'test/cron.test.ts', 'test/kernel-boot.test.ts', 'test/stubs.test.ts'],
+  mutants: [
+    { id: 'Q1', file: SCHEDULER, from: '      if (this.#fired.get(agent.agentId) === key) continue', to: '', why: 'a minute fires twice' },
+    { id: 'Q2', file: SCHEDULER, from: '      this.#fired.set(agent.agentId, key)', to: '', why: 'the minute is not claimed in memory before the run starts' },
+    { id: 'Q3', file: SCHEDULER, from: "    for (const row of this.#o.store.query({ type: 'run.scheduled' })) {", to: "    for (const row of this.#o.store.query({ type: 'run.scheduled' }).slice(0, 0)) {", why: 'a restart inside a fired minute fires it again' },
+    { id: 'Q4', file: SCHEDULER, from: '      if (this.#o.isBusy(agent.agentId)) {', to: '      if (false) {', why: 'a run is started while the agent’s last one is still going' },
+    { id: 'Q5', file: SCHEDULER, from: '          \'scheduler: unusable expression, skipping this agent\',\n        )\n        continue', to: '          \'scheduler: unusable expression, skipping this agent\',\n        )\n        throw e', why: 'one agent’s bad expression stops every other schedule' },
+    { id: 'Q6', file: CRON, from: '  return expr.bothDayFieldsRestricted ? domHit || dowHit : domHit && dowHit', to: '  return domHit && dowHit', why: 'cron’s day-of-month OR day-of-week rule is ANDed' },
+    { id: 'Q7', file: CRON, from: '  for (const d of dowRaw) dayOfWeek.add(d === 7 ? 0 : d)', to: '  for (const d of dowRaw) dayOfWeek.add(d)', why: 'day 7 is not Sunday' },
+    { id: 'Q8', file: CRON, from: '      if (lo > hi) {', to: '      if (false) {', why: 'a backwards range is accepted instead of refused' },
+    { id: 'Q9', file: CRON, from: '      if (slash !== -1) {\n        // `5/10`', to: '      if (false) {\n        // `5/10`', why: 'a step on a single value is accepted with one of two readings' },
+    { id: 'Q10', file: CRON, from: "  if (text.startsWith('@')) {", to: '  if (false) {', why: 'an @macro is accepted' },
+    { id: 'Q11', file: KERNEL, from: "        .filter((r) => r.status === 'active' && r.manifest.schedule !== undefined)", to: '        .filter((r) => r.manifest.schedule !== undefined)', why: 'an archived agent keeps firing' },
+    { id: 'Q12', file: KERNEL, from: "        [...runs.values()].some((r) => r.state.agentId === agentId && r.state.status !== 'finished'),", to: '        false,', why: 'the kernel never reports an agent busy, so runs overlap' },
+    { id: 'Q13', file: KERNEL, from: '    scheduler.start()', to: '    void scheduler', why: 'the kernel builds the scheduler and never starts it' },
+  ],
+  control: { id: 'C', file: SCHEDULER, from: '// Cron scheduler.', to: '// Cron scheduler. (control)', why: 'comment only' },
+}
+
+const registry: Suite = {
+  name: 'registry',
+  tests: ['test/agents-registry.test.ts', 'test/config-files.test.ts', 'test/delegation-unit.test.ts', 'test/kernel-boot.test.ts'],
+  mutants: [
+    { id: 'Y1', file: REGISTRY, from: '      pending.push({ manifest, dir })', to: "      this.#register({ manifest, status: 'active', dir })", why: 'a fleet with one bad manifest leaves the earlier ones registered' },
+    { id: 'Y2', file: REGISTRY, from: '      if (already !== undefined) {', to: '      if (false) {', why: 'a duplicate agent id loads' },
+    { id: 'Y3', file: REGISTRY, from: '      if (manifest.id !== entry) {', to: '      if (false) {', why: 'a manifest whose id does not match its directory loads' },
+    { id: 'Y4', file: REGISTRY, from: '      if (!this.#deps.providers.has(ref)) {', to: '      if (false) {', why: 'a model ref missing from providers.yaml loads' },
+    { id: 'Y5', file: REGISTRY, from: "      if (view.exposure !== 'agent') {", to: '      if (false) {', why: 'a manifest grants a tool the tool views withhold' },
+    { id: 'Y6', file: REGISTRY, from: '      if (!allowed.includes(view.risk)) {', to: '      if (false) {', why: 'a tier holds a tool above its risk ceiling' },
+    { id: 'Y7', file: REGISTRY, from: '    resolveCaps(this.#deps.budgets, manifest.budget ?? {})', to: '', why: 'a manifest may RAISE a budget cap' },
+    { id: 'Y8', file: REGISTRY, from: '    this.#agents.set(record.manifest.id, Object.freeze(record))', to: '    this.#agents.set(record.manifest.id, record)', why: 'a registered record can be edited by what holds it' },
+    { id: 'Y9', file: REGISTRY, from: "    if (template === undefined || template.manifest.kind !== 'template') {", to: '    if (template === undefined) {', why: 'an ephemeral agent can be spawned from a standing agent' },
+    { id: 'Y10', file: REGISTRY, from: '    if (tier > t.tier) {', to: '    if (false) {', why: 'a spawned agent exceeds its template’s tier (invariant 6)' },
+    { id: 'Y11', file: REGISTRY, from: '    if (outsideEgress.length > 0) {', to: '    if (false) {', why: 'a spawned agent exceeds its template’s egress (invariant 6)' },
+    { id: 'Y12', file: REGISTRY, from: '    if (outsideTools.length > 0) {', to: '    if (false) {', why: 'a spawned agent holds tools its template does not' },
+    { id: 'Y13', file: REGISTRY, from: '    if (this.#agents.has(input.childId)) {', to: '    if (false) {', why: 'a spawn overwrites an existing agent' },
+  ],
+  control: {
+    id: 'C',
+    file: REGISTRY,
+    from: '  // Tier 3 may REQUEST an irreversible tool. It is still human-gated, always.',
+    to: '  // Tier 3 may REQUEST an irreversible tool. It is still human-gated, always. (control)',
+    why: 'comment only',
+  },
+}
+
+const restart: Suite = {
+  name: 'restart',
+  tests: ['test/projections.test.ts', 'test/kernel-boot.test.ts', 'test/policy-approvals.test.ts', 'test/policy-quarantine.test.ts'],
+  mutants: [
+    { id: 'V1', file: PROJECTIONS, from: "        if (approvalId === '') break", to: '        break', why: 'an unanswered approval is not seen after a restart' },
+    { id: 'V2', file: PROJECTIONS, from: "        approvals.delete(stringAt(payload, 'approvalId'))", to: '', why: 'a decided approval is expired again on every restart' },
+    { id: 'V3', file: PROJECTIONS, from: "        if (holdId === '') break", to: '        break', why: 'an unreleased hold is not seen after a restart' },
+    { id: 'V4', file: PROJECTIONS, from: "        if (row.runId !== null) touchedUntrusted.add(row.runId)\n        holds.delete(stringAt(payload, 'holdId'))", to: '        if (row.runId !== null) touchedUntrusted.add(row.runId)', why: 'a released hold is abandoned again on restart' },
+    { id: 'V5', file: PROJECTIONS, from: "      case 'quarantine.abandoned': {\n        holds.delete(stringAt(payload, 'holdId'))", to: "      case 'quarantine.abandoned': {\n        void 0", why: 'recovery’s own abandon row does not close the hold, so recovery repeats' },
+    { id: 'V6', file: KERNEL, from: "decision: 'expired' },", to: "decision: 'denied' },", why: 'an unanswered approval is recorded as a person saying no' },
+    { id: 'V7', file: KERNEL, from: '    for (const approval of recovered.unresolvedApprovals) {', to: '    for (const approval of recovered.unresolvedApprovals.slice(0, 0)) {', why: 'boot leaves unanswered approvals open' },
+    { id: 'V8', file: KERNEL, from: '    for (const hold of recovered.unreleasedHolds) {', to: '    for (const hold of recovered.unreleasedHolds.slice(0, 0)) {', why: 'boot leaves unreleased holds open' },
+  ],
+  control: {
+    id: 'C',
+    file: PROJECTIONS,
+    from: '// So recovery TERMINATES what it finds.',
+    to: '// So recovery TERMINATES what it finds. (control)',
+    why: 'comment only',
+  },
+}
+
 export const CATALOG: readonly Suite[] = [
   delegation,
   recovery,
@@ -316,4 +390,7 @@ export const CATALOG: readonly Suite[] = [
   evalChecks,
   integrity,
   redaction,
+  schedule,
+  registry,
+  restart,
 ]

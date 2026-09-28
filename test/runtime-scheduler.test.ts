@@ -27,6 +27,15 @@ import { Scheduler, TICK_MS, scheduledInput } from '../src/runtime/scheduler.js'
 import { minuteKey } from '../src/runtime/cron.js'
 import { withStore } from './helpers/store.js'
 import { storeFile } from './helpers/store.js'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { connectControl } from '../src/cli/client.js'
+import { mintHumanActor } from '../src/control/actor.js'
+import { writeProbeRecord } from '../src/models/probe.js'
+import { REPO_ROOT, rows, TEST_TOKEN, withKernel } from './helpers/kernel.js'
+import { pmmcpMock } from './helpers/mock-pmmcp.js'
+import { freshProbe } from './helpers/probe.js'
+import { tmpdir } from './helpers/tmpdir.js'
 
 type Store = ReturnType<typeof withStore>
 
@@ -277,4 +286,89 @@ test('start is idempotent and stop is safe before it', (t) => {
   assert.equal(h.starts.length, 1, 'starting twice doubled the fires')
   h.scheduler.stop()
   h.scheduler.stop()
+})
+
+// ── through the real kernel ────────────────────────────────────────────────
+//
+// The tests above give the Scheduler its `agents` and `isBusy` by hand, so they
+// prove the rules and not the kernel's wiring of them: which agents the kernel
+// hands over (active ones only) and what it counts as busy (its live run map).
+// A kernel that got either wrong would pass every test above.
+
+/** The shipped fleet, with the writer on a schedule that matches every minute. */
+function scheduledFleet(dir: string): string {
+  const agents = join(dir, 'agents')
+  for (const id of ['ceo', 'researcher', 'writer']) {
+    mkdirSync(join(agents, id, 'history'), { recursive: true })
+    const yaml = readFileSync(join(REPO_ROOT, 'agents', id, 'agent.yaml'), 'utf8')
+    writeFileSync(join(agents, id, 'agent.yaml'), id === 'writer' ? `${yaml}\nschedule: "* * * * *"\n` : yaml)
+    writeFileSync(join(agents, id, 'AGENTS.md'), `# ${id}\n`)
+  }
+  return agents
+}
+
+async function bootScheduled(
+  t: Parameters<typeof withStore>[0],
+  fetch?: typeof globalThis.fetch,
+): Promise<Awaited<ReturnType<typeof withKernel>>> {
+  const mock = pmmcpMock({ secrets: { 'anthropic-api-key': 'vault-fixture-credential-scheduler' } })
+  t.after(async () => {
+    await mock.close()
+  })
+  return withKernel(t, {
+    clientFactory: mock.connect,
+    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    agentsDir: scheduledFleet(tmpdir(t)),
+    ...(fetch === undefined ? {} : { fetch }),
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe('anthropic/claude-sonnet-5'))
+    },
+  })
+}
+
+const scheduledRows = (dbPath: string, agentId: string) =>
+  rows(dbPath).filter((r) => r.type === 'run.scheduled' && r.payload.includes(`"agentId":"${agentId}"`))
+
+test('the kernel schedules active agents only: an archived agent stops firing', async (t) => {
+  const { kernel, fx } = await bootScheduled(t)
+  assert.deepEqual(kernel.scheduler.diagnostics().map((d) => d.agentId), ['writer'])
+
+  // Archive never deletes (invariant 6), so the manifest and its schedule are
+  // still there. What must change is that nothing fires it.
+  kernel.agents.archive('writer', mintHumanActor('conn-test'))
+  assert.deepEqual(kernel.scheduler.diagnostics(), [], 'the scheduler still holds an archived agent')
+  assert.deepEqual(kernel.scheduler.tick(), [])
+  await kernel.shutdown()
+  assert.deepEqual(scheduledRows(fx.dbPath, 'writer'), [], 'a minute was claimed for an archived agent')
+})
+
+test('the kernel reports an agent with a run in flight as busy, so its schedule does not overlap it', async (t) => {
+  // The writer's first model call never finishes: headers, then a body that
+  // never ends. While it hangs, a tick at a matching minute must claim the
+  // minute and start nothing.
+  let reached: () => void = () => undefined
+  const hanging = new Promise<void>((resolve) => {
+    reached = resolve
+  })
+  const fetch: typeof globalThis.fetch = () => {
+    reached()
+    return Promise.resolve(
+      new Response(new ReadableStream<Uint8Array>({ start: () => undefined }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+  }
+  const { kernel, fx } = await bootScheduled(t, fetch)
+
+  const client = await connectControl({ port: kernel.port, token: TEST_TOKEN, timeoutMs: 20_000 })
+  await client.call('run.start', { agentId: 'writer', input: 'a long write-up' })
+  client.close()
+  await hanging
+
+  assert.deepEqual(kernel.scheduler.tick(), [], 'a scheduled run started on top of one in flight')
+  await kernel.shutdown()
+  // Claimed and skipped: the minute is spent, and exactly one writer run exists.
+  assert.equal(scheduledRows(fx.dbPath, 'writer').length, 1)
+  assert.equal(rows(fx.dbPath).filter((r) => r.type === 'run.queued').length, 1)
 })

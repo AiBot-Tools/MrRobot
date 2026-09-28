@@ -254,6 +254,10 @@ test('the catalog is well-formed: unique ids, real test files, and controls that
   }
   const suites = CATALOG.map((s) => s.name)
   assert.equal(new Set(suites).size, suites.length)
+  // `--only` names mutants across suites, so an id must mean one mutant in the
+  // whole catalog, not just within its suite.
+  const all = CATALOG.flatMap((s) => s.mutants.map((mu) => mu.id))
+  assert.deepEqual(all.filter((id, i) => all.indexOf(id) !== i), [], 'a mutant id is reused across suites')
 })
 
 test('npm run falsify is a program: bad input is refused with usage, --list runs nothing', () => {
@@ -263,7 +267,7 @@ test('npm run falsify is a program: bad input is refused with usage, --list runs
   const bogus = run(['no-such-suite'])
   assert.equal(bogus.status, 2, bogus.stderr)
   assert.match(bogus.stderr, /unknown suite: no-such-suite/)
-  assert.match(bogus.stderr, /suites: delegation, recovery, replay, namespace, goals, anchor, eval/)
+  assert.match(bogus.stderr, /suites: delegation, recovery, replay, namespace, goals, anchor, eval, integrity, redaction/)
 
   const badOnly = run(['--only', 'D99'])
   assert.equal(badOnly.status, 2)

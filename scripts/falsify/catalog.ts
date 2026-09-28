@@ -218,4 +218,101 @@ const evalChecks: Suite = {
   },
 }
 
-export const CATALOG: readonly Suite[] = [delegation, recovery, replay, namespace, goals, anchor, evalChecks]
+// Invariant 5. These edit the chain, the canonicalizer, the triggers and the
+// redaction pass — the change-controlled core — and restore them; the operator
+// approved keeping them in the catalog on that basis. The worst silent failure
+// this kernel could have is a log that is tampered with, or holds a credential,
+// while verifyChain still says ok.
+const CHAIN = 'src/events/chain.ts'
+const CANONICAL = 'src/events/canonical.ts'
+const SCHEMA = 'src/events/schema.ts'
+const REDACT = 'src/events/redact.ts'
+
+const integrity: Suite = {
+  name: 'integrity',
+  tests: [
+    'test/chain.test.ts',
+    'test/canonical.test.ts',
+    'test/store.test.ts',
+    'test/store-anchor-trust.test.ts',
+    'test/kernel-boot.test.ts',
+    'test/cli.test.ts',
+  ],
+  mutants: [
+    { id: 'H1', file: CHAIN, from: '    if (row.seq !== expectedSeq) {', to: '    if (false) {', why: 'a gap in seq is not reported as a gap' },
+    { id: 'H2', file: CHAIN, from: '    if (row.prevHash !== prev) {', to: '    if (false) {', why: 'a broken prev_hash link passes' },
+    { id: 'H3', file: CHAIN, from: '    if (recomputed !== row.hash) {', to: '    if (false) {', why: 'a row whose content was edited passes' },
+    { id: 'H4', file: CHAIN, from: '  if (counter > tail) {', to: '  if (false) {', why: 'a deleted-and-refilled tail passes' },
+    { id: 'H5', file: CHAIN, from: '    if (anchor.genesis !== GENESIS) {', to: '    if (false) {', why: 'an anchor from another chain is accepted' },
+    { id: 'H6', file: CHAIN, from: '    if (tail < anchor.seq) {', to: '    if (false) {', why: 'a log behind its anchor (truncated) passes' },
+    { id: 'H7', file: CHAIN, from: '      if (anchored === undefined || anchored.hash !== anchor.hash) {', to: '      if (false) {', why: 'a rewritten row at the anchored position passes' },
+    { id: 'H8', file: CHAIN, from: '      type: row.type,\n    }),', to: '    }),', why: 'the event type is not hashed, so it can be changed silently' },
+    { id: 'H9', file: CHAIN, from: "export const GENESIS: string = sha256Hex('aos-kernel:events:v1')", to: "export const GENESIS: string = '0'.repeat(64)", why: 'the genesis loses its domain separation' },
+    { id: 'J1', file: CANONICAL, from: '      const keys = Object.keys(record).sort()', to: '      const keys = Object.keys(record)', why: 'key order changes the hash' },
+    { id: 'J2', file: CANONICAL, from: '      if (!Number.isSafeInteger(v)) {', to: '      if (!Number.isFinite(v)) {', why: 'floats are hashed, so the hash depends on float formatting' },
+    { id: 'J3', file: CANONICAL, from: '      if (LONE_SURROGATE.test(v)) {', to: '      if (false) {', why: 'a lone surrogate is hashed rather than refused' },
+    { id: 'J4', file: CANONICAL, from: '      if (proto !== Object.prototype && proto !== null) {', to: '      if (false) {', why: 'a Date or class instance is canonicalized as an object' },
+    { id: 'J5', file: CANONICAL, from: '      throw new TypeError(`unsupported value type ${typeof v} in event`)', to: "      return 'null'", why: 'undefined and bigint are silently written as null' },
+    { id: 'T1', file: SCHEMA, from: '    if (normalize(actual) !== normalize(expected.sql)) {', to: '    if (false) {', why: 'a trigger rewritten to do nothing passes the check' },
+    { id: 'T2', file: SCHEMA, from: '  if (extra.length > 0) {', to: '  if (false) {', why: 'an extra trigger on events is accepted' },
+    { id: 'T3', file: SCHEMA, from: "      \"BEGIN SELECT RAISE(ABORT, 'events is append-only: UPDATE refused'); END\",", to: '      "BEGIN SELECT 1; END",', why: 'UPDATE on events is allowed' },
+    { id: 'T4', file: SCHEMA, from: "      \"BEGIN SELECT RAISE(ABORT, 'events is append-only: DELETE refused'); END\",", to: '      "BEGIN SELECT 1; END",', why: 'DELETE on events is allowed' },
+    { id: 'T5', file: SCHEMA, from: "      'WHEN NEW.seq IS NULL OR NEW.seq != (SELECT coalesce(max(seq), 0) + 1 FROM events) ' +", to: "      'WHEN NEW.seq IS NULL ' +", why: 'a row can be inserted out of sequence' },
+    { id: 'T6', file: STORE, from: '    if (fresh && !this.#readOnly) createSchema(this.#db)', to: '    if (!this.#readOnly) createSchema(this.#db)', why: 'a dropped trigger is silently recreated instead of refused' },
+    { id: 'T7', file: STORE, from: '    if (!triggers.ok) {', to: '    if (false) {', why: 'the store opens a log whose triggers fail the check' },
+  ],
+  control: {
+    id: 'C',
+    file: CHAIN,
+    from: '// Hash chain over the event log.',
+    to: '// Hash chain over the event log. (control)',
+    why: 'comment only',
+  },
+}
+
+const redaction: Suite = {
+  name: 'redaction',
+  tests: [
+    'test/redact.test.ts',
+    'test/store.test.ts',
+    'test/secrets-broker.test.ts',
+    'test/log.test.ts',
+    'test/models-router.test.ts',
+    'test/models-openai-chat.test.ts',
+    'test/models-anthropic.test.ts',
+    'test/cli.test.ts',
+  ],
+  mutants: [
+    { id: 'S1', file: STORE, from: '    const payloadText = canonicalize(redactValue(stripUndefined(parsed.data)))', to: '    const payloadText = canonicalize(stripUndefined(parsed.data))', why: 'the store writes payloads unredacted' },
+    { id: 'S2', file: REDACT, from: '  if (key !== undefined && DENY_KEYS.test(key)) return CENSOR', to: '', why: 'a value under a key like `password` is kept' },
+    { id: 'S3', file: REDACT, from: '  let out = SecretMask.apply(s)', to: '  let out = s', why: 'a registered vault secret of no known shape is kept' },
+    { id: 'S4', file: REDACT, from: '    const values = [...SecretMask.#values].sort((a, b) => b.length - a.length)', to: '    const values = [...SecretMask.#values].sort((a, b) => a.length - b.length)', why: 'a secret containing another is left half-censored' },
+    { id: 'S5', file: REDACT, from: "    if (typeof value !== 'string' || value.length < MIN_MASK_LENGTH) return false", to: "    if (typeof value !== 'string') return false", why: 'a short common word can be registered and censored everywhere' },
+    { id: 'S6', file: REDACT, from: '  if (Array.isArray(v)) return v.map((item) => redactValue(item))', to: '  if (Array.isArray(v)) return v', why: 'secrets inside arrays are kept' },
+    { id: 'S7', file: REDACT, from: '  /\\bsk-(?:ant-)?[A-Za-z0-9_-]{8,}/g, // OpenAI sk-…, Anthropic sk-ant-…\n', to: '', why: 'an OpenAI or Anthropic key in a string is kept' },
+    { id: 'S8', file: REDACT, from: '  /\\bBearer\\s+[A-Za-z0-9._~+/-]+=*/g, // any bearer credential\n', to: '', why: 'a bearer token in a string is kept' },
+    { id: 'S9', file: REDACT, from: '|credentials?)$/i', to: '|credentials?)$/', why: 'deny-keys match only in lower case (`Authorization` is kept)' },
+    { id: 'S10', file: REDACT, from: '  /\\bgh[pousr]_[A-Za-z0-9]{20,}/g, // GitHub ghp_/gho_/ghu_/ghs_/ghr_\n', to: '', why: 'a GitHub token in a string is kept' },
+    { id: 'S11', file: 'src/log.ts', from: "  'req.headers[\"x-api-key\"]',\n", to: '', why: 'pino logs the x-api-key header the Anthropic SDK sends' },
+    { id: 'S12', file: 'src/log.ts', from: "  'req.headers.authorization',\n", to: '', why: 'pino logs a request Authorization header' },
+  ],
+  control: {
+    id: 'C',
+    file: REDACT,
+    from: '// Value-scrubbing pass for the event log.',
+    to: '// Value-scrubbing pass for the event log. (control)',
+    why: 'comment only',
+  },
+}
+
+export const CATALOG: readonly Suite[] = [
+  delegation,
+  recovery,
+  replay,
+  namespace,
+  goals,
+  anchor,
+  evalChecks,
+  integrity,
+  redaction,
+]

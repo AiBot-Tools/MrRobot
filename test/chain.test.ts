@@ -9,6 +9,7 @@ import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -66,6 +67,43 @@ test('edited payload → content mismatch', (t) => {
   assert.equal(result.ok, false)
   assert.equal(result.ok ? 0 : result.at, 2)
   assert.match(result.ok ? '' : result.reason, /content: stored hash does not match/)
+})
+
+test('every stored column but the hash itself is covered by the hash', (t) => {
+  // A column left out of the hashed set can be rewritten while verifyChain
+  // still says ok: change a row's type from tool.gate to anything, or move it
+  // to another run, and the audit reads differently with nothing to show it.
+  // So each column is edited on its own, on a fresh copy, and each must fail.
+  const edits = [
+    ['id', 'evt_forged'],
+    ['ts', '2001-01-01T00:00:00.000Z'],
+    ['type', 'kernel.shutdown'],
+    ['run_id', 'run_forged'],
+    ['agent_id', 'forged-agent'],
+  ] as const
+  for (const [column, value] of edits) {
+    const { path } = damagedLog(t, 3)
+    const tp = tamper(path)
+    tp.setColumn(2, column, value)
+    tp.close()
+    const result = verifyFile(path)
+    assert.equal(result.ok, false, `editing ${column} went unnoticed`)
+    assert.equal(result.ok ? 0 : result.at, 2)
+    assert.match(result.ok ? '' : result.reason, /content: stored hash does not match/)
+  }
+})
+
+test('the genesis is the documented, domain-separated value — computed here independently', (t) => {
+  // Changing it invalidates every hash ever written, and a genesis of zeros
+  // would make this chain indistinguishable from any other project's. An
+  // external auditor reproduces it from the string alone, so this does too,
+  // with node:crypto directly rather than through the kernel's own helper.
+  const expected = createHash('sha256').update('aos-kernel:events:v1', 'utf8').digest('hex')
+  assert.equal(GENESIS, expected)
+  const store = withStore(t)
+  seed(store, 1)
+  const first = store.query({ limit: 1 })[0]
+  assert.equal(first?.prevHash, expected, 'the first row does not link to the documented genesis')
 })
 
 test('deleted middle row → gap at the right seq', (t) => {

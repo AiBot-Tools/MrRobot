@@ -20,6 +20,8 @@ export interface Tamper {
   rows(): EventRow[]
   /** Replace a row's payload, leaving its stored hash stale. */
   setPayload(seq: number, payload: string): void
+  /** Overwrite one metadata column, leaving the stored hash stale. */
+  setColumn(seq: number, column: 'id' | 'ts' | 'type' | 'run_id' | 'agent_id', value: string | null): void
   /** Replace a row's payload AND recompute its hash, so the row self-verifies. */
   forgeRow(seq: number, payload: string): void
   /** Remove a row. */
@@ -58,6 +60,10 @@ export function tamper(path: string): Tamper {
     rows: () => readAllRows(db),
     setPayload(seq, payload) {
       db.run('UPDATE events SET payload = ? WHERE seq = ?', payload, seq)
+    },
+    setColumn(seq, column, value) {
+      // The column name comes from the closed union above, never from input.
+      db.run(`UPDATE events SET ${column} = ? WHERE seq = ?`, value, seq)
     },
     forgeRow(seq, payload) {
       const row = readAllRows(db).find((r) => r.seq === seq)

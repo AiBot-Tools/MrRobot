@@ -389,7 +389,7 @@ catch them. `npm run falsify` applies each, runs its suite's tests, and puts the
 file back.
 
 ```bash
-npm run falsify                    # every suite (delegation, recovery, replay, namespace, goals, anchor, eval)
+npm run falsify                    # every suite (nine: see --list)
 npm run falsify -- recovery        # one suite
 npm run falsify -- --only D13,W3   # named mutants
 npm run falsify -- --list          # the catalog, touching nothing
@@ -410,10 +410,12 @@ checks on every `npm test` that every catalog anchor still matches exactly once
 mutant.
 
 Run it after changing delegation, crash recovery, tool-call replay, the memory
-namespace pin, goal tracking, anchor trust or the eval checks — the seven suites —
-and add a mutant whenever a new test exists to catch a specific bug. Chain
-hashing, redaction and the immutability triggers have no mutants yet: the tool
-would edit them on every run, and CLAUDE.md puts touching them behind an ask.
+namespace pin, goal tracking, anchor trust, the eval checks, the chain /
+canonicalizer / triggers (`integrity`) or redaction — the nine suites — and add a
+mutant whenever a new test exists to catch a specific bug. The `integrity` and
+`redaction` suites edit change-controlled files (chain hashing, the triggers,
+the redaction pass) and restore them; the operator approved keeping them in the
+catalog on that basis.
 
 Last full run, against commit `e125c93`: 71 of 71 mutants killed (delegation 18,
 recovery 12, replay 7, namespace 7, goals 10, anchor 6, eval 11), 7 of 7

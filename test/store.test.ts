@@ -281,6 +281,26 @@ test('reopen refuses when a trigger body is rewritten under the same name', (t) 
   )
 })
 
+test('reopen refuses when an extra trigger has been added to events', (t) => {
+  // The expected three can stay intact while a fourth BEFORE INSERT trigger
+  // rewrites every row on its way in. Checking only the triggers we expect
+  // would pass that; the check must refuse anything it does not know.
+  // Deliberately damaged below, so the harness must not verify this file.
+  const path = storeFile(t)
+  const store = withStoreUnverified(t, { path })
+  boot(store)
+  store.close()
+
+  const raw = openDb(path)
+  raw.exec('CREATE TRIGGER events_rewrite BEFORE INSERT ON events BEGIN SELECT 1; END')
+  raw.close()
+
+  assert.throws(
+    () => new EventStore(path),
+    /integrity check failed: unexpected trigger\(s\) on events: events_rewrite/,
+  )
+})
+
 test('listener errors are swallowed, logged, and append still commits', (t) => {
   const store = withStore(t)
   const seen: number[] = []

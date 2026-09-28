@@ -417,9 +417,9 @@ mutant whenever a new test exists to catch a specific bug. The `integrity` and
 the redaction pass) and restore them; the operator approved keeping them in the
 catalog on that basis.
 
-Last full run, against commit `e125c93`: 71 of 71 mutants killed (delegation 18,
-recovery 12, replay 7, namespace 7, goals 10, anchor 6, eval 11), 7 of 7
-controls survived, exit 0. A result is a fact about that commit only; rerun it
+Last full run, against commit `cbeab01`: 104 of 104 mutants killed (delegation
+18, recovery 12, replay 7, namespace 7, goals 10, anchor 6, eval 11, integrity
+21, redaction 12), 9 of 9 controls survived, exit 0. A result is a fact about that commit only; rerun it
 rather than trusting this line after a change.
 
 ---

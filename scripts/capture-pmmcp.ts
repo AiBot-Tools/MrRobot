@@ -7,10 +7,13 @@
 // up, and `test/pmmcp-drift.test.ts` starts checking the double against the real
 // server on every test run instead of skipping.
 //
-//   PMMCP_TOKEN=... npm run capture:pmmcp
+//   npm run capture:pmmcp [-- OUT] [-- --config PATH]
 //
-// It writes test/fixtures/pmmcp-listtools.json and nothing else. It makes one
-// outbound connection, to the loopback URL in config/kernel.yaml, and calls
+// pmmcp takes no bearer (it trusts loopback), so nothing needs to be exported.
+// If kernel.yaml gives the server a `tokenEnv`, that variable must be set.
+//
+// It writes test/fixtures/pmmcp-listtools.json (or OUT) and nothing else. It
+// makes one outbound connection, to the loopback URL in kernel.yaml, and calls
 // tools/list only — no tool is invoked, so nothing in the operator's memory or
 // vault is read or written.
 //
@@ -42,7 +45,20 @@ interface Capture {
 
 async function main(argv: readonly string[]): Promise<number> {
   const repoRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
-  const configPath = join(repoRoot, 'config', 'kernel.yaml')
+  // --config exists so the offline test can point this at a closed port: with no
+  // bearer to withhold, the shipped config would reach the operator's live pmmcp.
+  const args = [...argv]
+  let configPath = join(repoRoot, 'config', 'kernel.yaml')
+  const flag = args.indexOf('--config')
+  if (flag !== -1) {
+    const value = args[flag + 1]
+    if (value === undefined) {
+      process.stderr.write('--config needs a path\n')
+      return 1
+    }
+    configPath = resolve(value)
+    args.splice(flag, 2)
+  }
   const config = parseKernelConfig(parseYaml(readFileSync(configPath, 'utf8')), { repoRoot })
 
   const server = config.mcp.servers['pmmcp']
@@ -50,9 +66,9 @@ async function main(argv: readonly string[]): Promise<number> {
     process.stderr.write('config/kernel.yaml declares no pmmcp server\n')
     return 1
   }
-  const tokenEnv = server.tokenEnv ?? 'PMMCP_TOKEN'
-  const token = process.env[tokenEnv]
-  if (token === undefined || token.trim() === '') {
+  const tokenEnv = server.tokenEnv
+  const token = tokenEnv === undefined ? undefined : process.env[tokenEnv]
+  if (tokenEnv !== undefined && (token === undefined || token.trim() === '')) {
     process.stderr.write(`${tokenEnv} is not set\n`)
     return 1
   }
@@ -76,7 +92,7 @@ async function main(argv: readonly string[]): Promise<number> {
         }))
         .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
     }
-    const out = argv[0] ?? join(repoRoot, CAPTURE_PATH)
+    const out = args[0] ?? join(repoRoot, CAPTURE_PATH)
     writeFileSync(out, `${JSON.stringify(capture, null, 2)}\n`)
     process.stdout.write(`captured ${String(tools.length)} tools to ${out}\n`)
     return 0

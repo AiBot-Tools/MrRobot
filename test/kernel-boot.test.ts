@@ -26,6 +26,8 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { parse as parseYaml } from 'yaml'
 import { WebSocket } from 'ws'
+import { createServer, type IncomingHttpHeaders } from 'node:http'
+import type { AddressInfo } from 'node:net'
 
 import { bootKernel, configHash, STUBS, SUBSYSTEM_ORDER } from '../src/kernel.js'
 import { isClean, projectRecovery } from '../src/events/projections.js'
@@ -1013,4 +1015,46 @@ test('envFallback:true shows secrets degraded in status.get', async (t) => {
   })
   assert.equal(clean.kernel.status().subsystems.secrets.state, 'ok')
   assert.equal(clean.kernel.status().envFallback, false)
+})
+
+test('pmmcp is dialled with no bearer unless kernel.yaml declares a tokenEnv, and a declared one left unset is never dialled', async (t) => {
+  // pmmcp authenticates nobody (it trusts loopback), so the shipped config names
+  // no tokenEnv. A loopback recorder stands in for it: the claim is what the
+  // kernel SENDS, which a mock client factory would never see.
+  const seen: IncomingHttpHeaders[] = []
+  const server = createServer((req, res) => {
+    seen.push(req.headers)
+    req.resume()
+    res.writeHead(404).end()
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())))
+  const url = `url: http://127.0.0.1:${String((server.address() as AddressInfo).port)}/mcp`
+  const pointAt = (extra: string) => (base: string): string =>
+    base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `${url}${extra}`)
+
+  // As shipped: dialled, and nothing that looks like a credential goes with it.
+  const tokenless = await withKernel(t, { kernelYaml: pointAt('') })
+  assert.ok(seen.length > 0, 'the kernel never dialled pmmcp')
+  assert.ok(seen.every((h) => h.authorization === undefined), 'a bearer went to a server that takes none')
+  const reason = tokenless.kernel.status().subsystems.hub.reason ?? ''
+  assert.doesNotMatch(reason, /is not set/)
+  await tokenless.kernel.shutdown()
+
+  // Declared and unset: refused with the variable named, before any request.
+  seen.length = 0
+  const declared = await withKernel(t, { kernelYaml: pointAt('\n      tokenEnv: PMMCP_TOKEN') })
+  assert.equal(seen.length, 0, 'a declared tokenEnv left unset still dialled')
+  assert.match(declared.kernel.status().subsystems.hub.reason ?? '', /PMMCP_TOKEN is not set/)
+  await declared.kernel.shutdown()
+
+  // Declared and set: the bearer goes in the Authorization header.
+  const bearer = 'pmmcp-bearer-for-this-test-only'
+  const withToken = await withKernel(t, {
+    kernelYaml: pointAt('\n      tokenEnv: PMMCP_TOKEN'),
+    env: { PMMCP_TOKEN: bearer },
+  })
+  assert.ok(seen.length > 0, 'a set tokenEnv was never dialled')
+  assert.ok(seen.every((h) => h.authorization === `Bearer ${bearer}`), 'the declared bearer was not sent')
+  await withToken.kernel.shutdown()
 })

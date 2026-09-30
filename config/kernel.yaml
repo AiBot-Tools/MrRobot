@@ -28,10 +28,11 @@ events:
 mcp:
   servers:
     pmmcp:
-      # Streamable HTTP on loopback, bearer required. 8765 is the pmmcp
-      # dashboard; 8766 is the MCP endpoint.
+      # Streamable HTTP on loopback. 8765 is the pmmcp dashboard; 8766 is the
+      # MCP endpoint. No tokenEnv: pmmcp authenticates nobody and trusts
+      # loopback (its RFC 9728 metadata lists no authorization servers), so any
+      # local process can call it. Declare a tokenEnv only if it grows a bearer.
       url: http://127.0.0.1:8766/mcp
-      tokenEnv: PMMCP_TOKEN
       # pmmcp sessions idle-expire, so the hub heartbeats inside that window.
       heartbeatMs: 240000
       requestTimeoutMs: 30000

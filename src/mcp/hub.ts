@@ -72,10 +72,19 @@ function isSessionGone(e: unknown): boolean {
  * runtime shapes agree exactly; this is a type-level seam, not a claim about
  * behaviour.
  */
-export function streamableHttpTransport(url: string, token: string): Transport {
-  const transport = new StreamableHTTPClientTransport(new URL(url), {
-    requestInit: { headers: { Authorization: `Bearer ${token}` } },
-  })
+/**
+ * Streamable HTTP to a loopback MCP server, with a bearer only when one is given.
+ *
+ * pmmcp authenticates nobody: it trusts loopback and publishes RFC 9728 metadata
+ * with no authorization servers. A server that does want a bearer names its
+ * `tokenEnv` in kernel.yaml, and then an unset token refuses the connection
+ * upstream of here rather than sending an empty `Bearer `.
+ */
+export function streamableHttpTransport(url: string, token?: string): Transport {
+  const transport = new StreamableHTTPClientTransport(
+    new URL(url),
+    token === undefined ? {} : { requestInit: { headers: { Authorization: `Bearer ${token}` } } },
+  )
   return transport as Transport
 }
 

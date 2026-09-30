@@ -24,7 +24,7 @@ import './helpers/guard.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync, spawn } from 'node:child_process'
-import { mkdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { closeVerified, withStore } from './helpers/store.js'
@@ -32,6 +32,18 @@ import { EventStore } from '../src/events/store.js'
 import { tmpdir } from './helpers/tmpdir.js'
 
 const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
+
+// The shipped config names the operator's REAL pmmcp and, since pmmcp takes no
+// bearer, nothing short of the address keeps an offline test from reaching it.
+// Port 9 (discard) on loopback: nothing listens, so a connect fails at once.
+const SHIPPED_PMMCP_URL = 'url: http://127.0.0.1:8766/mcp'
+const CLOSED_PMMCP_URL = 'url: http://127.0.0.1:9/mcp'
+
+/** The shipped kernel.yaml with pmmcp pointed at a closed port, or a throw. */
+function offlinePmmcp(shipped: string): string {
+  assert.ok(shipped.includes(SHIPPED_PMMCP_URL), 'the shipped pmmcp url moved; update SHIPPED_PMMCP_URL')
+  return shipped.replace(SHIPPED_PMMCP_URL, CLOSED_PMMCP_URL)
+}
 const BOOT = { schemaVersion: 1 as const, version: '0.0.1', configHash: 'h', degraded: [] }
 
 /** Run one CLI invocation as a child process. */
@@ -119,12 +131,11 @@ test('npm run dev boots the daemon, serves the CLI over the socket, and shuts do
   const port = 7791
   const configPath = join(dataDir, 'kernel.yaml')
   const shipped = readFileSync(join(REPO, 'config', 'kernel.yaml'), 'utf8')
-  const config = shipped
+  const config = offlinePmmcp(shipped)
     .replace(/^dataDir: .*$/m, `dataDir: ${dataDir}`)
     .replace(/^  port: \d+$/m, `  port: ${String(port)}`)
     .replace(/mountRoot: [^\n}]*/g, `mountRoot: ${dataDir}/work `)
   mkdirSync(join(dataDir, 'work'), { recursive: true })
-  const { writeFileSync } = await import('node:fs')
   writeFileSync(configPath, config)
 
   const env = {
@@ -221,9 +232,11 @@ test('the operator scripts are programs: each refuses with usage rather than doi
   // the suite would notice an entry guard that never fires — the module would
   // load, define main, and exit 0 having run no eval and captured nothing.
   //
-  // Both are driven with their credential ABSENT, which is the one path that
-  // touches no network and no daemon: each must name what is missing and exit
-  // non-zero.
+  // eval.ts is driven with its credential ABSENT. capture-pmmcp.ts needs no
+  // credential for pmmcp, so it is driven twice against a CLOSED loopback port:
+  // once as shipped (it must try, fail, and write nothing) and once with a
+  // declared-but-unset tokenEnv (it must refuse before connecting). Neither
+  // touches the operator's pmmcp or any daemon.
   const env = { PATH: process.env['PATH'] ?? '/usr/bin:/bin' }
 
   const evalRun = spawnSync('npx', ['tsx', 'scripts/eval.ts'], {
@@ -235,13 +248,35 @@ test('the operator scripts are programs: each refuses with usage rather than doi
   assert.equal(evalRun.status, 2, `eval.ts exited ${String(evalRun.status)}: ${evalRun.stderr}`)
   assert.match(evalRun.stderr, /AOS_CONTROL_TOKEN is not set/)
 
-  const capture = spawnSync('npx', ['tsx', 'scripts/capture-pmmcp.ts'], {
-    cwd: REPO,
-    env,
-    encoding: 'utf8',
-    timeout: 60_000,
-  })
-  assert.equal(capture.status, 1, `capture-pmmcp.ts exited ${String(capture.status)}: ${capture.stderr}`)
-  assert.match(capture.stderr, /PMMCP_TOKEN is not set/)
+  const dir = tmpdir(t)
+  const shipped = offlinePmmcp(readFileSync(join(REPO, 'config', 'kernel.yaml'), 'utf8'))
+  const capture = (yaml: string, name: string): { status: number | null; stderr: string; out: string } => {
+    const configPath = join(dir, `${name}.yaml`)
+    const out = join(dir, `${name}.json`)
+    writeFileSync(configPath, yaml)
+    const run = spawnSync('npx', ['tsx', 'scripts/capture-pmmcp.ts', out, '--config', configPath], {
+      cwd: REPO,
+      env,
+      encoding: 'utf8',
+      timeout: 60_000,
+    })
+    return { status: run.status, stderr: run.stderr, out }
+  }
+
+  // No tokenEnv, as shipped: it must attempt the connection, fail, and write nothing.
+  const tokenless = capture(shipped, 'tokenless')
+  assert.equal(tokenless.status, 1, `capture-pmmcp.ts exited ${String(tokenless.status)}: ${tokenless.stderr}`)
+  assert.doesNotMatch(tokenless.stderr, /is not set/)
+  assert.ok(tokenless.stderr.trim().length > 0, 'a failed capture said nothing')
+  assert.equal(existsSync(tokenless.out), false, 'a failed capture wrote a fixture')
+
+  // A declared tokenEnv that is unset refuses before any connection.
+  const declared = capture(
+    shipped.replace(CLOSED_PMMCP_URL, `${CLOSED_PMMCP_URL}\n      tokenEnv: PMMCP_TOKEN`),
+    'declared',
+  )
+  assert.equal(declared.status, 1, `capture-pmmcp.ts exited ${String(declared.status)}: ${declared.stderr}`)
+  assert.match(declared.stderr, /PMMCP_TOKEN is not set/)
+  assert.equal(existsSync(declared.out), false)
   t.diagnostic('both scripts refused as programs rather than exiting 0 silently')
 })

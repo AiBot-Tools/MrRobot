@@ -72,7 +72,6 @@ environment, and refuses to start without it. There is no `--env-file` flag on
 
 ```bash
 export AOS_CONTROL_TOKEN="$(openssl rand -hex 32)"
-export PMMCP_TOKEN=…           # optional; without it the kernel boots with no vault
 npm run dev
 ```
 
@@ -114,7 +113,7 @@ shipped fan-out case **fails today**: it requires two child runs and delegation 
 a stub, so the failing gate names the stub. A suite pruned to what the kernel can
 already do would score 1.00 forever and measure nothing.
 
-`capture:pmmcp` needs `PMMCP_TOKEN` and a running pmmcp. It calls `tools/list`
+`capture:pmmcp` needs a running pmmcp and no token (pmmcp takes no bearer). It calls `tools/list`
 and nothing else — no tool is invoked, so no memory and no vault entry is read —
 and writes `test/fixtures/pmmcp-listtools.json`. Everything this repo believes
 about pmmcp's tool surface apart from `get_secret`'s `label` is a guess made on
@@ -379,7 +378,7 @@ AOS_LIVE_TESTS=1 ANTHROPIC_API_KEY=… npm test
 
 # everything, including pmmcp writes to aos/agent/aos-live-test:
 AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_WRITES=1 \
-  PMMCP_URL=http://127.0.0.1:8766/mcp PMMCP_TOKEN=… ANTHROPIC_API_KEY=… npm test
+  PMMCP_URL=http://127.0.0.1:8766/mcp ANTHROPIC_API_KEY=… npm test
 ```
 
 Run `npm run capture:pmmcp` first if you can: the goal-tools test will name any
@@ -466,7 +465,7 @@ working credential path. This is also the first time `secrets.keyArg` is
 confirmed against the live `get_secret` schema.
 
 ```bash
-AOS_LIVE_TESTS=1 PMMCP_URL=http://127.0.0.1:8766/mcp PMMCP_TOKEN=… npm test
+AOS_LIVE_TESTS=1 PMMCP_URL=http://127.0.0.1:8766/mcp npm test
 ```
 
 - Result: _not yet run_
@@ -511,13 +510,15 @@ not in a commit message.
 
 Facts this repository cannot check from Linux, and how each gets settled. The
 first three of the plan's list are already resolved (Node v26.9.0; pmmcp at
-`http://127.0.0.1:8766/mcp`, loopback with a bearer; `get_secret` takes `label`,
+`http://127.0.0.1:8766/mcp`, loopback with **no** authentication — read from pmmcp's
+source, which trusts loopback and publishes RFC 9728 metadata with no authorization
+servers, so kernel.yaml declares no `tokenEnv`; `get_secret` takes `label`,
 not `key`).
 
 | Fact | How it gets settled |
 |---|---|
 | `node:sqlite` on darwin-arm64: `DatabaseSync` `timeout` runtime behaviour, `errcode 1811` stability, `t.mock.timers` | `npm test` on the Mac; `test/env.test.ts` fails first, with a named reason |
-| pmmcp: bearer acceptance, Streamable HTTP interop with SDK 1.30.0, idle timeout vs the 240 s heartbeat, the 49 tool names, `get_secret`/`set_secret` schemas | boot with pmmcp up: `hub.connected` and `hub.tools.classified` list what is really there; checklist line 2 |
+| pmmcp: Streamable HTTP interop with SDK 1.30.0, idle timeout vs the 240 s heartbeat, the 49 tool names, `get_secret`/`set_secret` schemas | boot with pmmcp up: `hub.connected` and `hub.tools.classified` list what is really there; checklist line 2 |
 | An Anthropic API key accepted as `Authorization: Bearer` (D20's alternative) | one `npm run cli -- probe anthropic/claude-sonnet-5` with `auth.header: Authorization` |
 | Docker on Colima: `--cap-drop=ALL` → empty `CapEff`; `--read-only` plus a `/workspace` writable by `65534` through virtiofs; `~/.colima/<profile>/docker.sock` paths; FSEvents through virtiofs | `scripts/colima-up.sh` (itself marked NEEDS VALIDATION on line 2) then the security check commands; Phase 2 live tests |
 | Whether the docker CLI works with a spawn env of only `PATH` + `DOCKER_HOST`, or needs `HOME` for `~/.docker/config.json` | `env -i PATH="$PATH" DOCKER_HOST=unix://$HOME/.colima/trusted/docker.sock docker version`. If it needs `HOME`, the driver adds `HOME` **only** — never the full environment |

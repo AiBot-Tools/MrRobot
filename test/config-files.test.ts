@@ -61,7 +61,9 @@ test('config/kernel.yaml parses and its four D30 budget defaults are present and
 
   // pmmcp: the MCP endpoint on 8766, not the dashboard on 8765.
   assert.equal(config.mcp.servers['pmmcp']?.url, 'http://127.0.0.1:8766/mcp')
-  assert.equal(config.mcp.servers['pmmcp']?.tokenEnv, 'PMMCP_TOKEN')
+  // No bearer: pmmcp authenticates nobody (loopback trust). Declaring one would
+  // make boot wait on a variable the server ignores.
+  assert.equal(config.mcp.servers['pmmcp']?.tokenEnv, undefined)
   assert.equal(config.secrets.keyArg, 'label')
   assert.equal(config.secrets.envFallback, false)
 

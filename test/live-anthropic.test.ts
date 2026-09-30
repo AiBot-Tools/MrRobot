@@ -207,8 +207,8 @@ test(
   {
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
-      : process.env['PMMCP_URL'] === undefined || process.env['PMMCP_TOKEN'] === undefined
-        ? 'PMMCP_URL and PMMCP_TOKEN must both be set, and the Anthropic key must already be in the pmmcp vault under the vaultId providers.yaml names'
+      : process.env['PMMCP_URL'] === undefined
+        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer), and the Anthropic key must already be in the pmmcp vault under the vaultId providers.yaml names'
         : false,
   },
   async (t) => {

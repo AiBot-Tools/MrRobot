@@ -57,8 +57,8 @@ const LIVE = process.env['AOS_LIVE_TESTS'] === '1'
 const WRITES = process.env['AOS_LIVE_PMMCP_WRITES'] === '1'
 const ANTHROPIC_HOST = 'api.anthropic.com'
 
-const hasPmmcp = (): boolean =>
-  process.env['PMMCP_URL'] !== undefined && process.env['PMMCP_TOKEN'] !== undefined
+// PMMCP_TOKEN is optional: pmmcp takes no bearer. Set it only for a server that does.
+const hasPmmcp = (): boolean => process.env['PMMCP_URL'] !== undefined
 
 /** The one non-placeholder ref in providers.yaml, read rather than hard-coded. */
 function realRef(): string {
@@ -98,7 +98,7 @@ test(
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
       : !hasPmmcp()
-        ? 'PMMCP_URL and PMMCP_TOKEN must both be set'
+        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer)'
         : !WRITES
           ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
           : false,
@@ -116,7 +116,7 @@ test(
     const state = await hub.connect('pmmcp', async () => {
       const client = new Client({ name: 'aos-live-runtime', version: '0.0.1' })
       await client.connect(
-        streamableHttpTransport(process.env['PMMCP_URL'] ?? '', process.env['PMMCP_TOKEN'] ?? ''),
+        streamableHttpTransport(process.env['PMMCP_URL'] ?? '', process.env['PMMCP_TOKEN']),
       )
       return client
     })
@@ -141,7 +141,7 @@ test(
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
       : !hasPmmcp()
-        ? 'PMMCP_URL and PMMCP_TOKEN must both be set'
+        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer)'
         : !WRITES
           ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
           : false,

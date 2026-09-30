@@ -83,7 +83,6 @@ mcp:
   servers:
     pmmcp:
       url: http://127.0.0.1:${String(CLOSED_PMMCP_PORT)}/mcp
-      tokenEnv: PMMCP_TOKEN
 secrets:
   envFallback: ${String(options.envFallback ?? false)}
 sandbox:

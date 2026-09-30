@@ -836,12 +836,15 @@ async function connectHub(
 
   let clientFactory = factory
   if (clientFactory === undefined) {
+    // No tokenEnv means the server takes no bearer (pmmcp trusts loopback). A
+    // DECLARED tokenEnv that is unset still refuses: the operator said this
+    // server wants a credential, and connecting without one would be a guess.
     const tokenEnv = server.tokenEnv
     const token = tokenEnv === undefined ? undefined : env[tokenEnv]
-    if (token === undefined || token.trim() === '') {
+    if (tokenEnv !== undefined && (token === undefined || token.trim() === '')) {
       return {
         ok: false,
-        reason: `${tokenEnv ?? 'pmmcp token'} is not set, so the kernel has no vault and no memory`,
+        reason: `${tokenEnv} is not set, so the kernel has no vault and no memory`,
       }
     }
     const url = server.url

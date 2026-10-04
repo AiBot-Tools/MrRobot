@@ -245,20 +245,54 @@ export class DockerDriver implements SandboxDriver {
   }
 
   async probe(): Promise<ProbeResult> {
+    let version: string
     try {
       const { stdout } = await this.#options.execFile(
         this.#binary,
         ['version', '--format', '{{.Server.Version}}'],
         { env: this.#env('trusted') },
       )
-      const version = stdout.trim()
+      version = stdout.trim()
       if (version === '') return { ok: false, why: 'docker version reported no server version' }
-      return { ok: true, version }
     } catch (e) {
       // Availability, never a throw: a kernel with no container runtime must
       // still boot and say why.
       return { ok: false, why: e instanceof Error ? e.message : String(e) }
     }
+
+    // Invariant 9's "internal network", PROVEN per domain rather than assumed
+    // from the name in kernel.yaml. Inside a Colima VM the Mac's loopback is
+    // 192.168.5.2 (`host.lima.internal`, per Lima's user-mode network docs),
+    // and pmmcp listens there unauthenticated: a container on a network with a
+    // route out could call its vault and admin tools. `--internal` removes the
+    // route; a network created by hand without it looks identical by name.
+    for (const domain of ['trusted', 'hostile'] as const) {
+      const network = this.#options.domains[domain].network
+      let internal: string
+      try {
+        const { stdout } = await this.#options.execFile(
+          this.#binary,
+          ['network', 'inspect', '--format', '{{.Internal}}', network],
+          { env: this.#env(domain) },
+        )
+        internal = stdout.trim()
+      } catch (e) {
+        return {
+          ok: false,
+          why: `${domain}: network ${network} could not be inspected: ${e instanceof Error ? e.message : String(e)}`,
+        }
+      }
+      if (internal !== 'true') {
+        return {
+          ok: false,
+          why:
+            `${domain}: network ${network} is not internal (Internal=${internal === '' ? '?' : internal}), so a ` +
+            "container on it could reach the Mac's loopback (where pmmcp listens unauthenticated) and the " +
+            `internet. Recreate it: docker network rm ${network} && docker network create --internal ${network}`,
+        }
+      }
+    }
+    return { ok: true, version }
   }
 
   run(spec: SandboxSpec): RunningSandbox {

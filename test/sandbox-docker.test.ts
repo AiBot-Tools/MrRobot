@@ -390,13 +390,50 @@ test('probe reports why when docker is unreachable', async (t) => {
   assert.equal(down.ok, false)
   assert.match(down.ok ? '' : down.why, /Cannot connect to the Docker daemon/)
 
-  d.setExec(() => Promise.resolve({ stdout: '27.3.1\n', stderr: '' }))
+  d.setExec((args) => Promise.resolve({ stdout: args[0] === 'network' ? 'true\n' : '27.3.1\n', stderr: '' }))
   const up = await d.driver.probe()
   assert.deepEqual(up, { ok: true, version: '27.3.1' })
 
   // A daemon that answers with nothing is not a working daemon.
   d.setExec(() => Promise.resolve({ stdout: '  \n', stderr: '' }))
   assert.equal((await d.driver.probe()).ok, false)
+})
+
+test('probe refuses a domain whose network is not internal, and checks each domain on its own VM', async (t) => {
+  // In a Colima VM the Mac's loopback is 192.168.5.2, where pmmcp listens
+  // unauthenticated. A network with a route out is a path to its vault tools.
+  const f = fixture(t)
+  const d = driverFor(f)
+  const internalOn = new Set(['unix:///tmp/colima-trusted.sock'])
+  const seen: string[] = []
+  d.setExec((args) => {
+    if (args[0] !== 'network') return Promise.resolve({ stdout: '27.3.1\n', stderr: '' })
+    const host = d.execs[d.execs.length - 1]?.env['DOCKER_HOST'] ?? ''
+    seen.push(`${host} ${args.join(' ')}`)
+    return Promise.resolve({ stdout: internalOn.has(host) ? 'true\n' : 'false\n', stderr: '' })
+  })
+
+  const refused = await d.driver.probe()
+  assert.equal(refused.ok, false)
+  assert.match(refused.ok ? '' : refused.why, /^hostile: network aos-internal is not internal \(Internal=false\)/)
+  assert.match(refused.ok ? '' : refused.why, /docker network create --internal aos-internal/)
+  // Each domain was asked through its OWN socket.
+  assert.deepEqual(seen, [
+    'unix:///tmp/colima-trusted.sock network inspect --format {{.Internal}} aos-internal',
+    'unix:///tmp/colima-hostile.sock network inspect --format {{.Internal}} aos-internal',
+  ])
+
+  internalOn.add('unix:///tmp/colima-hostile.sock')
+  assert.deepEqual(await d.driver.probe(), { ok: true, version: '27.3.1' })
+
+  // A network that does not exist is not internal either.
+  d.setExec((args) =>
+    args[0] === 'network'
+      ? Promise.reject(new Error('Error response from daemon: network aos-internal not found'))
+      : Promise.resolve({ stdout: '27.3.1\n', stderr: '' }),
+  )
+  const missing = await d.driver.probe()
+  assert.match(missing.ok ? '' : missing.why, /^trusted: network aos-internal could not be inspected: .*not found/)
 })
 
 test('kill is idempotent and sweepOrphans reaps only our containers', async (t) => {

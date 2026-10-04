@@ -56,7 +56,19 @@ up() {
   # Egress belongs to the Phase 2 proxy sidecar, not to the default bridge.
   local network="aos-${profile}"
   if docker --context "colima-${profile}" network inspect "${network}" >/dev/null 2>&1; then
-    echo "network ${network} already exists"
+    # An existing network is accepted only if it is internal. Inside the VM the
+    # Mac's loopback is 192.168.5.2 (host.lima.internal), where pmmcp listens
+    # unauthenticated; a network with a route out reaches it. Not deleted here:
+    # removing a network is the operator's call. The kernel's probe refuses it
+    # too, so the sandbox stays degraded until it is fixed.
+    local internal
+    internal="$(docker --context "colima-${profile}" network inspect --format '{{.Internal}}' "${network}")"
+    if [[ "${internal}" != "true" ]]; then
+      echo "network ${network} exists but is NOT internal (Internal=${internal})." >&2
+      echo "fix: docker --context colima-${profile} network rm ${network}  # then re-run this script" >&2
+      exit 1
+    fi
+    echo "network ${network} already exists and is internal"
   else
     echo "creating internal network ${network}"
     docker --context "colima-${profile}" network create --internal "${network}"

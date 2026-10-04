@@ -124,6 +124,10 @@ test('scripts/colima-up.sh exists, is executable, and its header says NEEDS VALI
   assert.ok(body.includes('--vm-type vz'), 'vz backend')
   assert.ok(body.includes('--mount-type virtiofs'), 'virtiofs mounts')
   assert.ok(body.includes('network create --internal'), 'internal networks')
+  // An EXISTING network is accepted only if it is internal: inside the VM the
+  // Mac's loopback (where pmmcp listens unauthenticated) is one hop away.
+  assert.ok(body.includes("network inspect --format '{{.Internal}}'"), 'checks an existing network is internal')
+  assert.match(body, /if \[\[ "\$\{internal\}" != "true" \]\]; then[\s\S]*?exit 1/, 'refuses a non-internal network')
   // Invariant 9: the mounts are the domains' own roots, never $HOME.
   assert.equal(/--mount\s+"\$\{HOME\}:/.test(body), false, 'mounts $HOME')
   for (const domain of ['trusted', 'hostile']) {

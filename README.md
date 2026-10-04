@@ -329,8 +329,19 @@ a restart finds it orphaned. **The kernel never writes `done`** — `review` sit
 between `in_progress` and `done` precisely so that finishing is a decision, and a
 kernel that closed its own goals would make every completion self-reported.
 
+pmmcp has no `review` status (its vocabulary is `pending`, `in_progress`,
+`completed`, `abandoned`, `blocked`), so `review` is sent as `in_progress` with
+`progress_pct: 100` and stays `review` in the kernel's log (`goals.statuses`).
+**Closing a goal is yours, in pmmcp** (`complete_goal`, or `update_goal` to
+`completed`/`abandoned`); the kernel has no command for it, because one would
+change the frozen protocol v1. pmmcp's `update_goal` takes no `project_id` and
+moves any goal by id, so the kernel moves only goals its own `goal.created` log
+says it created, in the namespace it created them in. pmmcp also answers refusals
+as successful text (`Error: Cannot transition…`, `Goal x not found.`); the writer
+counts a move only on pmmcp's `✅ Goal updated: <id>`.
+
 Every pmmcp goal tool name and argument lives in `config/kernel.yaml` under
-`goals:` because none of them is confirmed. Boot compares them against what the
+`goals:`, read from pmmcp's source and not yet confirmed against its live schema. Boot compares them against what the
 server declares and, on a disagreement, appends `goals.degraded` naming the tool
 or argument and disables goal writing — so a wrong guess is one line of YAML
 rather than a patch. (It is an event and not a `status.get` subsystem key because

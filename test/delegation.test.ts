@@ -153,12 +153,14 @@ test('one objective → goal tree + two child runs + a summary the eval harness 
   // Both task goals moved in the CEO's namespace — the tracker bug fixed last
   // commit is exactly what this depends on — and nothing was closed by the kernel.
   const taskGoals = admitted.map((a) => String(a['goalId']))
+  // `review` reaches pmmcp as in_progress at 100%: pmmcp has no review status.
   for (const goalId of taskGoals) {
-    assert.equal(mock.state.goals.get(goalId)?.status, 'review', `${goalId} did not reach review`)
+    assert.equal(mock.state.goals.get(goalId)?.status, 'in_progress', `${goalId} did not reach review`)
+    assert.equal(mock.state.goals.get(goalId)?.progressPct, 100, `${goalId} did not reach review`)
     assert.equal(mock.state.goals.get(goalId)?.projectId, CEO_PROJECT)
   }
   assert.equal(
-    [...mock.state.goals.values()].some((g) => g.status === 'done'),
+    [...mock.state.goals.values()].some((g) => g.status === 'completed'),
     false,
     'the kernel closed a goal itself',
   )

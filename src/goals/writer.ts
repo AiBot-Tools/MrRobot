@@ -20,6 +20,17 @@
 //   It never writes `done`. The status vocabulary has `review` between
 //   `in_progress` and `done` precisely so that finishing is a decision, and a
 //   kernel that closed its own goals would make every completion self-reported.
+//   pmmcp has no `review`, so it is SENT per `goals.statuses` (in_progress, with
+//   progress 100) and stays `review` in the kernel's log.
+//
+//   It never moves a goal it did not create. pmmcp's `update_goal` takes a
+//   goal_id and no project_id, so the server will move ANY goal by id; the
+//   kernel's own `goal.created` record, and the namespace it names, is the only
+//   check that a run's status update lands in that run's tree.
+//
+//   It never reads a reply as success without pmmcp's own confirmation. pmmcp
+//   answers errors as SUCCESSFUL text ("Error: Cannot transition…", "Goal x not
+//   found."), so `ok` from the transport proves nothing on its own.
 //
 //   It stops at the FIRST failure and reports what it had written. A partial tree
 //   is a fact on the server; pretending the whole write failed would leave goals
@@ -102,6 +113,11 @@ function textOf(content: unknown): string {
 export function goalIdOf(content: unknown): string | undefined {
   const text = textOf(content).trim()
   if (text === '') return undefined
+  // pmmcp's own reply (src/tools/goals.py): "✅ Goal created: goal_<hex>" then
+  // detail lines. Matched first and only at the start, so an error sentence
+  // that happens to quote an id is never read as a creation.
+  const created = /^✅ Goal created: (\S+)/u.exec(text)
+  if (created?.[1] !== undefined) return created[1]
   try {
     const parsed: unknown = JSON.parse(text)
     if (typeof parsed === 'string' && parsed.trim() !== '') return parsed.trim()
@@ -181,10 +197,11 @@ export class GoalWriter {
     const goalId = goalIdOf(content)
     if (goalId === undefined) {
       // Never a guess: a fabricated id is a goal nothing can ever update, and it
-      // would be indistinguishable from a real one in the log.
+      // would be indistinguishable from a real one in the log. The server's own
+      // words go in the message, because pmmcp reports errors as text.
       throw new GoalWriteFailed(
         `${this.#serverId}.${this.#o.goals.tools.create} returned no readable goal id for ` +
-          `${input.kind} "${input.title}"`,
+          `${input.kind} "${input.title}": ${textOf(content).slice(0, 300)}`,
         input.written,
       )
     }
@@ -287,12 +304,42 @@ export class GoalWriter {
           `"${to}" is a decision, not a transition`,
       )
     }
+    const owner = this.ownerOf(goalId)
+    if (owner === undefined) {
+      throw new PolicyDenied(
+        `goal ${goalId}`,
+        'this kernel did not create that goal, and pmmcp moves any goal by id, so it is not moved',
+      )
+    }
+    if (owner !== context.projectId) {
+      throw new PolicyDenied(
+        `goal ${goalId}`,
+        `it was created in ${owner}, not ${context.projectId}`,
+      )
+    }
+
     const a = this.#o.goals.args
-    await this.#call(
+    const sent = this.#o.goals.statuses[to]
+    const content = await this.#call(
       this.#o.goals.tools.updateStatus,
-      { [a.projectId]: context.projectId, [a.goalId]: goalId, [a.status]: to },
+      {
+        [a.goalId]: goalId,
+        [a.status]: sent,
+        // `review` is finished work awaiting the operator; 100 is how that shows
+        // in pmmcp, which has no review status of its own.
+        ...(to === 'review' ? { [a.progress]: 100 } : {}),
+      },
       `move goal ${goalId} to ${to}`,
     )
+    const reply = textOf(content).trim()
+    const confirmed = /^✅ Goal updated: (\S+)/u.exec(reply)
+    if (confirmed?.[1] !== goalId) {
+      throw new GoalWriteFailed(
+        `${this.#serverId}.${this.#o.goals.tools.updateStatus} did not confirm ${goalId} → ${sent}: ` +
+          reply.slice(0, 300),
+        [],
+      )
+    }
     this.#o.store.append({
       type: 'goal.status',
       ...(context.runId === undefined ? {} : { runId: context.runId }),
@@ -306,6 +353,20 @@ export class GoalWriter {
         ...(context.reason === undefined ? {} : { reason: context.reason.slice(0, 500) }),
       },
     })
+  }
+
+  /**
+   * The namespace this kernel created a goal in, from its own log, or undefined.
+   *
+   * The log rather than memory: it survives a restart, and it is the record an
+   * operator can read for themselves.
+   */
+  ownerOf(goalId: string): string | undefined {
+    for (const row of this.#o.store.query({ type: 'goal.created' })) {
+      const payload = JSON.parse(row.payload) as { goalId?: unknown; projectId?: unknown }
+      if (payload.goalId === goalId && typeof payload.projectId === 'string') return payload.projectId
+    }
+    return undefined
   }
 
   /**

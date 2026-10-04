@@ -133,7 +133,7 @@ const namespace: Suite = {
     { id: 'N4', file: 'src/mcp/tool-views.ts', from: '          view.namespaceArg === undefined\n', to: '          false\n', why: 'an exposed pmmcp tool loads without a namespace decision' },
     { id: 'N5', file: 'src/runtime/loop.ts', from: '        ...(view.namespaceArg === undefined ? {} : { namespaceArg: view.namespaceArg }),', to: '', why: 'the loop never tells the gate which argument to pin' },
     { id: 'N6', file: KERNEL, from: '      projectId: m.memory.projectId,', to: "      projectId: 'aos/ceo',", why: 'the kernel gives every agent the CEO’s namespace' },
-    { id: 'N7', file: TRACKER, from: '    return this.#namespaceOf.get(goalId) ?? this.#o.projectIdOf(agentId)', to: '    return this.#o.projectIdOf(agentId)', why: 'a child’s goal is moved in the child’s namespace, not where it was written' },
+    { id: 'N7', file: TRACKER, from: '  #projectFor(goalId: string): string | undefined {\n    return this.#namespaceOf.get(goalId)', to: "  #projectFor(goalId: string): string | undefined {\n    return this.#namespaceOf.has(goalId) ? 'aos/agent/researcher' : undefined", why: 'a child’s goal is moved in the child’s namespace, not where it was written' },
   ],
   control: {
     id: 'C',
@@ -164,6 +164,11 @@ const goals: Suite = {
     { id: 'G8', file: TRACKER, from: '        this.#o.isOrchestrator(agentId)\n', to: '        true\n', why: 'a worker’s final message is adopted as a plan' },
     { id: 'G9', file: TRACKER, from: '    for (const row of rows) this.#learnNamespace(row)', to: '', why: 'after a restart the tracker forgets where goals were written' },
     { id: 'G10', file: KERNEL, from: '        .blockOrphans(recovered.orphanRuns.map((r) => r.runId))', to: '        .blockOrphans([])', why: 'orphaned runs leave their goals in_progress' },
+    { id: 'G11', file: WRITER, from: '    if (owner === undefined) {', to: '    if (false) {', why: 'a goal the kernel never created is moved (pmmcp moves any goal by id)' },
+    { id: 'G12', file: WRITER, from: '    if (owner !== context.projectId) {', to: '    if (false) {', why: 'a goal created in one namespace is moved on behalf of another' },
+    { id: 'G13', file: WRITER, from: '    if (confirmed?.[1] !== goalId) {', to: '    if (false) {', why: 'pmmcp’s refusal, sent as success text, is recorded as a move' },
+    { id: 'G14', file: WRITER, from: '        ...(to === \'review\' ? { [a.progress]: 100 } : {}),', to: '', why: 'review reaches pmmcp indistinguishable from a task still running' },
+    { id: 'G15', file: WRITER, from: '  if (created?.[1] !== undefined) return created[1]', to: '', why: 'pmmcp’s own create reply yields no id, so no tree is ever written' },
   ],
   control: {
     id: 'C',

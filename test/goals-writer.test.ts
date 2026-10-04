@@ -92,17 +92,17 @@ function payloads(store: EventStore, type: string): Record<string, unknown>[] {
     .map((r) => JSON.parse(r.payload) as Record<string, unknown>)
 }
 
-test("the shipped config's goal tools are usable against the modelled server", async (t) => {
-  // The defaults in kernel.yaml and the names the double declares are the same
-  // guesses, so this asserts they AGREE rather than that either is right. The
-  // drift test is what settles whether the guess matches the real pmmcp.
+test("the shipped config's goal tools are usable against the double, which declares pmmcp's source", async (t) => {
+  // kernel.yaml and the double both carry what pmmcp's source declares, so this
+  // asserts they AGREE; the drift test against a live capture settles whether
+  // the source matches what FastMCP actually serves.
   const { hub } = await wired(t)
   assert.equal(goalToolsUnusable(hub, shippedConfig().goals), undefined)
   // And every argument the kernel will send is named in one place.
   const args = requiredArgs(shippedConfig().goals)
   assert.deepEqual(
     args.map((a) => a.tool),
-    ['create_goal', 'update_goal_status', 'get_goal', 'list_goals'],
+    ['create_goal', 'update_goal', 'get_goal_tree', 'list_goals'],
   )
 })
 
@@ -123,7 +123,7 @@ test('a renamed tool or argument degrades the writer with a reason that names it
     args: { ...config.args, title: 'name', status: 'state' },
   })
   assert.match(String(both), /create_goal/)
-  assert.match(String(both), /update_goal_status/)
+  assert.match(String(both), /update_goal\b/)
 })
 
 test('a validated plan becomes objective → milestone → task with the SERVER’s ids', async (t) => {
@@ -225,14 +225,27 @@ test('a failure partway through reports the ids already written', async (t) => {
   assert.equal(payloads(store, 'plan.adopted').length, 0)
 })
 
-test('the kernel may set in_progress, blocked and review — and never done', async (t) => {
+/** A tree the KERNEL wrote, so its goals carry goal.created rows in this store. */
+async function written(writer: GoalWriter): Promise<{ task: string; objective: string }> {
+  const tree = await writer.materialise(parsePlan(PLAN, { knownTemplates: ['researcher'] }), PROJECT, 'run_0')
+  return { task: String(tree.tasks.get('t1')), objective: tree.objectiveGoalId }
+}
+
+test('the kernel may set in_progress, blocked and review — and never done; review reaches pmmcp as in_progress at 100%', async (t) => {
   const { store, mock, writer } = await wired(t)
-  const { task } = mock.seedTree(PROJECT)
+  const { task } = await written(writer)
 
   await writer.setStatus(task, 'in_progress', { projectId: PROJECT, runId: 'run_1' })
   assert.equal(mock.state.goals.get(task)?.status, 'in_progress')
   await writer.setStatus(task, 'review', { projectId: PROJECT, runId: 'run_1' })
-  assert.equal(mock.state.goals.get(task)?.status, 'review')
+  // pmmcp has no `review`: in_progress with progress 100, per goals.statuses.
+  assert.equal(mock.state.goals.get(task)?.status, 'in_progress')
+  assert.equal(mock.state.goals.get(task)?.progressPct, 100)
+  const sent = mock.calls.filter((c) => c.tool === 'update_goal').map((c) => c.args)
+  assert.deepEqual(sent, [
+    { goal_id: task, status: 'in_progress' },
+    { goal_id: task, status: 'in_progress', progress_pct: 100 },
+  ])
 
   // `done` is a decision, not a transition. Refused before any call is made.
   const before = mock.calls.length
@@ -245,8 +258,8 @@ test('the kernel may set in_progress, blocked and review — and never done', as
     },
   )
   assert.equal(mock.calls.length, before, 'a refused status still reached the server')
-  assert.equal(mock.state.goals.get(task)?.status, 'review', 'the goal moved anyway')
 
+  // The kernel's log keeps the kernel's vocabulary.
   const moves = payloads(store, 'goal.status')
   assert.deepEqual(
     moves.map((m) => `${String(m['to'])}:${String(m['by'])}`),
@@ -255,14 +268,45 @@ test('the kernel may set in_progress, blocked and review — and never done', as
   assert.equal(moves[0]?.['runId'], 'run_1')
 })
 
-test('an illegal transition is a failure, and trySetStatus keeps the run alive', async (t) => {
+test('a goal this kernel did not create, or created in another namespace, is never moved', async (t) => {
+  // pmmcp's update_goal takes no project_id and moves ANY goal by id. The
+  // kernel's own goal.created record is the only namespace check there is.
   const { store, mock, writer } = await wired(t)
-  const { task } = mock.seedTree(PROJECT)
+  const foreign = mock.seedTree('aos/agent/researcher')
+  await assert.rejects(
+    () => writer.setStatus(foreign.task, 'in_progress', { projectId: PROJECT }),
+    (e: unknown) => e instanceof PolicyDenied && /did not create that goal/.test(e.message),
+  )
 
-  // pending → review is refused by the server's own transition table.
-  await assert.rejects(() => writer.setStatus(task, 'review', { projectId: PROJECT }), GoalWriteFailed)
-  assert.equal(mock.state.goals.get(task)?.status, 'pending')
+  const { task } = await written(writer)
+  const afterWrite = mock.calls.length
+  await assert.rejects(
+    () => writer.setStatus(task, 'in_progress', { projectId: 'aos/agent/researcher' }),
+    (e: unknown) => e instanceof PolicyDenied && /created in aos\/ceo, not aos\/agent\/researcher/.test(e.message),
+  )
+  assert.equal(mock.calls.length - afterWrite, 0, 'a refused move reached the server')
+  assert.equal(mock.calls.filter((c) => c.tool === 'update_goal').length, 0)
+  assert.equal(mock.state.goals.get(foreign.task)?.status, 'pending')
+  assert.equal(payloads(store, 'goal.status').length, 0)
+})
+
+test('pmmcp answering a refusal as SUCCESSFUL text is a failure, and trySetStatus keeps the run alive', async (t) => {
+  const { store, mock, writer } = await wired(t)
+  const { task } = await written(writer)
+  // The operator closed it in pmmcp; completed → blocked is not in pmmcp's table,
+  // and pmmcp says so as "Error: Cannot transition…" with no error flag.
+  mock.state.goals.get(task)!.status = 'completed'
+
+  await assert.rejects(
+    () => writer.setStatus(task, 'blocked', { projectId: PROJECT }),
+    (e: unknown) => e instanceof GoalWriteFailed && /did not confirm .*Cannot transition from 'completed' to 'blocked'/.test(e.message),
+  )
+  assert.equal(mock.state.goals.get(task)?.status, 'completed')
   assert.equal(payloads(store, 'goal.status').length, 0, 'a move that did not happen was recorded')
+
+  // Gone from the server: "Goal x not found." is success text too.
+  mock.state.goals.delete(task)
+  await assert.rejects(() => writer.setStatus(task, 'blocked', { projectId: PROJECT }), /not found/)
 
   // The lifecycle path must not take the run down with it: a stale goal is
   // something an operator can see and fix, a killed run is work lost.
@@ -298,6 +342,10 @@ test('a degraded writer refuses before touching the server', async (t) => {
 
 test('goalIdOf reads the shapes a server might return and refuses the rest', () => {
   const text = (t: string): { type: 'text'; text: string }[] => [{ type: 'text', text: t }]
+  // pmmcp's own reply, first line only, and only at the start.
+  assert.equal(goalIdOf(text('✅ Goal created: goal_0123456789ab\n   Title: x')), 'goal_0123456789ab')
+  assert.equal(goalIdOf(text('Error: Parent goal not found: goal_0123456789ab')), undefined)
+  assert.equal(goalIdOf(text('Error creating goal: ✅ Goal created: goal_x')), undefined)
   assert.equal(goalIdOf(text('{"id":"goal-1"}')), 'goal-1')
   assert.equal(goalIdOf(text('{"goal_id":"goal-2"}')), 'goal-2')
   assert.equal(goalIdOf(text('{"goalId":"goal-3"}')), 'goal-3')

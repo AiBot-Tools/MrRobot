@@ -124,23 +124,21 @@ const Secrets = z
 /**
  * The pmmcp goal tools, as CONFIG rather than constants.
  *
- * Every name and argument here is MODELLED, not confirmed: nobody has read
- * pmmcp's live `listTools` on this machine, and CLAUDE.md's Phase 1 says the
- * typed wrappers come from those schemas. Hardcoding `create_goal` into the
- * kernel would make it wrong on the operator's Mac in a way only a stack trace
- * explains, and right again only after a code change.
+ * The defaults are READ FROM pmmcp's source (src/tools/goals.py and
+ * src/storage/goal_store.py at 55f3c1a), not yet from its live `listTools`.
+ * They replace guesses that were wrong on every name but `create_goal`:
+ * pmmcp has `update_goal` (goal_id, status, progress_pct — and NO project_id),
+ * `get_goal_tree` (goal_id only), `parent_goal_id` and `goal_type`.
  *
- * So the kernel ships the modelled names as defaults, checks them against the
- * connected server at boot, and DEGRADES the goals subsystem with a reason
- * naming the tool or the argument that disagrees. That is the same posture
- * `secrets.keyArg` already has, and it turns a wrong guess into one line of YAML
- * instead of a patch. `npm run capture:pmmcp` is how the guesses become facts.
+ * Still config, and still checked against the connected server at boot, which
+ * DEGRADES the goals subsystem with a reason naming any tool or argument that
+ * disagrees: a pmmcp upgrade is one line of YAML, not a patch.
  */
 const GoalTools = z
   .object({
     create: z.string().min(1).default('create_goal'),
-    updateStatus: z.string().min(1).default('update_goal_status'),
-    get: z.string().min(1).default('get_goal'),
+    updateStatus: z.string().min(1).default('update_goal'),
+    get: z.string().min(1).default('get_goal_tree'),
     list: z.string().min(1).default('list_goals'),
   })
   .strict()
@@ -149,10 +147,28 @@ const GoalArgs = z
   .object({
     projectId: z.string().min(1).default('project_id'),
     goalId: z.string().min(1).default('goal_id'),
-    parentId: z.string().min(1).default('parent_id'),
-    kind: z.string().min(1).default('kind'),
+    parentId: z.string().min(1).default('parent_goal_id'),
+    kind: z.string().min(1).default('goal_type'),
     title: z.string().min(1).default('title'),
     status: z.string().min(1).default('status'),
+    /** Sent as 100 with `review`, so a finished task is visible as finished. */
+    progress: z.string().min(1).default('progress_pct'),
+  })
+  .strict()
+
+/**
+ * Kernel status → the status pmmcp is sent.
+ *
+ * pmmcp's vocabulary is pending, in_progress, completed, abandoned, blocked.
+ * It has no `review`, and the kernel never sets `completed` (finishing is the
+ * operator's decision). So `review` is sent as `in_progress` with progress 100,
+ * and stays `review` in the kernel's own log.
+ */
+const GoalStatuses = z
+  .object({
+    in_progress: z.string().min(1).default('in_progress'),
+    blocked: z.string().min(1).default('blocked'),
+    review: z.string().min(1).default('in_progress'),
   })
   .strict()
 
@@ -169,6 +185,7 @@ const Goals = z
     adoptFromRuns: z.boolean().default(true),
     tools: GoalTools.prefault({}),
     args: GoalArgs.prefault({}),
+    statuses: GoalStatuses.prefault({}),
   })
   .strict()
 

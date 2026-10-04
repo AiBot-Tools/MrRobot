@@ -87,18 +87,30 @@ goals:
   # plus one `goal.created` per goal. Set false to watch the CEO before it writes
   # anything durable.
   adoptFromRuns: true
+  # Read from pmmcp's source (src/tools/goals.py @55f3c1a); the boot check and
+  # `npm run capture:pmmcp` confirm them against the live server. update_goal
+  # and get_goal_tree take no project_id, so the kernel checks a goal's
+  # namespace against its own goal.created record before moving it.
   tools:
     create: create_goal
-    updateStatus: update_goal_status
-    get: get_goal
+    updateStatus: update_goal
+    get: get_goal_tree
     list: list_goals
   args:
     projectId: project_id
     goalId: goal_id
-    parentId: parent_id
-    kind: kind
+    parentId: parent_goal_id
+    kind: goal_type
     title: title
     status: status
+    progress: progress_pct
+  # pmmcp has no `review`: it is sent as in_progress (with progress 100) and
+  # stays `review` in the kernel's log. The kernel never sends `completed`;
+  # closing a goal is the operator's decision, made in pmmcp.
+  statuses:
+    in_progress: in_progress
+    blocked: blocked
+    review: in_progress
 
 lanes:
   main: 4

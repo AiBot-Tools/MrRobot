@@ -22,7 +22,6 @@ import {
   PMMCP_TOOLS,
   PMMCP_TOOL_COUNT,
   pmmcpMock,
-  type GoalStatus,
   type PmmcpMock,
 } from './helpers/mock-pmmcp.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
@@ -103,175 +102,135 @@ test('exactly one declared tool is confirmed, and it is get_secret taking label'
   }
 })
 
-test('the hierarchy is objective → milestone → task and nothing else', async (t) => {
+/** The goal id out of pmmcp's create reply: "✅ Goal created: goal_<hex>". */
+async function created(client: Client, args: Record<string, unknown>): Promise<string> {
+  const { text, isError } = await call(client, 'create_goal', args)
+  assert.equal(isError, false, text)
+  const id = /^✅ Goal created: (goal_[0-9a-f]{12})\n/u.exec(text)?.[1]
+  assert.ok(id !== undefined, `not a pmmcp create reply: ${text}`)
+  return id
+}
+
+test('create_goal replies as pmmcp does, and refuses as SUCCESSFUL text', async (t) => {
   const { client } = await open(t)
-  const objective = (await json(client, 'create_goal', {
-    project_id: 'aos/ceo',
-    kind: 'objective',
-    title: 'ship phase 1',
-  }))['id']
-  assert.equal(typeof objective, 'string')
+  const objective = await created(client, { project_id: 'aos/ceo', goal_type: 'objective', title: 'ship phase 1' })
 
-  // An objective is a root.
-  const rooted = await call(client, 'create_goal', {
+  // pmmcp reports a refusal as text with no error flag; only a missing
+  // required argument is a transport-level error (FastMCP's own validation).
+  const badType = await call(client, 'create_goal', { project_id: 'aos/ceo', goal_type: 'epic', title: 'x' })
+  assert.equal(badType.isError, false)
+  assert.match(badType.text, /^Error: Invalid goal_type: epic/)
+  const noParent = await call(client, 'create_goal', {
     project_id: 'aos/ceo',
-    kind: 'objective',
-    title: 'nested objective',
-    parent_id: objective,
+    goal_type: 'milestone',
+    title: 'x',
+    parent_goal_id: 'goal_000000000999',
   })
-  assert.equal(rooted.isError, true)
-  assert.match(rooted.text, /takes no parent_id/)
+  assert.equal(noParent.isError, false)
+  assert.match(noParent.text, /^Error: Parent goal not found: goal_000000000999/)
+  assert.equal((await call(client, 'create_goal', { project_id: 'aos/ceo' })).isError, true)
 
-  // A task may not skip the milestone level: depth is three by construction,
-  // which is what lets a projection walk a tree of known shape.
+  // Stricter than pmmcp, and labelled so: depth is three by construction.
   const skipped = await call(client, 'create_goal', {
     project_id: 'aos/ceo',
-    kind: 'task',
+    goal_type: 'task',
     title: 'orphan task',
-    parent_id: objective,
+    parent_goal_id: objective,
   })
-  assert.equal(skipped.isError, true)
-  assert.match(skipped.text, /hangs from a milestone, not a objective/)
+  assert.match(skipped.text, /^Error: a task hangs from a milestone .*stricter than pmmcp/)
 
-  const parentless = await call(client, 'create_goal', {
+  const milestone = await created(client, {
     project_id: 'aos/ceo',
-    kind: 'milestone',
-    title: 'floating',
-  })
-  assert.equal(parentless.isError, true)
-  assert.match(parentless.text, /requires a parent_id/)
-
-  // And the legal shape works.
-  const milestone = (await json(client, 'create_goal', {
-    project_id: 'aos/ceo',
-    kind: 'milestone',
+    goal_type: 'milestone',
     title: 'projections',
-    parent_id: objective,
-  }))['id']
-  const task = await json(client, 'create_goal', {
-    project_id: 'aos/ceo',
-    kind: 'task',
-    title: 'cron',
-    parent_id: milestone,
+    parent_goal_id: objective,
   })
-  assert.equal(task['status'], 'pending')
+  await created(client, { project_id: 'aos/ceo', goal_type: 'task', title: 'cron', parent_goal_id: milestone })
   assert.deepEqual(Object.keys(PARENT_KIND).sort(), ['milestone', 'objective', 'task'])
 })
 
-test('project_id namespaces goals and memories, and a foreign id reads as not found', async (t) => {
+test('update_goal and get_goal_tree take no project_id; listings carry titles and no ids', async (t) => {
   const { mock, client } = await open(t)
   const ceo = mock.seedTree('aos/ceo')
   mock.seedTree('aos/agent/researcher')
 
-  // Not "forbidden": the answer must not confirm that the id exists elsewhere.
-  const foreign = await call(client, 'get_goal', {
-    project_id: 'aos/agent/researcher',
-    goal_id: ceo.objective,
-  })
-  assert.equal(foreign.isError, true)
-  assert.match(foreign.text, /no goal .* in aos\/agent\/researcher/)
+  // No project on either tool: pmmcp moves and shows ANY goal by id. This is
+  // why the kernel checks a goal's namespace against its own goal.created log.
+  const spec = (name: string): string[] =>
+    Object.keys(PMMCP_TOOLS.find((s) => s.name === name)?.inputSchema.properties ?? {})
+  assert.equal(spec('update_goal').includes('project_id'), false)
+  assert.equal(spec('get_goal_tree').includes('project_id'), false)
+  const moved = await call(client, 'update_goal', { goal_id: ceo.task, status: 'in_progress' })
+  assert.match(moved.text, new RegExp(`^✅ Goal updated: ${ceo.task}\\n`, 'u'))
 
-  const listed = await json(client, 'list_goals', { project_id: 'aos/ceo' })
-  const goals = listed['goals']
-  assert.equal(Array.isArray(goals) && goals.length, 3, 'only this project\'s three goals')
+  const tree = await call(client, 'get_goal_tree', { goal_id: ceo.objective })
+  assert.equal(
+    tree.text,
+    // Progress rolls up ONE level, as pmmcp's _update_parent_progress does.
+    ['⬜ [O] seeded objective', '  ⬜ [M] seeded milestone (50%)', '    🔵 [T] seeded task'].join('\n'),
+  )
+  assert.equal(tree.text.includes(ceo.task), false, 'pmmcp listings carry no ids')
+
+  const listed = await call(client, 'list_goals', { project_id: 'aos/ceo' })
+  assert.equal(listed.text, '## Goals for aos/ceo (1)\n⬜ [O] seeded objective')
+  const none = await call(client, 'list_goals', { project_id: 'aos/nobody' })
+  assert.equal(none.text, "No goals found for project 'aos/nobody'.")
+  assert.equal((await call(client, 'get_goal_tree', { goal_id: 'goal_x' })).text, 'Goal goal_x not found.')
 
   await json(client, 'remember', { project_id: 'aos/ceo', content: 'the operator prefers terse' })
   const crossed = await json(client, 'recall', { project_id: 'aos/shared', query: 'operator' })
   assert.deepEqual(crossed['hits'], [], 'a memory never crosses a namespace')
-  const own = await json(client, 'recall', { project_id: 'aos/ceo', query: 'operator' })
-  assert.equal(Array.isArray(own['hits']) && own['hits'].length, 1)
 })
 
-test('status transitions are validated, review is not done, and done is terminal', async (t) => {
+test('status transitions are pmmcp\'s table, a same-status update is a no-op, and refusals are text', async (t) => {
   const { mock, client } = await open(t)
   const { task } = mock.seedTree('aos/ceo')
-  const move = (status: GoalStatus): Promise<{ text: string; isError: boolean }> =>
-    call(client, 'update_goal_status', { project_id: 'aos/ceo', goal_id: task, status })
+  const move = (status: string): Promise<{ text: string; isError: boolean }> =>
+    call(client, 'update_goal', { goal_id: task, status })
 
-  // The shortcut a self-marking worker would want, refused.
-  const shortcut = await move('done')
-  assert.equal(shortcut.isError, true)
-  assert.match(shortcut.text, /pending → done/)
+  const shortcut = await move('completed')
+  assert.equal(shortcut.isError, false)
+  assert.match(shortcut.text, /^Error: Cannot transition from 'pending' to 'completed'/)
+  assert.match((await move('review')).text, /^Error: Invalid status: review/)
 
-  assert.equal((await move('in_progress')).isError, false)
-  // in_progress → done is refused too: review is a real state on the path, not
-  // a label a projection may collapse.
-  assert.equal((await move('done')).isError, true)
-  assert.equal((await move('review')).isError, false)
-  assert.equal((await move('done')).isError, false)
+  assert.match((await move('in_progress')).text, /^✅ Goal updated/)
+  // The kernel sends `review` as in_progress after the run already set it.
+  assert.match((await move('in_progress')).text, /^✅ Goal updated/)
+  assert.match((await move('completed')).text, /^✅ Goal updated/)
+  assert.match((await move('in_progress')).text, /^✅ Goal updated/, 'completed reopens')
+  assert.equal((await call(client, 'update_goal', { goal_id: 'goal_nope', status: 'blocked' })).text, 'Goal goal_nope not found.')
 
-  const reopened = await move('in_progress')
-  assert.equal(reopened.isError, true)
-  assert.match(reopened.text, /terminal/)
-
-  // The table itself: every terminal status has no exits, and every status is
-  // reachable as a target from somewhere, or the vocabulary has a dead entry.
-  assert.deepEqual(GOAL_TRANSITIONS.done, [])
-  assert.deepEqual(GOAL_TRANSITIONS.abandoned, [])
-  const targets = new Set(Object.values(GOAL_TRANSITIONS).flat())
-  for (const status of GOAL_STATUSES) {
-    if (status === 'pending') continue // the initial state, never a target
-    assert.equal(targets.has(status), true, `${status} is in the vocabulary but unreachable`)
-  }
+  assert.deepEqual(GOAL_TRANSITIONS.completed, ['in_progress'])
+  assert.deepEqual(GOAL_TRANSITIONS.abandoned, ['pending'])
+  assert.deepEqual([...GOAL_STATUSES].sort(), ['abandoned', 'blocked', 'completed', 'in_progress', 'pending'])
 })
 
-test('auto_resume is off: nothing but an explicit update moves a status', async (t) => {
+test('auto_resume is off: a child\'s status moves its parent\'s progress, never its status', async (t) => {
   const { mock, client } = await open(t)
   const { objective, milestone, task } = mock.seedTree('aos/ceo')
-  await json(client, 'update_goal_status', {
-    project_id: 'aos/ceo',
-    goal_id: task,
-    status: 'in_progress',
-  })
-  await json(client, 'update_goal_status', { project_id: 'aos/ceo', goal_id: task, status: 'review' })
-  await json(client, 'update_goal_status', { project_id: 'aos/ceo', goal_id: task, status: 'done' })
+  await call(client, 'update_goal', { goal_id: task, status: 'in_progress' })
+  await call(client, 'complete_goal', { goal_id: task })
 
-  // Finishing every task must not finish the milestone or the objective. If the
-  // server advanced them, the kernel's own goal projection would be racing a
-  // second writer it cannot see.
-  const tree = await json(client, 'list_goals', { project_id: 'aos/ceo' })
-  const byId = new Map(
-    (tree['goals'] as { id: string; status: string }[]).map((g) => [g.id, g.status]),
-  )
-  assert.equal(byId.get(task), 'done')
-  assert.equal(byId.get(milestone), 'pending')
-  assert.equal(byId.get(objective), 'pending')
+  assert.equal(mock.state.goals.get(task)?.status, 'completed')
+  assert.equal(mock.state.goals.get(milestone)?.status, 'pending')
+  assert.equal(mock.state.goals.get(milestone)?.progressPct, 100, 'pmmcp rolls up progress one level')
+  assert.equal(mock.state.goals.get(objective)?.status, 'pending')
   assert.deepEqual(mock.state.autoTransitions, [])
 })
 
 test('parent rollup is off by default and refuses a live child when switched on', async (t) => {
-  // Off by default deliberately: nothing has confirmed pmmcp enforces this, and
-  // a double that invents a rule makes the kernel depend on a phantom.
+  // Off by default: pmmcp does not do this (src/storage/goal_store.py), and a
+  // double that invents a rule makes the kernel depend on a phantom.
   const loose = await open(t)
   const l = loose.mock.seedTree('aos/ceo')
-  for (const status of ['in_progress', 'review', 'done'] as const) {
-    await json(loose.client, 'update_goal_status', {
-      project_id: 'aos/ceo',
-      goal_id: l.milestone,
-      status,
-    })
-  }
-  assert.equal(loose.mock.state.goals.get(l.milestone)?.status, 'done', 'default allows it')
+  await call(loose.client, 'update_goal', { goal_id: l.milestone, status: 'in_progress' })
+  assert.match((await call(loose.client, 'complete_goal', { goal_id: l.milestone })).text, /^✅ Completed/)
   assert.equal(loose.mock.state.goals.get(l.task)?.status, 'pending', 'with the task still open')
 
   const strict = await open(t, { strictRollup: true })
   const s = strict.mock.seedTree('aos/ceo')
-  await json(strict.client, 'update_goal_status', {
-    project_id: 'aos/ceo',
-    goal_id: s.milestone,
-    status: 'in_progress',
-  })
-  await json(strict.client, 'update_goal_status', {
-    project_id: 'aos/ceo',
-    goal_id: s.milestone,
-    status: 'review',
-  })
-  const blocked = await call(strict.client, 'update_goal_status', {
-    project_id: 'aos/ceo',
-    goal_id: s.milestone,
-    status: 'done',
-  })
-  assert.equal(blocked.isError, true)
+  await call(strict.client, 'update_goal', { goal_id: s.milestone, status: 'in_progress' })
+  const blocked = await call(strict.client, 'complete_goal', { goal_id: s.milestone })
   assert.match(blocked.text, /not yet at rest/)
 })
 
@@ -346,7 +305,7 @@ test('a session idle-expires, and a fresh session finds the state intact', async
   let clock = 1_000
   const { mock, client } = await open(t, { idleMs: 60_000, now: () => clock })
   const { task } = mock.seedTree('aos/ceo')
-  assert.equal((await call(client, 'get_goal', { project_id: 'aos/ceo', goal_id: task })).isError, false)
+  assert.equal((await call(client, 'get_goal_tree', { goal_id: task })).text, '⬜ [T] seeded task')
 
   clock += 60_001
   // Both doors: a call and a ping. A session that still answers ping is one the
@@ -355,8 +314,8 @@ test('a session idle-expires, and a fresh session finds the state intact', async
   await assert.rejects(() => client.ping(), /session expired/)
 
   const second = await mock.connect()
-  const goal = await json(second, 'get_goal', { project_id: 'aos/ceo', goal_id: task })
-  assert.equal(goal['id'], task, 'the goals outlive the session that created them')
+  const goal = await call(second, 'get_goal_tree', { goal_id: task })
+  assert.equal(goal.text, '⬜ [T] seeded task', 'the goals outlive the session that created them')
   assert.equal(mock.sessions.length, 2)
   assert.equal(mock.sessions[0]?.expired, true)
   assert.equal(mock.sessions[1]?.expired, false)

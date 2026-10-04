@@ -169,15 +169,14 @@ export interface GoalTreeContext {
 /**
  * Write a tree, read it back through the server, move a task, refuse `done`.
  *
- * The read-back is deliberately shape-agnostic: pmmcp's result format is
- * unconfirmed, so rather than parsing a listing this asserts that every id the
- * server handed back on create appears in what the server returns when asked for
- * that parent's children. That holds for any reasonable format and fails for the
- * one outcome that matters — ids the server does not recognise.
+ * The read-back asks pmmcp for the objective's tree. pmmcp's listings carry
+ * titles and status icons but NO ids (Goal.to_display), so the check is that
+ * every title the kernel wrote comes back under the id the server handed out —
+ * which fails for the one outcome that matters: an id the server does not know.
  */
 export async function goalTreeRoundTrip(ctx: GoalTreeContext): Promise<void> {
   // The boot check, first. Against the live server this IS the test of the
-  // modelled names, and its reason names every tool and argument that disagrees.
+  // configured names, and its reason names every tool and argument that disagrees.
   const unusable = goalToolsUnusable(ctx.hub, ctx.goals)
   assert.equal(unusable, undefined, `the configured goal tools do not match the server: ${String(unusable)}`)
 
@@ -186,19 +185,21 @@ export async function goalTreeRoundTrip(ctx: GoalTreeContext): Promise<void> {
   assert.equal(tree.milestones.size, 1)
   assert.equal(tree.tasks.size, 2)
 
-  const milestoneId = tree.milestones.get('m1')
-  assert.ok(milestoneId)
   const a = ctx.goals.args
-  const listed = await ctx.hub.callKernelOnly(
+  const shown = await ctx.hub.callKernelOnly(
     'pmmcp',
-    ctx.goals.tools.list,
-    { [a.projectId]: ctx.projectId, [a.parentId]: milestoneId },
-    'runtime test: read back the children of a milestone just written',
+    ctx.goals.tools.get,
+    { [a.goalId]: tree.objectiveGoalId },
+    'runtime test: read back the tree just written',
   )
-  assert.equal(listed.ok, true, `listing the milestone's children failed: ${JSON.stringify(listed.content)}`)
-  const text = JSON.stringify(listed.content)
-  for (const [planId, goalId] of tree.tasks) {
-    assert.ok(text.includes(goalId), `${planId} (${goalId}) is not among the milestone's children`)
+  assert.equal(shown.ok, true, `reading the tree back failed: ${JSON.stringify(shown.content)}`)
+  const text = JSON.stringify(shown.content)
+  const titles = [
+    SMALL_PLAN.objective.title,
+    ...SMALL_PLAN.milestones.flatMap((m) => [m.title, ...m.tasks.map((t) => t.title)]),
+  ]
+  for (const title of titles) {
+    assert.ok(text.includes(JSON.stringify(title).slice(1, -1)), `"${title}" is not in the tree the server returned`)
   }
 
   // A task moves the way a run would move it.

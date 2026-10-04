@@ -173,8 +173,8 @@ test('evalHarnessAssumptions holds against a scripted provider', async (t) => {
 // took the happy path. Each body is therefore also run against the precise
 // violation it exists to catch, and must refuse.
 
-test('goalTreeRoundTrip refuses a server that does not return the ids it created', async (t) => {
-  const mock = pmmcpMock({ listGoalsReturnsNothing: true })
+test('goalTreeRoundTrip refuses a server that does not know the goals it created', async (t) => {
+  const mock = pmmcpMock({ forgetsGoals: true })
   t.after(async () => {
     await mock.close()
   })
@@ -190,7 +190,7 @@ test('goalTreeRoundTrip refuses a server that does not return the ids it created
 
   await assert.rejects(
     () => goalTreeRoundTrip({ hub, store, goals: shippedGoals(), projectId: LIVE_TEST_PROJECT, runId: 'run_neg' }),
-    /is not among the milestone's children/,
+    /is not in the tree the server returned/,
   )
 })
 

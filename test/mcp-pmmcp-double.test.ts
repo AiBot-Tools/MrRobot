@@ -336,12 +336,14 @@ test('an idle-expired session is noticed by the heartbeat and replaced, and the 
   // wiped memory to the CEO's next continuation.
   const read = await hub.callKernelOnly(
     'pmmcp',
-    'get_goal',
-    { project_id: 'aos/ceo', goal_id: tree.objective },
+    'get_goal_tree',
+    { goal_id: tree.objective },
     'test: the goal survived the reconnect',
   )
   assert.equal(read.ok, true)
-  assert.match(JSON.stringify(read.content), new RegExp(tree.objective))
+  // pmmcp's tree carries titles, not ids.
+  assert.match(JSON.stringify(read.content), /seeded objective/)
+  assert.doesNotMatch(JSON.stringify(read.content), /not found/)
 })
 
 test('the hub describes every declared tool with the schema the double declares', async (t) => {

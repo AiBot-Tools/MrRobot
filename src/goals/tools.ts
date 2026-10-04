@@ -1,8 +1,8 @@
 // Checking the configured pmmcp goal tools against the connected server.
 //
-// Every goal tool name and argument in config/kernel.yaml is MODELLED — nobody
-// has read pmmcp's live `listTools` on this machine. The kernel therefore does
-// not assume: at boot it asks the hub what the server declares and compares.
+// The goal tool names and arguments in config/kernel.yaml are read from pmmcp's
+// source, not yet from its live `listTools`. The kernel therefore does not
+// assume: at boot it asks the hub what the server declares and compares.
 //
 // The result is a DEGRADATION, not a refusal. A kernel that will not start
 // because one tool is named differently takes away the control plane the operator
@@ -22,10 +22,12 @@ export type GoalsConfig = KernelConfig['goals']
 /** The arguments the kernel will actually send, per configured tool. */
 export function requiredArgs(goals: GoalsConfig): { tool: string; args: string[] }[] {
   const a = goals.args
+  // pmmcp's update and tree tools take no project_id; the kernel's own
+  // goal.created record is the namespace check for those (see writer.ts).
   return [
-    { tool: goals.tools.create, args: [a.projectId, a.kind, a.title] },
-    { tool: goals.tools.updateStatus, args: [a.projectId, a.goalId, a.status] },
-    { tool: goals.tools.get, args: [a.projectId, a.goalId] },
+    { tool: goals.tools.create, args: [a.projectId, a.kind, a.title, a.parentId] },
+    { tool: goals.tools.updateStatus, args: [a.goalId, a.status, a.progress] },
+    { tool: goals.tools.get, args: [a.goalId] },
     { tool: goals.tools.list, args: [a.projectId] },
   ]
 }

@@ -28,7 +28,6 @@ import {
   GoalCreatedPayload,
   RunFinishedPayload,
   RunQueuedPayload,
-  RunStartedPayload,
 } from '../events/types.js'
 import { claimsOf } from '../eval/observe.js'
 import { looksLikePlan, parsePlan, PlanInvalid } from './plan.js'
@@ -66,11 +65,10 @@ export class GoalTracker {
    * goalId → the namespace the KERNEL created it in, from `goal.created`.
    *
    * A goal's namespace is where it was written, not where the run serving it
-   * lives. A delegated researcher works a task goal in `aos/ceo`; addressing its
-   * status updates to `aos/agent/researcher` fails on the server and would leave
-   * the goal stale with only a log line to show for it. So the kernel's own
-   * record of where it wrote each goal is the authority, and the running agent's
-   * namespace is only the fallback for goals the kernel did not create.
+   * lives: a delegated researcher works a task goal in `aos/ceo`. And it is the
+   * ONLY authority — there is no fallback to the running agent's namespace for a
+   * goal the kernel did not create, because pmmcp's update_goal takes no
+   * project_id and would move any goal by id. Such a goal is left alone.
    */
   readonly #namespaceOf = new Map<string, string>()
   /** Serial, so two updates to one goal cannot race each other. */
@@ -138,9 +136,9 @@ export class GoalTracker {
     this.#namespaceOf.set(p.goalId, p.projectId)
   }
 
-  /** Where a goal lives: where the kernel wrote it, else the running agent's own. */
-  #projectFor(goalId: string, agentId: string): string | undefined {
-    return this.#namespaceOf.get(goalId) ?? this.#o.projectIdOf(agentId)
+  /** Where a goal lives: where the kernel wrote it, or undefined if it did not. */
+  #projectFor(goalId: string): string | undefined {
+    return this.#namespaceOf.get(goalId)
   }
 
   #observe(row: EventRow): void {
@@ -158,9 +156,11 @@ export class GoalTracker {
     if (row.type === 'run.started') {
       const goalId = this.#goalOf.get(runId)
       if (goalId === undefined) return
-      const agentId = RunStartedPayload.parse(JSON.parse(row.payload)).agentId
-      const projectId = this.#projectFor(goalId, agentId)
-      if (projectId === undefined) return
+      const projectId = this.#projectFor(goalId)
+      if (projectId === undefined) {
+        this.#log.warn({ runId, goalId }, 'a run named a goal this kernel did not create; its status is not moved')
+        return
+      }
       this.#enqueue(
         async () => {
           await this.#o.writer.trySetStatus(goalId, 'in_progress', {
@@ -181,7 +181,7 @@ export class GoalTracker {
       const agentId = row.agentId
       if (agentId === null) return
 
-      const goalProject = goalId === undefined ? undefined : this.#projectFor(goalId, agentId)
+      const goalProject = goalId === undefined ? undefined : this.#projectFor(goalId)
       if (goalId !== undefined && goalProject !== undefined) {
         // `review` and never `done`: a run finishing is evidence, not a verdict.
         // Anything other than ok is `blocked`, which is a state something can act
@@ -261,9 +261,7 @@ export class GoalTracker {
       const goalId = this.#goalOf.get(runId)
       if (goalId === undefined) continue
       this.#goalOf.delete(runId)
-      const queued = this.#o.store.query({ runId }).find((r) => r.type === 'run.queued')
-      const agentId = queued?.agentId ?? null
-      const projectId = agentId === null ? this.#namespaceOf.get(goalId) : this.#projectFor(goalId, agentId)
+      const projectId = this.#projectFor(goalId)
       if (projectId === undefined) continue
       await this.#o.writer.trySetStatus(goalId, 'blocked', {
         projectId,

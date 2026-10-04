@@ -69,37 +69,25 @@ export const PARENT_KIND: Readonly<Record<GoalKind, GoalKind | undefined>> = {
   task: 'milestone',
 }
 
-export const GOAL_STATUSES = [
-  'pending',
-  'in_progress',
-  'blocked',
-  'review',
-  'done',
-  'abandoned',
-] as const
+/** pmmcp's vocabulary (src/storage/goal_store.py `_VALID_STATUSES`). No `review`. */
+export const GOAL_STATUSES = ['pending', 'in_progress', 'completed', 'abandoned', 'blocked'] as const
 export type GoalStatus = (typeof GOAL_STATUSES)[number]
 
 /**
- * Legal transitions. The load-bearing entries:
- *
- *   `review` does NOT reach `done` by itself and is not a synonym for it
- *   (design/agent-fleet KC15: "goal-status projection where `review` is not
- *   `done`"). A judge's verdict is advisory; something has to move it.
- *
- *   `done` and `abandoned` are terminal. Nothing reopens a finished goal, so a
- *   projection can treat them as final without a tiebreak rule.
+ * pmmcp's `_STATUS_TRANSITIONS`, verbatim. Setting a goal to the status it
+ * already has is allowed (a no-op), which is what lets the kernel send `review`
+ * as `in_progress` after a run already moved the task there.
  */
 export const GOAL_TRANSITIONS: Readonly<Record<GoalStatus, readonly GoalStatus[]>> = {
-  pending: ['in_progress', 'abandoned'],
-  in_progress: ['blocked', 'review', 'abandoned'],
-  blocked: ['in_progress', 'abandoned'],
-  review: ['in_progress', 'done', 'abandoned'],
-  done: [],
-  abandoned: [],
+  pending: ['in_progress', 'abandoned', 'blocked'],
+  in_progress: ['completed', 'blocked', 'abandoned', 'pending'],
+  blocked: ['in_progress', 'abandoned', 'pending'],
+  completed: ['in_progress'],
+  abandoned: ['pending'],
 }
 
-/** Terminal statuses, for a subtree-at-rest check. */
-export const TERMINAL_STATUSES: readonly GoalStatus[] = ['done', 'abandoned']
+/** At rest, for the opt-in subtree check. */
+export const TERMINAL_STATUSES: readonly GoalStatus[] = ['completed', 'abandoned']
 
 export interface MockGoal {
   readonly id: string
@@ -108,6 +96,7 @@ export interface MockGoal {
   readonly parentId: string | undefined
   readonly title: string
   status: GoalStatus
+  progressPct: number
   readonly metadata: Record<string, unknown>
   /** Monotonic, so a test can assert ordering without a clock. */
   readonly createdAt: number
@@ -155,9 +144,11 @@ export interface PmmcpToolSpec {
   readonly inputSchema: JsonObjectSchema
   /**
    * `confirmed` means the operator read this off a live `listTools`. Exactly one
-   * entry may carry it until the capture exists.
+   * entry may carry it until the capture exists. `source` means read from
+   * pmmcp's Python source (55f3c1a): far better than a guess, still not the
+   * schema FastMCP actually serves.
    */
-  readonly provenance: 'confirmed' | 'modelled'
+  readonly provenance: 'confirmed' | 'source' | 'modelled'
   readonly source: string
 }
 
@@ -167,6 +158,10 @@ const str = (description: string): { type: string; description: string } => ({
 })
 const num = (description: string): { type: string; description: string } => ({
   type: 'number',
+  description,
+})
+const ARR = (description: string): { type: string; description: string } => ({
+  type: 'array',
   description,
 })
 
@@ -201,57 +196,76 @@ export const PMMCP_TOOLS: readonly PmmcpToolSpec[] = [
   },
   {
     name: 'create_goal',
-    description: 'Create an objective, milestone or task',
+    description: 'Create a new goal (objective, milestone, or task) for a project',
     inputSchema: {
       type: 'object',
       properties: {
-        project_id: str('namespace'),
-        kind: str('objective | milestone | task'),
-        title: str('one line'),
-        parent_id: str('required for milestone and task'),
-        metadata: { type: 'object' },
+        title: str('Short goal title'),
+        project_id: str('Project this goal belongs to'),
+        description: str('Detailed description'),
+        goal_type: str('objective (high-level), milestone (mid), or task (concrete)'),
+        parent_goal_id: str('Parent goal ID for hierarchy'),
+        priority: num('1 (highest) to 5 (lowest)'),
+        acceptance_criteria: ARR('Measurable conditions for completion'),
+        tags: ARR('tags'),
+        related_files: ARR('related files'),
       },
-      required: ['project_id', 'kind', 'title'],
+      required: ['title', 'project_id'],
     },
-    provenance: 'modelled',
-    source: 'docs/design/agent-fleet.md §6.1; DECISIONS Q24 is still open',
+    provenance: 'source',
+    source: 'pmmcp src/tools/goals.py create_goal @55f3c1a',
   },
   {
-    name: 'get_goal',
-    description: 'Read one goal',
+    name: 'update_goal',
+    description: "Update an existing goal's status, progress, or metadata",
     inputSchema: {
       type: 'object',
-      properties: { project_id: str('namespace'), goal_id: str('id') },
-      required: ['project_id', 'goal_id'],
+      properties: {
+        goal_id: str('Goal ID to update'),
+        status: str('pending, in_progress, completed, abandoned, blocked'),
+        progress_pct: num('0.0 to 100.0'),
+        title: str('title'),
+        description: str('description'),
+        priority: num('1-5'),
+        blockers: ARR('blockers'),
+        tags: ARR('tags'),
+        acceptance_criteria: ARR('acceptance criteria'),
+        related_files: ARR('related files'),
+      },
+      required: ['goal_id'],
     },
-    provenance: 'modelled',
-    source: 'docs/design/agent-fleet.md §6.1',
+    provenance: 'source',
+    source: 'pmmcp src/tools/goals.py update_goal @55f3c1a: no project_id',
   },
   {
     name: 'list_goals',
-    description: 'List goals in a project, optionally filtered',
+    description: 'List all goals for a project, optionally filtered',
     inputSchema: {
       type: 'object',
       properties: {
-        project_id: str('namespace'),
-        parent_id: str('direct children of this goal'),
-        status: str('one status'),
+        project_id: str('Project to list goals for'),
+        status: str('Filter by status'),
+        goal_type: str('Filter by type'),
+        root_only: { type: 'boolean', description: 'Only show top-level goals (no children)' },
       },
       required: ['project_id'],
     },
-    provenance: 'modelled',
-    source: 'docs/design/agent-fleet.md §6.1',
+    provenance: 'source',
+    source: 'pmmcp src/tools/goals.py list_goals @55f3c1a',
   },
   {
-    name: 'update_goal_status',
-    description: 'Move a goal to a new status, if the transition is legal',
-    inputSchema: {
-      type: 'object',
-      properties: { project_id: str('namespace'), goal_id: str('id'), status: str('new status') },
-      required: ['project_id', 'goal_id', 'status'],
-    },
-    provenance: 'modelled',
-    source: 'CLAUDE.md environment facts: validated status transitions. Vocabulary UNCONFIRMED',
+    name: 'get_goal_tree',
+    description: 'Display a goal and all its sub-goals as a tree',
+    inputSchema: { type: 'object', properties: { goal_id: str('Root goal ID') }, required: ['goal_id'] },
+    provenance: 'source',
+    source: 'pmmcp src/tools/goals.py get_goal_tree @55f3c1a: no project_id',
+  },
+  {
+    name: 'complete_goal',
+    description: 'Shorthand to mark a goal as completed (100% progress)',
+    inputSchema: { type: 'object', properties: { goal_id: str('Goal to mark as completed') }, required: ['goal_id'] },
+    provenance: 'source',
+    source: 'pmmcp src/tools/goals.py complete_goal @55f3c1a; the kernel never calls it',
   },
   {
     name: 'get_secret',
@@ -381,12 +395,12 @@ export interface PmmcpMockOptions {
   /**
    * What `create_goal` returns the new id as.
    *
-   * `json` is an object with an `id`; `bare` is the id alone; `prose` is a
-   * sentence with no readable id, which is what the writer must refuse rather
-   * than guess at. The real shape is UNCONFIRMED, so the kernel has to cope with
-   * the first two and fail loudly on the third.
+   * `pmmcp` (the default) is the real reply, read from its source: "✅ Goal
+   * created: goal_<hex>" and detail lines. `json` and `bare` are other shapes
+   * the writer also reads; `prose` is a sentence with no readable id, which the
+   * writer must refuse rather than guess at.
    */
-  readonly goalIdShape?: 'json' | 'bare' | 'prose'
+  readonly goalIdShape?: 'pmmcp' | 'json' | 'bare' | 'prose'
   /**
    * Fault injection: calls to a tool BEYOND this count return an isError result.
    *
@@ -397,11 +411,12 @@ export interface PmmcpMockOptions {
    */
   readonly failAfter?: Readonly<Record<string, number>>
   /**
-   * `list_goals` answers ok with an empty list. A server that accepts a create and
-   * then does not recognise the id is the failure the runtime round-trip's
-   * read-back exists to catch, and it cannot be produced by an error result.
+   * `list_goals` and `get_goal_tree` answer as if no goal existed. A server that
+   * accepts a create and then does not know the goal is the failure the runtime
+   * round-trip's read-back exists to catch, and it cannot be produced by an
+   * error result.
    */
-  readonly listGoalsReturnsNothing?: boolean
+  readonly forgetsGoals?: boolean
   /**
    * Refuse to finish a milestone or objective while a child is not terminal.
    * OFF by default: nothing has confirmed pmmcp does this, and a double that
@@ -459,6 +474,11 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     seq += 1
     return `${prefix}-${String(seq)}`
   }
+  // pmmcp's shape: `goal_` + 12 hex (uuid4().hex[:12]); deterministic here.
+  const nextGoalId = (): string => {
+    seq += 1
+    return `goal_${seq.toString(16).padStart(12, '0')}`
+  }
 
   const specs: PmmcpToolSpec[] = PMMCP_TOOLS.map((spec) =>
     spec.name === 'get_secret' && secretArg !== 'label'
@@ -505,7 +525,7 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
 
   function seedTree(projectId: string): { objective: string; milestone: string; task: string } {
     const mk = (kind: GoalKind, title: string, parentId: string | undefined): string => {
-      const id = nextId('goal')
+      const id = nextGoalId()
       const at = now()
       state.goals.set(id, {
         id,
@@ -514,6 +534,7 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
         parentId,
         title,
         status: 'pending',
+        progressPct: 0,
         metadata: {},
         createdAt: at,
         updatedAt: at,
@@ -565,36 +586,41 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     return ok({ hits })
   })
 
+  // pmmcp reports failure as SUCCESSFUL text (src/tools/goals.py): "Error: …",
+  // "Goal x not found.". Only a missing required argument is a transport-level
+  // error, because FastMCP rejects it before the tool body runs.
+  const said = (text: string): CallToolResult => ok(text)
+
   handlers.set('create_goal', (args) => {
     const projectId = need(args, 'project_id')
-    const kindRaw = need(args, 'kind')
     const title = need(args, 'title')
     if (projectId === undefined) return fail('project_id is required')
     if (title === undefined) return fail('title is required')
-    if (kindRaw === undefined || !(GOAL_KINDS as readonly string[]).includes(kindRaw)) {
-      return fail(`kind must be one of ${GOAL_KINDS.join(', ')}`)
+    const kindRaw = need(args, 'goal_type') ?? 'objective'
+    if (!(GOAL_KINDS as readonly string[]).includes(kindRaw)) {
+      return said(`Error: Invalid goal_type: ${kindRaw}. Must be one of {'objective', 'milestone', 'task'}`)
     }
     const kind = kindRaw as GoalKind
+    const parentId = need(args, 'parent_goal_id')
+    if (parentId !== undefined && !state.goals.has(parentId)) {
+      return said(`Error: Parent goal not found: ${parentId}`)
+    }
+    // STRICTER than pmmcp, which checks only that the parent exists: the kernel
+    // always writes objective → milestone → task in one project, so holding it
+    // to that costs nothing and catches a writer that ever stops doing so.
     const wantParent = PARENT_KIND[kind]
-    const parentId = need(args, 'parent_id')
-    if (wantParent === undefined) {
-      if (parentId !== undefined) return fail('an objective is a root and takes no parent_id')
-    } else {
-      if (parentId === undefined) return fail(`a ${kind} requires a parent_id`)
-      const parent = state.goals.get(parentId)
-      if (parent === undefined || parent.projectId !== projectId) {
-        return fail(`no goal ${parentId} in ${projectId}`)
-      }
-      if (parent.kind !== wantParent) {
-        return fail(`a ${kind} hangs from a ${wantParent}, not a ${parent.kind}`)
+    if (wantParent === undefined && parentId !== undefined) {
+      return said('Error: an objective is a root and takes no parent_goal_id (stricter than pmmcp)')
+    }
+    if (wantParent !== undefined) {
+      const parent = parentId === undefined ? undefined : state.goals.get(parentId)
+      if (parent === undefined) return said(`Error: a ${kind} requires a parent_goal_id (stricter than pmmcp)`)
+      if (parent.projectId !== projectId || parent.kind !== wantParent) {
+        return said(`Error: a ${kind} hangs from a ${wantParent} in ${projectId} (stricter than pmmcp)`)
       }
     }
-    const metaRaw = args['metadata']
-    const metadata =
-      typeof metaRaw === 'object' && metaRaw !== null && !Array.isArray(metaRaw)
-        ? { ...(metaRaw as Record<string, unknown>) }
-        : {}
-    const id = nextId('goal')
+    const priority = typeof args['priority'] === 'number' ? Math.max(1, Math.min(5, args['priority'])) : 3
+    const id = nextGoalId()
     const at = now()
     state.goals.set(id, {
       id,
@@ -603,85 +629,120 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
       parentId,
       title,
       status: 'pending',
-      metadata,
+      progressPct: 0,
+      metadata: {},
       createdAt: at,
       updatedAt: at,
     })
-    const shape = options.goalIdShape ?? 'json'
+    const shape = options.goalIdShape ?? 'pmmcp'
     if (shape === 'bare') return ok(id)
     if (shape === 'prose') return ok(`I have created the ${kind} for you.`)
-    return ok({ id, kind, status: 'pending' })
+    if (shape === 'json') return ok({ id, kind, status: 'pending' })
+    return said(
+      `✅ Goal created: ${id}\n` +
+        `   Title: ${title}\n` +
+        `   Type: ${kind} | Priority: ${String(priority)}\n` +
+        '   Status: pending | auto_resume: false\n' +
+        '   Confirmation required: always',
+    )
   })
 
-  const view = (g: MockGoal): Record<string, unknown> => ({
-    id: g.id,
-    kind: g.kind,
-    title: g.title,
-    status: g.status,
-    parent_id: g.parentId ?? null,
-    metadata: g.metadata,
-  })
+  // pmmcp's Goal.to_display: icon, [O|M|T], title, (pct%) when non-zero. No id.
+  const ICON: Readonly<Record<GoalStatus, string>> = {
+    pending: '⬜',
+    in_progress: '🔵',
+    completed: '✅',
+    abandoned: '⛔',
+    blocked: '🔴',
+  }
+  const display = (g: MockGoal, indent = 0): string =>
+    `${'  '.repeat(indent)}${ICON[g.status]} [${g.kind[0]?.toUpperCase() ?? '?'}] ${g.title}` +
+    (g.progressPct > 0 ? ` (${g.progressPct.toFixed(0)}%)` : '')
 
-  handlers.set('get_goal', (args) => {
-    const projectId = need(args, 'project_id')
+  const childrenOf = (id: string): MockGoal[] =>
+    [...state.goals.values()].filter((g) => g.parentId === id).sort((x, y) => x.createdAt - y.createdAt)
+  const tree = (g: MockGoal, indent: number): string =>
+    [display(g, indent), ...childrenOf(g.id).map((c) => tree(c, indent + 1))].join('\n')
+
+  handlers.set('get_goal_tree', (args) => {
     const goalId = need(args, 'goal_id')
-    if (projectId === undefined) return fail('project_id is required')
     if (goalId === undefined) return fail('goal_id is required')
-    const goal = state.goals.get(goalId)
-    // A goal in another project is NOT FOUND, not forbidden: the answer must not
-    // confirm that an id exists somewhere else.
-    if (goal === undefined || goal.projectId !== projectId) return fail(`no goal ${goalId} in ${projectId}`)
-    return ok(view(goal))
+    const goal = options.forgetsGoals === true ? undefined : state.goals.get(goalId)
+    if (goal === undefined) return said(`Goal ${goalId} not found.`)
+    return said(tree(goal, 0))
   })
 
   handlers.set('list_goals', (args) => {
-    if (options.listGoalsReturnsNothing === true) return ok({ goals: [] })
     const projectId = need(args, 'project_id')
     if (projectId === undefined) return fail('project_id is required')
-    const parentId = need(args, 'parent_id')
     const status = need(args, 'status')
-    if (status !== undefined && !(GOAL_STATUSES as readonly string[]).includes(status)) {
-      return fail(`status must be one of ${GOAL_STATUSES.join(', ')}`)
+    const goalType = need(args, 'goal_type')
+    const rootOnly = args['root_only'] !== false
+    const goals =
+      options.forgetsGoals === true
+        ? []
+        : goalsOf(projectId)
+            .filter((g) => (rootOnly ? g.parentId === undefined : true))
+            .filter((g) => (status === undefined ? true : g.status === status))
+            .filter((g) => (goalType === undefined ? true : g.kind === goalType))
+            .sort((x, y) => x.createdAt - y.createdAt)
+    if (goals.length === 0) {
+      return said(`No goals found for project '${projectId}'${status === undefined ? '' : ` (status=${status})`}.`)
     }
-    const goals = goalsOf(projectId)
-      .filter((g) => (parentId === undefined ? true : g.parentId === parentId))
-      .filter((g) => (status === undefined ? true : g.status === status))
-      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-      .map(view)
-    return ok({ goals })
+    return said([`## Goals for ${projectId} (${String(goals.length)})`, ...goals.map((g) => display(g))].join('\n'))
   })
 
-  handlers.set('update_goal_status', (args) => {
-    const projectId = need(args, 'project_id')
-    const goalId = need(args, 'goal_id')
-    const status = need(args, 'status')
-    if (projectId === undefined) return fail('project_id is required')
-    if (goalId === undefined) return fail('goal_id is required')
-    if (status === undefined || !(GOAL_STATUSES as readonly string[]).includes(status)) {
-      return fail(`status must be one of ${GOAL_STATUSES.join(', ')}`)
-    }
-    const goal = state.goals.get(goalId)
-    if (goal === undefined || goal.projectId !== projectId) return fail(`no goal ${goalId} in ${projectId}`)
-    const next = status as GoalStatus
+  const move = (goal: MockGoal, next: GoalStatus): string | undefined => {
     const legal = GOAL_TRANSITIONS[goal.status]
-    if (!legal.includes(next)) {
-      return fail(
-        legal.length === 0
-          ? `${goalId} is ${goal.status}, which is terminal`
-          : `${goalId} cannot go ${goal.status} → ${next}; legal: ${legal.join(', ')}`,
-      )
+    if (next !== goal.status && !legal.includes(next)) {
+      return `Error: Cannot transition from '${goal.status}' to '${next}'. Allowed: {${legal.map((x) => `'${x}'`).join(', ')}}`
     }
-    if (strictRollup && next === 'done' && goal.kind !== 'task') {
-      const live = goalsOf(projectId).filter(
-        (g) => g.parentId === goalId && !TERMINAL_STATUSES.includes(g.status),
-      )
-      if (live.length > 0) {
-        return fail(`${goalId} has ${String(live.length)} child goal(s) not yet at rest`)
-      }
+    if (strictRollup && next === 'completed' && goal.kind !== 'task') {
+      const live = childrenOf(goal.id).filter((g) => !TERMINAL_STATUSES.includes(g.status))
+      if (live.length > 0) return `Error: ${goal.id} has ${String(live.length)} child goal(s) not yet at rest`
     }
     goal.status = next
+    if (next === 'completed') goal.progressPct = 100
     goal.updatedAt = now()
-    return ok({ id: goalId, status: next })
+    // pmmcp's _update_parent_progress: the immediate parent's PROGRESS follows
+    // its children (completed 100, in_progress 50); its status never does.
+    const parent = goal.parentId === undefined ? undefined : state.goals.get(goal.parentId)
+    if (parent !== undefined) {
+      const kids = childrenOf(parent.id)
+      const done = kids.filter((k) => k.status === 'completed').length
+      const working = kids.filter((k) => k.status === 'in_progress').length
+      parent.progressPct = Math.round(((done * 100 + working * 50) / kids.length) * 10) / 10
+    }
+    return undefined
+  }
+
+  handlers.set('update_goal', (args) => {
+    const goalId = need(args, 'goal_id')
+    if (goalId === undefined) return fail('goal_id is required')
+    const goal = state.goals.get(goalId)
+    if (goal === undefined) return said(`Goal ${goalId} not found.`)
+    const status = need(args, 'status')
+    if (status !== undefined) {
+      if (!(GOAL_STATUSES as readonly string[]).includes(status)) return said(`Error: Invalid status: ${status}`)
+      const refused = move(goal, status as GoalStatus)
+      if (refused !== undefined) return said(refused)
+    }
+    const pct = args['progress_pct']
+    if (typeof pct === 'number') {
+      if (pct < 0 || pct > 100) return said('Error: progress_pct must be between 0.0 and 100.0')
+      goal.progressPct = pct
+    }
+    return said(`✅ Goal updated: ${goalId}\n   ${display(goal)}`)
+  })
+
+  handlers.set('complete_goal', (args) => {
+    const goalId = need(args, 'goal_id')
+    if (goalId === undefined) return fail('goal_id is required')
+    const goal = state.goals.get(goalId)
+    if (goal === undefined) return said(`Goal ${goalId} not found.`)
+    const refused = move(goal, 'completed')
+    if (refused !== undefined) return said(refused)
+    return said(`✅ Completed: ${goal.title}`)
   })
 
   handlers.set('get_secret', (args) => {
@@ -793,7 +854,8 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
       // update. Anything else is recorded, and a test asserts it stays empty.
       for (const [id, status] of before) {
         const after = state.goals.get(id)?.status
-        if (after !== undefined && after !== status && name !== 'update_goal_status') {
+        const explicit = (name === 'update_goal' || name === 'complete_goal') && id === args['goal_id']
+        if (after !== undefined && after !== status && !explicit) {
           state.autoTransitions.push({ goalId: id, from: status, to: after })
         }
       }

@@ -127,6 +127,27 @@ async function runWithGoal(
   }
 }
 
+/**
+ * A tree on the server, recorded as the KERNEL's own — the goal.created rows
+ * materialise would have written. pmmcp's update_goal moves any goal by id, so
+ * the kernel moves only goals its own log says it created.
+ */
+function kernelTree(
+  store: { append: Kernel['store']['append'] },
+  mock: PmmcpMock,
+  projectId: string,
+): { objective: string; milestone: string; task: string } {
+  const ids = mock.seedTree(projectId)
+  for (const [kind, goalId] of [
+    ['objective', ids.objective],
+    ['milestone', ids.milestone],
+    ['task', ids.task],
+  ] as const) {
+    store.append({ type: 'goal.created', payload: { schemaVersion: 1, projectId, goalId, kind, title: `seeded ${kind}` } })
+  }
+  return ids
+}
+
 function statuses(dbPath: string): string[] {
   return rows(dbPath)
     .filter((r) => r.type === 'goal.status')
@@ -140,14 +161,16 @@ test('a run naming a goal moves it to in_progress, then review — never done', 
   const { mock, kernel, dbPath } = await bootWithGoals(t, [
     anthropicEndTurn({ text: 'the task is done', inputTokens: 900, outputTokens: 20 }),
   ])
-  const { task } = mock.seedTree(CEO_PROJECT)
+  const { task } = kernelTree(kernel.store, mock, CEO_PROJECT)
 
   const finished = await runWithGoal(kernel, 'do the task', task)
   assert.equal(finished['status'], 'ok', String(finished['reason']))
 
   // Drained through shutdown, because the updates are queued off the append.
+  // pmmcp has no `review`: in_progress at 100%, and `review` in the kernel's log.
   await kernel.shutdown()
-  assert.equal(mock.state.goals.get(task)?.status, 'review')
+  assert.equal(mock.state.goals.get(task)?.status, 'in_progress')
+  assert.equal(mock.state.goals.get(task)?.progressPct, 100)
   assert.deepEqual(statuses(dbPath), ['in_progress:kernel', 'review:kernel'])
 
   // The kernel never closed it. That is the point of `review` existing.
@@ -162,7 +185,7 @@ test('a run that fails moves its goal to blocked, not abandoned', async (t) => {
   // meets. `blocked` is a state something can act on; `abandoned` would be the
   // kernel giving up on the operator's behalf.
   const { mock, kernel, dbPath } = await bootWithGoals(t, [])
-  const { task } = mock.seedTree(CEO_PROJECT)
+  const { task } = kernelTree(kernel.store, mock, CEO_PROJECT)
 
   const finished = await runWithGoal(kernel, 'do the task', task)
   assert.notEqual(finished['status'], 'ok')
@@ -170,6 +193,23 @@ test('a run that fails moves its goal to blocked, not abandoned', async (t) => {
   await kernel.shutdown()
   assert.equal(mock.state.goals.get(task)?.status, 'blocked')
   assert.deepEqual(statuses(dbPath), ['in_progress:kernel', 'blocked:kernel'])
+})
+
+test('a run naming a goal this kernel did not create moves nothing on the server', async (t) => {
+  // pmmcp's update_goal takes no project_id: honouring an arbitrary goalId would
+  // let a run move any goal in the operator's memory, in any project.
+  const { mock, kernel, dbPath } = await bootWithGoals(t, [
+    anthropicEndTurn({ text: 'done', inputTokens: 900, outputTokens: 10 }),
+  ])
+  const { task } = mock.seedTree('aos/someone-else')
+
+  const finished = await runWithGoal(kernel, 'do the task', task)
+  assert.equal(finished['status'], 'ok', String(finished['reason']))
+  await kernel.shutdown()
+
+  assert.equal(mock.state.goals.get(task)?.status, 'pending')
+  assert.equal(mock.calls.filter((c) => c.tool === 'update_goal').length, 0)
+  assert.deepEqual(statuses(dbPath), [])
 })
 
 test('a run with no goalId touches no goal at all', async (t) => {
@@ -444,7 +484,6 @@ test('a restart blocks the goals of runs it orphaned, and re-executes nothing', 
   t.after(async () => {
     await mock.close()
   })
-  const { task } = mock.seedTree(CEO_PROJECT)
   const fx = fixture(t)
   const boot = (): Promise<Kernel> =>
     bootOn(t, fx, {
@@ -458,6 +497,7 @@ test('a restart blocks the goals of runs it orphaned, and re-executes nothing', 
   // tracker sees it too, so the in_progress status is set by the real path rather
   // than poked into the double — which is the state the restart has to clean up.
   const first = await boot()
+  const { task } = kernelTree(first.store, mock, CEO_PROJECT)
   const orphanRunId = 'run_orphaned_by_a_restart'
   first.store.append({
     type: 'run.queued',
@@ -572,7 +612,8 @@ test('a run serving a goal in ANOTHER namespace moves it there, not in its own',
   })
   await tracker.drain()
 
-  assert.equal(mock.state.goals.get(task)?.status, 'review', 'the goal did not move in its own namespace')
+  assert.equal(mock.state.goals.get(task)?.status, 'in_progress', 'the goal did not move in its own namespace')
+  assert.equal(mock.state.goals.get(task)?.progressPct, 100, 'review did not reach pmmcp as 100%')
   const moves = store
     .query({ type: 'goal.status' })
     .map((r) => JSON.parse(r.payload) as { projectId: string; to: string })

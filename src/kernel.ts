@@ -220,7 +220,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
   assertTokenUsable(token)
 
   // The store cannot open a database in a directory that does not exist, and on
-  // a first boot ~/.aos does not: without this, a clean machine fails with
+  // a first boot .aos/ does not: without this, a clean machine fails with
   // "unable to open database file" and no hint that a mkdir was all it needed.
   //
   // 0700, not the umask's guess. The log holds prompts, model responses and tool
@@ -822,6 +822,7 @@ function defaultDriver(config: KernelConfig, repoRoot: string): SandboxDriver {
   return realDockerDriver({
     domains: config.sandbox.domains,
     defaults: config.sandbox.defaults,
+    dockerConfig: join(config.dataDir, 'docker'),
     repoRoot,
   })
 }

@@ -268,7 +268,7 @@ test('boot refuses without AOS_CONTROL_TOKEN', async (t) => {
 })
 
 test('boot creates dataDir 0700 when it does not exist', async (t) => {
-  // A first boot on a clean machine has no ~/.aos. The store cannot open a
+  // A first boot on a clean machine has no .aos/. The store cannot open a
   // database in a directory that is not there, so without this the operator's
   // very first `npm run dev` fails with "unable to open database file" and no
   // hint that a mkdir was all it needed.

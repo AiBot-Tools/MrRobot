@@ -8,6 +8,9 @@ dist/
 *.db-shm
 events.head
 .falsify/
+# The kernel's data, sandbox workspaces, docker client config and npm cache.
+# config.ts refuses a data dir inside the repo unless this line is present.
+/.aos/
 .DS_Store
 agents/.DS_Store
 docs/.DS_Store

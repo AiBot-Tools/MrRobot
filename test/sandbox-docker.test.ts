@@ -320,6 +320,7 @@ function driverFor(f: Fixture): Spied {
     repoRoot: f.repoRoot,
     path: '/usr/bin:/bin',
     home: join(f.root, 'home'),
+    dockerConfig: join(f.root, 'data', 'docker'),
   })
 
   return {
@@ -333,7 +334,7 @@ function driverFor(f: Fixture): Spied {
   }
 }
 
-test('spawn env keys are exactly [DOCKER_HOST, PATH] with a poisoned ANTHROPIC_API_KEY in process.env', (t) => {
+test('spawn env keys are exactly [DOCKER_CONFIG, DOCKER_HOST, PATH] with a poisoned ANTHROPIC_API_KEY in process.env', (t) => {
   const f = fixture(t)
   const saved = process.env['ANTHROPIC_API_KEY']
   process.env['ANTHROPIC_API_KEY'] = 'POISONED-must-never-enter-a-container'
@@ -350,8 +351,11 @@ test('spawn env keys are exactly [DOCKER_HOST, PATH] with a poisoned ANTHROPIC_A
   // An EXACT sorted key list, never a subset check: a subset check passes
   // while the whole operator environment rides along beside the two keys we
   // meant to pass.
-  assert.deepEqual(Object.keys(env).sort(), ['DOCKER_HOST', 'PATH'])
+  assert.deepEqual(Object.keys(env).sort(), ['DOCKER_CONFIG', 'DOCKER_HOST', 'PATH'])
   assert.equal(env['DOCKER_HOST'], 'unix:///tmp/colima-trusted.sock')
+  // The kernel's own, empty docker config dir: never the operator's ~/.docker,
+  // whose contexts could redirect the CLI and whose helpers hold credentials.
+  assert.equal(env['DOCKER_CONFIG'], join(f.root, 'data', 'docker'))
   assert.equal(JSON.stringify(env).includes('POISONED'), false)
 
   // Each domain reaches its own VM, not a shared one.

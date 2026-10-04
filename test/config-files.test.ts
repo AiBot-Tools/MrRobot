@@ -94,12 +94,12 @@ test('config/kernel.yaml parses and its four D30 budget defaults are present and
     assert.match(domain.dockerHost, /^unix:\/\/\//, `${name} dockerHost is not an absolute socket`)
     assert.equal(domain.dockerHost.includes('~'), false)
     assert.equal(domain.network, `aos-${name}`)
-    // Never $HOME, never inside the repo — both refused at parse; asserted
-    // here because this is the shipped value, not a hypothetical one.
+    // Inside the program folder, under the git-ignored .aos/workspaces/, and
+    // never $HOME: asserted here because this is the shipped value.
     assert.notEqual(domain.mountRoot, homedir())
-    assert.equal(domain.mountRoot.startsWith(REPO), false)
+    assert.equal(domain.mountRoot, join(REPO, '.aos', 'workspaces', name))
   }
-  assert.equal(config.dataDir.startsWith(REPO), false)
+  assert.equal(config.dataDir, join(REPO, '.aos'))
   assert.notEqual(config.dataDir, homedir())
 })
 
@@ -135,6 +135,21 @@ test('scripts/colima-up.sh exists, is executable, and its header says NEEDS VALI
   }
   assert.equal(body.includes('--privileged'), false)
   assert.equal(body.includes('docker.sock:'), false, 'bind-mounts a docker socket')
+
+  // Everything it writes stays in the program folder or ~/.colima (the one
+  // home directory the operator allowed): not ~/.aos, not ~/.docker, not
+  // ~/Library/Caches/colima.
+  assert.ok(body.includes('TRUSTED_MOUNT="${REPO_ROOT}/.aos/workspaces/trusted"'))
+  assert.ok(body.includes('export DOCKER_CONFIG="${REPO_ROOT}/.aos/docker"'))
+  assert.ok(body.includes('export COLIMA_CACHE_HOME="${HOME}/.colima/'))
+  assert.equal(body.includes('${HOME}/.aos'), false, 'a mount still points at ~/.aos')
+  assert.equal(body.includes('docker --context'), false, 'a docker context lives in ~/.docker unless DOCKER_CONFIG moved it')
+})
+
+test('.npmrc keeps npm\'s cache in the program folder', () => {
+  // npm resolves a relative path config against the shell's cwd
+  // (@npmcli/config parse-field.js), so the README says to run npm from the root.
+  assert.match(read('.npmrc'), /^cache=\.aos\/npm-cache$/m)
 })
 
 test('config/tool-views.yaml: pmmcp pins nineteen closed, and only the two kernel tools are exposed', () => {

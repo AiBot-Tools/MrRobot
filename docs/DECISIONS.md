@@ -73,7 +73,7 @@ package is installed.
 | D22 | Sandbox caps (`256 pids / 2g / 2 cpus / 65534:65534`), Colima VM sizes vs the ~40 GB model budget? | placeholders as written | ✅ default |
 | D23 | Lane caps `main: 4`, `subagent: 8`? | as written | ✅ default |
 | D24 | TypeScript 5.9.3 vs 6.0.3 vs 7.0.2? | 5.9.3 | ✅ default |
-| D25 | `AOS_DATA_DIR` default `~/.aos` (outside the repo) vs `./data`? | `~/.aos` | ✅ default |
+| D25 | `AOS_DATA_DIR` default `~/.aos` (outside the repo) vs `./data`? | `~/.aos` | ↩️ REVERSED by the operator (2026-10): everything in the program folder, `./.aos`, git-ignored; parse admits in-repo paths only under `.aos/` and only while `.gitignore` ignores `/.aos/` |
 | D26 | Approval wait 300 s → deny? | 300 s | ✅ default |
 | D27 ★ | Acknowledge the T37 rewrite of CLAUDE.md "Current state" with the text in T37? | as written | ✅ default |
 | D28 | Reading of "a model is bound to an agent only after `aos probe` reports `toolCalling: true`": **registry** accepts a manifest naming an unprobed ref (so the CEO manifest can ship before the operator has run a probe); the **router** refuses… | registry accepts, router refuses (T18 `routable`, T19, T34) | ✅ default |

@@ -85,8 +85,39 @@ contains whitespace rather than minting a sentence as a credential.
 With no pmmcp and no Docker the kernel boots **degraded** and says exactly what
 is missing. That is the designed behaviour, not a failure — see below.
 
-`dataDir` defaults to `~/.aos`, outside the repository (D25), and is created
-`0700` on first boot. `AOS_DATA_DIR` overrides it.
+### Where things live
+
+Everything the kernel writes lives in the program folder, under `.aos/`, which
+git ignores. The one exception is `~/.colima`, Colima's own home.
+
+| Path | What |
+|---|---|
+| `.aos/events.db`, `.aos/events.head` | the event log and its anchor |
+| `.aos/workspaces/{trusted,hostile}` | sandbox mount roots, one per Colima VM |
+| `.aos/docker` | `DOCKER_CONFIG` for the kernel's docker calls and `colima-up.sh`, never `~/.docker` |
+| `.aos/npm-cache` | npm's cache (`.npmrc`); run npm from the repo root, because npm resolves a relative path against the shell's directory |
+| `~/.colima` | Colima's VMs and sockets; `colima-up.sh` also sets `COLIMA_CACHE_HOME=~/.colima/_cache`, which would otherwise be `~/Library/Caches/colima` |
+
+`dataDir` is `./.aos`, relative to the repo root, and is created `0700` on first
+boot. `AOS_DATA_DIR` overrides it, relative to your shell's directory. Inside the
+repo, `config.ts` accepts a data dir or mount root only under `.aos/`, and only
+while `.gitignore` ignores `/.aos/`. Anywhere, it refuses `$HOME` itself or any
+folder that contains the repo or `$HOME`.
+
+> **Warning.** `.aos/` holds the only copy of the event log. Running
+> `git clean -fdx`, re-cloning over the folder, or deleting the folder destroys
+> the log and its anchor together. Copy `.aos/` out first if you want the history.
+
+When you run `colima` or `docker` by hand, export the same two variables the
+script uses, so nothing lands in `~/.docker` or `~/Library/Caches`:
+
+```bash
+export DOCKER_CONFIG="$PWD/.aos/docker" COLIMA_CACHE_HOME="$HOME/.colima/_cache"
+```
+
+**Uninstall:** run `colima delete trusted` and `colima delete hostile`, then
+delete this folder and `~/.colima` if nothing else uses Colima. Global installs
+of Node, npm, Docker and Colima are yours to keep or remove.
 
 ---
 
@@ -558,6 +589,7 @@ not `key`).
 | pmmcp: Streamable HTTP interop with SDK 1.30.0, idle timeout vs the 240 s heartbeat, the 49 tool names, `get_secret`/`set_secret` schemas | boot with pmmcp up: `hub.connected` and `hub.tools.classified` list what is really there; checklist line 2 |
 | An Anthropic API key accepted as `Authorization: Bearer` (D20's alternative) | one `npm run cli -- probe anthropic/claude-sonnet-5` with `auth.header: Authorization` |
 | Docker on Colima: `--cap-drop=ALL` → empty `CapEff`; `--read-only` plus a `/workspace` writable by `65534` through virtiofs; `~/.colima/<profile>/docker.sock` paths; FSEvents through virtiofs | `scripts/colima-up.sh` (itself marked NEEDS VALIDATION on line 2) then the security check commands; Phase 2 live tests |
-| Whether the docker CLI works with a spawn env of only `PATH` + `DOCKER_HOST`, or needs `HOME` for `~/.docker/config.json` | `env -i PATH="$PATH" DOCKER_HOST=unix://$HOME/.colima/trusted/docker.sock docker version`. If it needs `HOME`, the driver adds `HOME` **only** — never the full environment |
+| Whether the docker CLI works with a spawn env of only `PATH`, `DOCKER_HOST` and `DOCKER_CONFIG` (the kernel's own `.aos/docker`) | `env -i PATH="$PATH" DOCKER_CONFIG="$PWD/.aos/docker" DOCKER_HOST=unix://$HOME/.colima/trusted/docker.sock docker version`. If it needs `HOME`, the driver adds `HOME` **only** — never the full environment |
+| Whether a running Colima VM created with the old `~/.aos` mounts picks up the new `.aos/workspaces` mount after `colima stop` and a re-run of `colima-up.sh` | `colima ssh -p trusted -- ls <repo>/.aos/workspaces/trusted`; if absent, `colima delete trusted` and re-run |
 | Moonshot base URL, model ids and pricing; OpenRouter `usage.cost` semantics; llama.cpp `include_usage`, named `tool_choice`, `--jinja`, and the `/props.chat_template_caps.supports_tool_calls` key name | `npm run cli -- probe <ref>` per entry, and `GET /v1/models` once keys are in the vault |
 | `@tauri-apps/plugin-websocket` custom-header support — a Phase 3 blocker for invariant 1 | a Phase 3 spike, before any protocol change |

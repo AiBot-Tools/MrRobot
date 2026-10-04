@@ -10,14 +10,17 @@ import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { parse as parseYaml } from 'yaml'
 
-import { assertNoSecretKeys, expandHome, parseKernelConfig } from '../src/config.js'
+import { assertNoSecretKeys, expandHome, gitignoresAos, parseKernelConfig } from '../src/config.js'
+import { tmpdir } from './helpers/tmpdir.js'
 
-const REPO_ROOT = '/home/user/MrRobot'
+// The real checkout, wherever it is: the location rules read its .gitignore.
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const FIXTURES = new URL('./fixtures/config/', import.meta.url)
 
 function fixture(name: string): unknown {
@@ -118,28 +121,100 @@ test('rejects a non-loopback pmmcp url', () => {
   assert.throws(() => parse(noPmmcp), /must include pmmcp/)
 })
 
-test('rejects a mountRoot or dataDir under the repo root or equal to $HOME', () => {
-  const inRepo = fixture('valid.yaml') as { dataDir: string }
-  inRepo.dataDir = join(REPO_ROOT, '.aos')
-  assert.throws(() => parse(inRepo), /inside the repository/)
+test('inside the repo, the data dir and mount roots live only under .aos/', () => {
+  // Operator decision (2026-10): everything in the program folder. The fence
+  // is .aos/, which git ignores, so the event log is never committed and never
+  // sits among the source an agent's repo access could reach.
+  const shipped = fixture('valid.yaml') as { dataDir: string }
+  shipped.dataDir = './.aos'
+  assert.equal(parse(shipped).dataDir, join(REPO_ROOT, '.aos'), 'relative to the repo root, not the cwd')
 
-  const mountInRepo = fixture('valid.yaml') as {
-    sandbox: { domains: { hostile: { mountRoot: string } } }
+  const elsewhere = fixture('valid.yaml') as { dataDir: string }
+  elsewhere.dataDir = join(REPO_ROOT, 'src', 'data')
+  assert.throws(() => parse(elsewhere), /inside the repository but outside .*\.aos/)
+
+  const mount = (root: string): unknown => {
+    const doc = fixture('valid.yaml') as { sandbox: { domains: { hostile: { mountRoot: string } } } }
+    doc.sandbox.domains.hostile.mountRoot = root
+    return doc
   }
-  mountInRepo.sandbox.domains.hostile.mountRoot = join(REPO_ROOT, 'workspaces')
-  assert.throws(() => parse(mountInRepo), /inside the repository/)
+  assert.equal(
+    parse(mount('./.aos/workspaces/hostile')).sandbox.domains.hostile.mountRoot,
+    join(REPO_ROOT, '.aos', 'workspaces', 'hostile'),
+  )
+  // A mount root must be under .aos/workspaces/: .aos/ itself holds the log.
+  assert.throws(() => parse(mount('./.aos')), /outside .*workspaces/)
+  assert.throws(() => parse(mount('workspaces/hostile')), /inside the repository but outside/)
+  assert.throws(() => parse(mount('./hostile')), /inside the repository but outside/)
+})
 
-  // $HOME itself as a mount root would hand a container everything.
+test('inside the repo is admitted only while .gitignore ignores /.aos/', (t) => {
+  const repo = tmpdir(t)
+  const doc = (): unknown => {
+    const d = fixture('valid.yaml') as { dataDir: string }
+    d.dataDir = './.aos'
+    return d
+  }
+  assert.throws(() => parse(doc(), repo), /\.gitignore does not ignore \/\.aos\//)
+  writeFileSync(join(repo, '.gitignore'), 'node_modules/\n.aos-backup/\n')
+  assert.throws(() => parse(doc(), repo), /does not ignore/, 'a look-alike line is not the line')
+  for (const line of ['/.aos/', '.aos/', '/.aos', '.aos']) {
+    writeFileSync(join(repo, '.gitignore'), `node_modules/\n${line}\n`)
+    assert.equal(parse(doc(), repo).dataDir, join(repo, '.aos'), line)
+  }
+  // And the real checkout ignores it, which the shipped config depends on.
+  assert.equal(gitignoresAos(REPO_ROOT), true, 'this repository no longer ignores /.aos/')
+})
+
+test('never $HOME, and never a directory that contains the repository or $HOME', (t) => {
   const home = fixture('valid.yaml') as { dataDir: string }
   home.dataDir = homedir()
   assert.throws(() => parse(home), /must not be \$HOME itself/)
 
-  // A directory UNDER home is fine, and ~ expands.
+  const parent = fixture('valid.yaml') as { dataDir: string }
+  parent.dataDir = dirname(REPO_ROOT)
+  assert.throws(() => parse(parent), /contains the repository/)
+
+  // A mount root containing $HOME hands a container everything (invariant 9).
+  const above = fixture('valid.yaml') as { sandbox: { domains: { trusted: { mountRoot: string } } } }
+  above.sandbox.domains.trusted.mountRoot = dirname(homedir())
+  assert.throws(() => parse(above), /contains (the repository|\$HOME)/)
+
+  // The $HOME rule on its own. On the operator's Mac the repo sits under $HOME,
+  // so a folder above home also contains the repo and trips that check first;
+  // a fake home beside a temp repo separates the two. os.homedir() reads $HOME.
+  const sandboxRoot = tmpdir(t)
+  mkdirSync(join(sandboxRoot, 'people', 'op'), { recursive: true })
+  mkdirSync(join(sandboxRoot, 'repo'))
+  writeFileSync(join(sandboxRoot, 'repo', '.gitignore'), '/.aos/\n')
+  const savedHome = process.env['HOME']
+  process.env['HOME'] = join(sandboxRoot, 'people', 'op')
+  try {
+    const aboveHome = fixture('valid.yaml') as { sandbox: { domains: { trusted: { mountRoot: string } } } }
+    aboveHome.sandbox.domains.trusted.mountRoot = join(sandboxRoot, 'people')
+    assert.throws(() => parse(aboveHome, join(sandboxRoot, 'repo')), /which contains \$HOME/)
+  } finally {
+    if (savedHome === undefined) delete process.env['HOME']
+    else process.env['HOME'] = savedHome
+  }
+
+  // Outside the repo and under home is still fine, and ~ expands.
   const under = fixture('valid.yaml') as { dataDir: string }
   under.dataDir = '~/.aos'
   assert.equal(parse(under).dataDir, join(homedir(), '.aos'))
   assert.equal(expandHome('~'), homedir())
   assert.equal(expandHome('/absolute/path'), '/absolute/path')
+
+  // AOS_DATA_DIR is typed in a shell: relative to the cwd, not the repo.
+  const dir = tmpdir(t)
+  mkdirSync(join(dir, 'data'))
+  const cwd = process.cwd()
+  process.chdir(dir)
+  try {
+    assert.equal(parseKernelConfig(fixture('valid.yaml'), { repoRoot: REPO_ROOT, dataDirOverride: 'data' }).dataDir, join(process.cwd(), 'data'))
+  } finally {
+    process.chdir(cwd)
+  }
 })
 
 test('rejects an allowedOrigins entry that is not tauri://localhost or loopback http(s)', () => {
@@ -253,11 +328,10 @@ test('a ~ in sandbox dockerHost is expanded; a relative socket path is refused',
   }
 })
 
-test('a ~ mountRoot resolves; a relative one is still refused', () => {
-  // The check exists to refuse a RELATIVE mountRoot — one that resolves
-  // against whatever directory the daemon started in, putting a container's
-  // mount somewhere nobody chose. A ~ path is anchored, and the loader expands
-  // it, so rejecting the raw string refused the one form an operator writes.
+test('a ~ mountRoot resolves; a relative one resolves against the repo root, never the cwd', () => {
+  // The old rule refused relative mountRoots because they resolved against
+  // whatever directory the daemon started in. They now resolve against the
+  // repository root, so `npm run dev` from anywhere mounts the same folder.
   const doc = fixture('valid.yaml') as { sandbox: { domains: Record<string, { mountRoot: string }> } }
   doc.sandbox.domains['trusted']!.mountRoot = '~/.aos/workspaces/trusted'
   doc.sandbox.domains['hostile']!.mountRoot = '~/.aos/workspaces/hostile'
@@ -266,17 +340,9 @@ test('a ~ mountRoot resolves; a relative one is still refused', () => {
   assert.equal(config.sandbox.domains.trusted.mountRoot, join(homedir(), '.aos/workspaces/trusted'))
   assert.equal(config.sandbox.domains.hostile.mountRoot, join(homedir(), '.aos/workspaces/hostile'))
 
-  for (const bad of ['workspaces/trusted', './trusted', '../outside']) {
-    const broken = fixture('valid.yaml') as { sandbox: { domains: Record<string, { mountRoot: string }> } }
-    broken.sandbox.domains['trusted']!.mountRoot = bad
-    assert.throws(() => parse(broken), /mountRoot must be absolute/, bad)
-  }
-
-  // And ~ itself is still $HOME, which is refused for the usual reason: it
-  // would hand a container everything.
-  const home = fixture('valid.yaml') as { sandbox: { domains: Record<string, { mountRoot: string }> } }
-  home.sandbox.domains['trusted']!.mountRoot = '~'
-  assert.throws(() => parse(home), /must not be \$HOME itself/)
+  const sibling = fixture('valid.yaml') as { sandbox: { domains: Record<string, { mountRoot: string }> } }
+  sibling.sandbox.domains['trusted']!.mountRoot = '../aos-outside/trusted'
+  assert.equal(parse(sibling).sandbox.domains.trusted.mountRoot, resolve(REPO_ROOT, '../aos-outside/trusted'))
 })
 
 test('control.port refuses a privileged port but allows the literal 0', () => {

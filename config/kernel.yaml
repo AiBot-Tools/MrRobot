@@ -9,9 +9,13 @@
 # that binds the control plane to a public interface (invariant 1).
 version: 1
 
-# Outside the repository and never $HOME itself — both refused at parse. The
-# event log must not live where repository tooling can reach it.
-dataDir: ~/.aos
+# Inside the program folder (operator decision, 2026-10), relative to the repo
+# root. Parse admits a path inside the repo only under .aos/, and only while
+# .gitignore ignores /.aos/, so the log is never committed. WARNING: `git clean
+# -fdx`, or deleting this folder, deletes the event log and its anchor with it.
+# Any absolute path outside the repo (e.g. ~/.aos) also works; $HOME itself, or
+# a directory containing the repo or $HOME, is refused.
+dataDir: ./.aos
 
 control:
   host: 127.0.0.1
@@ -60,11 +64,11 @@ sandbox:
       # because DOCKER_HOST reaches the docker CLI without a shell.
       dockerHost: unix://~/.colima/trusted/docker.sock
       network: aos-trusted
-      mountRoot: ~/.aos/workspaces/trusted
+      mountRoot: ./.aos/workspaces/trusted
     hostile:
       dockerHost: unix://~/.colima/hostile/docker.sock
       network: aos-hostile
-      mountRoot: ~/.aos/workspaces/hostile
+      mountRoot: ./.aos/workspaces/hostile
   defaults:
     user: 65534:65534
     pidsLimit: 256

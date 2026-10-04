@@ -7,10 +7,13 @@
 //   a default an operator can edit: there is no spelling of kernel.yaml that
 //   binds the control plane to a public interface (invariant 1).
 //
-//   dataDir and every mountRoot must resolve outside the repository and must
-//   not be $HOME itself. A data directory inside the repo would put the event
-//   log where an agent with repo access could reach it; $HOME as a mount root
-//   would hand a container everything (invariant 9).
+//   dataDir and every mountRoot live in `<repo>/.aos` (the shipped default,
+//   operator decision 2026-10: everything in the program folder) or outside
+//   the repository — never elsewhere inside it, never $HOME itself, and never
+//   a directory that CONTAINS the repository or $HOME. Inside the repo they are
+//   admitted only while .gitignore ignores `/.aos/`, so the event log can never
+//   be committed. A mountRoot containing $HOME or the repo would hand a
+//   container everything (invariant 9).
 //
 //   A post-parse walk rejects any key whose name looks like a secret, naming
 //   the path. CLAUDE.md says kernel.yaml holds no secrets; this makes that
@@ -20,8 +23,9 @@
 // Every numeric field is positive and no field admits "unlimited". A budget
 // that can be switched off is not a budget.
 
+import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { isAbsolute, resolve, sep } from 'node:path'
+import { isAbsolute, join, resolve, sep } from 'node:path'
 import { z } from 'zod'
 
 import { ConfigError } from './errors.js'
@@ -193,17 +197,10 @@ const SandboxDomain = z
   .object({
     dockerHost: z.string().startsWith('unix://'),
     network: z.string().min(1),
-    // Absolute, or a ~ path that becomes absolute. The point of the check is
-    // to refuse a RELATIVE mountRoot — one that would resolve against whatever
-    // directory the daemon happened to start in, putting a container's mount
-    // somewhere nobody chose. `~/...` is anchored, and parseKernelConfig
-    // expands it immediately below; testing the raw string here rejected the
-    // one form an operator actually writes and left that expansion dead.
-    mountRoot: z
-      .string()
-      .refine((p) => isAbsolute(expandHome(p)), {
-        message: 'mountRoot must be absolute, or a ~ path that resolves to one',
-      }),
+    // Absolute, a ~ path, or RELATIVE TO THE REPOSITORY ROOT (resolved in
+    // parseKernelConfig) — never relative to whatever directory the daemon
+    // started in, which would put a container's mount somewhere nobody chose.
+    mountRoot: z.string().min(1),
   })
   .strict()
 
@@ -245,7 +242,8 @@ const Budgets = z
 export const KernelConfig = z
   .object({
     version: z.literal(1),
-    dataDir: z.string().min(1).default('~/.aos'),
+    // Relative to the repository root, not the shell's working directory.
+    dataDir: z.string().min(1).default('./.aos'),
     control: Control.prefault({}),
     events: Events.prefault({}),
     mcp: Mcp,
@@ -326,45 +324,91 @@ export function parseKernelConfig(input: unknown, options: LoadOptions): KernelC
   }
   const config = result.data
 
-  const dataDir = expandHome(options.dataDirOverride ?? config.dataDir)
-  assertOutsideRepoAndHome(dataDir, 'dataDir', options.repoRoot)
-  for (const [name, domain] of Object.entries(config.sandbox.domains)) {
-    assertOutsideRepoAndHome(expandHome(domain.mountRoot), `sandbox.domains.${name}.mountRoot`, options.repoRoot)
+  // Paths in kernel.yaml are relative to the repository root, so `npm run dev`
+  // from any directory finds the same log. AOS_DATA_DIR is typed in a shell,
+  // so a relative one means the shell's working directory.
+  const inFile = (p: string): string => resolve(options.repoRoot, expandHome(p))
+  const dataDir =
+    options.dataDirOverride === undefined ? inFile(config.dataDir) : resolve(expandHome(options.dataDirOverride))
+  assertDataLocation(dataDir, 'dataDir', options.repoRoot, '.aos')
+  const mountRoot = {
+    trusted: inFile(config.sandbox.domains.trusted.mountRoot),
+    hostile: inFile(config.sandbox.domains.hostile.mountRoot),
+  }
+  for (const [name, root] of Object.entries(mountRoot)) {
+    assertDataLocation(root, `sandbox.domains.${name}.mountRoot`, options.repoRoot, join('.aos', 'workspaces'))
   }
 
   return {
     ...config,
-    dataDir: resolve(dataDir),
+    dataDir,
     sandbox: {
       ...config.sandbox,
       domains: {
         trusted: {
           ...config.sandbox.domains.trusted,
           dockerHost: expandDockerHost(config.sandbox.domains.trusted.dockerHost),
-          mountRoot: resolve(expandHome(config.sandbox.domains.trusted.mountRoot)),
+          mountRoot: mountRoot.trusted,
         },
         hostile: {
           ...config.sandbox.domains.hostile,
           dockerHost: expandDockerHost(config.sandbox.domains.hostile.dockerHost),
-          mountRoot: resolve(expandHome(config.sandbox.domains.hostile.mountRoot)),
+          mountRoot: mountRoot.hostile,
         },
       },
     },
   }
 }
 
-function assertOutsideRepoAndHome(target: string, field: string, repoRoot: string): void {
+const within = (child: string, parent: string): boolean =>
+  child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep)
+
+/** True when the repository's .gitignore ignores the top-level `.aos/`. */
+export function gitignoresAos(repoRoot: string): boolean {
+  let text: string
+  try {
+    text = readFileSync(join(repoRoot, '.gitignore'), 'utf8')
+  } catch {
+    return false
+  }
+  return text.split(/\r?\n/).some((line) => /^\/?\.aos\/?$/.test(line.trim()))
+}
+
+/**
+ * Where the event log and the container mounts may live.
+ *
+ * Inside the repository: only under `<repo>/<allowed>`, and only while
+ * .gitignore ignores `/.aos/`. Anywhere: never $HOME itself, and never a
+ * directory that contains the repository or $HOME. Paths are compared after
+ * symlink resolution, so a link cannot launder one location into another.
+ */
+function assertDataLocation(target: string, field: string, repoRoot: string, allowed: string): void {
   const real = realpathNearest(target)
   const repo = realpathNearest(repoRoot)
   const home = realpathNearest(homedir())
+  const fence = join(repo, allowed)
 
-  if (real === repo || real.startsWith(repo.endsWith(sep) ? repo : repo + sep)) {
-    throw new ConfigError(
-      `${field} resolves to ${real}, inside the repository. The event log and container ` +
-        'mounts must not live where repository tooling can reach them.',
-    )
-  }
   if (real === home) {
     throw new ConfigError(`${field} must not be $HOME itself (${home})`)
+  }
+  if (within(repo, real)) {
+    throw new ConfigError(`${field} resolves to ${real}, which contains the repository (${repo})`)
+  }
+  if (within(home, real)) {
+    throw new ConfigError(`${field} resolves to ${real}, which contains $HOME (${home})`)
+  }
+  if (within(real, repo)) {
+    if (!within(real, fence)) {
+      throw new ConfigError(
+        `${field} resolves to ${real}, inside the repository but outside ${fence}. ` +
+          'Inside the repo, the event log and container mounts live only under .aos/, which git ignores.',
+      )
+    }
+    if (!gitignoresAos(repoRoot)) {
+      throw new ConfigError(
+        `${field} is under ${join(repo, '.aos')}, but .gitignore does not ignore /.aos/. ` +
+          'Add the line `/.aos/` first: the event log must never be committed.',
+      )
+    }
   }
 }

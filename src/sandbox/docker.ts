@@ -9,8 +9,10 @@
 // directory — and a future edit that widens any of those throws rather than
 // producing a container.
 //
-// The spawn environment is exactly { DOCKER_HOST, PATH }, and that is a
-// security property rather than a tidiness one. Measured, not assumed
+// The spawn environment is exactly { DOCKER_CONFIG, DOCKER_HOST, PATH }, and that
+// is a security property rather than a tidiness one. DOCKER_CONFIG is a
+// kernel-owned directory under the data dir, so not even the CLI's own config
+// lookup reaches the operator's ~/.docker. Measured, not assumed
 // (docker CLI 29.3.1):
 //
 //   With DOCKER_HOST set, the CLI connects to exactly that socket and HOME
@@ -219,6 +221,13 @@ export interface DockerDriverOptions {
   readonly binary?: string
   readonly path?: string
   readonly home?: string
+  /**
+   * DOCKER_CONFIG for every invocation: a kernel-owned, normally empty
+   * directory (`<dataDir>/docker`). Without it the CLI falls back to the
+   * operator's ~/.docker, whose contexts and credential helpers the kernel
+   * neither controls nor wants.
+   */
+  readonly dockerConfig?: string
 }
 
 export class DockerDriver implements SandboxDriver {
@@ -234,11 +243,13 @@ export class DockerDriver implements SandboxDriver {
   /**
    * The ONLY environment a docker invocation gets.
    *
-   * Exactly two keys, always, and built from kernel config rather than copied
-   * from the process — see this file's header for why HOME is not among them.
+   * DOCKER_HOST and PATH, plus DOCKER_CONFIG when the kernel names one — all
+   * built from kernel config rather than copied from the process. See this
+   * file's header for why HOME is not among them.
    */
   #env(domain: 'trusted' | 'hostile'): Record<string, string> {
     return {
+      ...(this.#options.dockerConfig === undefined ? {} : { DOCKER_CONFIG: this.#options.dockerConfig }),
       DOCKER_HOST: this.#options.domains[domain].dockerHost,
       PATH: this.#options.path ?? process.env['PATH'] ?? '/usr/bin:/bin',
     }

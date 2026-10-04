@@ -529,6 +529,20 @@ not in a commit message.
 
 ---
 
+## pmmcp is unauthenticated, and that is accepted for now
+
+pmmcp trusts loopback and checks no credential. Anything on the Mac can call any
+of its tools, including the vault and `admin`. The operator accepted that for now,
+on two conditions the kernel enforces or will enforce:
+
+- **Containers stay off it.** Inside a Colima VM the Mac's loopback is
+  `192.168.5.2` (`host.lima.internal`). The sandbox probe refuses a domain whose
+  docker network is not `--internal`, so no container has a route there.
+- **The Phase 2 egress proxy denies it**: `192.168.5.2`, `host.lima.internal`,
+  `host.docker.internal`.
+
+Revisit (a bearer in pmmcp) before Phase 4 makes Telegram and SMS inputs.
+
 ## Still needs validation
 
 Facts this repository cannot check from Linux, and how each gets settled. The

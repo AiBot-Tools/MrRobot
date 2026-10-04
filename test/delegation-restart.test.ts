@@ -70,13 +70,13 @@ const settle = (): Promise<void> =>
   })
 
 test('a restart mid-delegation orphans nothing: runs, admissions, bill and goals all close', async (t) => {
-  const mock = pmmcpMock({ secrets: { [VAULT_ID]: 'vault-fixture-credential-restart' } })
+  const mock = pmmcpMock()
   t.after(async () => {
     await mock.close()
   })
   const fx = fixture(t)
   writeProbeRecord(fx.dataDir, freshProbe(REF))
-  const env = { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' }
+  const env = { ANTHROPIC_API_KEY: 'env-fixture-credential-restart' }
 
   // Fetch order is the order the kernel makes calls; the fifth is the writer's
   // first turn, and it hangs. (The writer is offered no tools, so there is no

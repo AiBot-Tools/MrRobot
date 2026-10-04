@@ -96,14 +96,30 @@ const Mcp = z
   .strict()
   .refine((m) => 'pmmcp' in m.servers, { message: 'mcp.servers must include pmmcp' })
 
+/**
+ * Where provider credentials come from.
+ *
+ * `env` (the default): each entry's own `auth.envVar`, read once at boot. The
+ * operator exports it from a prompt (`read -rs`), so it is never in a file.
+ *
+ * `vault`: pmmcp's `get_secret`, then `envFallback` if that is on (D8). Kept,
+ * DORMANT: pmmcp's `get_secret` never returns plaintext — it answers with a
+ * masked sentence by design — so against the real server this path can only
+ * refuse. It exists for a pmmcp that one day authenticates its callers and
+ * hands a value to exactly one of them.
+ */
 const Secrets = z
   .object({
+    source: z.enum(['env', 'vault']).default('env'),
     // Confirmed against the live get_secret schema; the broker still asserts
     // it at runtime and fails closed if the server disagrees.
     keyArg: z.string().min(1).default('label'),
     envFallback: z.boolean().default(false),
   })
   .strict()
+  .refine((s) => !(s.source === 'env' && s.envFallback), {
+    message: 'secrets.envFallback is a fallback FROM the vault, so it needs secrets.source: vault',
+  })
 
 /**
  * The pmmcp goal tools, as CONFIG rather than constants.

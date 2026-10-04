@@ -38,9 +38,15 @@ const REAL_REF = 'anthropic/claude-sonnet-5'
 const VAULT_ID = 'anthropic-api-key'
 const VAULT_VALUE = 'vault-fixture-credential-4be21a'
 
-/** A vault answering for the one credential the shipped providers.yaml names. */
+/**
+ * A vault answering for the one credential the shipped providers.yaml names.
+ *
+ * `revealSecrets` by default, because every caller here tests the DORMANT
+ * `secrets.source: vault` path, which only a plaintext-returning pmmcp could
+ * serve. The real pmmcp masks; the tests that say so pass `revealSecrets: false`.
+ */
 function vaultMock(t: TestContext, options: Parameters<typeof pmmcpMock>[0] = {}): PmmcpMock {
-  const mock = pmmcpMock({ secrets: { [VAULT_ID]: VAULT_VALUE }, ...options })
+  const mock = pmmcpMock({ secrets: { [VAULT_ID]: VAULT_VALUE }, revealSecrets: true, ...options })
   t.after(async () => {
     await mock.close()
   })
@@ -120,7 +126,7 @@ test('the broker reads a credential out of the vault and the value never lands i
   const { store, hub } = hubOn(t)
   await hub.connect('pmmcp', mock.connect)
 
-  const broker = new SecretsBroker({ store, hub, keyArg: 'label', envFallback: false })
+  const broker = new SecretsBroker({ store, source: 'vault', hub, keyArg: 'label', envFallback: false })
   // The schema confirmation the operator's boot depends on, against a server
   // that declares the confirmed argument.
   assert.equal(await broker.start(), 'ready')
@@ -155,7 +161,7 @@ test('a vault that disagrees about its own argument name fails the broker closed
   const { store, hub } = hubOn(t)
   await hub.connect('pmmcp', mock.connect)
 
-  const broker = new SecretsBroker({ store, hub, keyArg: 'label', envFallback: false })
+  const broker = new SecretsBroker({ store, source: 'vault', hub, keyArg: 'label', envFallback: false })
   await assert.rejects(() => broker.start(), SecretsSchemaMismatch)
   // Nothing was asked of the vault: the refusal comes off the declared schema,
   // before a malformed request exists.
@@ -172,7 +178,7 @@ test('boot degrades secrets, loudly, when the live vault declares a different ar
   const mock = vaultMock(t, { secretArg: 'name' })
   const { kernel, fx } = await withKernel(t, {
     clientFactory: mock.connect,
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    secretsSource: 'vault',
   })
 
   const secrets = kernel.status().subsystems.secrets
@@ -199,11 +205,69 @@ test('boot degrades secrets, loudly, when the live vault declares a different ar
   )
 })
 
-test('a run pays for a model call with a credential resolved from the VAULT', async (t) => {
-  // The Phase 0 exit criterion's shape, as close as a Linux box can get: pmmcp
-  // connected, the credential out of the vault rather than the environment, the
-  // gate, the log and the cost arithmetic all real, and only the provider
-  // doubled. What remains for the Mac is the provider socket itself.
+test('the Phase 0 exit shape: pmmcp connected, the credential from the environment, the vault never asked', async (t) => {
+  // As close as a Linux box gets to the exit criterion: pmmcp connected and
+  // answering exactly as the real one does (a MASKED get_secret), the key from
+  // the environment, the gate, the log and the cost arithmetic all real, and
+  // only the provider doubled.
+  const mock = pmmcpMock({ secrets: { [VAULT_ID]: VAULT_VALUE } })
+  t.after(async () => {
+    await mock.close()
+  })
+  const envValue = 'env-fixture-credential-exit-shape'
+  const provider = fakeProvider([anthropicEndTurn({ text: 'pong', inputTokens: 1_000, outputTokens: 100 })])
+  const { kernel, fx } = await withKernel(t, {
+    clientFactory: mock.connect,
+    env: { ANTHROPIC_API_KEY: envValue },
+    fetch: provider.fetch,
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+  const status = kernel.status()
+  assert.equal(status.subsystems.hub.state, 'ok', status.subsystems.hub.reason ?? '')
+  assert.equal(status.subsystems.secrets.state, 'ok', status.subsystems.secrets.reason ?? '')
+  assert.equal(status.subsystems.router.state, 'ok', status.subsystems.router.reason ?? '')
+
+  const finished = await runThroughControl(kernel, 'reply with the word pong')
+  assert.equal(finished['status'], 'ok', String(finished['reason']))
+  assert.ok((finished['costMicroUsd'] as number) > 0, 'a run that spent nothing never reached a provider')
+
+  assert.deepEqual(mock.calls.filter((c) => c.tool === 'get_secret'), [], 'the env source asked the vault')
+  assert.equal(provider.requests[0]?.headers['x-api-key'], envValue)
+  await kernel.shutdown()
+  const accessed = rows(fx.dbPath)
+    .filter((r) => r.type === 'secret.accessed')
+    .map((r) => (JSON.parse(r.payload) as { source: string }).source)
+  assert.deepEqual(accessed, ['env'])
+  assert.equal(JSON.stringify(rows(fx.dbPath)).includes(envValue), false, 'the credential reached the log')
+})
+
+test('source: vault against the REAL pmmcp reply refuses the masked sentence, so the ref is unroutable and says why', async (t) => {
+  const mock = pmmcpMock({ secrets: { [VAULT_ID]: VAULT_VALUE } })
+  t.after(async () => {
+    await mock.close()
+  })
+  const provider = fakeProvider([anthropicEndTurn({ text: 'pong', inputTokens: 1, outputTokens: 1 })])
+  const { kernel } = await withKernel(t, {
+    clientFactory: mock.connect,
+    secretsSource: 'vault',
+    fetch: provider.fetch,
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+  const router = kernel.status().subsystems.router
+  assert.equal(router.state, 'degraded')
+  assert.match(router.reason ?? '', /a message, not a credential/)
+  // The masked tail of the key never surfaced in the reason.
+  assert.equal((router.reason ?? '').includes(VAULT_VALUE.slice(-4)), false)
+  assert.equal(provider.requests.length, 0, 'a masked sentence went out as the API key')
+})
+
+test('the dormant vault path: a pmmcp that returned plaintext would pay for a run from the VAULT', async (t) => {
+  // Kept for the day pmmcp authenticates its callers and hands a value to one
+  // of them. `revealSecrets` is that hypothetical server; the real one masks.
   const mock = vaultMock(t)
   const provider = fakeProvider([
     anthropicEndTurn({ text: 'pong', inputTokens: 1_000, outputTokens: 100 }),
@@ -211,7 +275,7 @@ test('a run pays for a model call with a credential resolved from the VAULT', as
 
   const { kernel, fx } = await withKernel(t, {
     clientFactory: mock.connect,
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    secretsSource: 'vault',
     fetch: provider.fetch,
     // routable() consults the persisted probe record, so it has to be on disk
     // before boot decides whether anything can be served.

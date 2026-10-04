@@ -63,6 +63,8 @@ export const MOCK_TOOL_NAMES: readonly string[] = [
 export interface MockMcpOptions {
   /** The name `get_secret` declares. Defaults to the confirmed live one. */
   readonly secretArg?: string
+  /** Replace get_secret's reply, e.g. with pmmcp's real masked sentence. */
+  readonly secretReply?: (id: string) => string
 }
 
 export async function mockMcp(options: MockMcpOptions = {}): Promise<MockMcp> {
@@ -97,7 +99,8 @@ export async function mockMcp(options: MockMcpOptions = {}): Promise<MockMcp> {
       const id = String(args[secretArg] ?? '')
       // A distinct value per id, so a test can prove the right one came back
       // without any real secret existing anywhere.
-      return { content: [{ type: 'text' as const, text: `fixture-secret-for-${id}` }] }
+      const text = options.secretReply?.(id) ?? `fixture-secret-for-${id}`
+      return { content: [{ type: 'text' as const, text }] }
     },
   )
 

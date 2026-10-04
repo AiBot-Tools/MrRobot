@@ -57,10 +57,23 @@ interface Wired {
 
 async function wire(
   t: TestContext,
-  options: { keyArg?: string; envFallback?: boolean; env?: NodeJS.ProcessEnv; secretArg?: string; noHub?: boolean } = {},
+  options: {
+    keyArg?: string
+    envFallback?: boolean
+    env?: NodeJS.ProcessEnv
+    secretArg?: string
+    noHub?: boolean
+    // Every test below the env section exercises the DORMANT vault path, so
+    // that is this harness's default; the env tests ask for `env` by name.
+    source?: 'env' | 'vault'
+    secretReply?: (id: string) => string
+  } = {},
 ): Promise<Wired> {
   const store = withStore(t)
-  const mock = await mockMcp(options.secretArg === undefined ? {} : { secretArg: options.secretArg })
+  const mock = await mockMcp({
+    ...(options.secretArg === undefined ? {} : { secretArg: options.secretArg }),
+    ...(options.secretReply === undefined ? {} : { secretReply: options.secretReply }),
+  })
   const hub = new McpHub({ store, views: VIEWS })
   t.after(async () => {
     await hub.close()
@@ -70,6 +83,7 @@ async function wire(
 
   const broker = new SecretsBroker({
     store,
+    source: options.source ?? 'vault',
     ...(options.noHub === true ? {} : { hub }),
     keyArg: options.keyArg ?? 'label',
     envFallback: options.envFallback ?? false,
@@ -340,4 +354,57 @@ test('a purpose is required, so no call site reaches a vault without saying why'
     () => broker.ref('anthropic-api-key', '   '),
     (e: unknown) => e instanceof PolicyDenied && /without a stated purpose/.test(e.message),
   )
+})
+
+// ── source: env, the working path (pmmcp never returns plaintext) ─────────
+
+test('source env reads the entry\'s own envVar, logs source:env, is ready, and never calls the vault', async (t) => {
+  const value = 'sk-env-fixture-not-a-real-key-0001'
+  const { broker, store, mock } = await wire(t, { source: 'env', env: { ANTHROPIC_API_KEY: value, OTHER: 'x' } })
+  assert.equal(await broker.start(), 'ready', 'env is the designed source, not a degradation')
+
+  const ref = await broker.ref('anthropic-api-key', 'provider credential', { envVar: 'ANTHROPIC_API_KEY' })
+  assert.equal(ref.source, 'env')
+  assert.equal(broker.use(ref, (v) => v), value)
+  assert.deepEqual(
+    mock.calls.filter((c) => c.tool === 'get_secret'),
+    [],
+    'the env source asked the vault anyway',
+  )
+  assert.deepEqual(payloads(store, 'secret.accessed'), [
+    { schemaVersion: 1, id: 'anthropic-api-key', purpose: 'provider credential', source: 'env' },
+  ])
+  assert.equal(JSON.stringify(store.query()).includes(value), false, 'the env value reached the log')
+})
+
+test('source env refuses an entry with no envVar, an unset var, and a value that is a sentence', async (t) => {
+  const { broker } = await wire(t, {
+    source: 'env',
+    env: { EMPTY: '', SENTENCE: "Secret 'anthropic-api-key' exists (masked): ****abcd" },
+  })
+  await broker.start()
+  await assert.rejects(broker.ref('a', 'p'), (e: unknown) => e instanceof PolicyDenied && /no auth\.envVar/.test(e.message))
+  await assert.rejects(broker.ref('a', 'p', { envVar: 'UNSET' }), /UNSET is not set/)
+  await assert.rejects(broker.ref('a', 'p', { envVar: 'EMPTY' }), /EMPTY is not set/)
+  await assert.rejects(broker.ref('a', 'p', { envVar: 'SENTENCE' }), /contains whitespace/)
+})
+
+test('source vault refuses pmmcp\'s masked sentence rather than minting it, and never quotes it', async (t) => {
+  // The REAL pmmcp reply (src/tools/security.py). Minted, it would become the
+  // API key, and its last four characters are the real key's.
+  const reply = (id: string): string => `Secret '${id}' exists (masked): ********************wxyz`
+  const { broker, store } = await wire(t, { secretReply: reply })
+  await broker.start()
+
+  await assert.rejects(
+    broker.ref('anthropic-api-key', 'provider credential', { envVar: 'ANTHROPIC_API_KEY' }),
+    (e: unknown) =>
+      e instanceof PolicyDenied && /a message, not a credential/.test(e.message) && !e.message.includes('wxyz'),
+  )
+  assert.deepEqual(payloads(store, 'secret.accessed'), [], 'a refused reply was recorded as an access')
+
+  // pmmcp's not-found sentence is refused the same way.
+  const missing = await wire(t, { secretReply: (id) => `Secret '${id}' not found.` })
+  await missing.broker.start()
+  await assert.rejects(missing.broker.ref('anthropic-api-key', 'p'), /a message, not a credential/)
 })

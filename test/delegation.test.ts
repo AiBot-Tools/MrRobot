@@ -71,14 +71,14 @@ async function boot(
   script: readonly ScriptEntry[],
   options: { readonly now?: () => number } = {},
 ): Promise<{ mock: PmmcpMock; kernel: Awaited<ReturnType<typeof withKernel>>['kernel']; dbPath: string; requests: RecordedRequest[] }> {
-  const mock = pmmcpMock({ secrets: { [VAULT_ID]: 'vault-fixture-credential-delegation' } })
+  const mock = pmmcpMock()
   t.after(async () => {
     await mock.close()
   })
   const provider = fakeProvider(script)
   const { kernel, fx } = await withKernel(t, {
     clientFactory: mock.connect,
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    env: { ANTHROPIC_API_KEY: 'env-fixture-credential-delegation' },
     fetch: provider.fetch,
     ...(options.now === undefined ? {} : { now: options.now }),
     beforeBoot: (f) => {

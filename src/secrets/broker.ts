@@ -1,4 +1,17 @@
-// Secrets broker — the kernel's only caller of the pmmcp vault (invariant 2).
+// Secrets broker — the kernel's only door to a credential (invariant 2).
+//
+// Two sources, chosen by kernel.yaml `secrets.source`:
+//
+//   env (default)  each provider entry's own `auth.envVar`, read once at boot.
+//                  pmmcp's `get_secret` never returns plaintext — it answers
+//                  with a masked sentence — so the environment, filled from a
+//                  prompt and never from a file, is the working path.
+//
+//   vault          pmmcp's `get_secret`, then D8's envFallback. DORMANT: kept
+//                  for a pmmcp that one day returns a value to an authenticated
+//                  caller. Any reply containing whitespace is a message, not a
+//                  credential, and is refused rather than minted — the masked
+//                  sentence would otherwise become the API key.
 //
 // Agents never hold a vault handle, and neither does most of the kernel. What
 // circulates is a SecretRef: an opaque handle whose value lives in a WeakMap
@@ -41,6 +54,16 @@ import type { McpHub } from '../mcp/hub.js'
 export const VAULT_TOOL = 'get_secret'
 
 export type SecretSource = 'vault' | 'env'
+
+/**
+ * A reply that cannot be a credential. Provider keys are single tokens;
+ * pmmcp's replies (`Secret 'x' exists (masked): ****abcd`, `Secret 'x' not
+ * found.`, `Error retrieving secret …`) are sentences. Refusing on whitespace
+ * catches all of them without parsing pmmcp's wording.
+ */
+export function isMessageNotCredential(value: string): boolean {
+  return /\s/.test(value)
+}
 
 /**
  * The value store.
@@ -108,7 +131,9 @@ export function assertSecretSchema(inputSchema: unknown, keyArg: string, toolRef
 
 export interface BrokerOptions {
   readonly store: EventStore
-  /** Absent means no vault: the broker is degraded and ref() throws. */
+  /** Where credentials come from. Defaults to `env`. */
+  readonly source?: SecretSource
+  /** Absent means no vault: with `source: vault` the broker is degraded. */
   readonly hub?: McpHub | undefined
   readonly serverId?: string
   readonly keyArg: string
@@ -127,6 +152,7 @@ export interface RefOptions {
 
 export class SecretsBroker {
   readonly #store: EventStore
+  readonly #source: SecretSource
   readonly #hub: McpHub | undefined
   readonly #serverId: string
   readonly #keyArg: string
@@ -136,12 +162,21 @@ export class SecretsBroker {
 
   constructor(options: BrokerOptions) {
     this.#store = options.store
-    this.#hub = options.hub
+    this.#source = options.source ?? 'env'
+    // The env source never touches the vault, so it is never handed one.
+    this.#hub = this.#source === 'vault' ? options.hub : undefined
     this.#serverId = options.serverId ?? 'pmmcp'
     this.#keyArg = options.keyArg
     this.#envFallback = options.envFallback
     this.#env = options.env ?? process.env
-    this.#degraded = options.hub === undefined ? 'no MCP hub: the pmmcp vault is unreachable' : undefined
+    this.#degraded =
+      this.#source === 'vault' && options.hub === undefined
+        ? 'no MCP hub: the pmmcp vault is unreachable'
+        : undefined
+  }
+
+  get source(): SecretSource {
+    return this.#source
   }
 
   get keyArg(): string {
@@ -169,6 +204,12 @@ export class SecretsBroker {
    * and disagrees about its own arguments.
    */
   async start(): Promise<'ready' | 'degraded'> {
+    if (this.#source === 'env') {
+      // Nothing to confirm: there is no vault schema on this path, and env is
+      // the designed source rather than a fallback, so it is not a degradation.
+      await Promise.resolve()
+      return this.status()
+    }
     if (this.#hub === undefined) {
       this.#degrade('no MCP hub: the pmmcp vault is unreachable')
     } else {
@@ -211,6 +252,21 @@ export class SecretsBroker {
       throw new PolicyDenied(id, 'a secret may not be resolved without a stated purpose')
     }
 
+    if (this.#source === 'env') {
+      const envVar = options.envVar
+      if (envVar === undefined) {
+        throw new PolicyDenied(id, 'secrets.source is env and this entry declares no auth.envVar')
+      }
+      const fromEnv = this.#env[envVar]
+      if (fromEnv === undefined || fromEnv === '') {
+        throw new PolicyDenied(id, `${envVar} is not set (secrets.source: env)`)
+      }
+      if (isMessageNotCredential(fromEnv)) {
+        throw new PolicyDenied(id, `${envVar} contains whitespace, so it is not a credential`)
+      }
+      return this.#mint(id, 'env', fromEnv, purpose)
+    }
+
     let vaultError: string | undefined
     if (this.#hub === undefined) {
       vaultError = this.#degraded ?? 'no MCP hub'
@@ -223,8 +279,16 @@ export class SecretsBroker {
           purpose,
         )
         const value = result.ok ? extractText(result.content) : undefined
-        if (value !== undefined && value !== '') return this.#mint(id, 'vault', value, purpose)
-        vaultError = result.ok ? 'the vault returned no value' : 'the vault reported an error'
+        if (value !== undefined && value !== '' && !isMessageNotCredential(value)) {
+          return this.#mint(id, 'vault', value, purpose)
+        }
+        // The reply itself is never quoted: pmmcp's masked sentence carries the
+        // last four characters of the real key.
+        vaultError = !result.ok
+          ? 'the vault reported an error'
+          : value === undefined || value === ''
+            ? 'the vault returned no value'
+            : 'the vault returned a message, not a credential (pmmcp never returns plaintext)'
       } catch (e) {
         vaultError = e instanceof Error ? e.message : String(e)
       }

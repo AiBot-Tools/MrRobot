@@ -40,12 +40,15 @@ mcp:
       listToolsTimeoutMs: 15000
 
 secrets:
-  # Confirmed against the live get_secret schema (2026-09-21): the argument is
-  # `label`, not `key`. The broker still asserts it at runtime and fails closed
-  # if the server disagrees.
+  # env: each provider entry's auth.envVar, read once at boot. Export it from a
+  # prompt (`read -rs ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY`), never
+  # from a file. pmmcp's get_secret returns only a masked sentence, by design,
+  # so `vault` cannot supply a key; it stays in the code, dormant.
+  source: env
+  # Used only by source: vault. Confirmed against the live get_secret schema
+  # (2026-09-21): the argument is `label`, not `key`.
   keyArg: label
-  # Off: the vault is the credential path. Turning this on lets a per-entry
-  # auth.envVar be consulted AFTER a vault failure, and nothing else.
+  # Only meaningful with source: vault (parse refuses it otherwise).
   envFallback: false
 
 sandbox:

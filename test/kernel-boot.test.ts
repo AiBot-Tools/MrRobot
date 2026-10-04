@@ -108,7 +108,7 @@ async function expectBootRefusal(
 /** The one non-placeholder ref in the shipped providers.yaml. */
 const REAL_REF = 'anthropic/claude-sonnet-5'
 
-test('boots DEGRADED with hub, secrets and sandbox degraded, each with a reason, and control ok, over a real WS connection', async (t) => {
+test('boots DEGRADED with hub, sandbox and router degraded, each with a reason, secrets and control ok, over a real WS connection', async (t) => {
   const { kernel, fx } = await withKernel(t)
 
   const status = kernel.status()
@@ -119,14 +119,16 @@ test('boots DEGRADED with hub, secrets and sandbox degraded, each with a reason,
 
   // Each degraded subsystem names WHY. "degraded" with no reason is an
   // operator opening a debugger.
-  for (const name of ['hub', 'secrets', 'sandbox', 'router'] as const) {
+  for (const name of ['hub', 'sandbox', 'router'] as const) {
     assert.equal(status.subsystems[name].state, 'degraded', name)
     assert.ok((status.subsystems[name].reason ?? '').length > 0, `${name} has no reason`)
   }
-  assert.match(status.subsystems.hub.reason ?? '', /PMMCP_TOKEN is not set|did not connect|ECONN|EACCES/)
-  assert.match(status.subsystems.secrets.reason ?? '', /no vault/)
+  assert.match(status.subsystems.hub.reason ?? '', /did not connect|ECONN|EACCES|fetch failed/)
   assert.match(status.subsystems.sandbox.reason ?? '', /no container runtime/)
+  // No key exported, so nothing is routable — and the reason names the variable.
   assert.match(status.subsystems.router.reason ?? '', /no routable model/)
+  // secrets.source: env needs no pmmcp, so a missing pmmcp does not degrade it.
+  assert.equal(status.subsystems.secrets.state, 'ok', status.subsystems.secrets.reason ?? '')
 
   // Absent is not degraded: egress is not built at all, and it says so in its own
   // words rather than in a status string invented here.
@@ -142,7 +144,7 @@ test('boots DEGRADED with hub, secrets and sandbox degraded, each with a reason,
   // The two that must be ok for the kernel to be worth talking to.
   assert.equal(status.subsystems.events.state, 'ok')
   assert.equal(status.subsystems.control.state, 'ok')
-  assert.deepEqual([...kernel.degraded].sort(), ['egress', 'hub', 'router', 'sandbox', 'secrets'])
+  assert.deepEqual([...kernel.degraded].sort(), ['egress', 'hub', 'router', 'sandbox'])
 
   // And the control plane really serves, over a real socket with a real
   // handshake — not merely "the object was constructed".
@@ -163,7 +165,9 @@ test('boots DEGRADED with hub, secrets and sandbox degraded, each with a reason,
 
   // The chain head is real, so `status.get` is answerable straight after boot.
   assert.ok((status.chainHead?.seq ?? 0) > 0)
-  assert.equal(status.envFallback, false)
+  // Protocol v1's `envFallback` reads "a credential may come from the
+  // environment", which secrets.source: env makes the designed path.
+  assert.equal(status.envFallback, true)
   assert.ok(fx.dataDir.length > 0, 'the fixture has no data dir')
 })
 
@@ -570,13 +574,13 @@ test('a run pays for a model call with a credential resolved at boot', async (t)
   // looks up what boot already resolved. Wired the other way round, no run can
   // ever make a model call, and the Phase 0 exit criterion is unreachable.
   //
-  // Offline: the provider is a double and the vault is absent, so the credential
-  // comes from the env fallback (D8). No socket leaves the machine.
+  // Offline: the provider is a double and pmmcp is absent; the credential comes
+  // from the environment, the shipped `secrets.source: env`. No socket leaves
+  // the machine.
   const provider = fakeProvider([anthropicEndTurn({ text: 'pong', inputTokens: 1_000, outputTokens: 100 })])
   const KEY = 'offline-fixture-credential-9c1f0b'
 
   const { kernel, fx } = await withKernel(t, {
-    envFallback: true,
     env: { ANTHROPIC_API_KEY: KEY },
     fetch: provider.fetch,
     // routable() consults the persisted probe record, so it has to be on disk
@@ -635,10 +639,11 @@ test('boot resolves a credential only for a ref the router can serve', async (t)
   // real reach on the operator's machine: a credential fetched is a credential
   // in the process, and fetching one for a model nothing can use is reach taken
   // for no purpose.
+  // The dormant vault path, against a fixture vault that returns plaintext.
   const mock = await mockMcp()
   const { kernel, fx } = await withKernel(t, {
     clientFactory: () => Promise.resolve(mock.client),
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    secretsSource: 'vault',
   })
   assert.equal(kernel.status().subsystems.hub.state, 'ok')
 
@@ -678,13 +683,13 @@ test('a run with no credential path refuses before the wire', async (t) => {
 
   // Boot could not resolve it, and the router says so with the reason.
   assert.equal(kernel.status().subsystems.router.state, 'degraded')
-  assert.match(kernel.status().subsystems.router.reason ?? '', /envFallback is off|vault/)
+  assert.match(kernel.status().subsystems.router.reason ?? '', /ANTHROPIC_API_KEY is not set/)
   assert.equal(rows(fx.dbPath).filter((r) => r.type === 'secret.accessed').length, 0)
 
   const finish = await runThroughControl(kernel, 'reply with the word pong')
   assert.equal(finish['status'], 'error')
   assert.equal(finish['costMicroUsd'], 0)
-  assert.match(String(finish['reason']), /credential|envFallback|vault/)
+  assert.match(String(finish['reason']), /ANTHROPIC_API_KEY is not set/)
 
   // Nothing went out. This is the claim: refused at the router, not at the
   // provider.
@@ -983,7 +988,7 @@ test('envFallback:true shows secrets degraded in status.get', async (t) => {
   // D8: while env fallback is on, a credential MAY come from the environment
   // rather than the vault. A kernel reporting ready in that state would be
   // hiding exactly the thing an operator needs to know.
-  const noVault = await withKernel(t, { envFallback: true })
+  const noVault = await withKernel(t, { envFallback: true, secretsSource: 'vault' })
   assert.equal(noVault.kernel.status().envFallback, true)
   assert.equal(noVault.kernel.status().subsystems.secrets.state, 'degraded')
   assert.equal(noVault.kernel.status().state, 'degraded')
@@ -994,8 +999,8 @@ test('envFallback:true shows secrets degraded in status.get', async (t) => {
   const mock = await mockMcp()
   const withVault = await withKernel(t, {
     envFallback: true,
+    secretsSource: 'vault',
     clientFactory: () => Promise.resolve(mock.client),
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
   })
   const status = withVault.kernel.status()
   assert.equal(status.subsystems.hub.state, 'ok', 'the mock hub did not connect')
@@ -1011,7 +1016,7 @@ test('envFallback:true shows secrets degraded in status.get', async (t) => {
   // degradation above is attributable to the flag and nothing else.
   const clean = await withKernel(t, {
     clientFactory: () => Promise.resolve(mock.client),
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    secretsSource: 'vault',
   })
   assert.equal(clean.kernel.status().subsystems.secrets.state, 'ok')
   assert.equal(clean.kernel.status().envFallback, false)

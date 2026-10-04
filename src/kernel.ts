@@ -396,6 +396,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     // ── secrets: the router's resolveCredential closes over this ──────────
     const broker = new SecretsBroker({
       store,
+      source: config.secrets.source,
       ...(hubState.ok ? { hub } : {}),
       keyArg: config.secrets.keyArg,
       envFallback: config.secrets.envFallback,
@@ -433,7 +434,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
         payload: { schemaVersion: 1, reason: secretsReason },
       })
     }
-    if (!hubState.ok) {
+    if (config.secrets.source === 'vault' && !hubState.ok) {
       // Said better than the broker can: the broker knows only that it has no
       // hub, while boot knows why the hub is not there.
       secretsReason = `no vault: ${hubState.reason ?? 'pmmcp is not connected'}`
@@ -1079,7 +1080,9 @@ function buildSurface(d: SurfaceDeps): KernelSurface {
         subsystems: d.subsystems(),
         chainHead: tail === 0 ? null : { seq: tail, hash: d.store.head() },
         lanes: d.lanes.diagnostics(),
-        envFallback: d.config.secrets.envFallback,
+        // Protocol v1's field: true whenever a credential may come from the
+        // environment, which `source: env` makes the designed path.
+        envFallback: d.config.secrets.source === 'env' || d.config.secrets.envFallback,
       })
     },
 

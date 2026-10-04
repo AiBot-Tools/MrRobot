@@ -333,7 +333,7 @@ test('a real kernel pins each agent to ITS OWN manifest namespace, not one the l
   // Nothing in the shipped fleet can call a namespaced tool (tool-views.yaml
   // exposes nothing), so this boots the real kernel on a fixture whose views
   // expose recall with its namespace argument, and a researcher allowed to use it.
-  const mock = pmmcpMock({ secrets: { 'anthropic-api-key': 'vault-fixture-credential-namespace' } })
+  const mock = pmmcpMock()
   t.after(async () => {
     await mock.close()
   })
@@ -362,7 +362,7 @@ test('a real kernel pins each agent to ITS OWN manifest namespace, not one the l
     anthropicEndTurn({ text: 'done' }),
   ])
   const kernel = await bootOn(t, fx, {
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    env: { ANTHROPIC_API_KEY: 'env-fixture-credential-namespace' },
     clientFactory: mock.connect,
     fetch: provider.fetch,
     agentsDir,

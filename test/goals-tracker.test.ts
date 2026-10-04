@@ -70,14 +70,14 @@ async function bootWithGoals(
   script: readonly ScriptedResponse[],
   extra: Parameters<typeof withKernel>[1] = {},
 ): Promise<{ mock: PmmcpMock; kernel: Awaited<ReturnType<typeof withKernel>>['kernel']; dbPath: string }> {
-  const mock = pmmcpMock({ secrets: { [VAULT_ID]: 'vault-fixture-credential-goals' } })
+  const mock = pmmcpMock()
   t.after(async () => {
     await mock.close()
   })
   const provider = fakeProvider(script)
   const { kernel, fx } = await withKernel(t, {
     clientFactory: mock.connect,
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    env: { ANTHROPIC_API_KEY: 'env-fixture-credential-goals' },
     fetch: provider.fetch,
     beforeBoot: (f) => {
       writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
@@ -440,7 +440,7 @@ test('a restart blocks the goals of runs it orphaned, and re-executes nothing', 
   // One fixture, two boots against the SAME data dir — the pattern the existing
   // restart test uses, because a second `withKernel` would silently get a fresh
   // temp directory and the second kernel would see an empty log.
-  const mock = pmmcpMock({ secrets: { [VAULT_ID]: 'vault-fixture-credential-goals' } })
+  const mock = pmmcpMock()
   t.after(async () => {
     await mock.close()
   })
@@ -448,7 +448,7 @@ test('a restart blocks the goals of runs it orphaned, and re-executes nothing', 
   const fx = fixture(t)
   const boot = (): Promise<Kernel> =>
     bootOn(t, fx, {
-      env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+      env: { ANTHROPIC_API_KEY: 'env-fixture-credential-goals' },
       clientFactory: mock.connect,
     })
 

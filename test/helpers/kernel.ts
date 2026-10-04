@@ -60,6 +60,8 @@ export interface FixtureOptions {
   readonly kernelYaml?: (base: string) => string
   readonly anchorEvery?: number
   readonly envFallback?: boolean
+  /** kernel.yaml `secrets.source`. Defaults to `env`, as shipped. */
+  readonly secretsSource?: 'env' | 'vault'
 }
 
 /** Build a temp data dir and a kernel.yaml pointing at it. */
@@ -84,6 +86,7 @@ mcp:
     pmmcp:
       url: http://127.0.0.1:${String(CLOSED_PMMCP_PORT)}/mcp
 secrets:
+  source: ${options.secretsSource ?? 'env'}
   envFallback: ${String(options.envFallback ?? false)}
 sandbox:
   image: aos-worker:test

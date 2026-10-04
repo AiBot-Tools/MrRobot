@@ -140,8 +140,8 @@ test(
     // Reasons inline, where the hygiene rule reads them: each names what to set.
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
-      : !hasPmmcp()
-        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer)'
+      : !hasPmmcp() || process.env['ANTHROPIC_API_KEY'] === undefined
+        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer) and ANTHROPIC_API_KEY'
         : !WRITES
           ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
           : false,
@@ -152,13 +152,12 @@ test(
     const ref = realRef()
     const pmmcpUrl = process.env['PMMCP_URL'] ?? ''
 
-    // The vault is the credential path, exactly as in the Phase 0 exit criterion:
-    // envFallback off AND the variable it would fall back to poisoned.
+    // The key from the environment, as in the Phase 0 exit criterion: pmmcp's
+    // get_secret masks by design, so pmmcp is the goal store here, not the vault.
     const { kernel, fx } = await withKernel(t, {
-      envFallback: false,
       env: {
         PMMCP_TOKEN: process.env['PMMCP_TOKEN'],
-        ANTHROPIC_API_KEY: 'poisoned-not-a-real-key-this-must-never-be-used',
+        ANTHROPIC_API_KEY: process.env['ANTHROPIC_API_KEY'],
       },
       sandboxDriver: fakeSandbox(),
       kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `url: ${pmmcpUrl}`),
@@ -192,10 +191,9 @@ test(
     t.after(revoke)
     const ref = realRef()
 
-    // No pmmcp: this needs only a model, and the env fallback (D8) is the
-    // cheapest honest way to get one. It is not an exit-criterion test.
+    // No pmmcp: this needs only a model, and the environment (secrets.source:
+    // env, as shipped) is where the key comes from. Not an exit-criterion test.
     const { kernel, fx } = await withKernel(t, {
-      envFallback: true,
       env: { ANTHROPIC_API_KEY: process.env['ANTHROPIC_API_KEY'] },
       sandboxDriver: fakeSandbox(),
     })

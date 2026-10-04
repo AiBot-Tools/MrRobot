@@ -200,15 +200,22 @@ test('budgets cannot be zero or negative', () => {
   assert.throws(() => parse(lanes), /invalid/)
 })
 
-test('envFallback defaults to false', () => {
-  // Reading a credential from the environment widens what the kernel trusts,
-  // so it is opt-in, never the default.
+test('secrets.source defaults to env; envFallback defaults to false and needs source: vault', () => {
+  // pmmcp's get_secret never returns plaintext, so the environment is the
+  // working credential path and the vault is dormant.
+  assert.equal(parse(fixture('minimal.yaml')).secrets.source, 'env')
   assert.equal(parse(fixture('minimal.yaml')).secrets.envFallback, false)
   assert.equal(parse(fixture('valid.yaml')).secrets.envFallback, false)
 
-  const on = fixture('valid.yaml') as { secrets: { envFallback: boolean } }
+  // A fallback FROM the vault means nothing without the vault.
+  const onWithEnv = fixture('valid.yaml') as { secrets: { envFallback: boolean } }
+  onWithEnv.secrets.envFallback = true
+  assert.throws(() => parse(onWithEnv), /needs secrets\.source: vault/)
+
+  const on = fixture('valid.yaml') as { secrets: { envFallback: boolean; source: string } }
   on.secrets.envFallback = true
-  assert.equal(parse(on).secrets.envFallback, true, 'it can be turned on deliberately')
+  on.secrets.source = 'vault'
+  assert.equal(parse(on).secrets.envFallback, true, 'it can be turned on deliberately, with the vault')
 
   // keyArg carries the operator-confirmed argument name.
   assert.equal(parse(fixture('minimal.yaml')).secrets.keyArg, 'label')

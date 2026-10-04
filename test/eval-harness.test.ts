@@ -42,14 +42,14 @@ async function kernelWith(
   t: Parameters<typeof withKernel>[0],
   script: readonly ScriptedResponse[],
 ): Promise<{ target: EvalTarget; provider: ReturnType<typeof fakeProvider> }> {
-  const mock = pmmcpMock({ secrets: { [VAULT_ID]: 'vault-fixture-credential-eval' } })
+  const mock = pmmcpMock()
   t.after(async () => {
     await mock.close()
   })
   const provider = fakeProvider(script)
   const { kernel, fx } = await withKernel(t, {
     clientFactory: mock.connect,
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    env: { ANTHROPIC_API_KEY: 'env-fixture-credential-eval' },
     fetch: provider.fetch,
     beforeBoot: (f) => {
       writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
@@ -153,7 +153,7 @@ test('a run slower than the case ceiling fails by name rather than hanging', asy
   // The provider answers, but late: the wait ceiling must fire first and say which
   // case and which run it gave up on. The connect timeout is deliberately NOT the
   // same number — a short run ceiling must not make the harness unable to connect.
-  const mock = pmmcpMock({ secrets: { [VAULT_ID]: 'vault-fixture-credential-eval' } })
+  const mock = pmmcpMock()
   t.after(async () => {
     await mock.close()
   })
@@ -165,7 +165,7 @@ test('a run slower than the case ceiling fails by name rather than hanging', asy
 
   const { kernel, fx } = await withKernel(t, {
     clientFactory: mock.connect,
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    env: { ANTHROPIC_API_KEY: 'env-fixture-credential-eval' },
     fetch: slow,
     beforeBoot: (f) => {
       writeProbeRecord(f.dataDir, freshProbe(REAL_REF))

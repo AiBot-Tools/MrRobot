@@ -311,13 +311,13 @@ async function bootScheduled(
   t: Parameters<typeof withStore>[0],
   fetch?: typeof globalThis.fetch,
 ): Promise<Awaited<ReturnType<typeof withKernel>>> {
-  const mock = pmmcpMock({ secrets: { 'anthropic-api-key': 'vault-fixture-credential-scheduler' } })
+  const mock = pmmcpMock()
   t.after(async () => {
     await mock.close()
   })
   return withKernel(t, {
     clientFactory: mock.connect,
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    env: { ANTHROPIC_API_KEY: 'env-fixture-credential-scheduler' },
     agentsDir: scheduledFleet(tmpdir(t)),
     ...(fetch === undefined ? {} : { fetch }),
     beforeBoot: (f) => {

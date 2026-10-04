@@ -362,6 +362,14 @@ export interface PmmcpMockOptions {
   readonly secretArg?: string
   /** Vault entries present at start. */
   readonly secrets?: Readonly<Record<string, string>>
+  /**
+   * Make `get_secret` return the plaintext. The REAL pmmcp never does: it
+   * answers `Secret '<label>' exists (masked): ****abcd` or `Secret '<label>'
+   * not found.` (src/tools/security.py), both as successful text. Only the
+   * dormant `secrets.source: vault` path's own tests turn this on, to prove it
+   * against a hypothetical pmmcp that hands a value over.
+   */
+  readonly revealSecrets?: boolean
   /** Register placeholders until tools/list reports this many. */
   readonly padTo?: number
   /**
@@ -435,6 +443,7 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
   const secretArg = options.secretArg ?? 'label'
   const now = options.now ?? ((): number => Date.now())
   const strictRollup = options.strictRollup ?? false
+  const revealSecrets = options.revealSecrets ?? false
 
   const state: PmmcpState = {
     goals: new Map(),
@@ -680,6 +689,12 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     if (label === undefined) return fail(`${secretArg} is required`)
     const value = state.secrets.get(label)
     state.audit.push({ action: 'get_secret', label, ok: value !== undefined, at: now() })
+    if (!revealSecrets) {
+      // pmmcp's own replies, verbatim in shape: success text either way.
+      if (value === undefined) return ok(`Secret '${label}' not found.`)
+      const masked = value.length > 4 ? '*'.repeat(value.length - 4) + value.slice(-4) : '****'
+      return ok(`Secret '${label}' exists (masked): ${masked}`)
+    }
     if (value === undefined) return fail(`no vault entry ${label}`)
     return ok(value)
   })

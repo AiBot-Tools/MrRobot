@@ -3,7 +3,7 @@
 The kernel — the control plane — of a local-first Agentic OS for a single
 operator on one Mac. A CEO agent orchestrates a fleet; every action lands in a
 hash-chained, append-only event log; pmmcp (the operator's Persistent Memory MCP
-server) is shared long-term memory and the secrets vault; models are bound per
+server) is shared long-term memory and the goal store; models are bound per
 agent across Anthropic, OpenAI-compatible and local endpoints.
 
 Three planes. **Shell** (UI; holds no secrets, executes nothing) → **Kernel**
@@ -72,8 +72,15 @@ environment, and refuses to start without it. There is no `--env-file` flag on
 
 ```bash
 export AOS_CONTROL_TOKEN="$(openssl rand -hex 32)"
+read -rs ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY   # typed, never stored
 npm run dev
 ```
+
+Provider keys come from the environment (`secrets.source: env`): each entry's own
+`auth.envVar`, read once at boot. pmmcp's `get_secret` answers only with a masked
+sentence (`Secret 'x' exists (masked): ****abcd`), by design, so it cannot supply
+a key; the vault path stays in the code, dormant, and refuses any reply that
+contains whitespace rather than minting a sentence as a credential.
 
 With no pmmcp and no Docker the kernel boots **degraded** and says exactly what
 is missing. That is the designed behaviour, not a failure — see below.
@@ -332,7 +339,8 @@ rather than a patch. (It is an event and not a `status.get` subsystem key becaus
 The kernel is tested against a **pmmcp double** (`test/helpers/mock-pmmcp.ts`):
 an in-process MCP server with the goal hierarchy, the validated status
 transitions, `project_id` namespacing, the vault and an idle-expiring session
-all modelled. It is what lets the vault credential path, invariant 7 at 49
+all modelled — `get_secret` answering with pmmcp's real masked sentence unless a
+test opts into `revealSecrets` for the dormant vault path. It is what lets the credential paths, invariant 7 at 49
 tools, and a reconnect after a `-32001` be tested with no pmmcp anywhere. Its
 tool names and arguments are MODELLED, recorded as such in `PMMCP_TOOLS`, and
 nothing in the kernel may treat one as known-good until the capture confirms
@@ -351,7 +359,7 @@ and a live test cannot rot unexercised the way a gated-only one does.
 | Test | Needs | What only a live run settles |
 |---|---|---|
 | goal tools round-trip | pmmcp + both opt-ins | whether the MODELLED goal tool names and arguments in `kernel.yaml` match the real server — the first assertion is the boot check, and it names every disagreement |
-| plan → tree | pmmcp, key in the vault, both opt-ins | whether a real model's plan survives the `.strict()` parser; on failure the message carries the parser's own reason and the model's words |
+| plan → tree | pmmcp, `ANTHROPIC_API_KEY`, both opt-ins | whether a real model's plan survives the `.strict()` parser; on failure the message carries the parser's own reason and the model's words |
 | eval harness gates | `ANTHROPIC_API_KEY` | whether the harness's own gates — one terminal row, paired LLM events, cost equal to the sum of logged calls — hold against a real provider's accounting |
 
 `test/live-anthropic.test.ts` carries one more of these: **rejected-call replay**
@@ -457,14 +465,13 @@ AOS_LIVE_TESTS=1 ANTHROPIC_API_KEY=… npm test
 - Commit: —
 - `costMicroUsd`: —
 
-**2. The exit criterion, automated.** Requires the Anthropic key already stored
-in the pmmcp vault under the `vaultId` that `config/providers.yaml` names
-(`anthropic-api-key`) — a one-time manual step outside the kernel. `envFallback`
-is off and `ANTHROPIC_API_KEY` is poisoned by the test, so the vault is the only
-working credential path. This is also the first time `secrets.keyArg` is
-confirmed against the live `get_secret` schema.
+**2. The exit criterion, automated.** pmmcp connected and its tools classified,
+the key resolved from the environment (`secret.accessed { source: 'env' }`), a
+fresh probe, then a run with non-zero cost, in that log order. pmmcp is the
+memory and goal store here, not the key store: its `get_secret` masks by design.
 
 ```bash
+read -rs ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY
 AOS_LIVE_TESTS=1 PMMCP_URL=http://127.0.0.1:8766/mcp npm test
 ```
 

@@ -66,14 +66,14 @@ test('goalTreeRoundTrip holds against the double', async (t) => {
 })
 
 test('planToTree holds against the double, and nothing lands in aos/ceo', async (t) => {
-  const mock = pmmcpMock({ secrets: { [VAULT_ID]: 'vault-fixture-credential-runtime' } })
+  const mock = pmmcpMock()
   t.after(async () => {
     await mock.close()
   })
   const provider = fakeProvider([anthropicEndTurn({ text: SCRIPTED_PLAN, inputTokens: 1_500, outputTokens: 400 })])
   const { kernel, fx } = await withKernel(t, {
     clientFactory: mock.connect,
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    env: { ANTHROPIC_API_KEY: 'env-fixture-credential-runtime' },
     fetch: provider.fetch,
     agentsDir: liveFleet(tmpdir(t), REF),
     beforeBoot: (f) => {
@@ -102,7 +102,7 @@ test('planToTree fails with the parser’s reason when the model’s plan does n
   // The failure path is the one a live run is most likely to take: a real model
   // adds a key the strict schema refuses. The message must say which, or the
   // operator is left guessing whether the model, the parser or the server failed.
-  const mock = pmmcpMock({ secrets: { [VAULT_ID]: 'vault-fixture-credential-runtime' } })
+  const mock = pmmcpMock()
   t.after(async () => {
     await mock.close()
   })
@@ -110,7 +110,7 @@ test('planToTree fails with the parser’s reason when the model’s plan does n
   const provider = fakeProvider([anthropicEndTurn({ text: withExtraKey, inputTokens: 1_500, outputTokens: 400 })])
   const { kernel, fx } = await withKernel(t, {
     clientFactory: mock.connect,
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    env: { ANTHROPIC_API_KEY: 'env-fixture-credential-runtime' },
     fetch: provider.fetch,
     agentsDir: liveFleet(tmpdir(t), REF),
     beforeBoot: (f) => {
@@ -149,7 +149,6 @@ test('evalHarnessAssumptions holds against a scripted provider', async (t) => {
     anthropicEndTurn({ text: 'The shared vault is the single point of compromise.', inputTokens: 900, outputTokens: 60 }),
   ])
   const { kernel, fx } = await withKernel(t, {
-    envFallback: true,
     env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-eval-runtime' },
     fetch: provider.fetch,
     beforeBoot: (f) => {
@@ -200,14 +199,14 @@ test('planToTree refuses a tree written anywhere but the namespace it was told t
   // assertion inside the body; on a live run nothing else checks it. So it is
   // run against a kernel that writes to the test namespace while the body is
   // told to expect another, and must say so.
-  const mock = pmmcpMock({ secrets: { [VAULT_ID]: 'vault-fixture-credential-runtime' } })
+  const mock = pmmcpMock()
   t.after(async () => {
     await mock.close()
   })
   const provider = fakeProvider([anthropicEndTurn({ text: SCRIPTED_PLAN, inputTokens: 1_500, outputTokens: 400 })])
   const { kernel, fx } = await withKernel(t, {
     clientFactory: mock.connect,
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    env: { ANTHROPIC_API_KEY: 'env-fixture-credential-runtime' },
     fetch: provider.fetch,
     agentsDir: liveFleet(tmpdir(t), REF),
     beforeBoot: (f) => {
@@ -239,7 +238,6 @@ test('evalHarnessAssumptions refuses a run whose calibration checks could not pa
     http(500, { error: { type: 'api_error', message: 'upstream down' } }),
   ])
   const { kernel, fx } = await withKernel(t, {
-    envFallback: true,
     env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-eval-runtime' },
     fetch: provider.fetch,
     beforeBoot: (f) => {

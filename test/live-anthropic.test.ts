@@ -152,11 +152,10 @@ test(
     t.after(revoke)
 
     const ref = realRef()
-    // envFallback ON and no pmmcp: the shipped entry's vault path fails and the
-    // broker falls back to this entry's own auth.envVar (D8). That is why this
-    // test cannot be the exit criterion — it proves the provider, not the vault.
+    // No pmmcp: the key comes from the environment (secrets.source: env, as
+    // shipped). That is why this test is not the exit criterion — it proves the
+    // provider, not the pmmcp connection.
     const booted = await withKernel(t, {
-      envFallback: true,
       env: { ANTHROPIC_API_KEY: process.env['ANTHROPIC_API_KEY'] },
       sandboxDriver: fakeSandbox(),
     })
@@ -203,12 +202,12 @@ test(
 // ── 2. the Phase 0 exit criterion ──────────────────────────────────────────
 
 test(
-  'Phase 0 exit criterion: with pmmcp connected and envFallback off, probe then run ceo finishes with non-zero cost paid from the vault',
+  'Phase 0 exit criterion: with pmmcp connected, probe then run ceo finishes with non-zero cost, the key from the environment',
   {
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
-      : process.env['PMMCP_URL'] === undefined
-        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer), and the Anthropic key must already be in the pmmcp vault under the vaultId providers.yaml names'
+      : process.env['PMMCP_URL'] === undefined || process.env['ANTHROPIC_API_KEY'] === undefined
+        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer) and ANTHROPIC_API_KEY (read -rs, never from a file)'
         : false,
   },
   async (t) => {
@@ -217,29 +216,24 @@ test(
 
     const ref = realRef()
     const pmmcpUrl = process.env['PMMCP_URL'] ?? ''
+    const key = process.env['ANTHROPIC_API_KEY'] ?? ''
 
-    // The vault is the ONLY working credential path here, and it is made the
-    // only one twice over: envFallback is off, AND the environment variable the
-    // entry would fall back to is poisoned. A test that merely turned the
-    // fallback off could still pass on a kernel that ignored the setting.
+    // pmmcp's get_secret returns only a masked sentence, by design, so the key
+    // comes from the environment (secrets.source: env, as shipped) and pmmcp is
+    // the memory and goal store. The criterion is both at once: pmmcp really
+    // connected, and a real run that really spent money.
     const booted = await withKernel(t, {
-      envFallback: false,
-      env: {
-        PMMCP_TOKEN: process.env['PMMCP_TOKEN'],
-        ANTHROPIC_API_KEY: 'poisoned-not-a-real-key-this-must-never-be-used',
-      },
+      env: { PMMCP_TOKEN: process.env['PMMCP_TOKEN'], ANTHROPIC_API_KEY: key },
       sandboxDriver: fakeSandbox(),
       // No clientFactory: the hub opens a real Streamable HTTP session to the
       // operator's pmmcp. The guard already admits loopback.
       kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `url: ${pmmcpUrl}`),
     })
 
-    // Before running: the vault is genuinely up, and the kernel is not degraded
-    // in the two places that matter.
     const status = booted.kernel.status()
     assert.equal(status.subsystems.hub.state, 'ok', status.subsystems.hub.reason ?? '')
     assert.equal(status.subsystems.secrets.state, 'ok', status.subsystems.secrets.reason ?? '')
-    assert.equal(status.envFallback, false)
+    assert.equal(booted.fx.config.secrets.source, 'env')
 
     const finish = await probeThenRun(booted, ref, 'reply with the word pong')
     assert.equal(finish['status'], 'ok', String(finish['reason'] ?? ''))
@@ -248,9 +242,8 @@ test(
     await booted.kernel.shutdown()
     const all = rows(booted.fx.dbPath)
 
-    // In this order. The order is the argument: the vault connected, its tools
-    // were classified, the key came OUT of the vault, the model was probed, and
-    // only then did a run spend money.
+    // In this order: pmmcp connected and its tools were classified, the key was
+    // resolved, the model was probed, and only then did a run spend money.
     const connected = seqOf(all, 'hub.connected')
     const classified = seqOf(all, 'hub.tools.classified')
     const accessed = seqOf(all, 'secret.accessed')
@@ -260,19 +253,10 @@ test(
       connected < classified && classified < accessed && accessed < probed && probed < finished,
       `log order was ${[connected, classified, accessed, probed, finished].join(' < ')}`,
     )
+    assert.equal(payloadOf(all, 'secret.accessed')['source'], 'env')
 
-    // THE assertion. 'env' here would mean the fallback ran despite being off,
-    // and the criterion would be unmet however green the rest looked.
-    assert.equal(payloadOf(all, 'secret.accessed')['source'], 'vault')
-
-    // The broker confirmed kernel.yaml's secrets.keyArg against the LIVE
-    // get_secret schema. Reaching a vault-sourced credential at all is that
-    // confirmation: the broker throws SecretsSchemaMismatch otherwise, so this
-    // is the moment keyArg stops being "unverified".
-    assert.equal(booted.fx.config.secrets.keyArg, 'label')
-
-    // Nothing unclassified was exposed: the shipped file names nine tools and
-    // the rest stay kernel-only by the literal default (invariant 7).
+    // Nothing unclassified was exposed: unclassified pmmcp tools stay
+    // kernel-only by the literal default (invariant 7).
     const tools = payloadOf(all, 'hub.tools.classified')
     assert.equal(tools['exposed'], 0, 'a pmmcp tool is exposed to agents')
     assert.ok((tools['kernelOnly'] as number) > 0)
@@ -286,12 +270,8 @@ test(
       store.close()
     }
 
-    // The poisoned value must appear nowhere: not used, not logged.
-    assert.equal(
-      JSON.stringify(all).includes('poisoned-not-a-real-key'),
-      false,
-      'the poisoned env value reached the log',
-    )
+    // The key went out on the wire and is nowhere in the log.
+    assert.equal(JSON.stringify(all).includes(key), false, 'the API key reached the log')
   },
 )
 

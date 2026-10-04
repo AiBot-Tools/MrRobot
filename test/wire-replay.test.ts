@@ -229,7 +229,7 @@ test('a real kernel: a worker that names a tool it was not offered is told, and 
   // The case that surfaced the bug: the shipped writer, offered nothing, asks
   // for pmmcp__recall with no text. Before the fix the next request could not
   // even be encoded and the run ended `error`.
-  const mock = pmmcpMock({ secrets: { 'anthropic-api-key': 'vault-fixture-credential-replay' } })
+  const mock = pmmcpMock()
   t.after(async () => {
     await mock.close()
   })
@@ -240,7 +240,7 @@ test('a real kernel: a worker that names a tool it was not offered is told, and 
   ])
   const { kernel, fx } = await withKernel(t, {
     clientFactory: mock.connect,
-    env: { PMMCP_TOKEN: 'unused-because-the-factory-is-injected' },
+    env: { ANTHROPIC_API_KEY: 'env-fixture-credential-replay' },
     fetch: provider.fetch,
     beforeBoot: (f) => {
       writeProbeRecord(f.dataDir, freshProbe(ANTHROPIC_REF))

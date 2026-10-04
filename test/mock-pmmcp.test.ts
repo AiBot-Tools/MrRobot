@@ -275,8 +275,22 @@ test('parent rollup is off by default and refuses a live child when switched on'
   assert.match(blocked.text, /not yet at rest/)
 })
 
+test('get_secret answers as the real pmmcp does: a masked sentence, never the value, and success either way', async (t) => {
+  // src/tools/security.py in pmmcp: found → `Secret '<label>' exists (masked):
+  // ****<last 4>`; missing → `Secret '<label>' not found.`; neither is isError.
+  const { client } = await open(t, { secrets: { 'anthropic-api-key': 'sk-ant-fixture-wxyz' } })
+  const got = await call(client, 'get_secret', { label: 'anthropic-api-key' })
+  assert.equal(got.isError, false)
+  assert.equal(got.text, "Secret 'anthropic-api-key' exists (masked): ***************wxyz")
+  assert.equal(got.text.includes('sk-ant'), false)
+
+  const missing = await call(client, 'get_secret', { label: 'nothing-here' })
+  assert.equal(missing.isError, false)
+  assert.equal(missing.text, "Secret 'nothing-here' not found.")
+})
+
 test('the vault answers on the confirmed argument and its audit log holds no value', async (t) => {
-  const { mock, client } = await open(t, { secrets: { 'anthropic-api-key': 'sk-ant-fixture' } })
+  const { mock, client } = await open(t, { secrets: { 'anthropic-api-key': 'sk-ant-fixture' }, revealSecrets: true })
   const got = await call(client, 'get_secret', { label: 'anthropic-api-key' })
   assert.equal(got.isError, false)
   assert.equal(got.text, 'sk-ant-fixture')
@@ -298,7 +312,7 @@ test('the vault answers on the confirmed argument and its audit log holds no val
 })
 
 test('a wrong secretArg makes get_secret unanswerable and stops claiming confirmation', async (t) => {
-  const { client } = await open(t, { secretArg: 'name', secrets: { k: 'v' } })
+  const { client } = await open(t, { secretArg: 'name', secrets: { k: 'v' }, revealSecrets: true })
   const wrong = await call(client, 'get_secret', { label: 'k' })
   assert.equal(wrong.isError, true, 'the server wants `name`, so `label` resolves nothing')
   const right = await call(client, 'get_secret', { name: 'k' })

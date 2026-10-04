@@ -7,7 +7,7 @@
 //
 // What that reaches which nothing else did:
 //
-//   invariant 7 at real cardinality — 49 tools, nine classified, nothing
+//   invariant 7 at real cardinality — 49 tools, nineteen classified, nothing
 //   exposed to agents, forty defaulting closed;
 //   the vault as the credential path, rather than the D8 env fallback;
 //   `broker.start()`'s schema confirmation, which fails closed on the
@@ -76,11 +76,11 @@ function payloads(store: EventStore, type: string): Record<string, unknown>[] {
     .map((r) => JSON.parse(r.payload) as Record<string, unknown>)
 }
 
-test('a 49-tool server classifies closed: nothing exposed, nine pinned, forty defaulted', async (t) => {
+test('a 49-tool server classifies closed: nothing exposed, nineteen pinned, thirty defaulted', async (t) => {
   // Invariant 7 at the cardinality the operator's machine actually has. The
-  // shipped policy file classifies nine of 49, and the claim is that the other
-  // forty are unreachable by an agent because the DEFAULT is closed — not
-  // because somebody remembered to write them down.
+  // shipped policy file classifies nineteen of 49, and the claim is that the
+  // other thirty are unreachable by an agent because the DEFAULT is closed —
+  // not because somebody remembered to write them down.
   const mock = vaultMock(t, { padTo: PMMCP_TOOL_COUNT })
   const { store, hub } = hubOn(t)
   assert.equal(await hub.connect('pmmcp', mock.connect), 'connected')
@@ -96,7 +96,7 @@ test('a 49-tool server classifies closed: nothing exposed, nine pinned, forty de
 
   assert.equal(counts.exposed, 0, 'no pmmcp tool is exposed to agents')
   assert.equal(counts.disabled, 2, 'the two nested-LLM tools, and only those')
-  assert.equal(counts.unclassified.length, PMMCP_TOOL_COUNT - 9, 'forty of 49 are unclassified')
+  assert.equal(counts.unclassified.length, PMMCP_TOOL_COUNT - 19, 'thirty of 49 are unclassified')
   assert.equal(
     counts.kernelOnly,
     PMMCP_TOOL_COUNT - 2,

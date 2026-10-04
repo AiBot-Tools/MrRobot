@@ -133,7 +133,7 @@ test('scripts/colima-up.sh exists, is executable, and its header says NEEDS VALI
   assert.equal(body.includes('docker.sock:'), false, 'bind-mounts a docker socket')
 })
 
-test('config/tool-views.yaml: pmmcp pins its nine closed, and only the two kernel tools are exposed', () => {
+test('config/tool-views.yaml: pmmcp pins nineteen closed, and only the two kernel tools are exposed', () => {
   const file = parseToolViews(readYaml('config/tool-views.yaml'))
   const servers = Object.keys(file.servers).sort()
   assert.deepEqual(servers, ['kernel', 'pmmcp'])
@@ -150,18 +150,34 @@ test('config/tool-views.yaml: pmmcp pins its nine closed, and only the two kerne
     assert.equal(view.risk, 'write', `${name} must be write risk so a tainted run needs a human`)
   }
 
-  // The nine: seven forced kernel-only plus two forced disabled. Nothing else
-  // is invented here — the other 40 pmmcp tools resolve kernel-only by the
-  // literal default until the operator classifies them from
-  // `hub.tools.classified`.
-  const nine = [...FORCED_KERNEL_ONLY, ...FORCED_DISABLED].sort()
-  assert.equal(nine.length, 9)
-  assert.deepEqual(Object.keys(file.servers['pmmcp']!.tools).sort(), nine)
+  // The nine forced (seven kernel-only, two disabled), plus ten the operator
+  // pinned kernel-only explicitly after pmmcp's source was read: destructive,
+  // vault-adjacent, or (scrape_context) an egress path around the proxy. Every
+  // other pmmcp tool resolves kernel-only by the literal default.
+  const forced = [...FORCED_KERNEL_ONLY, ...FORCED_DISABLED].sort()
+  assert.equal(forced.length, 9)
+  const operatorPinned = [
+    'forget',
+    'delete_secret',
+    'list_secrets',
+    'set_secret_expiry',
+    'get_audit_logs',
+    'save_secret_template',
+    'get_secret_template',
+    'repair_and_heal',
+    'index_git_history',
+    'scrape_context',
+  ]
+  const pinned = [...forced, ...operatorPinned].sort()
+  assert.deepEqual(Object.keys(file.servers['pmmcp']!.tools).sort(), pinned)
+  for (const name of operatorPinned) {
+    assert.equal(resolveView(file, 'pmmcp', name).exposure, 'kernel-only', name)
+  }
 
   // Written out, not merely injected by the parser: an audit of the file has to
   // be able to see the decision.
   const raw = read('config/tool-views.yaml')
-  for (const name of nine) assert.match(raw, new RegExp(`^\\s+${name}:$`, 'm'), name)
+  for (const name of pinned) assert.match(raw, new RegExp(`^\\s+${name}:$`, 'm'), name)
 
   // Nothing is exposed to agents. This is the count that makes invariant 7's
   // default-deny a fact about the shipped file rather than a posture.

@@ -245,8 +245,9 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   assert.equal(/Apple container driver \(throws\)|Apple container driver \(stub\)/.test(section), false)
 
   // The tool-view count is stated in both documents and must agree.
-  assert.match(section, /classifies 9 of 49 pmmcp tools/)
-  assert.match(CLAUDE_MD, /9 pinned names classified in `config\/tool-views\.yaml`/)
+  assert.match(section, /pins 19 pmmcp tools closed/)
+  assert.match(section, /exposes none/)
+  assert.match(CLAUDE_MD, /19 pinned closed in `config\/tool-views\.yaml`, none exposed/)
   assert.equal(/all classified in `config\/tool-views\.yaml`/.test(CLAUDE_MD), false)
 })
 

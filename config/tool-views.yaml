@@ -5,12 +5,17 @@
 # classified is unreachable by agents rather than quietly available — which is
 # what matters on a server that gains tools between releases.
 #
-# pmmcp exposes 49 tools. This file classifies NINE of them, and every one of
-# those nine is pinned CLOSED. Nothing is exposed to agents. The other 40 are
-# not invented here: they resolve to kernel-only by the literal default, and
-# the hub emits `hub.tools.classified` at connect listing them so the operator
-# can classify them from what the server actually reports rather than from a
-# guess written on a Linux box.
+# pmmcp registers about 49-53 tools, depending on its own config. This file
+# classifies NINETEEN of them, and every one is pinned CLOSED. Nothing is
+# exposed to agents. The rest are not invented here: they resolve to
+# kernel-only by the literal default, and the hub emits `hub.tools.classified`
+# at connect listing them so the operator can classify them from what the
+# server actually reports.
+#
+# Before exposing `recall` or `remember`: in pmmcp both take an OPTIONAL
+# project_id, and leaving it out means GLOBAL scope (src/tools/primary.py). The
+# namespaceArg pin below must therefore always SET project_id, never merely
+# check one the model chose to send.
 #
 # Exposing a pmmcp tool to agents also needs a `namespaceArg`: the argument that
 # names a memory namespace, which the gate then pins to the calling agent's own
@@ -61,6 +66,51 @@ servers:
         exposure: kernel-only
         risk: write
         note: rewrites the project index
+
+      # Pinned kernel-only explicitly (operator decision, 2026-10). Each is
+      # already kernel-only by default; writing it down makes the decision
+      # auditable and survives a future default change. Read from pmmcp's
+      # source (55f3c1a).
+      forget:
+        exposure: kernel-only
+        risk: irreversible
+        note: deletes a memory by key; project_id optional, so global by default
+      delete_secret:
+        exposure: kernel-only
+        risk: irreversible
+        note: vault delete
+      list_secrets:
+        exposure: kernel-only
+        risk: read
+        note: vault metadata (labels, no values)
+      set_secret_expiry:
+        exposure: kernel-only
+        risk: write
+        note: vault entry expiry
+      get_audit_logs:
+        exposure: kernel-only
+        risk: read
+        note: vault access audit
+      save_secret_template:
+        exposure: kernel-only
+        risk: write
+        note: vault template write
+      get_secret_template:
+        exposure: kernel-only
+        risk: read
+        note: vault template read
+      repair_and_heal:
+        exposure: kernel-only
+        risk: irreversible
+        note: rewrites pmmcp's own stores
+      index_git_history:
+        exposure: kernel-only
+        risk: write
+        note: indexes a repository's history into memory
+      scrape_context:
+        exposure: kernel-only
+        risk: irreversible
+        note: makes pmmcp fetch URLs itself, an egress path around the Phase 2 proxy
 
       # Forced disabled: nobody may call these, the kernel included. They make
       # nested model calls inside pmmcp, which would bypass the router,

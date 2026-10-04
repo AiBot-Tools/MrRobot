@@ -78,7 +78,7 @@ test('every tool config/tool-views.yaml pins is declared by the double', () => {
   const views = parseToolViews(parseYaml(readFileSync(`${REPO_ROOT}/config/tool-views.yaml`, 'utf8')))
   const pinned = Object.keys(views.servers['pmmcp']?.tools ?? {}).sort()
   const declared = new Set(PMMCP_TOOLS.map((s) => s.name))
-  assert.equal(pinned.length, 9, 'tool-views pins nine pmmcp tools')
+  assert.equal(pinned.length, 19, 'tool-views pins nineteen pmmcp tools')
   for (const name of pinned) {
     assert.equal(declared.has(name), true, `the double does not declare the pinned tool ${name}`)
   }

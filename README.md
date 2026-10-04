@@ -263,10 +263,15 @@ It does **not** resume them, and that is a design decision rather than a gap:
 Resuming a run across a restart needs run state and held content persisted, and
 both are their own decisions with their own costs. Neither is pretended here.
 
-Also true, and not stubs so much as scope: `config/tool-views.yaml` classifies
-**9 of pmmcp's 49 tools**, and all nine are pinned closed — nothing is exposed
-to agents. The remaining 40 are kernel-only by the schema's literal default
-until the operator classifies them from the `hub.tools.classified` event. Every
+Also true, and not stubs so much as scope: `config/tool-views.yaml` pins
+**19 pmmcp tools closed** — the nine the schema forces, plus ten the operator
+pinned kernel-only after pmmcp's source was read (`forget`, the vault-adjacent
+tools, `repair_and_heal`, `index_git_history`, and `scrape_context`, which makes
+pmmcp fetch URLs itself and so would route around the Phase 2 egress proxy).
+Nothing is exposed to agents. Every other tool is kernel-only by the schema's
+literal default until the operator classifies it from `hub.tools.classified`.
+Before `recall` or `remember` is ever exposed: pmmcp treats a missing
+`project_id` as GLOBAL scope, so the gate's namespace pin must set it. Every
 non-Anthropic entry in `config/providers.yaml` is `placeholder: true` and the
 router refuses to serve one.
 

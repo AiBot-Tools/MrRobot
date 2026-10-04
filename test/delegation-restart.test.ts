@@ -116,7 +116,31 @@ test('a restart mid-delegation orphans nothing: runs, admissions, bill and goals
   const client = await connectControl({ port: first.port, token: TEST_TOKEN, timeoutMs: 20_000 })
   const { runId: ceoRunId } = (await client.call('run.start', { agentId: 'ceo', input: 'go' })) as { runId: string }
   client.close()
-  await hung
+  // Bounded. If anything upstream breaks — a plan that no longer adopts, a
+  // delegation refused — the CEO run ends before the fifth call, and an
+  // unbounded wait turns that failure into a hang that names nothing (the
+  // falsifier's G15 found exactly this). Fail fast, and say where it stopped.
+  await new Promise<void>((resolve, reject) => {
+    const why = (what: string): Error =>
+      new Error(`${what} before the fifth model call; the log holds: ${logOf(fx.dbPath).map((r) => r.type).join(', ')}`)
+    const timer = setTimeout(() => {
+      off()
+      reject(why('the scripted run stalled'))
+    }, 20_000)
+    timer.unref?.()
+    const off = first.store.subscribe((row) => {
+      if (row.type === 'run.finished' && row.runId === ceoRunId) {
+        clearTimeout(timer)
+        off()
+        reject(why('the CEO run finished'))
+      }
+    })
+    void hung.then(() => {
+      clearTimeout(timer)
+      off()
+      resolve()
+    })
+  })
   // The writer's goal move to in_progress rides the tracker's queue; let it land
   // so the restart has a live status to clean up rather than a pending one.
   await settle()

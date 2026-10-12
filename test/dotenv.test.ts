@@ -30,6 +30,7 @@ import {
 } from '../src/secrets/dotenv.js'
 import { REPO_ROOT } from './helpers/kernel.js'
 import { tmpdir } from './helpers/tmpdir.js'
+import { daemonEnv } from '../src/main.js'
 
 const ACCEPTED = new Set(['AOS_CONTROL_TOKEN', 'ANTHROPIC_API_KEY'])
 const TOKEN = 'qTok3nVa1ueFor7estsOnly0123456789abcdef'
@@ -320,4 +321,30 @@ test('dotenvPathFrom reads --dotenv once, resolves it against the base, and refu
   assert.match(refusal(() => dotenvPathFrom(['--dotenv', '--config'], '/base')), /needs a path/)
   assert.match(refusal(() => dotenvPathFrom(['--dotenv='], '/base')), /needs a path/)
   assert.match(refusal(() => dotenvPathFrom(['--dotenv', 'a', '--dotenv', 'b'], '/base')), /may be given once/)
+})
+
+test('daemonEnv without --dotenv never opens a trap .env in the repo root and returns exactly the credential names from the shell', (t) => {
+  t.after(() => SecretMask.clear())
+  const read = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
+  const config = parseKernelConfig(read('config/kernel.yaml'), { repoRoot: REPO_ROOT })
+  const providers = parseProviders(read('config/providers.yaml'))
+
+  // A trap: a repo root whose .env would be refused (0644, an undeclared name)
+  // the moment anything opened it.
+  const repo = tmpdir(t)
+  writeFileSync(join(repo, '.gitignore'), '/.env\n')
+  writeFileSync(join(repo, '.env'), 'NODE_OPTIONS=--require=/tmp/evil.js\n', { mode: 0o644 })
+  chmodSync(join(repo, '.env'), 0o644)
+  const shell = { ANTHROPIC_API_KEY: 'fromTheShell', PATH: '/usr/bin', NODE_OPTIONS: '--inspect' }
+
+  const plain = daemonEnv(['--config', 'x.yaml'], { repoRoot: repo, config, providers, shell })
+  assert.equal(plain.loaded, undefined)
+  // Exactly the credential names: nothing else from the shell rides along.
+  assert.deepEqual(plain.env, { AOS_CONTROL_TOKEN: undefined, ANTHROPIC_API_KEY: 'fromTheShell' })
+
+  // The trap is armed: with the flag, the same file is opened and refused.
+  assert.match(
+    refusal(() => daemonEnv(['--dotenv', '.env'], { repoRoot: repo, config, providers, shell })),
+    /has mode 0644/,
+  )
 })

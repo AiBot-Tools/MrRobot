@@ -24,7 +24,7 @@ import './helpers/guard.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { closeVerified, withStore } from './helpers/store.js'
@@ -181,6 +181,9 @@ test('npm run dev boots the daemon, serves the CLI over the socket, and shuts do
   assert.ok(listening, `the daemon never listened:\n${log}`)
   // Degraded, with the six subsystems this machine cannot supply.
   assert.match(log, /booted degraded/)
+  // Started without --dotenv (as every test is): no .env was opened, not even
+  // the operator's real one in this repository's root.
+  assert.match(log, /credentials: shell only \(no --dotenv\)/)
 
   // Now the other shell: a real CLI process talking to a real daemon. This is
   // the round trip nothing else in the suite makes.
@@ -279,4 +282,139 @@ test('the operator scripts are programs: each refuses with usage rather than doi
   assert.match(declared.stderr, /PMMCP_TOKEN is not set/)
   assert.equal(existsSync(declared.out), false)
   t.diagnostic('both scripts refused as programs rather than exiting 0 silently')
+})
+
+/** A kernel.yaml for a spawned daemon: its own data dir and port, pmmcp offline. */
+function daemonConfig(dataDir: string, port: number): string {
+  const path = join(dataDir, 'kernel.yaml')
+  const shipped = readFileSync(join(REPO, 'config', 'kernel.yaml'), 'utf8')
+  writeFileSync(
+    path,
+    offlinePmmcp(shipped)
+      .replace(/^dataDir: .*$/m, `dataDir: ${dataDir}`)
+      .replace(/^  port: \d+$/m, `  port: ${String(port)}`)
+      .replace(/mountRoot: [^\n}]*/g, `mountRoot: ${dataDir}/work `),
+  )
+  mkdirSync(join(dataDir, 'work'), { recursive: true })
+  return path
+}
+
+/** A credentials file OUTSIDE the repository, so the in-repo fence does not apply. */
+function credsFile(dir: string, text: string, mode = 0o600): string {
+  const path = join(dir, 'creds.env')
+  writeFileSync(path, text, { mode })
+  chmodSync(path, mode)
+  return path
+}
+
+// Opaque on purpose: nothing like a real key shape, so its absence from the log
+// proves the exact-value mask rather than the pattern redactor.
+const FILE_TOKEN = 'qFileOnlyControlToken0123456789abcdefgh'
+const FILE_KEY = 'qFileOnlyProviderKeyZYXWVUTSRQ987654321'
+
+test('the daemon reads AOS_CONTROL_TOKEN and a provider key that exist only in a --dotenv file, and neither reaches the log or the output', async (t) => {
+  const dataDir = join(tmpdir(t), 'daemon-dotenv')
+  mkdirSync(dataDir, { recursive: true })
+  const configPath = daemonConfig(dataDir, 7792)
+  const creds = credsFile(tmpdir(t), `# test credentials\nAOS_CONTROL_TOKEN=${FILE_TOKEN}\nANTHROPIC_API_KEY=${FILE_KEY}\n`)
+
+  // No credential in the environment at all: only the file can supply them.
+  const env = { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '', AOS_DATA_DIR: dataDir }
+  const daemon = spawn(process.execPath, ['--import', 'tsx', 'src/main.ts', '--config', configPath, '--dotenv', creds], {
+    cwd: REPO,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let log = ''
+  daemon.stdout.on('data', (d: Buffer) => {
+    log += d.toString('utf8')
+  })
+  daemon.stderr.on('data', (d: Buffer) => {
+    log += d.toString('utf8')
+  })
+  t.after(() => {
+    if (daemon.exitCode === null) daemon.kill('SIGKILL')
+  })
+  const listening = await new Promise<boolean>((resolve) => {
+    const deadline = setTimeout(() => resolve(false), 45_000)
+    const poll = setInterval(() => {
+      if (log.includes('listening on 127.0.0.1') || daemon.exitCode !== null) {
+        clearInterval(poll)
+        clearTimeout(deadline)
+        resolve(daemon.exitCode === null)
+      }
+    }, 250)
+    poll.unref?.()
+    deadline.unref?.()
+  })
+  // Booting at all proves the token came from the file: without one the
+  // control plane refuses to start.
+  assert.ok(listening, `the daemon never listened:\n${log}`)
+  assert.match(log, /credentials: \.env \(AOS_CONTROL_TOKEN, ANTHROPIC_API_KEY\)/)
+
+  daemon.kill('SIGTERM')
+  const exited = await new Promise<number | null>((resolve) => {
+    const deadline = setTimeout(() => resolve(null), 30_000)
+    deadline.unref?.()
+    daemon.once('exit', (code) => {
+      clearTimeout(deadline)
+      resolve(code ?? 0)
+    })
+  })
+  assert.equal(exited, 0, `the daemon did not exit cleanly:\n${log}`)
+
+  const store = new EventStore(join(dataDir, 'events.db'), { readOnly: true })
+  try {
+    const rows = store.query()
+    const accessed = rows.filter((r) => r.type === 'secret.accessed').map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+    assert.deepEqual(
+      accessed.map((a) => `${String(a['id'])}:${String(a['source'])}`),
+      ['anthropic-api-key:env'],
+      'the file-sourced key was not resolved through the env source',
+    )
+    const everything = JSON.stringify(rows)
+    for (const secret of [FILE_TOKEN, FILE_KEY]) {
+      assert.equal(everything.includes(secret), false, 'a file-sourced value reached the event log')
+      assert.equal(log.includes(secret), false, 'a file-sourced value reached the daemon output')
+    }
+    assert.equal(store.verifyChain(store.readAnchor()).ok, true)
+  } finally {
+    store.close()
+  }
+})
+
+test('the daemon refuses a group-readable or non-regular --dotenv before it boots, naming the fix, and creates no log', (t) => {
+  const run = (creds: string, dataDir: string): { status: number | null; out: string } => {
+    const configPath = daemonConfig(dataDir, 7793)
+    const result = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--config', configPath, '--dotenv', creds], {
+      cwd: REPO,
+      env: { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '', AOS_DATA_DIR: dataDir },
+      encoding: 'utf8',
+      timeout: 30_000,
+    })
+    return { status: result.status, out: `${result.stdout ?? ''}${result.stderr ?? ''}` }
+  }
+
+  const readable = credsFile(tmpdir(t), `AOS_CONTROL_TOKEN=${FILE_TOKEN}\n`, 0o644)
+  const dataA = join(tmpdir(t), 'a')
+  mkdirSync(dataA, { recursive: true })
+  const a = run(readable, dataA)
+  assert.equal(a.status, 1, a.out)
+  assert.ok(a.out.includes(`chmod 600 ${readable}`), a.out)
+  assert.equal(existsSync(join(dataA, 'events.db')), false, 'the daemon wrote a log before refusing')
+  assert.equal(a.out.includes(FILE_TOKEN), false)
+
+  // A FIFO: opened non-blocking, so the refusal cannot hang waiting for a writer.
+  const fifo = join(tmpdir(t), 'fifo.env')
+  const made = spawnSync('mkfifo', ['-m', '600', fifo])
+  if (made.status === 0) {
+    const dataB = join(tmpdir(t), 'b')
+    mkdirSync(dataB, { recursive: true })
+    const b = run(fifo, dataB)
+    assert.equal(b.status, 1, b.out)
+    assert.match(b.out, /is not a regular file/)
+    assert.equal(existsSync(join(dataB, 'events.db')), false)
+  } else {
+    t.diagnostic('mkfifo is unavailable here; the FIFO case is covered by the unit test for /dev/null')
+  }
 })

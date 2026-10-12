@@ -64,21 +64,31 @@ export const identify: Identify = (path) => {
 }
 
 /**
- * True when `child` is `parent` itself or lies beneath it: by spelling, or by
- * identity — some ancestor of `child` (itself included) IS `parent`. The
- * spelling test is the floor, so this can only find more containment than a
- * string comparison, never less: a forbidden zone refuses more aliases, and an
- * allowed zone admits only paths that are physically inside it.
+ * True when `child` is `parent` itself or lies beneath it AS SPELLED. The test
+ * for an ALLOWED zone — a workspace under its mountRoot, the event log under
+ * <repo>/.aos — where identity would let a link or a bind mount that shares
+ * the zone's dev:ino vouch for a path that physically lives elsewhere.
  */
-export function isUnder(parent: string, child: string, id: Identify = identify): boolean {
+export function isSpelledUnder(parent: string, child: string): boolean {
   const p = resolve(parent)
   const c = resolve(child)
-  if (c === p) return true
   // The separator is what stops /data/aos-evil matching /data/aos.
-  if (c.startsWith(p.endsWith(sep) ? p : p + sep)) return true
+  return c === p || c.startsWith(p.endsWith(sep) ? p : p + sep)
+}
+
+/**
+ * True when `child` is `parent` itself or lies beneath it: by spelling, or by
+ * identity — some ancestor of `child` (itself included) IS `parent`. The test
+ * for a FORBIDDEN zone (a protected root, $HOME, the repository): the
+ * spelling test is its floor, so it can only find more containment than a
+ * string comparison, never less, and refuses aliases a string would miss.
+ */
+export function isUnder(parent: string, child: string, id: Identify = identify): boolean {
+  if (isSpelledUnder(parent, child)) return true
+  const p = resolve(parent)
   const target = id(p)
   if (target === undefined) return false
-  for (let d = c; ; d = dirname(d)) {
+  for (let d = resolve(child); ; d = dirname(d)) {
     if (id(d) === target) return true
     if (dirname(d) === d) return false
   }

@@ -26,7 +26,7 @@ import './helpers/guard.js'
 
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { tmpdir } from './helpers/tmpdir.js'
@@ -254,6 +254,47 @@ test('a workspace resolving under a protected root is refused', (t) => {
     confineWorkspace(join(f.repoRoot, 'scratch'), f.repoRoot, f.repoRoot),
     realpathSync(join(f.repoRoot, 'scratch')),
   )
+})
+
+test('a workspace that is, or contains, $HOME or the repository is refused on every run, under any spelling', (t) => {
+  // config.ts checks the mountRoot once, at boot. A bind mount or a link made
+  // since can put $HOME under it, spelled as an innocent workspace; on APFS a
+  // case variant does the same. An identity function stands in for that.
+  const f = fixture(t)
+  const home = join(tmpdir(t), 'op')
+  mkdirSync(home)
+  mkdirSync(join(f.mountRoot, 'looks-innocent'))
+  mkdirSync(join(f.mountRoot, 'repo-again'))
+  const aliases: Record<string, string> = {
+    [realpathSync(join(f.mountRoot, 'looks-innocent'))]: home,
+    [realpathSync(join(f.mountRoot, 'repo-again'))]: f.repoRoot,
+  }
+  // An alias covers everything beneath it, as a real one would.
+  const unalias = (p: string): string => {
+    for (const [alias, real] of Object.entries(aliases)) {
+      if (p === alias || p.startsWith(`${alias}/`)) return real + p.slice(alias.length)
+    }
+    return p
+  }
+  const id = (p: string): string | undefined => {
+    try {
+      const st = statSync(unalias(p), { bigint: true })
+      return `${String(st.dev)}:${String(st.ino)}`
+    } catch {
+      return undefined
+    }
+  }
+  const confine = (p: string): string => confineWorkspace(p, f.mountRoot, f.repoRoot, { home, id })
+  assert.throws(() => confine(join(f.mountRoot, 'looks-innocent')), /is or contains \$HOME/)
+  assert.throws(() => confine(join(f.mountRoot, 'repo-again')), /is or contains the repository/)
+  assert.equal(confine(f.workspace), f.realWorkspace)
+
+  // And the allowed zone is judged by spelling: a workspace that IS the
+  // mountRoot by identity but is spelled elsewhere is outside it.
+  const elsewhere = join(tmpdir(t), 'elsewhere')
+  mkdirSync(elsewhere)
+  aliases[realpathSync(elsewhere)] = f.mountRoot
+  assert.throws(() => confine(elsewhere), /outside the domain mountRoot/)
 })
 
 test('resolved real path, not the request string, is passed to docker', (t) => {

@@ -171,11 +171,13 @@ export function auditRunArgs(args: readonly string[], home: string, workspace: s
   // command argument. An empty HOME would make this vacuous, so it is skipped
   // rather than compared against ''.
   //
-  // Checked under EVERY spelling of home: as given and fully resolved. The
-  // workspace is a resolved path (confineWorkspace), so comparing it with an
-  // unresolved HOME misses whenever a component of HOME is a symlink — which on
-  // macOS includes anything under /var, /tmp and /etc. A command argument can
-  // use either spelling, so both are refused.
+  // Checked under both spellings of home a string can carry: as given and
+  // fully resolved. The workspace is a resolved path (confineWorkspace), so
+  // comparing it with an unresolved HOME misses whenever a component of HOME
+  // is a symlink — which on macOS includes anything under /var, /tmp and /etc.
+  // A command argument can use either spelling, so both are refused. Spellings
+  // a string cannot see (an APFS case variant, a firmlink, a bind mount) are
+  // refused by identity in confineWorkspace, on every run.
   if (home !== '') {
     const spellings = [...new Set([home, realpathNearest(home)])]
     for (const h of spellings) {

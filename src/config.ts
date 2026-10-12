@@ -29,7 +29,7 @@ import { z } from 'zod'
 
 import { ConfigError } from './errors.js'
 import { rootGitignoreIgnores } from './gitignore.js'
-import { isUnder, realpathNearest } from './agents/protected.js'
+import { identify, isSpelledUnder, isUnder, realpathNearest, type Identify } from './agents/protected.js'
 import { DENY_KEYS } from './events/redact.js'
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
@@ -379,25 +379,45 @@ export function gitignoresAos(repoRoot: string): boolean {
  * directory that contains the repository or $HOME. Paths are compared after
  * symlink resolution, so a link cannot launder one location into another.
  */
-function assertDataLocation(target: string, field: string, repoRoot: string, allowed: string): void {
+export function assertDataLocation(
+  target: string,
+  field: string,
+  repoRoot: string,
+  allowed: string,
+  // Seams for tests: an alias of $HOME or the repository cannot be made on a
+  // case-sensitive filesystem without root.
+  opts: { readonly home?: string; readonly id?: Identify } = {},
+): void {
+  const id = opts.id ?? identify
   const real = realpathNearest(target)
   const repo = realpathNearest(repoRoot)
-  const home = realpathNearest(homedir())
+  const home = realpathNearest(opts.home ?? homedir())
   const fence = join(repo, allowed)
 
-  // isUnder decides by identity as well as spelling, so a case-variant or
-  // firmlinked spelling of $HOME or the repository is still recognised.
-  if (real === home || (isUnder(home, real) && isUnder(real, home))) {
+  // Forbidden zones by identity as well as spelling (isUnder), so a
+  // case-variant or firmlinked spelling of $HOME or the repository is still
+  // recognised.
+  if (real === home || (isUnder(home, real, id) && isUnder(real, home, id))) {
     throw new ConfigError(`${field} must not be $HOME itself (${home})`)
   }
-  if (isUnder(real, repo)) {
+  if (isUnder(real, repo, id)) {
     throw new ConfigError(`${field} resolves to ${real}, which contains the repository (${repo})`)
   }
-  if (isUnder(real, home)) {
+  if (isUnder(real, home, id)) {
     throw new ConfigError(`${field} resolves to ${real}, which contains $HOME (${home})`)
   }
-  if (isUnder(repo, real)) {
-    if (!isUnder(fence, real)) {
+  if (isUnder(repo, real, id)) {
+    // The allowed zone by spelling only, and it must be what it says: a
+    // `.aos` that is a link puts the data wherever the link points, which
+    // `/.aos/` in .gitignore does not cover.
+    const realFence = realpathNearest(fence)
+    if (realFence !== fence) {
+      throw new ConfigError(
+        `${fence} is a link to ${realFence}: git does not ignore what is written through it. ` +
+          `Make ${allowed} a real directory.`,
+      )
+    }
+    if (!isSpelledUnder(fence, real)) {
       throw new ConfigError(
         `${field} resolves to ${real}, inside the repository but outside ${fence}. ` +
           'Inside the repo, the event log and container mounts live only under .aos/, which git ignores.',

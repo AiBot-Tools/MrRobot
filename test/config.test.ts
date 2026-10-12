@@ -10,13 +10,13 @@ import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse as parseYaml } from 'yaml'
 
-import { assertNoSecretKeys, expandHome, gitignoresAos, parseKernelConfig } from '../src/config.js'
+import { assertDataLocation, assertNoSecretKeys, expandHome, gitignoresAos, parseKernelConfig } from '../src/config.js'
 import { tmpdir } from './helpers/tmpdir.js'
 
 // The real checkout, wherever it is: the location rules read its .gitignore.
@@ -215,6 +215,67 @@ test('never $HOME, and never a directory that contains the repository or $HOME',
   } finally {
     process.chdir(cwd)
   }
+})
+
+test('$HOME and the repository are recognised under any spelling; .aos is admitted only as spelled', (t) => {
+  // On the operator's APFS volume /users/op and /Users/op are one directory.
+  // Real directories stand in for $HOME and the repo; an identity function
+  // makes the "-ALIAS" spellings resolve to them, as the filesystem would.
+  const base = tmpdir(t)
+  const home = join(base, 'people', 'op')
+  const repo = join(base, 'people', 'op', 'MrRobot')
+  mkdirSync(join(repo, '.aos'), { recursive: true })
+  writeFileSync(join(repo, '.gitignore'), '/.aos/\n')
+  const aliases: Record<string, string> = {
+    [`${home}-ALIAS`]: home,
+    [`${join(base, 'people')}-ALIAS`]: join(base, 'people'),
+    [`${repo}-ALIAS`]: repo,
+  }
+  // An alias covers everything beneath it, as a real one would.
+  const unalias = (p: string): string => {
+    for (const [alias, real] of Object.entries(aliases)) {
+      if (p === alias || p.startsWith(`${alias}/`)) return real + p.slice(alias.length)
+    }
+    return p
+  }
+  const id = (p: string): string | undefined => {
+    try {
+      const st = statSync(unalias(p), { bigint: true })
+      return `${String(st.dev)}:${String(st.ino)}`
+    } catch {
+      return undefined
+    }
+  }
+  const check = (target: string, allowed = '.aos'): void => assertDataLocation(target, 'dataDir', repo, allowed, { home, id })
+
+  assert.throws(() => check(`${home}-ALIAS`), /must not be \$HOME itself/)
+  assert.throws(() => check(`${join(base, 'people')}-ALIAS`), /contains (the repository|\$HOME)/)
+  assert.throws(() => check(join(`${repo}-ALIAS`, 'data')), /inside the repository but outside/)
+  // Inside .aos by identity but not as spelled: refused, never vouched for.
+  assert.throws(() => check(join(`${repo}-ALIAS`, '.aos', 'x')), /inside the repository but outside/)
+  // And the plain spelling still works.
+  assert.doesNotThrow(() => check(join(repo, '.aos', 'x')))
+})
+
+test('a .aos that is a link is refused: what is written through it lands where git does not ignore it', (t) => {
+  // `mv .aos aos-data && ln -s aos-data .aos`: /.aos/ in .gitignore does not
+  // cover a symlink, and the data would sit in aos-data/, un-ignored.
+  const repo = tmpdir(t)
+  writeFileSync(join(repo, '.gitignore'), '/.aos/\n')
+  mkdirSync(join(repo, 'aos-data', 'workspaces', 'hostile'), { recursive: true })
+  symlinkSync('aos-data', join(repo, '.aos'))
+  const doc = fixture('valid.yaml') as { dataDir: string; sandbox: { domains: { hostile: { mountRoot: string } } } }
+  doc.dataDir = './.aos'
+  assert.throws(() => parse(doc, repo), /\.aos is a link to .*aos-data/)
+  const mount = fixture('valid.yaml') as { dataDir: string; sandbox: { domains: { hostile: { mountRoot: string } } } }
+  mount.dataDir = tmpdir(t)
+  mount.sandbox.domains.hostile.mountRoot = './.aos/workspaces/hostile'
+  assert.throws(() => parse(mount, repo), /is a link to/)
+  // A link to the repository root itself is no better.
+  const loop = tmpdir(t)
+  writeFileSync(join(loop, '.gitignore'), '/.aos/\n')
+  symlinkSync('.', join(loop, '.aos'))
+  assert.throws(() => parse(doc, loop), /is a link to|contains the repository/)
 })
 
 test('rejects an allowedOrigins entry that is not tauri://localhost or loopback http(s)', () => {

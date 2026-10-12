@@ -473,6 +473,29 @@ const dotenvDefault: Suite = {
   },
 }
 
+const GITIGNORE = 'src/gitignore.ts'
+
+const gitignore: Suite = {
+  name: 'gitignore',
+  tests: ['test/gitignore.test.ts', 'test/dotenv.test.ts', 'test/config.test.ts', 'test/config-files.test.ts'],
+  mutants: [
+    { id: 'I1', file: GITIGNORE, from: '      if (forms.some((f) => matches(f, entry, kind, true) !== false)) ignored = false', to: '      if (false) ignored = false', why: 'a later `!*` or `!.en?` re-includes .env and the check still says ignored' },
+    { id: 'I2', file: GITIGNORE, from: '  let pattern = trimTrailingSpaces(line)', to: '  let pattern = trimTrailingSpaces(line.trim())', why: 'a line git reads as \' .env\' or \'.env<TAB>\' is credited as ignoring .env' },
+    { id: 'I3', file: GITIGNORE, from: '  if (dirOnly && kind !== \'dir\') return false', to: '', why: 'a directory-only `.env/` is credited as ignoring the file' },
+    { id: 'I4', file: GITIGNORE, from: '    } else if (matches(raw, entry, kind, false) === true) {', to: '    } else if (matches(raw, entry, kind, true) === true) {', why: 'an ignoring line that matches only under core.ignorecase is credited on any machine' },
+    { id: 'I5', file: GITIGNORE, from: '  if (segments.length !== 1) return false', to: '  if (segments.length !== 1) return true', why: '`foo/.env` or `.env/**` is credited as ignoring the root entry' },
+    { id: 'I6', file: GITIGNORE, from: '    if (!lstatSync(path).isFile()) return false', to: '    if (false) return false', why: 'a symlinked .gitignore, which git does not read, is trusted' },
+    { id: 'I7', file: GITIGNORE, from: '  if (text.startsWith(\'\\xEF\\xBB\\xBF\')) text = text.slice(3)', to: '', why: 'a BOM-prefixed .gitignore is read unlike git, which skips the BOM: a first-line `!.env` goes unseen' },
+  ],
+  control: {
+    id: 'C',
+    file: GITIGNORE,
+    from: '// Does <repo>/.gitignore ignore one entry directly under the repository root?',
+    to: '// Does <repo>/.gitignore ignore one entry directly under the repository root? (control)',
+    why: 'comment only',
+  },
+}
+
 export const CATALOG: readonly Suite[] = [
   delegation,
   recovery,
@@ -489,4 +512,5 @@ export const CATALOG: readonly Suite[] = [
   sandbox,
   dotenv,
   dotenvDefault,
+  gitignore,
 ]

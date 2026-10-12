@@ -284,6 +284,13 @@ test('inside the repository only <repo>/.env is read, and only while .gitignore 
   assert.match(refusal(() => loadDotenv(env, inRepo)), /is not ignored by .*\.gitignore: add the line \/\.env/)
   writeFileSync(join(repo, '.gitignore'), '.env\n!.env\n')
   assert.match(refusal(() => loadDotenv(env, inRepo)), /is not ignored/)
+  // Read with git's rules (test/gitignore.test.ts): a negation that does not
+  // spell .env still re-includes it, and a leading space or a trailing `/` makes
+  // a line git does not apply to the file.
+  for (const text of ['.env*\n!*\n', '.env*\n!.en?\n', ' .env\n', '.env/\n']) {
+    writeFileSync(join(repo, '.gitignore'), text)
+    assert.match(refusal(() => loadDotenv(env, inRepo)), /is not ignored/, JSON.stringify(text))
+  }
   for (const line of ['/.env', '.env', '.env*', '.env*\n!.env.example']) {
     writeFileSync(join(repo, '.gitignore'), `node_modules/\n${line}\n`)
     assert.equal(gitignoresDotenv(repo), true, line)

@@ -23,12 +23,12 @@
 // Every numeric field is positive and no field admits "unlimited". A budget
 // that can be switched off is not a budget.
 
-import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 import { z } from 'zod'
 
 import { ConfigError } from './errors.js'
+import { rootGitignoreIgnores } from './gitignore.js'
 import { realpathNearest } from './agents/protected.js'
 import { DENY_KEYS } from './events/redact.js'
 
@@ -364,15 +364,14 @@ export function parseKernelConfig(input: unknown, options: LoadOptions): KernelC
 const within = (child: string, parent: string): boolean =>
   child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep)
 
-/** True when the repository's .gitignore ignores the top-level `.aos/`. */
+/**
+ * True when the repository's .gitignore ignores the top-level directory `.aos`,
+ * read with git's rules and failing closed (src/gitignore.ts). Ignoring the
+ * directory itself, not just its contents, is what stops a later `!` line from
+ * re-including the event log.
+ */
 export function gitignoresAos(repoRoot: string): boolean {
-  let text: string
-  try {
-    text = readFileSync(join(repoRoot, '.gitignore'), 'utf8')
-  } catch {
-    return false
-  }
-  return text.split(/\r?\n/).some((line) => /^\/?\.aos\/?$/.test(line.trim()))
+  return rootGitignoreIgnores(repoRoot, '.aos', 'dir')
 }
 
 /**

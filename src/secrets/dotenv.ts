@@ -35,12 +35,13 @@
 //   Messages carry the path, line numbers and accepted names only, because the
 //   daemon's catch logs e.message and pino has no value mask of its own.
 
-import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs'
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from 'node:fs'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 
 import type { KernelConfig } from '../config.js'
 import { ConfigError } from '../errors.js'
 import { SecretMask } from '../events/redact.js'
+import { rootGitignoreIgnores } from '../gitignore.js'
 import type { ProvidersFile } from '../models/registry.js'
 
 export const DOTENV_FLAG = '--dotenv'
@@ -130,24 +131,12 @@ export function dotenvPathFrom(argv: readonly string[], base: string): string | 
 }
 
 /**
- * True when <repoRoot>/.gitignore ignores `.env`: a trimmed line `.env`, `/.env`
- * or `.env*`, with no later negation that names `.env` itself. `!.env.example`
- * is fine — it un-ignores the template, not the live file.
+ * True when <repoRoot>/.gitignore ignores the file `.env`, read with git's
+ * rules and failing closed (src/gitignore.ts): `.env*` then `!.env.example`
+ * ignores it; a later negation that could match `.env` — `!*`, `!.en?` — does not.
  */
 export function gitignoresDotenv(repoRoot: string): boolean {
-  let text: string
-  try {
-    text = readFileSync(join(repoRoot, '.gitignore'), 'utf8')
-  } catch {
-    return false
-  }
-  let ignored = false
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim()
-    if (line === '.env' || line === '/.env' || line === '.env*' || line === '/.env*') ignored = true
-    else if (line === '!.env' || line === '!/.env' || line === '!.env*' || line === '!/.env*') ignored = false
-  }
-  return ignored
+  return rootGitignoreIgnores(repoRoot, DOTENV_FILE, 'file')
 }
 
 /**

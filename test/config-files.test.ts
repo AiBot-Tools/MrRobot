@@ -502,7 +502,9 @@ test('.gitignore ignores .env*, editor copies, and un-ignores only .env.example'
   const ignore = lines.indexOf('.env*')
   assert.ok(ignore !== -1, '.gitignore has no .env* line')
   assert.ok(lines.indexOf('!.env.example') > ignore, '!.env.example must follow .env*')
-  const negations = lines.filter((l) => l.startsWith('!') && l.includes('.env'))
+  // Every negation, not only those that spell .env: `!*` or `!.en?` would
+  // re-include the live file just the same.
+  const negations = lines.filter((l) => l.startsWith('!'))
   assert.deepEqual(negations, ['!.env.example'], 'a negation re-includes more than the template')
   for (const editor of ['*~', '*.swp', '*.swo']) assert.ok(lines.includes(editor), `.gitignore misses ${editor}`)
 })

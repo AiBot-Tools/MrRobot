@@ -38,7 +38,7 @@ import { EventStore } from '../events/store.js'
 import { redactString } from '../events/redact.js'
 import { expandHome, parseKernelConfig, type KernelConfig } from '../config.js'
 import { parseProviders } from '../models/registry.js'
-import { credentialNames, oneCredential } from '../secrets/dotenv.js'
+import { credentialNames, dotenvPathFrom, oneCredential } from '../secrets/dotenv.js'
 import { connectControl, ControlCallError, type ControlClient } from './client.js'
 import type { ApprovalItem, HoldItem } from '../control/protocol.js'
 
@@ -187,6 +187,10 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
   let parsed
   try {
     parsed = parseArgs({ args: [...argv], options: OPTIONS, allowPositionals: true, strict: true })
+    // parseArgs keeps the last of a repeated option; the daemon and eval refuse
+    // a second --dotenv, and so does this, so `npm run cli -- --dotenv x` cannot
+    // quietly replace the .env that package.json names.
+    dotenvPathFrom(argv, io.cwd)
   } catch (e) {
     io.err(e instanceof Error ? e.message : String(e))
     io.err(USAGE)

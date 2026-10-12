@@ -677,6 +677,20 @@ test('with --dotenv and no token anywhere, a socket command says AOS_CONTROL_TOK
   assert.deepEqual(h.connects, [])
 })
 
+test('a second --dotenv is a usage error, as for the daemon and eval, not a silent override', async (t) => {
+  const h = harness(t, { env: { AOS_CONTROL_TOKEN: undefined } })
+  withProviders(h)
+  const path = creds(t, `AOS_CONTROL_TOKEN=${FILE_TOKEN}\n`)
+  for (const argv of [
+    ['approvals', '--config', h.configPath, '--dotenv', '.env', '--dotenv', path],
+    ['approvals', '--config', h.configPath, '--dotenv=.env', '--dotenv', path],
+  ]) {
+    assert.equal(await runCli(argv, h.io), 2)
+    assert.match(h.errs.join('\n'), /--dotenv may be given once/)
+    assert.deepEqual(h.connects, [])
+  }
+})
+
 test('a refused --dotenv is a refusal before the wire, naming the fix', async (t) => {
   const h = harness(t, { env: { AOS_CONTROL_TOKEN: undefined } })
   withProviders(h)

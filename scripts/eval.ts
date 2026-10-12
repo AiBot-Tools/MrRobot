@@ -24,7 +24,7 @@ import { parse as parseYaml } from 'yaml'
 
 import { parseKernelConfig } from '../src/config.js'
 import { parseProviders } from '../src/models/registry.js'
-import { credentialNames, oneCredential } from '../src/secrets/dotenv.js'
+import { credentialNames, dotenvPathFrom, oneCredential } from '../src/secrets/dotenv.js'
 import { CEO_CHECKS } from '../src/eval/checks.js'
 import { runSuite, type EvalTarget } from '../src/eval/harness.js'
 import { exitCode, renderSuite, toJson } from '../src/eval/report.js'
@@ -42,8 +42,14 @@ async function main(argv: readonly string[]): Promise<number> {
 
   // The shell first, then the file --dotenv names (npm run eval passes .env):
   // only the control token, never a provider key — this process needs none.
-  const dotenv = flag(argv, 'dotenv')
-  const dotenvPath = dotenv === undefined ? undefined : resolve(repoRoot, dotenv)
+  // Parsed as the daemon parses it: either form, and a second one refused.
+  let dotenvPath: string | undefined
+  try {
+    dotenvPath = dotenvPathFrom(argv, repoRoot)
+  } catch (e) {
+    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`)
+    return 2
+  }
   const token = oneCredential(config.control.tokenEnv, dotenvPath, {
     repoRoot,
     accepted:

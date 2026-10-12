@@ -427,8 +427,8 @@ const dotenv: Suite = {
     { id: 'X6', file: DOTENV, from: '    if (st.size > DOTENV_MAX_BYTES) {', to: '    if (false) {', why: 'an arbitrarily large file is read and parsed' },
     { id: 'X7', file: DOTENV, from: '    if (!accepted.has(name)) {', to: '    if (false) {', why: 'any name in the file is admitted, NODE_OPTIONS and AOS_LIVE_TESTS included' },
     { id: 'X8', file: DOTENV, from: '  for (const name of options.wanted) {', to: '  for (const name of options.accepted) {', why: 'the CLI and eval receive provider keys they never asked for' },
-    { id: 'X9', file: DOTENV, from: '    env[name] = fromShell !== undefined && fromShell !== \'\' ? fromShell : loaded?.values[name]', to: '    env[name] = loaded?.values[name] ?? fromShell', why: 'the file silently beats a value the operator exported' },
-    { id: 'X10', file: DOTENV, from: '    if (fromShell !== undefined && fromShell !== \'\') {\n      shadowed.push(name)', to: '    if (fromShell !== undefined) {\n      shadowed.push(name)', why: 'an exported empty string hides the key in the file' },
+    { id: 'X9', file: DOTENV, from: '  for (const name of names) env[name] = shellValue(shell, name) ?? loaded?.values[name]', to: '  for (const name of names) env[name] = loaded?.values[name] ?? shellValue(shell, name)', why: 'the file silently beats a value the operator exported' },
+    { id: 'X10', file: DOTENV, from: '  return value !== undefined && value.trim() !== \'\' ? value : undefined', to: '  return value !== undefined ? value : undefined', why: 'an exported empty or blank string hides the key in the file (and is "set" to one reader, "unset" to another)' },
     { id: 'X11', file: DOTENV, from: '    if (earlier !== undefined) {', to: '    if (false) {', why: 'a name set twice resolves silently to one of them' },
     { id: 'X12', file: DOTENV, from: '    if (ENV_LINE.test(value)) {', to: '    if (false) {', why: 'a value that is a joined NAME=value line is loaded as a key' },
     { id: 'X13', file: DOTENV, from: '    SecretMask.register(fromFile.value)', to: '    void fromFile.value', why: 'a file-sourced value is not masked before anything can log it' },
@@ -440,7 +440,8 @@ const dotenv: Suite = {
     { id: 'X18', file: DOTENV, from: '      problems.push(`line ${String(n)}: a name this kernel does not read: delete the line`)', to: '      problems.push(`line ${String(n)}: ${name} is a name this kernel does not read: delete the line`)', why: 'a refusal quotes an unaccepted name, which may be a pasted key' },
     { id: 'X19', file: DOTENV, from: '    if (parsed.value === \'\') out.delete(name)', to: '', why: 'a blank value is returned as the empty string instead of unset' },
     { id: 'X20', file: DOTENV, from: '    if (value.toLowerCase().startsWith(PLACEHOLDER_PREFIX)) {', to: '    if (false) {', why: 'an unfilled copy of .env.example sends its placeholder as a key' },
-    { id: 'X21', file: DOTENV, from: '  if (fromShell !== \'\') return fromShell\n', to: '', why: 'the CLI opens the file even when the shell already has the token' },
+    { id: 'X21', file: DOTENV, from: '  if (fromShell !== undefined) return fromShell.trim()\n', to: '', why: 'the CLI opens the file even when the shell already has the token' },
+    { id: 'X29', file: DOTENV, from: '    if (/[^\\x21-\\x7e]/.test(value)) {', to: '    if (false) {', why: 'a smart-quoted or zero-width-spaced key in .env is loaded and fails at the first request, naming nothing' },
     { id: 'X23', file: 'src/secrets/broker.ts', from: '  if (looksLikeEnvLine(value)) {', to: '  if (false) {', why: 'a shell value that is a joined NAME=value line is minted as a key' },
     { id: 'X26', file: 'src/secrets/broker.ts', from: '    return this.#mintFromEnv(id, envVar, fromEnv, purpose)\n  }\n\n  /** Both env paths', to: '    return this.#mint(id, \'env\', fromEnv, purpose)\n  }\n\n  /** Both env paths', why: 'the D8 env fallback mints a value source env would refuse' },
     { id: 'X27', file: 'src/secrets/broker.ts', from: '  if (/[^\\x21-\\x7e]/.test(value)) return', to: '  if (false) return', why: 'a smart-quoted or zero-width-spaced key is minted and fails far away, naming nothing' },
@@ -456,17 +457,20 @@ const dotenv: Suite = {
   },
 }
 
-// X22 lives apart from the dotenv suite on purpose. That suite runs
-// test/entrypoints.test.ts, which spawns the daemon with cwd = this checkout —
-// where the operator keeps the real <repo>/.env. A mutant that defaults the
-// daemon's credentials file to <repo>/.env, run there, has a test-spawned
-// daemon read the real keys before any assertion can kill it. Here the only
-// test is the in-process one that points daemonEnv at a trap repo.
+// Mutants on how an entry point picks its credentials file live apart from the
+// dotenv suite on purpose. That suite runs test/entrypoints.test.ts, which
+// spawns the daemon, the CLI and eval with cwd = this checkout — where the
+// operator keeps the real <repo>/.env. X22 (default the daemon to <repo>/.env),
+// run there, would have a test-spawned daemon read the real keys before any
+// assertion killed it. Here the tests are in-process and their repos are temp
+// directories: dotenv.test.ts points daemonEnv at a trap repo, and cli.test.ts
+// runs the CLI with a temp cwd. falsify.test.ts keeps it that way.
 const dotenvDefault: Suite = {
   name: 'dotenvDefault',
-  tests: ['test/dotenv.test.ts'],
+  tests: ['test/dotenv.test.ts', 'test/cli.test.ts'],
   mutants: [
     { id: 'X22', file: 'src/main.ts', from: '  const path = dotenvPathFrom(argv, ctx.repoRoot)', to: '  const path = dotenvPathFrom(argv, ctx.repoRoot) ?? join(ctx.repoRoot, \'.env\')', why: 'a daemon started without --dotenv opens <repo>/.env anyway' },
+    { id: 'X30', file: 'src/cli/index.ts', from: '    dotenvPathFrom(argv, io.cwd)\n', to: '', why: 'npm run cli -- --dotenv other silently replaces the .env package.json names' },
   ],
   control: {
     id: 'C',

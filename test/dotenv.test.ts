@@ -25,6 +25,7 @@ import {
   dotenvPathFrom,
   gitignoresDotenv,
   loadDotenv,
+  oneCredential,
   parseDotenv,
   placeInRepo,
   type DotenvOptions,
@@ -99,6 +100,18 @@ test('an exported empty value does not shadow the file', (t) => {
     AOS_CONTROL_TOKEN: undefined,
     ANTHROPIC_API_KEY: KEY,
   })
+})
+
+test('a whitespace-only shell value is unset to every reader: the daemon, the CLI and the shadow report', (t) => {
+  t.after(() => SecretMask.clear())
+  const path = write(t, `AOS_CONTROL_TOKEN=${TOKEN}\nANTHROPIC_API_KEY=${KEY}\n`)
+  for (const blank of [' ', '\t', '  \t ']) {
+    const shell = { AOS_CONTROL_TOKEN: blank, ANTHROPIC_API_KEY: blank }
+    const loaded = loadDotenv(path, opts({ shell }))
+    assert.deepEqual(loaded.shadowed, [], JSON.stringify(blank))
+    assert.deepEqual(credentialEnv(ACCEPTED, shell, loaded), { AOS_CONTROL_TOKEN: TOKEN, ANTHROPIC_API_KEY: KEY })
+    assert.equal(oneCredential('AOS_CONTROL_TOKEN', path, { repoRoot: REPO_ROOT, accepted: ACCEPTED, shell }), TOKEN)
+  }
 })
 
 test('only wanted names leave the loader: a caller wanting AOS_CONTROL_TOKEN never receives ANTHROPIC_API_KEY', (t) => {
@@ -181,12 +194,17 @@ test('a missing file is not an error: found is false and no values are returned'
 
 test('grammar accepts comments, blank lines, export prefixes, CRLF, matched quotes and a leading BOM', (t) => {
   t.after(() => SecretMask.clear())
-  const text = `﻿# credentials\r\n\r\n   \r\n  # indented comment\r\nexport AOS_CONTROL_TOKEN = "${TOKEN}"\r\nANTHROPIC_API_KEY='${KEY}'   \r\n`
+  const text = `# credentials\r\n\r\n   \r\n  # indented comment\r\nexport AOS_CONTROL_TOKEN = "${TOKEN}"\r\nANTHROPIC_API_KEY='${KEY}'   \r\n`
   const path = write(t, text)
   assert.deepEqual(loadDotenv(path, opts()).values, { AOS_CONTROL_TOKEN: TOKEN, ANTHROPIC_API_KEY: KEY })
+
+  // The BOM directly before an assignment, where nothing but the decoder can
+  // remove it (trim() would also eat it from a comment line, proving nothing).
+  const bom = write(t, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(`AOS_CONTROL_TOKEN=${TOKEN}\n`)]), 0o600, 'bom.env')
+  assert.deepEqual(loadDotenv(bom, opts()).values, { AOS_CONTROL_TOKEN: TOKEN })
 })
 
-test('grammar refuses by line number: inner whitespace, an unmatched quote, an unquoted #, a bare CR, and a value that is itself NAME=value', () => {
+test('grammar refuses by line number: inner whitespace, an unmatched quote, an unquoted #, a bare CR, a value that is itself NAME=value, and anything outside printable ASCII', () => {
   const cases: [string, RegExp][] = [
     ['ANTHROPIC_API_KEY=two words', /line 1: ANTHROPIC_API_KEY holds whitespace/],
     ['ANTHROPIC_API_KEY="unterminated', /line 1: ANTHROPIC_API_KEY has an unmatched quote/],
@@ -195,6 +213,11 @@ test('grammar refuses by line number: inner whitespace, an unmatched quote, an u
     ['ANTHROPIC_API_KEY=a`b', /line 1: ANTHROPIC_API_KEY holds whitespace/],
     ['ANTHROPIC_API_KEY=ab\rcd', /line 1: a stray carriage return/],
     ['ANTHROPIC_API_KEY=AOS_CONTROL_TOKEN=abc', /line 1: ANTHROPIC_API_KEY holds a whole NAME=value line/],
+    ['ANTHROPIC_API_KEY=\u201Csk-ant-abc\u201D', /line 1: ANTHROPIC_API_KEY holds a character outside printable ASCII/],
+    ['ANTHROPIC_API_KEY=sk-ant-abc\u200B', /line 1: ANTHROPIC_API_KEY holds a character outside printable ASCII/],
+    ['ANTHROPIC_API_KEY=sk-ant-\u00E9abc', /line 1: ANTHROPIC_API_KEY holds a character outside printable ASCII/],
+    // JS counts U+FEFF as whitespace, so a stray BOM mid-file is refused as that.
+    ['ANTHROPIC_API_KEY=sk-ant-\uFEFFabc', /line 1: ANTHROPIC_API_KEY holds whitespace/],
     ['just some text', /line 1: not NAME=value/],
     ['=novalue', /line 1: not NAME=value/],
   ]

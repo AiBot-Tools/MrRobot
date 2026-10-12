@@ -151,11 +151,19 @@ export function credentialEnv(
   loaded: DotenvResult | undefined,
 ): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {}
-  for (const name of names) {
-    const fromShell = shell[name]
-    env[name] = fromShell !== undefined && fromShell !== '' ? fromShell : loaded?.values[name]
-  }
+  for (const name of names) env[name] = shellValue(shell, name) ?? loaded?.values[name]
   return env
+}
+
+/**
+ * A shell value that counts as set: anything but unset, empty or only
+ * whitespace. One definition for the daemon, the CLI, eval and the shadow
+ * report, so `export AOS_CONTROL_TOKEN=" "` cannot be "set" to one of them and
+ * "unset" to another while the real value sits in the file.
+ */
+function shellValue(shell: Readonly<Record<string, string | undefined>>, name: string): string | undefined {
+  const value = shell[name]
+  return value !== undefined && value.trim() !== '' ? value : undefined
 }
 
 function realpathOrSelf(p: string): string {
@@ -225,6 +233,12 @@ export function parseDotenv(text: string, accepted: ReadonlySet<string>, label =
     }
     if (/[\s#'"`]/.test(value)) {
       problems.push(`line ${String(n)}: ${name} holds whitespace, a quote, a backtick or '#': a key is one unbroken token`)
+      continue
+    }
+    // A TextEdit smart quote or a zero-width space pasted from a web page is
+    // none of the above, and no provider key or token holds one.
+    if (/[^\x21-\x7e]/.test(value)) {
+      problems.push(`line ${String(n)}: ${name} holds a character outside printable ASCII (a smart quote, a zero-width space): retype it`)
       continue
     }
     if (ENV_LINE.test(value)) {
@@ -320,11 +334,11 @@ export function loadDotenv(path: string, options: DotenvOptions): DotenvResult {
 
   let text: string
   try {
+    // ignoreBOM is false: the decoder consumes a leading UTF-8 BOM itself.
     text = new TextDecoder('utf-8', { fatal: true }).decode(buf)
   } catch {
     throw new ConfigError(`${abs} is not valid UTF-8`)
   }
-  if (text.startsWith('﻿')) text = text.slice(1)
   if (text.includes('\0')) throw new ConfigError(`${abs} contains a NUL byte`)
 
   const parsed = parseDotenv(text, options.accepted, abs)
@@ -333,8 +347,7 @@ export function loadDotenv(path: string, options: DotenvOptions): DotenvResult {
   for (const name of options.wanted) {
     const fromFile = parsed.get(name)
     if (fromFile === undefined) continue
-    const fromShell = options.shell[name]
-    if (fromShell !== undefined && fromShell !== '') {
+    if (shellValue(options.shell, name) !== undefined) {
       shadowed.push(name)
       continue
     }
@@ -357,8 +370,8 @@ export function oneCredential(
   path: string | undefined,
   options: Omit<DotenvOptions, 'wanted'>,
 ): string | undefined {
-  const fromShell = (options.shell[name] ?? '').trim()
-  if (fromShell !== '') return fromShell
+  const fromShell = shellValue(options.shell, name)
+  if (fromShell !== undefined) return fromShell.trim()
   if (path === undefined) return undefined
   return loadDotenv(path, { ...options, wanted: [name] }).values[name]
 }

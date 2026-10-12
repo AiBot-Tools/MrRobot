@@ -12,10 +12,11 @@
 // finish `router-degraded` with zero cost and the test would be measuring
 // nothing.
 //
-// Only the second is the Phase 0 exit criterion. The first proves the provider
-// path using D8's env fallback, and a credential from the environment can never
-// stand in for a credential from the vault — that substitution is the whole
-// thing invariant 2 exists to prevent.
+// Only the second is the Phase 0 exit criterion. Both take the key from the
+// environment (secrets.source: env, as shipped: the shell or <repo>/.env); the
+// first proves the provider path with pmmcp unreachable (a closed port), and
+// only the second has pmmcp really connected, which is what the criterion
+// asks for.
 
 import { allowHost } from './helpers/guard.js'
 

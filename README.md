@@ -73,15 +73,25 @@ committed template: placeholders only, never edited to hold a real value, and it
 does not change when your `.env` does.
 
 ```bash
-test -e .env || (umask 077 && cp .env.example .env)   # a new .env, mode 0600; never overwrites one
-chmod 600 .env                                         # cp keeps an existing file's mode, so set it
-${EDITOR:-nano} .env                                   # replace both replace-me-... values (openssl rand -hex 32 makes a token)
-npm run dev                                            # logs: credentials: .env (AOS_CONTROL_TOKEN, ANTHROPIC_API_KEY)
-npm run cli -- agents                                  # in a second shell; nothing to export
+test -e .env || (umask 077 && cp .env.example .env)
+chmod 600 .env
+nano .env
+npm run dev
 ```
 
-Use a plain-text editor: TextEdit's smart quotes turn `"` into `“`, which the
-loader refuses (a key is printable ASCII).
+Line by line: the first creates `.env` from the template at mode 0600 and never
+overwrites one that exists; the second sets 0600 anyway, because `cp` keeps an
+existing file's mode; in the editor, replace both `replace-me-...` values
+(`openssl rand -hex 32` makes a token); `npm run dev` then logs `credentials:
+.env (AOS_CONTROL_TOKEN, ANTHROPIC_API_KEY)`, and `npm run cli -- agents` works
+from a second shell with nothing exported. The block has no inline comments on
+purpose: stock macOS zsh does not treat `#` as one when you paste.
+
+Any plain-text editor will do in place of nano, but not TextEdit: its smart
+quotes turn `"` into `“`, which the loader refuses (a key is printable ASCII).
+The kernel checks the mode bits; on macOS an ACL can still grant others read
+access to a 0600 file (`ls -le .env` shows a `+`), and `chmod -N .env` removes
+it.
 
 **Upgrading from a sourced `.env`.** Before D31 the setup was `cp .env.example
 .env && set -a && . ./.env && set +a`. A `.env` made that way is mode 0644 and
@@ -102,10 +112,10 @@ How it is read (`src/secrets/dotenv.ts`, decision D31):
 - Values go into the kernel's memory, never into `process.env`, so no child
   process and no SDK ambient lookup sees them. They are masked from the log the
   moment they are read, and no error message quotes a value or a line.
-- A non-empty value exported in the shell wins over the file, and the daemon
-  warns, by name, that it did.
-- Refused at startup, each with the fix in the message: a `.env` other users can
-  read (`chmod 600 .env`), a symlink, another owner, a second hard link, more
+- A shell export that is not blank wins over the file, and the daemon warns, by
+  name, that it did.
+- Refused at startup, each with the fix in the message: a `.env` whose mode lets
+  group or others read or write it (`chmod 600 .env`), a symlink, another owner, a second hard link, more
   than 64 KB, a `.gitignore` that stops ignoring it (read with git's own rules,
   so `!*` or a leading space count), any name but the two above, a value still
   beginning `replace-me`, a character outside printable ASCII, two lines joined
@@ -200,9 +210,11 @@ never from what the model said it did; the model's own summary is examined only 
 be contradicted by the log. And a check that could not run reports `n/a`, which is
 not a pass — the summary always prints how many checks did not run beside the
 score, because a 1.00 covering two of sixteen checks is not a good result. The
-shipped fan-out case **fails today**: it requires two child runs and delegation is
-a stub, so the failing gate names the stub. A suite pruned to what the kernel can
-already do would score 1.00 forever and measure nothing.
+shipped fan-out case needs two child runs: it passes only when the CEO's model
+adopts a plan and delegates both tasks through `kernel.adopt_plan` and
+`kernel.delegate` (see Delegation below), so a failure there is a finding about
+the model or the kernel, not a known stub. A suite pruned to what a model already
+does would score 1.00 forever and measure nothing.
 
 `capture:pmmcp` needs a running pmmcp and no token (pmmcp takes no bearer). It calls `tools/list`
 and nothing else — no tool is invoked, so no memory and no vault entry is read —
@@ -520,11 +532,16 @@ It exits 0 only when every mutant is **killed**, every suite's comment-only
 not a kill (a hang is a test with no bound), and a mutant that leaves the file
 unparseable or stops the test files loading is **invalid**, never a kill.
 
-It edits the working tree, so: it refuses a file with uncommitted changes
-(`--allow-dirty` to override), writes the original bytes to `.falsify/` before
-every edit and restores them from there at the next start if a run was killed
-outright, restores on SIGINT/SIGTERM, and kills a hung test's whole process
-group. `test/falsify.test.ts` proves each of those against real processes, and
+It edits the working tree (src/ and two test helpers), so: it refuses a file
+with uncommitted changes (`--allow-dirty` to override), writes the original bytes
+and its own pid to `.falsify/` before every edit, restores on SIGINT, SIGTERM,
+SIGHUP (a closed terminal) and SIGQUIT, and kills a hung test's whole process
+group. A run killed outright (SIGKILL, a power cut) is restored by the next
+start, or by `npm run falsify -- --recover`; until then `npm run dev` refuses to
+start and `npm test` refuses to run, because a source file may still hold a
+planted bug. A second run on a tree with a live one refuses, and an option it
+does not know is refused rather than ignored. `test/falsify.test.ts` proves each
+of those against real processes, and
 checks on every `npm test` that every catalog anchor still matches exactly once
 — a refactor that moves one fails the suite instead of silently disabling its
 mutant.
@@ -536,10 +553,14 @@ registry, restart recovery of approvals and holds, the container audit and path
 containment (`sandbox`), the `.env` loader and the credential checks around it
 (`dotenv`, and `dotenvDefault` for how an entry point picks its file), or the
 `.gitignore` reading (`gitignore`) — the sixteen suites — and add a mutant
-whenever a new test exists to catch a specific bug. A mutant on how an entry
-point picks its credentials file must never run beside
-`test/entrypoints.test.ts`, which spawns entry points from this checkout, where
-your real `.env` lives; `test/falsify.test.ts` refuses a catalog that does. The `integrity` and
+whenever a new test exists to catch a specific bug. No test may let a mutant
+reach your real `.env`: `test/entrypoints.test.ts` runs every entry point from a
+temporary copy of the checkout holding a trap `.env` (and `hygiene.test.ts`
+refuses a spawn from the real tree), in-process loader tests are told their
+repository is a trap directory, and the live helper opens `<repo>/.env` only
+from a live test's own process. `test/falsify.test.ts` also refuses a catalog
+that puts an entry-point or `.env`-path mutant beside the entry-point spawns, as
+a second line. The `integrity` and
 `redaction` suites edit change-controlled files (chain hashing, the triggers,
 the redaction pass) and restore them; the operator approved keeping them in the
 catalog on that basis.

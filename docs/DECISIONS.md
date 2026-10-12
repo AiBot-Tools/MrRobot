@@ -17,8 +17,9 @@ defaults" and name only what you want changed, for example `D3: better-sqlite3` 
 design decisions, 16 of them blocking.
 
 **Status.** The original 59 answered on 2026-09-21, all defaults accepted except D13. Since
-then, by the operator (2026-10): D7 reversed, and D31 (credentials in `<repo>/.env`) and D32
-answered.
+then, by the operator (2026-10): D7 and D25 reversed, and D31 (credentials in `<repo>/.env`)
+and D32 answered. D8's answer still stands as written, but D31 made `secrets.source: env` the
+shipped default, so the vault it calls primary is dormant.
 
 ## 1. Blocking — answer before any code is written
 
@@ -29,7 +30,7 @@ answered.
 | **D3** | `node:sqlite` (stdlib, RC API) vs `better-sqlite3@13.0.3` (native N-API addon, +27 MB)? | `node:sqlite` behind `src/events/db.ts` | ✅ default — kernel needs its own SQLite for the hash-chained event log (invariant 5), separate from pmmcp's SQLite |
 | **D5** | Accept the MCP SDK's 94-package footprint (express/hono/jose installed, never loaded)? | accept; recorded in README | ✅ default |
 | **D6** | Raw-fetch Chat Completions adapter vs adding `openai@7.20.0` (0 transitive deps, Node ≥ 22)? | raw fetch; `openai` not installed | ✅ default |
-| **D8** | Allow the opt-in `secrets.envFallback` at all (widens what the kernel reads from env; default OFF, DEGRADED when ON)? The env name is a **per-entry secondary** (`auth.envVar` beside a mandatory `auth.vaultId`, §3.4), consulted only after that entry's vault path failed — never a substitute for `vaul… | allowed, default off; `vaultId` stays mandatory on every non-local entry | ✅ default — pmmcp vault (`get_secret`/`set_secret`) is the primary store; env fallback is only for when pmmcp is unreachable |
+| **D8** | Allow the opt-in `secrets.envFallback` at all (widens what the kernel reads from env; default OFF, DEGRADED when ON)? The env name is a **per-entry secondary** (`auth.envVar` beside a mandatory `auth.vaultId`, §3.4), consulted only after that entry's vault path failed — never a substitute for `vaul… | allowed, default off; `vaultId` stays mandatory on every non-local entry | ✅ default — pmmcp vault (`get_secret`/`set_secret`) is the primary store; env fallback is only for when pmmcp is unreachable. *Superseded in practice (2026-10, D31): `secrets.source: env` ships, keys come from the shell or `<repo>/.env`, and the vault path is dormant because pmmcp's `get_secret` masks by design.* |
 | **D10** | Origin policy: `allowedOrigins` default `[]` (Tauri origin admitted only when listed) and bind `127.0.0.1` only; Phase 3 must open the socket from Rust or amend invariant 1 via a v2 connect ticket? | `[]`, IPv4 only, no ticket in v1 | ✅ default |
 | **D27** | Acknowledge the T37 rewrite of CLAUDE.md "Current state" with the text in T37? | as written | ✅ default |
 | **D29** | Ship a test that is skipped by default (`test/live-anthropic.test.ts`, gated by `AOS_LIVE_TESTS=1`, and T35's hygiene rule whitelisting `test/live-*.test.ts`)? CLAUDE.md lists "skipping a test" as ask-before, so this cannot be decided silently. Alternative: keep the live tests in a separate script… | gated skip inside the suite, whitelisted by name only | ✅ default |

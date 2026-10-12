@@ -496,6 +496,31 @@ test('package.json passes --dotenv .env to dev, cli and eval and to nothing else
   assert.equal(read('.npmrc').includes('env-file'), false)
 })
 
+test('the .env setup commands paste cleanly into stock macOS zsh: no inline # comments', () => {
+  // zsh does not set INTERACTIVE_COMMENTS, so a pasted `cmd  # note` passes
+  // "#" and "note" to cmd, and an apostrophe in the note opens a quote that
+  // swallows the lines after it. The commands an operator copies carry none.
+  const readme = read('README.md')
+  const setup = readme.slice(readme.indexOf('## Setup'))
+  const block = /```bash\n([\s\S]*?)```/g
+  let found = false
+  for (const m of setup.matchAll(block)) {
+    const body = m[1] ?? ''
+    if (!body.includes('.env.example')) continue
+    found = true
+    for (const line of body.split('\n')) assert.equal(line.includes('#'), false, `README setup line carries a comment: ${line}`)
+    break
+  }
+  assert.ok(found, 'README Setup has no bash block that creates .env')
+  // The same commands, quoted inside .env.example's own comments.
+  const commands = read('.env.example')
+    .split('\n')
+    .filter((l) => l.startsWith('#   '))
+    .map((l) => l.slice(4))
+  assert.ok(commands.length >= 2, '.env.example no longer shows how to create .env')
+  for (const command of commands) assert.equal(command.includes('#'), false, `.env.example command carries a comment: ${command}`)
+})
+
 test('.gitignore ignores .env*, editor copies, and un-ignores only .env.example', () => {
   assert.equal(gitignoresDotenv(REPO), true)
   const lines = read('.gitignore').split('\n').map((l) => l.trim())

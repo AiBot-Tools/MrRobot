@@ -10,7 +10,11 @@
 //   because a process that never reads a secret cannot leak it.
 //
 //   Everything else opens a socket, and the token rides the Authorization
-//   header only (src/cli/client.ts has nowhere else to put it).
+//   header only (src/cli/client.ts has nowhere else to put it). The token comes
+//   from the shell, else from the file `--dotenv` names (npm run cli passes
+//   `--dotenv .env`) — read inside withClient only, so verify-chain and search
+//   never open it, and only the token leaves it: the CLI never holds a provider
+//   key.
 //
 // `approve <id>` and `deny <id>` dispatch on the id's PREFIX rather than
 // guessing. `hold_…` is a quarantine hold and `apr_…` is an approval, and an
@@ -33,6 +37,8 @@ import { ConfigError } from '../errors.js'
 import { EventStore } from '../events/store.js'
 import { redactString } from '../events/redact.js'
 import { expandHome, parseKernelConfig, type KernelConfig } from '../config.js'
+import { parseProviders } from '../models/registry.js'
+import { credentialNames, oneCredential } from '../secrets/dotenv.js'
 import { connectControl, ControlCallError, type ControlClient } from './client.js'
 import type { ApprovalItem, HoldItem } from '../control/protocol.js'
 
@@ -77,6 +83,8 @@ export const USAGE = `aos — Agentic OS console
   aos deny <apr_…> [--reason R]
 
   --config <path>   kernel.yaml (default ./config/kernel.yaml)
+  --dotenv <path>   read AOS_CONTROL_TOKEN from this file when the shell has none
+                    (npm run cli passes --dotenv .env; socket commands only)
 `
 
 export interface CliIo {
@@ -90,6 +98,7 @@ export interface CliIo {
 
 const OPTIONS = {
   config: { type: 'string' },
+  dotenv: { type: 'string' },
   'include-archived': { type: 'boolean' },
   type: { type: 'string' },
   run: { type: 'string' },
@@ -125,15 +134,40 @@ function dbPath(config: KernelConfig): string {
   return join(config.dataDir, EVENTS_DB_FILE)
 }
 
+function dotenvOf(values: Values): string | undefined {
+  return typeof values['dotenv'] === 'string' ? values['dotenv'] : undefined
+}
+
 async function withClient<T>(
   io: CliIo,
   config: KernelConfig,
+  dotenv: string | undefined,
   fn: (client: ControlClient) => Promise<T>,
 ): Promise<T> {
-  // Read ONLY here, so the read is on the path that needs it.
-  const token = (io.env[config.control.tokenEnv] ?? '').trim()
+  // Read ONLY here, so the read is on the path that needs it — the shell first,
+  // then the --dotenv file, and only the token, never a provider key.
+  const name = config.control.tokenEnv
+  const path = dotenv === undefined ? undefined : resolve(io.cwd, dotenv)
+  const token = (
+    oneCredential(name, path, {
+      repoRoot: io.cwd,
+      accepted:
+        path === undefined
+          ? new Set([name])
+          : credentialNames(
+              config,
+              parseProviders(parseYaml(readFileSync(join(io.cwd, 'config', 'providers.yaml'), 'utf8'))),
+            ),
+      shell: io.env,
+    }) ?? ''
+  ).trim()
   if (token === '') {
-    throw new ConfigError(`${config.control.tokenEnv} is not set; this command needs it.`)
+    throw new ConfigError(
+      `${name} is not set; this command needs it. ` +
+        (path === undefined
+          ? `Export it, or add it to .env (npm run cli passes --dotenv .env).`
+          : `Export it, or add it to ${path}.`),
+    )
   }
   const connect = io.connect ?? connectControl
   const client = await connect({ port: config.control.port, token })
@@ -197,7 +231,7 @@ async function dispatch(
       return search(io, config, values)
 
     case 'agents':
-      return withClient(io, config, async (client) => {
+      return withClient(io, config, dotenvOf(values), async (client) => {
         const agents = (await client.call('agents.list', {
           includeArchived: values['include-archived'] === true,
         })) as { id: string; kind: string; tier: number; status: string; modelPrimary: string }[]
@@ -208,7 +242,7 @@ async function dispatch(
       })
 
     case 'approvals':
-      return withClient(io, config, async (client) => {
+      return withClient(io, config, dotenvOf(values), async (client) => {
         const listed = (await client.call('approvals.list')) as {
           approvals: ApprovalItem[]
           holds: HoldItem[]
@@ -223,7 +257,7 @@ async function dispatch(
     case 'probe': {
       const ref = positionals[0]
       if (ref === undefined) return usage(io, 'probe needs a model ref')
-      return withClient(io, config, async (client) => {
+      return withClient(io, config, dotenvOf(values), async (client) => {
         const record = (await client.call('model.probe', { ref })) as { toolCalling: boolean; reason?: string }
         io.out(`${ref}\ttoolCalling=${String(record.toolCalling)}${record.reason === undefined ? '' : `\t${record.reason}`}`)
         return record.toolCalling ? 0 : 1
@@ -233,7 +267,7 @@ async function dispatch(
     case 'kill': {
       const runId = positionals[0]
       if (runId === undefined) return usage(io, 'kill needs a runId')
-      return withClient(io, config, async (client) => {
+      return withClient(io, config, dotenvOf(values), async (client) => {
         const result = (await client.call('run.kill', {
           runId,
           ...(typeof values['reason'] === 'string' ? { reason: values['reason'] } : {}),
@@ -247,7 +281,7 @@ async function dispatch(
       const agentId = positionals[0]
       const input = positionals.slice(1).join(' ')
       if (agentId === undefined || input === '') return usage(io, 'run needs an agentId and an input')
-      return withClient(io, config, async (client) => {
+      return withClient(io, config, dotenvOf(values), async (client) => {
         // Subscribing before the call is not enough. The daemon broadcasts as
         // it appends, so a fast run can finish before the reply frame that
         // names it is even parsed — and a listener that only matches a runId it
@@ -323,7 +357,7 @@ async function resolveById(
       // still sitting in the log.
       return usage(io, 'a quarantine hold cannot be denied: release it, or leave it held')
     }
-    return withClient(io, config, async (client) => {
+    return withClient(io, config, dotenvOf(values), async (client) => {
       const result = (await client.call('quarantine.release', { holdId: id })) as { runTainted: boolean }
       io.out(`${id}\treleased\trunTainted=${String(result.runTainted)}`)
       return 0
@@ -335,7 +369,7 @@ async function resolveById(
     return 1
   }
 
-  return withClient(io, config, async (client) => {
+  return withClient(io, config, dotenvOf(values), async (client) => {
     const listed = (await client.call('approvals.list')) as { approvals: ApprovalItem[] }
     const item = listed.approvals.find((a) => a.approvalId === id)
     if (item === undefined) {

@@ -312,7 +312,7 @@ function credsFile(dir: string, text: string, mode = 0o600): string {
 const FILE_TOKEN = 'qFileOnlyControlToken0123456789abcdefgh'
 const FILE_KEY = 'qFileOnlyProviderKeyZYXWVUTSRQ987654321'
 
-test('the daemon reads AOS_CONTROL_TOKEN and a provider key that exist only in a --dotenv file, and neither reaches the log or the output', async (t) => {
+test('the daemon and the CLI read AOS_CONTROL_TOKEN and a provider key that exist only in a --dotenv file, and neither reaches the log or the output', async (t) => {
   const dataDir = join(tmpdir(t), 'daemon-dotenv')
   mkdirSync(dataDir, { recursive: true })
   const configPath = daemonConfig(dataDir, 7792)
@@ -351,6 +351,14 @@ test('the daemon reads AOS_CONTROL_TOKEN and a provider key that exist only in a
   // control plane refuses to start.
   assert.ok(listening, `the daemon never listened:\n${log}`)
   assert.match(log, /credentials: \.env \(AOS_CONTROL_TOKEN, ANTHROPIC_API_KEY\)/)
+
+  // The other shell, as `npm run cli` runs it: the token only in the file.
+  const agents = cli(['agents', '--config', configPath, '--dotenv', creds], { AOS_DATA_DIR: dataDir })
+  assert.equal(agents.status, 0, agents.stderr)
+  assert.match(agents.stdout, /^ceo\t/m)
+  for (const secret of [FILE_TOKEN, FILE_KEY]) {
+    assert.equal(`${agents.stdout}${agents.stderr}`.includes(secret), false, 'the CLI printed a credential')
+  }
 
   daemon.kill('SIGTERM')
   const exited = await new Promise<number | null>((resolve) => {
@@ -417,4 +425,18 @@ test('the daemon refuses a group-readable or non-regular --dotenv before it boot
   } else {
     t.diagnostic('mkfifo is unavailable here; the FIFO case is covered by the unit test for /dev/null')
   }
+})
+
+test('eval.ts takes AOS_CONTROL_TOKEN from --dotenv, and without it still names what is missing', (t) => {
+  const creds = credsFile(tmpdir(t), `AOS_CONTROL_TOKEN=${FILE_TOKEN}\nANTHROPIC_API_KEY=${FILE_KEY}\n`)
+  // An unknown case stops eval right after the token check, before any socket.
+  const run = spawnSync('npx', ['tsx', 'scripts/eval.ts', '--dotenv', creds, '--case', 'nope'], {
+    cwd: REPO,
+    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
+    encoding: 'utf8',
+    timeout: 60_000,
+  })
+  assert.equal(run.status, 2, run.stderr)
+  assert.match(run.stderr, /no case nope/, 'the token was not taken from the file')
+  assert.equal(`${run.stdout}${run.stderr}`.includes(FILE_TOKEN), false)
 })

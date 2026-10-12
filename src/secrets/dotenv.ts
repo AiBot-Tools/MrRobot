@@ -341,3 +341,22 @@ export function loadDotenv(path: string, options: DotenvOptions): DotenvResult {
   }
   return { path: abs, found: true, values, shadowed }
 }
+
+/**
+ * One credential, for a client that needs only that one (the CLI and eval need
+ * the control token, never a provider key): a non-empty shell value, else the
+ * file at `path`, else undefined. Without a path no file is opened.
+ *
+ * `accepted` must still be every credential name, so the operator's file —
+ * which holds provider keys too — is not refused for containing them.
+ */
+export function oneCredential(
+  name: string,
+  path: string | undefined,
+  options: Omit<DotenvOptions, 'wanted'>,
+): string | undefined {
+  const fromShell = (options.shell[name] ?? '').trim()
+  if (fromShell !== '') return fromShell
+  if (path === undefined) return undefined
+  return loadDotenv(path, { ...options, wanted: [name] }).values[name]
+}

@@ -1,7 +1,7 @@
 // Operator-only: run the orchestration eval suite against a live daemon.
 //
-//   npm run dev                      # in one shell, with .env sourced
-//   AOS_CONTROL_TOKEN=… npm run eval # in another
+//   npm run dev    # in one shell (reads ./.env through --dotenv)
+//   npm run eval   # in another (reads only AOS_CONTROL_TOKEN from ./.env)
 //
 // THIS SPENDS REAL MONEY. Every case is a real run against whatever model the
 // agent is bound to, under that agent's real budget. The suite's ceilings are
@@ -23,6 +23,8 @@ import { fileURLToPath } from 'node:url'
 import { parse as parseYaml } from 'yaml'
 
 import { parseKernelConfig } from '../src/config.js'
+import { parseProviders } from '../src/models/registry.js'
+import { credentialNames, oneCredential } from '../src/secrets/dotenv.js'
 import { CEO_CHECKS } from '../src/eval/checks.js'
 import { runSuite, type EvalTarget } from '../src/eval/harness.js'
 import { exitCode, renderSuite, toJson } from '../src/eval/report.js'
@@ -38,9 +40,23 @@ async function main(argv: readonly string[]): Promise<number> {
   const configPath = flag(argv, 'config') ?? join(repoRoot, 'config', 'kernel.yaml')
   const config = parseKernelConfig(parseYaml(readFileSync(configPath, 'utf8')), { repoRoot })
 
-  const token = process.env[config.control.tokenEnv]
+  // The shell first, then the file --dotenv names (npm run eval passes .env):
+  // only the control token, never a provider key — this process needs none.
+  const dotenv = flag(argv, 'dotenv')
+  const dotenvPath = dotenv === undefined ? undefined : resolve(repoRoot, dotenv)
+  const token = oneCredential(config.control.tokenEnv, dotenvPath, {
+    repoRoot,
+    accepted:
+      dotenvPath === undefined
+        ? new Set([config.control.tokenEnv])
+        : credentialNames(config, parseProviders(parseYaml(readFileSync(join(repoRoot, 'config', 'providers.yaml'), 'utf8')))),
+    shell: process.env,
+  })
   if (token === undefined || token.trim() === '') {
-    process.stderr.write(`${config.control.tokenEnv} is not set\n`)
+    process.stderr.write(
+      `${config.control.tokenEnv} is not set` +
+        (dotenvPath === undefined ? ' (export it, or run npm run eval, which reads .env)\n' : ` (export it, or add it to ${dotenvPath})\n`),
+    )
     return 2
   }
   const portArg = flag(argv, 'port')

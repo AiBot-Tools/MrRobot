@@ -24,7 +24,7 @@ import './helpers/guard.js'
 
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { closeVerified, withStore, withStoreUnverified } from './helpers/store.js'
@@ -614,4 +614,75 @@ test('without AOS_CONTROL_TOKEN the client never connects', async (t) => {
   for (const command of ['verify-chain', 'search']) {
     assert.equal(SOCKET_COMMANDS.includes(command as never), false, command)
   }
+})
+
+/** A credentials file outside any repo, so only the file checks apply. */
+function creds(t: TestContext, text: string, mode = 0o600): string {
+  const path = join(tmpdir(t), 'creds.env')
+  writeFileSync(path, text, { mode })
+  chmodSync(path, mode)
+  return path
+}
+
+/** The harness repo needs the shipped providers.yaml to know the credential names. */
+function withProviders(h: Harness): void {
+  copyFileSync(new URL('../config/providers.yaml', import.meta.url), join(h.io.cwd, 'config', 'providers.yaml'))
+}
+
+const FILE_TOKEN = 'qCliFileToken0123456789abcdefghijklmnop'
+
+test('a socket command takes AOS_CONTROL_TOKEN from --dotenv when the shell lacks it, and only the token', async (t) => {
+  t.after(() => SecretMask.clear())
+  const h = harness(t, { env: { AOS_CONTROL_TOKEN: undefined } })
+  withProviders(h)
+  h.reply('approvals.list', { approvals: [], holds: [] })
+  // The operator's file holds a provider key too; the CLI must accept the file
+  // and still never take the key.
+  const path = creds(t, `AOS_CONTROL_TOKEN=${FILE_TOKEN}\nANTHROPIC_API_KEY=qCliNeverTakesThisKey0123456789\n`)
+  const code = await runCli(['approvals', '--config', h.configPath, '--dotenv', path], h.io)
+  assert.equal(code, 0, h.errs.join('\n'))
+  assert.deepEqual(h.connects.map((c) => c.token), [FILE_TOKEN])
+  assert.equal(h.envReads.includes('ANTHROPIC_API_KEY'), false, 'the CLI looked for a provider key')
+})
+
+test('a shell token wins over --dotenv, and the file is not even opened', async (t) => {
+  const h = harness(t)
+  withProviders(h)
+  h.reply('approvals.list', { approvals: [], holds: [] })
+  // 0644: opening it would be refused, so success proves it was never opened.
+  const trap = creds(t, `AOS_CONTROL_TOKEN=${FILE_TOKEN}\n`, 0o644)
+  assert.equal(await runCli(['approvals', '--config', h.configPath, '--dotenv', trap], h.io), 0, h.errs.join('\n'))
+  assert.notEqual(h.connects[0]?.token, FILE_TOKEN)
+})
+
+test('verify-chain and search never open the --dotenv file and never read AOS_CONTROL_TOKEN', async (t) => {
+  const h = harness(t, { noConnect: true })
+  const store = withStore(t, { path: join(h.dataDir, 'events.db') })
+  store.append({ type: 'kernel.booted', payload: { schemaVersion: 1, version: '0.0.1', configHash: 'h', degraded: [] } })
+  closeVerified(store)
+  const trap = creds(t, 'NODE_OPTIONS=--require=/tmp/evil.js\n', 0o644)
+  assert.equal(await runCli(['verify-chain', '--config', h.configPath, '--dotenv', trap], h.io), 0, h.errs.join('\n'))
+  assert.equal(await runCli(['search', '--config', h.configPath, '--dotenv', trap], h.io), 0, h.errs.join('\n'))
+  assert.equal(h.envReads.includes('AOS_CONTROL_TOKEN'), false)
+})
+
+test('with --dotenv and no token anywhere, a socket command says AOS_CONTROL_TOKEN is not set and names the file', async (t) => {
+  const h = harness(t, { env: { AOS_CONTROL_TOKEN: undefined } })
+  withProviders(h)
+  const path = creds(t, '# no token here\nANTHROPIC_API_KEY=\n')
+  assert.equal(await runCli(['approvals', '--config', h.configPath, '--dotenv', path], h.io), 1)
+  const err = h.errs.join('\n')
+  assert.match(err, /AOS_CONTROL_TOKEN is not set; this command needs it/)
+  assert.ok(err.includes(path), err)
+  assert.deepEqual(h.connects, [])
+})
+
+test('a refused --dotenv is a refusal before the wire, naming the fix', async (t) => {
+  const h = harness(t, { env: { AOS_CONTROL_TOKEN: undefined } })
+  withProviders(h)
+  const path = creds(t, `AOS_CONTROL_TOKEN=${FILE_TOKEN}\n`, 0o640)
+  assert.equal(await runCli(['approvals', '--config', h.configPath, '--dotenv', path], h.io), 1)
+  assert.ok(h.errs.join('\n').includes(`chmod 600 ${path}`))
+  assert.equal(h.errs.join('\n').includes(FILE_TOKEN), false)
+  assert.deepEqual(h.connects, [])
 })

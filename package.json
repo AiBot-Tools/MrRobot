@@ -8,10 +8,10 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "dev": "node --import tsx src/main.ts --dotenv .env",
-    "cli": "node --import tsx src/cli/index.ts",
+    "cli": "node --import tsx src/cli/index.ts --dotenv .env",
     "build": "tsc -p tsconfig.build.json",
     "capture:pmmcp": "node --import tsx scripts/capture-pmmcp.ts",
-    "eval": "node --import tsx scripts/eval.ts",
+    "eval": "node --import tsx scripts/eval.ts --dotenv .env",
     "falsify": "node --import tsx scripts/falsify.ts"
   },
   "dependencies": {

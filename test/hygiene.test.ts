@@ -464,7 +464,10 @@ test('nothing in src/ or scripts/ writes process.env or uses Node\'s .env loader
     /from\s+['"]dotenv['"]/,
     /--env-file/,
   ]
-  for (const file of [...SRC, ...SCRIPTS]) {
+  // The mutation catalog is excluded the way this file is: its strings are
+  // deliberate copies of the bugs (X16 writes process.env), applied and
+  // reverted by the falsifier, never run as code.
+  for (const file of [...SRC, ...SCRIPTS].filter((f) => f.path !== 'scripts/falsify/catalog.ts')) {
     for (const line of codeLines(file)) {
       for (const pattern of forbidden) {
         assert.equal(pattern.test(line.text), false, `${file.path}:${String(line.n)} matches ${String(pattern)}`)

@@ -404,6 +404,55 @@ const sandbox: Suite = {
   control: { id: 'C', file: DOCKER, from: '    // Invariant 9, one flag at a time.', to: '    // Invariant 9, one flag at a time. (control)', why: 'comment only' },
 }
 
+const DOTENV = 'src/secrets/dotenv.ts'
+
+const dotenv: Suite = {
+  name: 'dotenv',
+  tests: [
+    'test/dotenv.test.ts',
+    'test/cli.test.ts',
+    'test/entrypoints.test.ts',
+    'test/secrets-broker.test.ts',
+    'test/env.test.ts',
+    'test/hygiene.test.ts',
+    'test/config-files.test.ts',
+  ],
+  mutants: [
+    { id: 'X1', file: DOTENV, from: '    if ((st.mode & 0o077) !== 0) {', to: '    if (false) {', why: 'a .env other users can read or write is loaded' },
+    { id: 'X2', file: DOTENV, from: 'constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK', to: 'constants.O_RDONLY | constants.O_NONBLOCK', why: 'a symlinked .env is followed to wherever it points' },
+    { id: 'X3', file: DOTENV, from: '    if (!st.isFile()) throw', to: '    if (false) throw', why: 'a directory, device or FIFO is read as a .env' },
+    { id: 'X4', file: DOTENV, from: '    if (st.uid !== uid) throw', to: '    if (false) throw', why: 'a .env owned by another user is trusted' },
+    { id: 'X5', file: DOTENV, from: '    if (st.nlink !== 1) throw', to: '    if (false) throw', why: 'a .env hard-linked elsewhere is read' },
+    { id: 'X6', file: DOTENV, from: '    if (st.size > DOTENV_MAX_BYTES) {', to: '    if (false) {', why: 'an arbitrarily large file is read and parsed' },
+    { id: 'X7', file: DOTENV, from: '    if (!accepted.has(name)) {', to: '    if (false) {', why: 'any name in the file is admitted, NODE_OPTIONS and AOS_LIVE_TESTS included' },
+    { id: 'X8', file: DOTENV, from: '  for (const name of options.wanted) {', to: '  for (const name of options.accepted) {', why: 'the CLI and eval receive provider keys they never asked for' },
+    { id: 'X9', file: DOTENV, from: '    env[name] = fromShell !== undefined && fromShell !== \'\' ? fromShell : loaded?.values[name]', to: '    env[name] = loaded?.values[name] ?? fromShell', why: 'the file silently beats a value the operator exported' },
+    { id: 'X10', file: DOTENV, from: '    if (fromShell !== undefined && fromShell !== \'\') {\n      shadowed.push(name)', to: '    if (fromShell !== undefined) {\n      shadowed.push(name)', why: 'an exported empty string hides the key in the file' },
+    { id: 'X11', file: DOTENV, from: '    if (earlier !== undefined) {', to: '    if (false) {', why: 'a name set twice resolves silently to one of them' },
+    { id: 'X12', file: DOTENV, from: '    if (ENV_LINE.test(value)) {', to: '    if (false) {', why: 'a value that is a joined NAME=value line is loaded as a key' },
+    { id: 'X13', file: DOTENV, from: '    SecretMask.register(fromFile.value)', to: '    void fromFile.value', why: 'a file-sourced value is not masked before anything can log it' },
+    { id: 'X14', file: DOTENV, from: '    if (!gitignoresDotenv(options.repoRoot)) {', to: '    if (false) {', why: 'an in-repo .env git would commit is read anyway' },
+    { id: 'X15', file: DOTENV, from: '    if (dir !== repo || basename(abs) !== DOTENV_FILE) {', to: '    if (false) {', why: 'any file inside the repo, the template included, is read as credentials' },
+    { id: 'X16', file: DOTENV, from: '  return { path: abs, found: true, values, shadowed }', to: '  Object.assign(process.env, values)\n  return { path: abs, found: true, values, shadowed }', why: 'file-sourced values are written into process.env, where every child inherits them' },
+    { id: 'X17', file: DOTENV, from: '      problems.push(`line ${String(n)}: not NAME=value`)', to: '      problems.push(`line ${String(n)}: not NAME=value: ${line}`)', why: 'a refusal quotes the offending line, which may be a pasted key' },
+    { id: 'X18', file: DOTENV, from: '      problems.push(`line ${String(n)}: a name this kernel does not read: delete the line`)', to: '      problems.push(`line ${String(n)}: ${name} is a name this kernel does not read: delete the line`)', why: 'a refusal quotes an unaccepted name, which may be a pasted key' },
+    { id: 'X19', file: DOTENV, from: '    if (parsed.value === \'\') out.delete(name)', to: '', why: 'a blank value is returned as the empty string instead of unset' },
+    { id: 'X20', file: DOTENV, from: '    if (value.toLowerCase().startsWith(PLACEHOLDER_PREFIX)) {', to: '    if (false) {', why: 'an unfilled copy of .env.example sends its placeholder as a key' },
+    { id: 'X21', file: DOTENV, from: '  if (fromShell !== \'\') return fromShell\n', to: '', why: 'the CLI opens the file even when the shell already has the token' },
+    { id: 'X22', file: 'src/main.ts', from: '  const path = dotenvPathFrom(argv, ctx.repoRoot)', to: '  const path = dotenvPathFrom(argv, ctx.repoRoot) ?? join(ctx.repoRoot, \'.env\')', why: 'a daemon started without --dotenv (every test) opens the repo\'s real .env' },
+    { id: 'X23', file: 'src/secrets/broker.ts', from: '      if (looksLikeEnvLine(fromEnv)) {', to: '      if (false) {', why: 'a shell value that is a joined NAME=value line is minted as a key' },
+    { id: 'X24', file: 'test/helpers/live-env.ts', from: '  if (env[\'AOS_LIVE_TESTS\'] !== \'1\') throw new Error', to: '  if (false) throw new Error', why: 'an offline test can open the repo\'s real .env' },
+    { id: 'X25', file: 'test/helpers/guard.ts', from: 'if (process.env[\'AOS_LIVE_TESTS\'] !== \'1\') {\n  for (const name of Object.keys(process.env)) {', to: 'if (false) {\n  for (const name of Object.keys(process.env)) {', why: 'a key exported in the shell running npm test reaches every offline test' },
+  ],
+  control: {
+    id: 'C',
+    file: DOTENV,
+    from: "// The operator's credentials file: <repo>/.env, read by entry points only.",
+    to: "// The operator's credentials file: <repo>/.env, read by entry points only. (control)",
+    why: 'comment only',
+  },
+}
+
 export const CATALOG: readonly Suite[] = [
   delegation,
   recovery,
@@ -418,4 +467,5 @@ export const CATALOG: readonly Suite[] = [
   registry,
   restart,
   sandbox,
+  dotenv,
 ]

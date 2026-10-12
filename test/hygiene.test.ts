@@ -487,6 +487,23 @@ test('nothing in src/ or scripts/ writes process.env or uses Node\'s .env loader
   }
 })
 
+test('no test spawns an entry point from the real checkout, where the operator keeps .env', () => {
+  // src/main.ts and the CLI take their repository from the cwd, eval from its
+  // own file. Spawned from this checkout, one regression that defaults to
+  // <repo>/.env reads the operator's keys; spawned from shadowCheckout(), it
+  // hits a trap. So a test that runs one as a program must use the copy.
+  // A spawn whose argv array names an entry point.
+  const SPAWNS_ENTRY = /\bspawn(?:Sync)?\(\s*[^,]+,\s*\[[^\]]*['"](?:src\/main\.ts|src\/cli\/index\.ts|scripts\/eval\.ts|scripts\/capture-pmmcp\.ts)['"]/
+  const spawners = TEST.filter((f) => SPAWNS_ENTRY.test(f.text))
+  assert.ok(spawners.some((f) => f.path === 'test/entrypoints.test.ts'), 'entrypoints.test.ts no longer runs entry points')
+  for (const file of spawners) {
+    assert.match(file.text, /shadowCheckout\(\)/, `${file.path} spawns an entry point without a shadow checkout`)
+    for (const line of codeLines(file)) {
+      assert.equal(/cwd:\s*(?:REPO_ROOT\b|REPO\b|process\.cwd\(\))/.test(line.text), false, `${file.path}:${String(line.n)} spawns from the real checkout`)
+    }
+  }
+})
+
 /** The top-level arguments of the first `name(` call on a line, or undefined. */
 function callArgs(text: string, name: string): string[] | undefined {
   const start = text.indexOf(`${name}(`)
@@ -540,7 +557,12 @@ test('liveCredential is called only in test/live-*.test.ts behind LIVE, or with 
   }
   const unit = calls.filter((c) => c.path === 'test/dotenv.test.ts')
   assert.ok(unit.length >= 3, 'dotenv.test.ts no longer tests liveCredential')
+  // A backstop: liveCredential itself refuses the default path outside a live
+  // process (KEEPS_CREDENTIALS). A call that leaves the path out may appear
+  // only as a thunk handed to assert.throws, proving exactly that refusal.
   for (const call of unit) {
-    assert.equal(callArgs(call.text, 'liveCredential')?.length, 3, `${call.path}:${String(call.n)} leaves liveCredential's path to its default`)
+    const args = callArgs(call.text, 'liveCredential')?.length
+    if (args === 3) continue
+    assert.match(call.text, /\(\)\s*=>\s*liveCredential\(/, `${call.path}:${String(call.n)} leaves liveCredential's path to its default`)
   }
 })

@@ -11,7 +11,10 @@
 // still cannot leave the machine. Unix domain sockets carry no host and are
 // left alone: the Docker driver talks to a socket path.
 
+import { existsSync, readFileSync } from 'node:fs'
 import net from 'node:net'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 /**
  * Credentials never reach an offline test. Any name a provider key, the
@@ -21,21 +24,57 @@ import net from 'node:net'
  *
  * The one exception is a test/live-*.test.ts file on the gated live run
  * (AOS_LIVE_TESTS=1). The gate alone is not enough: `AOS_LIVE_TESTS=1 npm
- * test` runs every file, and the sixty offline ones must still be scrubbed.
- * `node --test` gives each file its own process with the file as argv[1];
- * anything else (an -e script, --test-isolation=none) is scrubbed.
+ * test` runs every file, and every offline one must still be scrubbed.
+ * `node --test` gives each file its own process whose argv is exactly
+ * [node, file]; anything else — an -e script, or --test-isolation=none, where
+ * one process runs every file listed — is scrubbed.
  */
 export const CREDENTIAL_NAME = /^(ANTHROPIC|OPENAI|OPENROUTER|MOONSHOT)_|_API_KEY$|^AOS_CONTROL_TOKEN$|^PMMCP_TOKEN$/
 
 const LIVE_FILE = /[/\\]test[/\\]live-[^/\\]+\.test\.ts$/
 
 /** True only in a live test file's own process on the gated run. */
-export const KEEPS_CREDENTIALS = process.env['AOS_LIVE_TESTS'] === '1' && LIVE_FILE.test(process.argv[1] ?? '')
+export const KEEPS_CREDENTIALS =
+  process.env['AOS_LIVE_TESTS'] === '1' && process.argv.length === 2 && LIVE_FILE.test(process.argv[1] ?? '')
 
 if (!KEEPS_CREDENTIALS) {
   for (const name of Object.keys(process.env)) {
     if (CREDENTIAL_NAME.test(name)) delete process.env[name]
   }
+}
+
+/**
+ * A falsify run that died (a closed terminal, a SIGKILL, a power cut) leaves a
+ * source file mutated, and its journal is replayed only by the next falsify
+ * start. Testing that tree would test a planted bug. A journal whose runner is
+ * still alive is a run in progress — the very run that started this test.
+ */
+function interruptedMutation(root: string): string | undefined {
+  const path = join(root, '.falsify', 'journal.json')
+  if (!existsSync(path)) return undefined
+  let journal: { file?: unknown; pid?: unknown } = {}
+  try {
+    journal = JSON.parse(readFileSync(path, 'utf8')) as { file?: unknown; pid?: unknown }
+  } catch {
+    return path
+  }
+  if (typeof journal.pid === 'number') {
+    try {
+      process.kill(journal.pid, 0)
+      return undefined
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'EPERM') return undefined
+    }
+  }
+  return typeof journal.file === 'string' ? journal.file : path
+}
+
+const mutated = interruptedMutation(fileURLToPath(new URL('../..', import.meta.url)))
+if (mutated !== undefined) {
+  throw new Error(
+    `an interrupted falsify run left ${mutated} mutated: run \`npm run falsify -- --recover\` ` +
+      '(or git checkout the file and delete .falsify/journal.json) before testing',
+  )
 }
 
 /** Thrown instead of opening a connection the test suite must never make. */

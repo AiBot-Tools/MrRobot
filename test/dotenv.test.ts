@@ -9,9 +9,10 @@
 import './helpers/guard.js'
 
 import assert from 'node:assert/strict'
-import { chmodSync, linkSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir as osTmpdir } from 'node:os'
 import { join } from 'node:path'
-import test, { type TestContext } from 'node:test'
+import test, { after, type TestContext } from 'node:test'
 import { parse as parseYaml } from 'yaml'
 
 import { parseKernelConfig } from '../src/config.js'
@@ -47,10 +48,20 @@ function write(t: TestContext, text: string | Buffer, mode = 0o600, name = 'cred
   return path
 }
 
+// The repository these in-process calls are told they run in: a temp dir
+// holding a trap .env (0644, an undeclared name), never this checkout. A
+// regression or mutant that swaps a fixture path for <repoRoot>/.env then hits
+// the trap and is refused, instead of reading the operator's real file.
+const TRAP_REPO = mkdtempSync(join(osTmpdir(), 'aos-trap-repo-'))
+writeFileSync(join(TRAP_REPO, '.gitignore'), '/.env\n')
+writeFileSync(join(TRAP_REPO, '.env'), 'NODE_OPTIONS=--require=/nonexistent/aos-dotenv-trap.js\n', { mode: 0o644 })
+chmodSync(join(TRAP_REPO, '.env'), 0o644)
+after(() => rmSync(TRAP_REPO, { recursive: true, force: true }))
+
 function opts(overrides: Partial<DotenvOptions> = {}): DotenvOptions {
   return {
-    // A repo root the fixture paths are outside of, so only the file checks apply.
-    repoRoot: REPO_ROOT,
+    // The fixture paths are outside it, so only the file checks apply.
+    repoRoot: TRAP_REPO,
     accepted: ACCEPTED,
     wanted: [...ACCEPTED],
     shell: {},
@@ -110,14 +121,14 @@ test('a whitespace-only shell value is unset to every reader: the daemon, the CL
     const loaded = loadDotenv(path, opts({ shell }))
     assert.deepEqual(loaded.shadowed, [], JSON.stringify(blank))
     assert.deepEqual(credentialEnv(ACCEPTED, shell, loaded), { AOS_CONTROL_TOKEN: TOKEN, ANTHROPIC_API_KEY: KEY })
-    assert.equal(oneCredential('AOS_CONTROL_TOKEN', path, { repoRoot: REPO_ROOT, accepted: ACCEPTED, shell }), TOKEN)
+    assert.equal(oneCredential('AOS_CONTROL_TOKEN', path, { repoRoot: TRAP_REPO, accepted: ACCEPTED, shell }), TOKEN)
   }
 })
 
 test('a shell value is returned as set, not trimmed: the live tests see what the daemon\'s broker sees', (t) => {
   const path = write(t, `AOS_CONTROL_TOKEN=${TOKEN}\n`)
   const padded = ' sk-ant-padded0123456789\n'
-  const options = { repoRoot: REPO_ROOT, accepted: ACCEPTED, shell: { ANTHROPIC_API_KEY: padded } }
+  const options = { repoRoot: TRAP_REPO, accepted: ACCEPTED, shell: { ANTHROPIC_API_KEY: padded } }
   assert.equal(oneCredential('ANTHROPIC_API_KEY', path, options), padded)
   assert.equal(credentialEnv(['ANTHROPIC_API_KEY'], options.shell, undefined)['ANTHROPIC_API_KEY'], padded)
 })
@@ -429,12 +440,21 @@ test('daemonEnv without --dotenv never opens a trap .env in the repo root and re
   )
 })
 
-test('liveCredential refuses unless AOS_LIVE_TESTS=1 in the env it is given, and opens nothing then', (t) => {
+test('liveCredential refuses unless AOS_LIVE_TESTS=1 in the env it is given, and outside a live process never opens <repo>/.env', (t) => {
   // A trap path: opening it would be refused with chmod 600, so the gate's own
   // error proves nothing was opened.
   const trap = write(t, 'ANTHROPIC_API_KEY=x\n', 0o644)
   for (const env of [{}, { AOS_LIVE_TESTS: '0' }, { AOS_LIVE_TESTS: 'true' }]) {
     assert.throws(() => liveCredential('ANTHROPIC_API_KEY', env, trap), /for AOS_LIVE_TESTS=1 only/)
+  }
+  // And with the gate's env satisfied but no path, an offline process is still
+  // refused before <repo>/.env is opened: that default belongs to a live test's
+  // own process alone, however the call is written.
+  for (const call of [
+    () => liveCredential('ANTHROPIC_API_KEY', { AOS_LIVE_TESTS: '1' }),
+    () => liveCredential('ANTHROPIC_API_KEY', { AOS_LIVE_TESTS: '1' }, undefined),
+  ]) {
+    assert.throws(call, /only from a test\/live-\*\.test\.ts process/)
   }
 })
 

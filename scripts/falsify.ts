@@ -20,9 +20,12 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { CATALOG } from './falsify/catalog.js'
-import { problems, render, runSuites, type Mutant, type Suite } from './falsify/runner.js'
+import { liveRun, problems, recoverInterrupted, render, runSuites, type Mutant, type Suite } from './falsify/runner.js'
 
-const USAGE = 'usage: npm run falsify -- [suite ...] [--only ID,ID] [--timeout MS] [--allow-dirty] [--list]'
+const USAGE = 'usage: npm run falsify -- [suite ...] [--only ID,ID] [--timeout MS] [--allow-dirty] [--list] [--recover] [--help]'
+
+/** Every flag this reads; anything else is refused rather than ignored, so a typo never runs the whole catalog. */
+const FLAGS = new Set(['--only', '--timeout', '--allow-dirty', '--list', '--recover', '--help', '-h'])
 
 function flag(argv: readonly string[], name: string): string | undefined {
   const i = argv.indexOf(`--${name}`)
@@ -43,7 +46,26 @@ function gitClean(root: string): (files: readonly string[]) => void {
 async function main(argv: readonly string[]): Promise<number> {
   const root = resolve(fileURLToPath(new URL('..', import.meta.url)))
   const valueOf = new Set(['--only', '--timeout'])
-  const positional = argv.filter((a, i) => !a.startsWith('--') && !valueOf.has(argv[i - 1] ?? ''))
+  if (argv.includes('--help') || argv.includes('-h')) {
+    process.stdout.write(`${USAGE}\n`)
+    return 0
+  }
+  const unknownFlags = argv.filter((a, i) => a.startsWith('-') && !FLAGS.has(a) && !valueOf.has(argv[i - 1] ?? ''))
+  if (unknownFlags.length > 0) {
+    process.stderr.write(`unknown option: ${unknownFlags.join(', ')}\n${USAGE}\n`)
+    return 2
+  }
+  if (argv.includes('--recover')) {
+    const live = liveRun(root)
+    if (live !== undefined) {
+      process.stderr.write(`a falsify run is in progress (pid ${String(live)}); it restores its own file\n`)
+      return 2
+    }
+    const restored = recoverInterrupted(root)
+    process.stdout.write(restored === undefined ? 'nothing to recover\n' : `restored ${restored}\n`)
+    return 0
+  }
+  const positional = argv.filter((a, i) => !a.startsWith('-') && !valueOf.has(argv[i - 1] ?? ''))
 
   const unknown = positional.filter((name) => !CATALOG.some((s) => s.name === name))
   if (unknown.length > 0) {

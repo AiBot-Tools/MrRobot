@@ -12,11 +12,12 @@
 // second signal is not polite — if a shutdown hangs, the operator gets their
 // terminal back.
 
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse as parseYaml } from 'yaml'
 
+import { ConfigError } from './errors.js'
 import { bootKernel } from './kernel.js'
 import { parseKernelConfig, type KernelConfig } from './config.js'
 import { parseProviders, type ProvidersFile } from './models/registry.js'
@@ -29,8 +30,22 @@ function readYaml(path: string): unknown {
   return parseYaml(readFileSync(path, 'utf8'))
 }
 
+/**
+ * The journal `npm run falsify` keeps while a source file is mutated
+ * (scripts/falsify/runner.ts JOURNAL_DIR/JOURNAL). While it exists, a file in
+ * src/ may hold a deliberately planted bug — a disabled check, a credentials
+ * path — so the daemon does not start, whether the run is live or died.
+ */
+export const FALSIFY_JOURNAL = join('.falsify', 'journal.json')
+
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
   const repoRoot = resolve(process.cwd())
+  if (existsSync(join(repoRoot, FALSIFY_JOURNAL))) {
+    throw new ConfigError(
+      `${join(repoRoot, FALSIFY_JOURNAL)} exists: a falsify run is in progress or was interrupted, and a source ` +
+        'file may still be mutated. Let it finish, or run: npm run falsify -- --recover',
+    )
+  }
   const configPath = configPathFrom(argv, repoRoot)
 
   const config = parseKernelConfig(readYaml(configPath), {

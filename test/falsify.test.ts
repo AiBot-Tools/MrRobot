@@ -28,8 +28,10 @@ import test, { type TestContext } from 'node:test'
 import { CATALOG } from '../scripts/falsify/catalog.js'
 import {
   judge,
+  liveRun,
   problems,
   recoverInterrupted,
+  RESTORING_SIGNALS,
   runSuites,
   unusable,
   type Mutant,
@@ -220,6 +222,40 @@ await runSuites([{ name: 'f', tests: [${JSON.stringify(join(root, 'mod.test.ts')
   assert.equal(recoverInterrupted(root), undefined, 'recovery is not idempotent')
 })
 
+test('a runner sent SIGHUP mid-mutant (a closed terminal) restores the file before it exits', async (t) => {
+  const { root, original } = fixture(t)
+  const driver = join(root, 'drive.ts')
+  writeFileSync(
+    driver,
+    `import { runSuites } from ${JSON.stringify(join(REPO_ROOT, 'scripts/falsify/runner.ts'))}
+await runSuites([{ name: 'f', tests: [${JSON.stringify(join(root, 'mod.test.ts'))}], control: { id: 'C', file: 'mod.ts', from: '// fixture module', to: '// c', why: '' },
+  mutants: [{ id: 'hang', file: 'mod.ts', from: 'return a + b', to: 'for (;;) {}\\n  return a + b', why: '' }] }],
+  { root: ${JSON.stringify(root)}, timeoutMs: 120000 })
+`,
+  )
+  const child = spawn(process.execPath, ['--import', 'tsx', driver], { cwd: root, stdio: 'ignore', detached: true })
+  t.after(() => spawnSync('pkill', ['-KILL', '-f', root]))
+  const journal = join(root, '.falsify', 'journal.json')
+  const deadline = Date.now() + 60_000
+  while (!(existsSync(journal) && readFileSync(join(root, 'mod.ts'), 'utf8') !== original)) {
+    assert.ok(Date.now() < deadline, 'the runner never reached its mutant')
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  // The journal names the live runner, so a test or a daemon can tell this
+  // run from one that died.
+  assert.equal((JSON.parse(readFileSync(journal, 'utf8')) as { pid: number }).pid, child.pid)
+  assert.equal(liveRun(root), child.pid)
+  // And a second runner on the same tree refuses rather than "recovering" it.
+  await assert.rejects(runSuites([], { root, timeoutMs: 1_000 }), /already in progress/)
+
+  child.kill('SIGHUP')
+  const code = await new Promise<number | null>((resolve) => child.once('exit', (c) => resolve(c)))
+  assert.equal(code, 129)
+  assert.equal(readFileSync(join(root, 'mod.ts'), 'utf8'), original, 'SIGHUP left the mutant in place')
+  assert.equal(existsSync(journal), false)
+  assert.deepEqual([...RESTORING_SIGNALS], ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'])
+})
+
 test('a hang is never a kill, and a failure with no named test is never a kill', () => {
   assert.equal(judge({ timedOut: true, code: null, failing: ['adds'], passing: [] }).verdict, 'hung')
   assert.equal(judge({ timedOut: false, code: 1, failing: ['test/x.test.ts'], passing: [] }).verdict, 'invalid')
@@ -268,7 +304,9 @@ test('no mutant that could steer an entry point at a credentials file runs besid
   // Such mutants belong in a suite of in-process tests against a trap repo.
   const SPAWNS = 'test/entrypoints.test.ts'
   const ENTRY = new Set(['src/main.ts', 'src/cli/index.ts', 'scripts/eval.ts', 'scripts/capture-pmmcp.ts'])
-  const NAMES_THE_FILE = /['"`]\.env['"`/]|DOTENV_FILE/
+  // `.env` not preceded by an identifier character (so not `process.env`):
+  // '.env', '/.env', `${base}/.env`, './.env' all count.
+  const NAMES_THE_FILE = /(?<![\w$])\.env\b|DOTENV_FILE/
   const hazards: string[] = []
   for (const s of CATALOG) {
     if (!s.tests.includes(SPAWNS)) continue
@@ -279,7 +317,7 @@ test('no mutant that could steer an entry point at a credentials file runs besid
   assert.deepEqual(hazards, [])
 })
 
-test('npm run falsify is a program: bad input is refused with usage, --list runs nothing', () => {
+test('npm run falsify is a program: bad input and unknown options are refused with usage; --list, --help and --recover run nothing', () => {
   const run = (args: string[]) =>
     spawnSync('npx', ['tsx', 'scripts/falsify.ts', ...args], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 60_000 })
 
@@ -297,6 +335,21 @@ test('npm run falsify is a program: bad input is refused with usage, --list runs
   assert.match(list.stdout, /^replay {2}\(test\/wire-replay\.test\.ts/m)
   assert.match(list.stdout, /R1 +src\/runtime\/loop\.ts/)
   assert.doesNotMatch(list.stdout, /^delegation/m)
-  // Listing touched nothing.
+
+  // An option it does not read is refused, never ignored: a typo or --help
+  // must not run the whole catalog against the working tree.
+  const help = run(['--help'])
+  assert.equal(help.status, 0, help.stderr)
+  assert.match(help.stdout, /^usage: npm run falsify/)
+  for (const typo of [['--lsit'], ['--dry-run', 'replay'], ['-x']]) {
+    const r = run(typo)
+    assert.equal(r.status, 2, `${typo.join(' ')}: ${r.stdout}`)
+    assert.match(r.stderr, /unknown option/)
+    assert.doesNotMatch(r.stderr, /baseline/)
+  }
+  const recover = run(['--recover'])
+  assert.equal(recover.status, 0, recover.stderr)
+  assert.match(recover.stdout, /nothing to recover/)
+  // None of it touched anything.
   assert.equal(existsSync(join(REPO_ROOT, '.falsify', 'journal.json')), false)
 })

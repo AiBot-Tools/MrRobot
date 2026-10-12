@@ -26,7 +26,10 @@
 //   the original bytes are written to a journal BEFORE the edit, and a run that
 //     finds a journal restores it first — a SIGKILL mid-mutant is recovered by
 //     the next start;
-//   restore happens in `finally`, and SIGINT/SIGTERM restore before exiting;
+//   restore happens in `finally`, and SIGINT, SIGTERM, SIGHUP (a closed
+//     terminal, a dropped SSH session) and SIGQUIT restore before exiting;
+//   the journal names the runner's pid, so the test guard and the daemon can
+//     tell a run in progress from one that died and left a file mutated;
 //   the test process runs in its own process group and the whole group is
 //     killed on timeout, so a hung child cannot outlive the verdict.
 
@@ -97,14 +100,24 @@ export interface RunnerOptions {
   readonly log?: (line: string) => void
 }
 
-const JOURNAL_DIR = '.falsify'
-const JOURNAL = 'journal.json'
+/** Where the journal lives, relative to the root: read by test/helpers/guard.ts and src/main.ts too. */
+export const JOURNAL_DIR = '.falsify'
+export const JOURNAL = 'journal.json'
 
 interface Journal {
   readonly file: string
   /** The original bytes, base64 — exact, whatever the encoding. */
   readonly original: string
+  /** The runner that wrote it: alive means a run in progress, gone means one that died. */
+  readonly pid: number
 }
+
+/**
+ * Every signal whose default action would end the run without a restore.
+ * SIGKILL cannot be caught; the journal covers it.
+ */
+export const RESTORING_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const
+const SIGNAL_NUMBERS: Partial<Record<NodeJS.Signals, number>> = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGTERM: 15 }
 
 // ── journal ────────────────────────────────────────────────────────────────
 
@@ -123,6 +136,20 @@ export function recoverInterrupted(root: string): string | undefined {
   writeFileSync(join(root, journal.file), Buffer.from(journal.original, 'base64'))
   rmSync(path)
   return journal.file
+}
+
+/** The pid of a runner that holds the journal and is still alive, if any. */
+export function liveRun(root: string): number | undefined {
+  const path = journalPath(root)
+  if (!existsSync(path)) return undefined
+  const pid = (JSON.parse(readFileSync(path, 'utf8')) as Partial<Journal>).pid
+  if (typeof pid !== 'number' || pid === process.pid) return undefined
+  try {
+    process.kill(pid, 0)
+    return pid
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM' ? pid : undefined
+  }
 }
 
 function writeJournal(root: string, journal: Journal): void {
@@ -248,6 +275,10 @@ export async function runSuites(suites: readonly Suite[], options: RunnerOptions
   const runTests = options.runTests ?? nodeTestRunner(root)
   const log = options.log ?? (() => undefined)
 
+  // Another runner alive on this tree owns the journal: "recovering" would undo
+  // its mutant mid-run, and two runners would race on the same files.
+  const live = liveRun(root)
+  if (live !== undefined) throw new Error(`a falsify run is already in progress on ${root} (pid ${String(live)})`)
   const recovered = recoverInterrupted(root)
   if (recovered !== undefined) log(`restored ${recovered}, left mutated by an interrupted run`)
 
@@ -260,10 +291,9 @@ export async function runSuites(suites: readonly Suite[], options: RunnerOptions
   }
   const onSignal = (signal: NodeJS.Signals): void => {
     restore()
-    process.exit(signal === 'SIGINT' ? 130 : 143)
+    process.exit(128 + (SIGNAL_NUMBERS[signal] ?? 15))
   }
-  process.once('SIGINT', onSignal)
-  process.once('SIGTERM', onSignal)
+  for (const signal of RESTORING_SIGNALS) process.once(signal, onSignal)
 
   const reports: SuiteReport[] = []
   try {
@@ -303,7 +333,7 @@ export async function runSuites(suites: readonly Suite[], options: RunnerOptions
           log(`  ${mutant.id}: invalid — ${why}`)
           continue
         }
-        current = { file: mutant.file, original: original.toString('base64') }
+        current = { file: mutant.file, original: original.toString('base64'), pid: process.pid }
         writeJournal(root, current)
         try {
           writeFileSync(path, text.replace(mutant.from, () => mutant.to))
@@ -318,8 +348,7 @@ export async function runSuites(suites: readonly Suite[], options: RunnerOptions
     }
   } finally {
     restore()
-    process.removeListener('SIGINT', onSignal)
-    process.removeListener('SIGTERM', onSignal)
+    for (const signal of RESTORING_SIGNALS) process.removeListener(signal, onSignal)
   }
   return reports
 }

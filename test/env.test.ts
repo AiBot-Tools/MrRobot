@@ -9,7 +9,7 @@ import './helpers/guard.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import net from 'node:net'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -18,6 +18,8 @@ import { DatabaseSync } from 'node:sqlite'
 import { allowHost, clearAllowedHosts, NetworkBlocked } from './helpers/guard.js'
 import { VERSION } from '../src/version.js'
 import { tmpdir } from './helpers/tmpdir.js'
+
+const REPO_DIR = fileURLToPath(new URL('..', import.meta.url))
 
 test('tsx resolves a .js specifier to a .ts source', () => {
   // The import above is written `../src/version.js`; the file on disk is
@@ -229,10 +231,10 @@ test('the test guard removes credential names from every test process except a l
   const body =
     `await import(${JSON.stringify(guard)})\n` +
     "console.log(JSON.stringify({ key: process.env.ANTHROPIC_API_KEY ?? null, token: process.env.AOS_CONTROL_TOKEN ?? null, other: process.env.OPENROUTER_API_KEY ?? null, path: process.env.PATH === undefined ? null : 'kept' }))\n"
-  const probe = (file: string, live: boolean): Record<string, unknown> => {
+  const probe = (file: string, live: boolean, extra: readonly string[] = []): Record<string, unknown> => {
     const path = join(dir, file)
     writeFileSync(path, body)
-    const result = spawnSync(process.execPath, ['--import', 'tsx', path], {
+    const result = spawnSync(process.execPath, ['--import', 'tsx', path, ...extra], {
       encoding: 'utf8',
       timeout: 30_000,
       env: {
@@ -250,6 +252,9 @@ test('the test guard removes credential names from every test process except a l
   assert.deepEqual(probe('cli.test.ts', false), scrubbed)
   assert.deepEqual(probe('live-probe.test.ts', false), scrubbed)
   assert.deepEqual(probe('cli.test.ts', true), scrubbed, 'an offline file kept credentials on the live run')
+  // One process given several files (--test-isolation=none) is scrubbed even
+  // when a live file comes first: the offline files after it share the process.
+  assert.deepEqual(probe('live-probe.test.ts', true, [join(dir, 'cli.test.ts')]), scrubbed, 'a shared process kept credentials')
   assert.deepEqual(probe('not-live-probe.test.ts', true), scrubbed)
   assert.deepEqual(probe('live-probe.test.ts', true), {
     key: 'qGuardCanaryKey',
@@ -257,4 +262,36 @@ test('the test guard removes credential names from every test process except a l
     other: 'qGuardCanaryOther',
     path: 'kept',
   })
+})
+
+test('the test guard refuses a tree an interrupted falsify run left mutated, and allows a run in progress', (t) => {
+  // The guard finds the repository from its own location, so a copy of it in a
+  // temp tree with a journal stands in for the checkout.
+  const root = tmpdir(t)
+  writeFileSync(join(root, 'package.json'), '{"type":"module"}\n')
+  mkdirSync(join(root, 'test', 'helpers'), { recursive: true })
+  const guard = join(root, 'test', 'helpers', 'guard.ts')
+  writeFileSync(guard, readFileSync(fileURLToPath(new URL('./helpers/guard.ts', import.meta.url))))
+  mkdirSync(join(root, '.falsify'))
+  const journal = (pid: number | undefined): void =>
+    writeFileSync(join(root, '.falsify', 'journal.json'), JSON.stringify({ file: 'src/policy/gate.ts', original: '', ...(pid === undefined ? {} : { pid }) }))
+  const load = (): ReturnType<typeof spawnSync> =>
+    spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `await import(${JSON.stringify(guard)})`], {
+      cwd: REPO_DIR,
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
+    })
+
+  const dead = spawnSync(process.execPath, ['-e', '0']).pid
+  for (const pid of [dead, undefined]) {
+    journal(pid)
+    const r = load()
+    assert.notEqual(r.status, 0, 'a dead run\'s journal was ignored')
+    assert.match(String(r.stderr), /interrupted falsify run left src\/policy\/gate\.ts mutated/)
+  }
+  const live = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'])
+  t.after(() => live.kill('SIGKILL'))
+  journal(live.pid)
+  assert.equal(load().status, 0, 'a run in progress was refused')
 })

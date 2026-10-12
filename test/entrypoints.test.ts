@@ -21,17 +21,24 @@
 
 import './helpers/guard.js'
 
-import { test } from 'node:test'
+import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync, spawn } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { closeVerified, withStore } from './helpers/store.js'
 import { EventStore } from '../src/events/store.js'
 import { tmpdir } from './helpers/tmpdir.js'
+import { shadowCheckout } from './helpers/checkout.js'
 
-const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
+// Every program here runs from a copy of the checkout holding a trap .env,
+// never from the checkout itself, where the operator keeps the real one (see
+// helpers/checkout.ts). hygiene.test.ts refuses a spawn from the real tree.
+const CHECKOUT = shadowCheckout()
+after(() => CHECKOUT.dispose())
+const ROOT = CHECKOUT.root
 
 // The shipped config names the operator's REAL pmmcp and, since pmmcp takes no
 // bearer, nothing short of the address keeps an offline test from reaching it.
@@ -53,7 +60,7 @@ function cli(args: readonly string[], env: Record<string, string>): {
   stderr: string
 } {
   const result = spawnSync(process.execPath, ['--import', 'tsx', 'src/cli/index.ts', ...args], {
-    cwd: REPO,
+    cwd: ROOT,
     encoding: 'utf8',
     timeout: 60_000,
     // A clean environment plus exactly what the command needs: inheriting the
@@ -130,7 +137,7 @@ test('npm run dev boots the daemon, serves the CLI over the socket, and shuts do
   // collide with the port-0 fixtures every other kernel test uses.
   const port = 7791
   const configPath = join(dataDir, 'kernel.yaml')
-  const shipped = readFileSync(join(REPO, 'config', 'kernel.yaml'), 'utf8')
+  const shipped = readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8')
   const config = offlinePmmcp(shipped)
     .replace(/^dataDir: .*$/m, `dataDir: ${dataDir}`)
     .replace(/^  port: \d+$/m, `  port: ${String(port)}`)
@@ -145,7 +152,7 @@ test('npm run dev boots the daemon, serves the CLI over the socket, and shuts do
     AOS_DATA_DIR: dataDir,
   }
   const daemon = spawn(process.execPath, ['--import', 'tsx', 'src/main.ts', '--config', configPath], {
-    cwd: REPO,
+    cwd: ROOT,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -229,6 +236,39 @@ test('npm run dev boots the daemon, serves the CLI over the socket, and shuts do
   assert.match(verify.stdout, /^ok\t\d+ events\thead [0-9a-f]{64}\n$/)
 })
 
+test('the checkout these programs run from holds an armed trap .env, so a default-path regression reads nothing real', () => {
+  // Pointed at it on purpose, the daemon must refuse it: that refusal is what a
+  // regression or mutant that defaults to <repo>/.env would hit here, instead
+  // of the operator's real file.
+  const run = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--dotenv', '.env'], {
+    cwd: ROOT,
+    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', HOME: process.env['HOME'] ?? '' },
+    encoding: 'utf8',
+    timeout: 60_000,
+  })
+  assert.notEqual(run.status, 0)
+  assert.match(`${run.stdout}${run.stderr}`, /\.env has mode 0644/)
+  assert.notEqual(ROOT, fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, ''))
+})
+
+test('the daemon will not start on a tree a falsify run has mutated, live or interrupted', () => {
+  const dir = join(ROOT, '.falsify')
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'journal.json'), JSON.stringify({ file: 'src/policy/gate.ts', original: '', pid: 1 }))
+  try {
+    const run = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts'], {
+      cwd: ROOT,
+      env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', HOME: process.env['HOME'] ?? '' },
+      encoding: 'utf8',
+      timeout: 60_000,
+    })
+    assert.equal(run.status, 1)
+    assert.match(`${run.stdout}${run.stderr}`, /a falsify run is in progress or was interrupted/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('the operator scripts are programs: each refuses with usage rather than doing nothing', (t) => {
   // The same blindness this file exists for. `scripts/eval.ts` and
   // `scripts/capture-pmmcp.ts` are only ever reached through npm, so nothing in
@@ -243,7 +283,7 @@ test('the operator scripts are programs: each refuses with usage rather than doi
   const env = { PATH: process.env['PATH'] ?? '/usr/bin:/bin' }
 
   const evalRun = spawnSync('npx', ['tsx', 'scripts/eval.ts'], {
-    cwd: REPO,
+    cwd: ROOT,
     env,
     encoding: 'utf8',
     timeout: 60_000,
@@ -252,13 +292,13 @@ test('the operator scripts are programs: each refuses with usage rather than doi
   assert.match(evalRun.stderr, /AOS_CONTROL_TOKEN is not set/)
 
   const dir = tmpdir(t)
-  const shipped = offlinePmmcp(readFileSync(join(REPO, 'config', 'kernel.yaml'), 'utf8'))
+  const shipped = offlinePmmcp(readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8'))
   const capture = (yaml: string, name: string): { status: number | null; stderr: string; out: string } => {
     const configPath = join(dir, `${name}.yaml`)
     const out = join(dir, `${name}.json`)
     writeFileSync(configPath, yaml)
     const run = spawnSync('npx', ['tsx', 'scripts/capture-pmmcp.ts', out, '--config', configPath], {
-      cwd: REPO,
+      cwd: ROOT,
       env,
       encoding: 'utf8',
       timeout: 60_000,
@@ -287,7 +327,7 @@ test('the operator scripts are programs: each refuses with usage rather than doi
 /** A kernel.yaml for a spawned daemon: its own data dir and port, pmmcp offline. */
 function daemonConfig(dataDir: string, port: number): string {
   const path = join(dataDir, 'kernel.yaml')
-  const shipped = readFileSync(join(REPO, 'config', 'kernel.yaml'), 'utf8')
+  const shipped = readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8')
   writeFileSync(
     path,
     offlinePmmcp(shipped)
@@ -324,7 +364,7 @@ test('the daemon and the CLI read AOS_CONTROL_TOKEN and a provider key that exis
   // No credential in the environment at all: only the file can supply them.
   const env = { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '', AOS_DATA_DIR: dataDir }
   const daemon = spawn(process.execPath, ['--import', 'tsx', 'src/main.ts', '--config', configPath, '--dotenv', creds], {
-    cwd: REPO,
+    cwd: ROOT,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -398,7 +438,7 @@ test('the daemon refuses a group-readable or non-regular --dotenv before it boot
   const run = (creds: string, dataDir: string): { status: number | null; out: string } => {
     const configPath = daemonConfig(dataDir, 7793)
     const result = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--config', configPath, '--dotenv', creds], {
-      cwd: REPO,
+      cwd: ROOT,
       env: { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '', AOS_DATA_DIR: dataDir },
       encoding: 'utf8',
       timeout: 30_000,
@@ -434,7 +474,7 @@ test('eval.ts takes AOS_CONTROL_TOKEN from --dotenv in either form, refuses a se
   const creds = credsFile(tmpdir(t), `AOS_CONTROL_TOKEN=${FILE_TOKEN}\nANTHROPIC_API_KEY=${FILE_KEY}\n`)
   // An unknown case stops eval right after the token check, before any socket.
   const run = spawnSync('npx', ['tsx', 'scripts/eval.ts', '--dotenv', creds, '--case', 'nope'], {
-    cwd: REPO,
+    cwd: ROOT,
     env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
     encoding: 'utf8',
     timeout: 60_000,
@@ -445,7 +485,7 @@ test('eval.ts takes AOS_CONTROL_TOKEN from --dotenv in either form, refuses a se
 
   // The --dotenv=path form is read, as the daemon reads it.
   const eqForm = spawnSync('npx', ['tsx', 'scripts/eval.ts', `--dotenv=${creds}`, '--case', 'nope'], {
-    cwd: REPO,
+    cwd: ROOT,
     env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
     encoding: 'utf8',
     timeout: 60_000,
@@ -456,7 +496,7 @@ test('eval.ts takes AOS_CONTROL_TOKEN from --dotenv in either form, refuses a se
   // `npm run eval -- --dotenv other` puts a second flag after package.json's:
   // refused, as by the daemon and the CLI, rather than one silently ignored.
   const twice = spawnSync('npx', ['tsx', 'scripts/eval.ts', '--dotenv', creds, '--dotenv', creds, '--case', 'nope'], {
-    cwd: REPO,
+    cwd: ROOT,
     env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
     encoding: 'utf8',
     timeout: 60_000,

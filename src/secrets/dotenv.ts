@@ -4,9 +4,12 @@
 //
 //   Who reads it: src/main.ts (npm run dev), src/cli/index.ts and scripts/eval.ts,
 //   and only when their argv carries `--dotenv <path>`. package.json passes
-//   `--dotenv .env` to those three scripts and to nothing else; `npm test` never
-//   does, and nothing here has a default path, so a test that boots or spawns
-//   an entry point opens no file.
+//   `--dotenv .env` to those three scripts and to nothing else, and nothing here
+//   has a default path, so a test that boots or spawns an entry point opens no
+//   file. The one test reader is test/helpers/live-env.ts, which opens
+//   <repo>/.env only on the operator's gated live run (AOS_LIVE_TESTS=1), is
+//   called only from test/live-*.test.ts (hygiene.test.ts holds that), and only
+//   when the shell lacks the key.
 //
 //   Who writes it: the operator. No code path writes it, or .env.example, which
 //   is the committed, placeholder-only template and never holds a real value.

@@ -446,7 +446,8 @@ const dotenv: Suite = {
     { id: 'X26', file: 'src/secrets/broker.ts', from: '    return this.#mintFromEnv(id, envVar, fromEnv, purpose)\n  }\n\n  /** Both env paths', to: '    return this.#mint(id, \'env\', fromEnv, purpose)\n  }\n\n  /** Both env paths', why: 'the D8 env fallback mints a value source env would refuse' },
     { id: 'X27', file: 'src/secrets/broker.ts', from: '  if (/[^\\x21-\\x7e]/.test(value)) return', to: '  if (false) return', why: 'a smart-quoted or zero-width-spaced key is minted and fails far away, naming nothing' },
     { id: 'X24', file: 'test/helpers/live-env.ts', from: '  if (env[\'AOS_LIVE_TESTS\'] !== \'1\') throw new Error', to: '  if (false) throw new Error', why: 'an offline test can open the repo\'s real .env' },
-    { id: 'X25', file: 'test/helpers/guard.ts', from: 'if (process.env[\'AOS_LIVE_TESTS\'] !== \'1\') {\n  for (const name of Object.keys(process.env)) {', to: 'if (false) {\n  for (const name of Object.keys(process.env)) {', why: 'a key exported in the shell running npm test reaches every offline test' },
+    { id: 'X25', file: 'test/helpers/guard.ts', from: 'if (!KEEPS_CREDENTIALS) {', to: 'if (false) {', why: 'a key exported in the shell running npm test reaches every offline test' },
+    { id: 'X31', file: 'test/helpers/guard.ts', from: "export const KEEPS_CREDENTIALS = process.env['AOS_LIVE_TESTS'] === '1' && LIVE_FILE.test(process.argv[1] ?? '')", to: "export const KEEPS_CREDENTIALS = process.env['AOS_LIVE_TESTS'] === '1'", why: 'on the live run all sixty offline test files keep the shell\'s keys, not just the two live ones' },
   ],
   control: {
     id: 'C',

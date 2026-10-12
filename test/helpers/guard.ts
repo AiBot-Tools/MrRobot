@@ -18,12 +18,21 @@ import net from 'node:net'
  * control token or the pmmcp bearer would use is removed from this test
  * process's environment at import — so a key the operator exported in the
  * shell that runs `npm test` cannot be picked up, logged or sent by accident.
- * The gated live run (AOS_LIVE_TESTS=1) is the one exception: it is the only
- * run that is meant to use a real key.
+ *
+ * The one exception is a test/live-*.test.ts file on the gated live run
+ * (AOS_LIVE_TESTS=1). The gate alone is not enough: `AOS_LIVE_TESTS=1 npm
+ * test` runs every file, and the sixty offline ones must still be scrubbed.
+ * `node --test` gives each file its own process with the file as argv[1];
+ * anything else (an -e script, --test-isolation=none) is scrubbed.
  */
 export const CREDENTIAL_NAME = /^(ANTHROPIC|OPENAI|OPENROUTER|MOONSHOT)_|_API_KEY$|^AOS_CONTROL_TOKEN$|^PMMCP_TOKEN$/
 
-if (process.env['AOS_LIVE_TESTS'] !== '1') {
+const LIVE_FILE = /[/\\]test[/\\]live-[^/\\]+\.test\.ts$/
+
+/** True only in a live test file's own process on the gated run. */
+export const KEEPS_CREDENTIALS = process.env['AOS_LIVE_TESTS'] === '1' && LIVE_FILE.test(process.argv[1] ?? '')
+
+if (!KEEPS_CREDENTIALS) {
   for (const name of Object.keys(process.env)) {
     if (CREDENTIAL_NAME.test(name)) delete process.env[name]
   }

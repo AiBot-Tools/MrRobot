@@ -307,8 +307,11 @@ function credsFile(dir: string, text: string, mode = 0o600): string {
   return path
 }
 
-// Opaque on purpose: nothing like a real key shape, so its absence from the log
-// proves the exact-value mask rather than the pattern redactor.
+// Opaque on purpose: nothing like a real key shape, so the pattern redactor
+// cannot be what keeps them out of the log. On this path nothing writes them
+// at all (the broker logs ids, the token is only compared), so their absence
+// is a check that nothing starts to; the exact-value mask itself is proven in
+// dotenv.test.ts ("every returned value is registered with SecretMask…").
 const FILE_TOKEN = 'qFileOnlyControlToken0123456789abcdefgh'
 const FILE_KEY = 'qFileOnlyProviderKeyZYXWVUTSRQ987654321'
 

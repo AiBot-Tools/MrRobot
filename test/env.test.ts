@@ -10,11 +10,14 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import net from 'node:net'
 import { spawnSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 
 import { allowHost, clearAllowedHosts, NetworkBlocked } from './helpers/guard.js'
 import { VERSION } from '../src/version.js'
+import { tmpdir } from './helpers/tmpdir.js'
 
 test('tsx resolves a .js specifier to a .ts source', () => {
   // The import above is written `../src/version.js`; the file on disk is
@@ -212,34 +215,46 @@ function cmp(a: Semver, b: Semver): number {
   return a.major - b.major || a.minor - b.minor || a.patch - b.patch
 }
 
-test('the test guard removes credential names from an offline test process, and keeps them only on the live run', () => {
+test('the test guard removes credential names from every test process except a live file on the live run', (t) => {
   // A key the operator exported in the shell that runs npm test must never be
-  // visible to an offline test. Spawned, because the guard runs at import.
-  const probe = (live: boolean): Record<string, unknown> => {
-    const result = spawnSync(
-      process.execPath,
-      [
-        '--import',
-        'tsx',
-        '--input-type=module',
-        '-e',
-        "await import('./test/helpers/guard.ts'); console.log(JSON.stringify({ key: process.env.ANTHROPIC_API_KEY ?? null, token: process.env.AOS_CONTROL_TOKEN ?? null, other: process.env.OPENROUTER_API_KEY ?? null, path: process.env.PATH === undefined ? null : 'kept' }))",
-      ],
-      {
-        encoding: 'utf8',
-        timeout: 30_000,
-        env: {
-          PATH: process.env['PATH'] ?? '/usr/bin:/bin',
-          ANTHROPIC_API_KEY: 'qGuardCanaryKey',
-          AOS_CONTROL_TOKEN: 'qGuardCanaryToken',
-          OPENROUTER_API_KEY: 'qGuardCanaryOther',
-          ...(live ? { AOS_LIVE_TESTS: '1' } : {}),
-        },
+  // visible to an offline test — on the live run too, where every offline file
+  // runs beside the two live ones. Spawned, because the guard runs at import,
+  // and run as a FILE, because argv[1] is how the guard knows which test it is.
+  const root = tmpdir(t)
+  // ESM, as in this repo, so the probe can await the guard at top level.
+  writeFileSync(join(root, 'package.json'), '{"type":"module"}\n')
+  const dir = join(root, 'test')
+  mkdirSync(dir)
+  const guard = fileURLToPath(new URL('./helpers/guard.ts', import.meta.url))
+  const body =
+    `await import(${JSON.stringify(guard)})\n` +
+    "console.log(JSON.stringify({ key: process.env.ANTHROPIC_API_KEY ?? null, token: process.env.AOS_CONTROL_TOKEN ?? null, other: process.env.OPENROUTER_API_KEY ?? null, path: process.env.PATH === undefined ? null : 'kept' }))\n"
+  const probe = (file: string, live: boolean): Record<string, unknown> => {
+    const path = join(dir, file)
+    writeFileSync(path, body)
+    const result = spawnSync(process.execPath, ['--import', 'tsx', path], {
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: {
+        PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+        ANTHROPIC_API_KEY: 'qGuardCanaryKey',
+        AOS_CONTROL_TOKEN: 'qGuardCanaryToken',
+        OPENROUTER_API_KEY: 'qGuardCanaryOther',
+        ...(live ? { AOS_LIVE_TESTS: '1' } : {}),
       },
-    )
+    })
     assert.equal(result.status, 0, result.stderr)
     return JSON.parse(result.stdout.trim().split('\n').pop() ?? '{}') as Record<string, unknown>
   }
-  assert.deepEqual(probe(false), { key: null, token: null, other: null, path: 'kept' })
-  assert.deepEqual(probe(true), { key: 'qGuardCanaryKey', token: 'qGuardCanaryToken', other: 'qGuardCanaryOther', path: 'kept' })
+  const scrubbed = { key: null, token: null, other: null, path: 'kept' }
+  assert.deepEqual(probe('cli.test.ts', false), scrubbed)
+  assert.deepEqual(probe('live-probe.test.ts', false), scrubbed)
+  assert.deepEqual(probe('cli.test.ts', true), scrubbed, 'an offline file kept credentials on the live run')
+  assert.deepEqual(probe('not-live-probe.test.ts', true), scrubbed)
+  assert.deepEqual(probe('live-probe.test.ts', true), {
+    key: 'qGuardCanaryKey',
+    token: 'qGuardCanaryToken',
+    other: 'qGuardCanaryOther',
+    path: 'kept',
+  })
 })

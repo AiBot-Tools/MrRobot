@@ -467,11 +467,14 @@ test('nothing in src/ or scripts/ writes process.env or uses Node\'s .env loader
     /from\s+['"]dotenv['"]/,
     /--env-file/,
   ]
-  // The mutation catalog is excluded the way this file is: its strings are
-  // deliberate copies of the bugs (X16 writes process.env), applied and
-  // reverted by the falsifier, never run as code.
-  for (const file of [...SRC, ...SCRIPTS].filter((f) => f.path !== 'scripts/falsify/catalog.ts')) {
+  // In the mutation catalog only a one-line mutant literal is exempt: its
+  // from/to strings are deliberate copies of the bugs (X16 writes process.env),
+  // applied and reverted by the falsifier. The rest of the file is code that
+  // runs — falsify.test.ts imports it on every npm test — and is scanned.
+  const MUTANT_LITERAL = /^\s*\{ id: '[A-Z]+\d*', file: /
+  for (const file of [...SRC, ...SCRIPTS]) {
     for (const line of codeLines(file)) {
+      if (file.path === 'scripts/falsify/catalog.ts' && MUTANT_LITERAL.test(line.text)) continue
       for (const pattern of forbidden) {
         assert.equal(pattern.test(line.text), false, `${file.path}:${String(line.n)} matches ${String(pattern)}`)
       }
@@ -484,17 +487,60 @@ test('nothing in src/ or scripts/ writes process.env or uses Node\'s .env loader
   }
 })
 
-test('liveCredential is called only in test/live-*.test.ts and only behind LIVE', () => {
+/** The top-level arguments of the first `name(` call on a line, or undefined. */
+function callArgs(text: string, name: string): string[] | undefined {
+  const start = text.indexOf(`${name}(`)
+  if (start === -1) return undefined
+  const args: string[] = []
+  let depth = 0
+  let quote: string | undefined
+  let current = ''
+  for (const ch of text.slice(start + name.length + 1)) {
+    if (quote !== undefined) {
+      current += ch
+      if (ch === quote) quote = undefined
+    } else if (ch === "'" || ch === '"' || ch === '`') {
+      quote = ch
+      current += ch
+    } else if ('([{'.includes(ch)) {
+      depth += 1
+      current += ch
+    } else if (')]}'.includes(ch) && depth > 0) {
+      depth -= 1
+      current += ch
+    } else if (ch === ')') {
+      if (current.trim() !== '') args.push(current.trim())
+      return args
+    } else if (ch === ',' && depth === 0) {
+      args.push(current.trim())
+      current = ''
+    } else {
+      current += ch
+    }
+  }
+  return undefined
+}
+
+test('liveCredential is called only in test/live-*.test.ts behind LIVE, or with an explicit path', () => {
   // The one test path that opens the repository's real .env must be reachable
-  // only on the operator's gated live run.
-  const calls = TEST.filter((f) => f.path !== 'test/helpers/live-env.ts' && f.path !== 'test/dotenv.test.ts').flatMap((f) =>
+  // only on the operator's gated live run. dotenv.test.ts tests the helper
+  // itself, with AOS_LIVE_TESTS=1 in a literal env, so there every call must
+  // name its file: dropping the path argument would make an offline test open
+  // the operator's real <repo>/.env.
+  const calls = TEST.filter((f) => f.path !== 'test/helpers/live-env.ts').flatMap((f) =>
     codeLines(f)
       .filter((l) => l.text.includes('liveCredential('))
       .map((l) => ({ path: f.path, n: l.n, text: l.text })),
   )
-  assert.ok(calls.length >= 2, 'the live files no longer take their key through liveCredential')
-  for (const call of calls) {
+  const live = calls.filter((c) => c.path !== 'test/dotenv.test.ts')
+  assert.ok(live.length >= 2, 'the live files no longer take their key through liveCredential')
+  for (const call of live) {
     assert.match(call.path, /^test\/live-[^/]+\.test\.ts$/, `${call.path}:${String(call.n)}`)
     assert.match(call.text, /LIVE \?/, `${call.path}:${String(call.n)} calls liveCredential outside the LIVE gate`)
+  }
+  const unit = calls.filter((c) => c.path === 'test/dotenv.test.ts')
+  assert.ok(unit.length >= 3, 'dotenv.test.ts no longer tests liveCredential')
+  for (const call of unit) {
+    assert.equal(callArgs(call.text, 'liveCredential')?.length, 3, `${call.path}:${String(call.n)} leaves liveCredential's path to its default`)
   }
 })

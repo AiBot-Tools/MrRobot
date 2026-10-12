@@ -1,11 +1,11 @@
 # Model catalogue: how to reach each model, what it costs, what it can do.
 #
-# This file holds NO secrets. A non-local entry references its credential by
-# vault id; `auth.envVar` beside it is a per-entry SECONDARY consulted ONLY
-# after a vault failure and ONLY when kernel.yaml sets secrets.envFallback
-# true. A literal credential is refused by key name and by value shape, and an
-# envVar without a vaultId is refused outright — that combination is how a
-# production key quietly leaves the vault and moves into the environment.
+# This file holds NO secrets. A non-local entry names its credential twice:
+# `auth.envVar` is the working path (kernel.yaml secrets.source: env — the shell,
+# or the operator's <repo>/.env through --dotenv; add the name to .env.example
+# when you clear a placeholder), and `auth.vaultId` serves the dormant vault
+# path. A literal credential is refused by key name and by value shape, and an
+# envVar without a vaultId is still refused, so the dormant path stays whole.
 #
 # Phase 0 ships exactly ONE real entry. Every other entry is
 # `placeholder: true`, which the schema enforces for any non-anthropic ref, and
@@ -35,9 +35,8 @@ entries:
     auth:
       header: x-api-key
       scheme: none
-      # Both are present on purpose: the vault is the credential path, and the
-      # envVar exists so the env-fallback path has something to resolve when
-      # the operator opts into it and the vault is down.
+      # Both are present on purpose: envVar is the working path (shell or .env);
+      # vaultId serves the dormant vault path.
       vaultId: anthropic-api-key
       envVar: ANTHROPIC_API_KEY
     headers:

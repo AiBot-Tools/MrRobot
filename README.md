@@ -66,18 +66,49 @@ npm run typecheck              # must be clean
 npm test                       # must be green
 ```
 
-The daemon needs `AOS_CONTROL_TOKEN` (at least 32 characters) in the
-environment, and refuses to start without it. There is no `--env-file` flag on
-`dev` or `cli` by design (D7): source your `.env` yourself.
+The daemon needs `AOS_CONTROL_TOKEN` (at least 32 characters) and, to reach a
+model, `ANTHROPIC_API_KEY`. Both live in **your own `.env` in the repository
+root**: git-ignored, mode 0600, written only by you. `.env.example` is the
+committed template: placeholders only, never edited to hold a real value, and it
+does not change when your `.env` does.
 
 ```bash
-export AOS_CONTROL_TOKEN="$(openssl rand -hex 32)"
-read -rs ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY   # typed, never stored
-npm run dev
+(umask 077 && cp .env.example .env)   # creates .env as mode 0600
+$EDITOR .env                          # replace both replace-me-... values (openssl rand -hex 32 makes a token)
+npm run dev                           # logs: credentials: .env (AOS_CONTROL_TOKEN, ANTHROPIC_API_KEY)
+npm run cli -- agents                 # in a second shell; nothing to export
 ```
 
-Provider keys come from the environment (`secrets.source: env`): each entry's own
-`auth.envVar`, read once at boot. pmmcp's `get_secret` answers only with a masked
+How it is read (`src/secrets/dotenv.ts`, decision D31):
+
+- `npm run dev`, `npm run cli` and `npm run eval` pass `--dotenv .env`. `npm
+  test`, and `node src/main.ts` run directly, open no file. The CLI and eval take
+  only `AOS_CONTROL_TOKEN` from it, never a provider key.
+- Values go into the kernel's memory, never into `process.env`, so no child
+  process and no SDK ambient lookup sees them. They are masked from the log the
+  moment they are read, and no error message quotes a value or a line.
+- A non-empty value exported in the shell wins over the file, and the daemon
+  warns, by name, that it did.
+- Refused at startup, each with the fix in the message: a `.env` other users can
+  read (`chmod 600 .env`), a symlink, another owner, a second hard link, more
+  than 64 KB, a `.gitignore` that stops ignoring it, any name but the two above,
+  a value still beginning `replace-me`, two lines joined into one, a name set
+  twice. It parses with its own strict grammar: Node's built-in `.env` parser
+  gives a whitespace-only value the whole next line.
+- Live tests (`AOS_LIVE_TESTS=1 npm test`) take the key from the shell or
+  `.env`; every other test strips credential names from its own environment.
+
+**Keep it safe.** This repository is public: never `git add -f .env`, and turn
+on GitHub secret scanning with push protection. `.env` is plaintext on disk:
+Time Machine, iCloud Desktop/Documents sync, and zipping or copying the folder
+all carry it, and any tool running as you can read it. Use a dedicated Anthropic
+key with a spend limit, and rotate it if the folder is ever copied. Do not run
+pmmcp's `index_project` on this repository: pmmcp skips a file named exactly
+`.env` only through its default ignore list, and stores `.env.local`-style files
+unredacted.
+
+Provider keys reach the kernel through its env (`secrets.source: env`): each entry's own
+`auth.envVar`, resolved at boot. pmmcp's `get_secret` answers only with a masked
 sentence (`Secret 'x' exists (masked): ****abcd`), by design, so it cannot supply
 a key; the vault path stays in the code, dormant, and refuses any reply that
 contains whitespace rather than minting a sentence as a credential.
@@ -95,6 +126,7 @@ git ignores. The one exception is `~/.colima`, Colima's own home.
 | `.aos/events.db`, `.aos/events.head` | the event log and its anchor |
 | `.aos/workspaces/{trusted,hostile}` | sandbox mount roots, one per Colima VM |
 | `.aos/docker` | `DOCKER_CONFIG` for the kernel's docker calls and `colima-up.sh`, never `~/.docker` |
+| `.env` | your credentials (`AOS_CONTROL_TOKEN`, `ANTHROPIC_API_KEY`): written by you, mode 0600, git-ignored; read, never written, by the npm entry scripts; deleted by `git clean -fdx` like `.aos/` |
 | `.aos/npm-cache` | npm's cache (`.npmrc`); run npm from the repo root, because npm resolves a relative path against the shell's directory |
 | `~/.colima` | Colima's VMs and sockets; `colima-up.sh` also sets `COLIMA_CACHE_HOME=~/.colima/_cache`, which would otherwise be `~/Library/Caches/colima` |
 
@@ -518,7 +550,7 @@ fresh probe, then a run with non-zero cost, in that log order. pmmcp is the
 memory and goal store here, not the key store: its `get_secret` masks by design.
 
 ```bash
-read -rs ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY
+# ANTHROPIC_API_KEY comes from .env (or a shell export, which wins)
 AOS_LIVE_TESTS=1 PMMCP_URL=http://127.0.0.1:8766/mcp npm test
 ```
 

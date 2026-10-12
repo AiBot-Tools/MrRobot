@@ -44,10 +44,11 @@ mcp:
       listToolsTimeoutMs: 15000
 
 secrets:
-  # env: each provider entry's auth.envVar, read once at boot. Export it from a
-  # prompt (`read -rs ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY`), never
-  # from a file. pmmcp's get_secret returns only a masked sentence, by design,
-  # so `vault` cannot supply a key; it stays in the code, dormant.
+  # env: each provider entry's auth.envVar, from the env the kernel boots with:
+  # a non-empty shell export, else the operator's <repo>/.env, which the entry
+  # point reads through --dotenv (npm run dev passes it; the kernel and broker
+  # never open a file). pmmcp's get_secret returns only a masked sentence, by
+  # design, so `vault` cannot supply a key; it stays in the code, dormant.
   source: env
   # Used only by source: vault. Confirmed against the live get_secret schema
   # (2026-09-21): the argument is `label`, not `key`.

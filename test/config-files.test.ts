@@ -38,6 +38,8 @@ import {
 import { AgentRegistry } from '../src/agents/registry.js'
 import { loadSoul } from '../src/agents/souls.js'
 import { DENY_KEYS, TOKEN_PATTERNS } from '../src/events/redact.js'
+import { credentialNames, gitignoresDotenv, parseDotenv, PLACEHOLDER_PREFIX } from '../src/secrets/dotenv.js'
+import { ConfigError } from '../src/errors.js'
 import { withStore } from './helpers/store.js'
 
 const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
@@ -443,4 +445,70 @@ test('no file under config/, agents/, souls/ contains a value matching TOKEN_PAT
     keys(parseYaml(text))
     assert.deepEqual(seen, [], `${rel} has secret-looking keys: ${seen.join(', ')}`)
   }
+})
+
+test('.env.example is the placeholder-only template: exactly the accepted names, every value a placeholder the loader refuses', () => {
+  // Committed to a PUBLIC repository and never filled in place: the operator's
+  // real values live in the git-ignored .env, and nothing here may resemble one.
+  const text = read('.env.example')
+  const names = credentialNames(
+    parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO }),
+    parseProviders(readYaml('config/providers.yaml')),
+  )
+  const lines = text.split('\n')
+  assert.match(lines[0] ?? '', /^#/, 'the template must open with a comment')
+  const assignments = lines
+    .map((line, i) => ({ line, n: i + 1 }))
+    .filter(({ line }) => line.trim() !== '' && !line.trim().startsWith('#'))
+  const seen = assignments.map(({ line, n }) => {
+    const m = /^([A-Z][A-Z0-9_]*)=(.*)$/.exec(line)
+    assert.ok(m, `.env.example:${String(n)} is not NAME=value`)
+    const value = m[2] ?? ''
+    assert.ok(value.startsWith(`${PLACEHOLDER_PREFIX}-`), `.env.example:${String(n)} is not a ${PLACEHOLDER_PREFIX}- placeholder`)
+    for (const pattern of TOKEN_PATTERNS) assert.equal(pattern.test(value), false, `.env.example:${String(n)} looks like a credential`)
+    // The line above each assignment says what it is.
+    assert.match(lines[n - 2] ?? '', /^# /, `.env.example:${String(n)} has no comment above it`)
+    return m[1]
+  })
+  assert.deepEqual([...seen].sort(), [...names].sort(), 'the template and the accepted credential names have diverged')
+
+  // Copied but not filled in: the loader refuses every line, by name.
+  try {
+    parseDotenv(text, names)
+    assert.fail('the loader accepted the unfilled template')
+  } catch (e) {
+    assert.ok(e instanceof ConfigError)
+    for (const name of names) assert.match(e.message, new RegExp(`${name} still holds the \\.env\\.example placeholder`))
+  }
+})
+
+test('package.json passes --dotenv .env to dev, cli and eval and to nothing else; no script or .npmrc uses Node --env-file', () => {
+  const scripts = (JSON.parse(read('package.json')) as { scripts: Record<string, string> }).scripts
+  for (const name of ['dev', 'cli', 'eval']) {
+    assert.match(scripts[name] ?? '', / --dotenv \.env$/, `${name} does not pass --dotenv .env`)
+  }
+  // npm test above all: no test may open the operator's real .env.
+  for (const [name, command] of Object.entries(scripts)) {
+    if (['dev', 'cli', 'eval'].includes(name)) continue
+    assert.equal(command.includes('--dotenv'), false, `${name} passes --dotenv`)
+  }
+  for (const command of Object.values(scripts)) assert.equal(command.includes('--env-file'), false)
+  assert.equal(read('.npmrc').includes('env-file'), false)
+})
+
+test('.gitignore ignores .env*, editor copies, and un-ignores only .env.example', () => {
+  assert.equal(gitignoresDotenv(REPO), true)
+  const lines = read('.gitignore').split('\n').map((l) => l.trim())
+  const ignore = lines.indexOf('.env*')
+  assert.ok(ignore !== -1, '.gitignore has no .env* line')
+  assert.ok(lines.indexOf('!.env.example') > ignore, '!.env.example must follow .env*')
+  const negations = lines.filter((l) => l.startsWith('!') && l.includes('.env'))
+  assert.deepEqual(negations, ['!.env.example'], 'a negation re-includes more than the template')
+  for (const editor of ['*~', '*.swp', '*.swo']) assert.ok(lines.includes(editor), `.gitignore misses ${editor}`)
+})
+
+test('.dockerignore keeps credentials, the event log and git history out of any build context', () => {
+  const lines = read('.dockerignore').split('\n').map((l) => l.trim())
+  for (const entry of ['.env*', '.aos/', '.git/']) assert.ok(lines.includes(entry), `.dockerignore misses ${entry}`)
+  assert.equal(lines.some((l) => l.startsWith('!') && l.includes('.env')), false)
 })

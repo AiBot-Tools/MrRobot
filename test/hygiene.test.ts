@@ -431,7 +431,7 @@ test('no source file writes to souls/ or AGENTS.md', () => {
 
 const SCRIPTS = files('scripts')
 
-test('only the entry points, the live helper and its test import secrets/dotenv.js; kernel.ts, config.ts and the broker never do', () => {
+test('only the entry points, the live helper and two tests import secrets/dotenv.js; kernel.ts, config.ts and the broker never do', () => {
   // The operator's .env is opened from exactly three entry points, by flag. A
   // library module that imported the loader would be a fourth door with no
   // argv to say whether it should open anything.
@@ -445,6 +445,7 @@ test('only the entry points, the live helper and its test import secrets/dotenv.
     'scripts/eval.ts',
     'src/cli/index.ts',
     'src/main.ts',
+    'test/config-files.test.ts',
     'test/dotenv.test.ts',
     'test/helpers/live-env.ts',
   ])

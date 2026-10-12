@@ -1,0 +1,7 @@
+# Nothing secret or stateful goes into an image build context: not the
+# operator's credentials, not the event log, not git history.
+.env*
+.aos/
+.git/
+.falsify/
+node_modules/

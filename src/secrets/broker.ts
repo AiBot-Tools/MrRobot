@@ -68,13 +68,30 @@ export function isMessageNotCredential(value: string): boolean {
 }
 
 /**
- * A value that is itself `NAME=...`: two lines of a .env joined into one. Node's
- * own .env parser does exactly that to a whitespace-only value, which then
- * takes the next line; a shell that sourced such a file carries it too. No
- * provider key starts with an upper-case env-var name and an `=`.
+ * A value that is itself `NAME=...`. Node's own .env parser (the one behind
+ * its env-file flag) gives a whitespace-only value the whole next line, and an
+ * export like `export ANTHROPIC_API_KEY=$(grep ANTHROPIC .env)` keeps the name.
+ * The kernel's own loader refuses such a line, so this fires on a shell value.
+ * No provider key starts with an upper-case env-var name and an `=`.
  */
 export function looksLikeEnvLine(value: string): boolean {
   return /^[A-Z][A-Z0-9_]*=/.test(value)
+}
+
+/**
+ * Why `value` cannot be a credential, as a phrase that never quotes it, or
+ * undefined. Every value is checked before it is minted, whatever its source:
+ * the shell, the .env loader, the vault, or the D8 fallback to the env.
+ */
+export function notACredential(value: string): string | undefined {
+  if (isMessageNotCredential(value)) return 'contains whitespace'
+  // A key sent as an HTTP header must be printable ASCII; a smart quote or a
+  // zero-width space from a pasted key would otherwise fail far from here.
+  if (/[^\x21-\x7e]/.test(value)) return 'contains a character outside printable ASCII (a smart quote, a zero-width space)'
+  if (looksLikeEnvLine(value)) {
+    return "holds a whole NAME=value line: check how it was exported (Node's own .env parser gives a blank value the next line; $(grep …) keeps the name)"
+  }
+  return undefined
 }
 
 /**
@@ -273,16 +290,7 @@ export class SecretsBroker {
       if (fromEnv === undefined || fromEnv === '') {
         throw new PolicyDenied(id, `${envVar} is not set (secrets.source: env): add it to .env or export it`)
       }
-      if (isMessageNotCredential(fromEnv)) {
-        throw new PolicyDenied(id, `${envVar} contains whitespace, so it is not a credential`)
-      }
-      if (looksLikeEnvLine(fromEnv)) {
-        throw new PolicyDenied(
-          id,
-          `${envVar} holds a whole NAME=value line, not a credential: in a .env, a value of only spaces swallows the line below it`,
-        )
-      }
-      return this.#mint(id, 'env', fromEnv, purpose)
+      return this.#mintFromEnv(id, envVar, fromEnv, purpose)
     }
 
     let vaultError: string | undefined
@@ -297,7 +305,7 @@ export class SecretsBroker {
           purpose,
         )
         const value = result.ok ? extractText(result.content) : undefined
-        if (value !== undefined && value !== '' && !isMessageNotCredential(value)) {
+        if (value !== undefined && value !== '' && notACredential(value) === undefined) {
           return this.#mint(id, 'vault', value, purpose)
         }
         // The reply itself is never quoted: pmmcp's masked sentence carries the
@@ -306,7 +314,9 @@ export class SecretsBroker {
           ? 'the vault reported an error'
           : value === undefined || value === ''
             ? 'the vault returned no value'
-            : 'the vault returned a message, not a credential (pmmcp never returns plaintext)'
+            : isMessageNotCredential(value)
+              ? 'the vault returned a message, not a credential (pmmcp never returns plaintext)'
+              : `the vault returned a value that ${notACredential(value) ?? 'is not a credential'}`
       } catch (e) {
         vaultError = e instanceof Error ? e.message : String(e)
       }
@@ -327,8 +337,14 @@ export class SecretsBroker {
     if (fromEnv === undefined || fromEnv === '') {
       throw new PolicyDenied(id, `${vaultError ?? 'the vault failed'} and ${envVar} is not set`)
     }
+    return this.#mintFromEnv(id, envVar, fromEnv, purpose)
+  }
 
-    return this.#mint(id, 'env', fromEnv, purpose)
+  /** Both env paths, source env and the D8 fallback, through one check. */
+  #mintFromEnv(id: string, envVar: string, value: string, purpose: string): SecretRef {
+    const problem = notACredential(value)
+    if (problem !== undefined) throw new PolicyDenied(id, `${envVar} ${problem}, so it is not a credential`)
+    return this.#mint(id, 'env', value, purpose)
   }
 
   #mint(id: string, source: SecretSource, value: string, purpose: string): SecretRef {

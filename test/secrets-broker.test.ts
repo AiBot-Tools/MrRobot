@@ -434,3 +434,57 @@ test('source env refuses a value that is a whole NAME=value line, never quotes i
   }
   SecretMask.clear()
 })
+
+// Values no provider key can be, each a canary that must not appear in the
+// refusal: a joined NAME=value line, whitespace, a TextEdit smart quote, and a
+// zero-width space pasted from a web page.
+const NOT_KEYS: readonly (readonly [string, RegExp, string])[] = [
+  ['OPENROUTER_API_KEY=qJoinedCanary0123', /holds a whole NAME=value line/, 'qJoinedCanary'],
+  ['two wordsCanary', /contains whitespace/, 'wordsCanary'],
+  ['\u201Csk-ant-quoteCanary\u201D', /outside printable ASCII/, 'quoteCanary'],
+  ['sk-ant-zwspCanary\u200B', /outside printable ASCII/, 'zwspCanary'],
+]
+
+test('source env refuses a value outside printable ASCII, a smart quote or a zero-width space, without quoting it', async (t) => {
+  for (const [value, why, canary] of NOT_KEYS) {
+    const { broker, store } = await wire(t, { source: 'env', env: { ANTHROPIC_API_KEY: value } })
+    await broker.start()
+    await assert.rejects(
+      broker.ref('anthropic-api-key', 'p', { envVar: 'ANTHROPIC_API_KEY' }),
+      (e: unknown) => e instanceof PolicyDenied && why.test(e.message) && !e.message.includes(canary),
+    )
+    assert.deepEqual(payloads(store, 'secret.accessed'), [], value)
+  }
+})
+
+test('the D8 env fallback runs the same checks as source env: nothing it refuses is minted', async (t) => {
+  // vault + envFallback is a supported config, and against the real pmmcp it is
+  // the path EVERY credential takes: get_secret only ever answers a sentence.
+  for (const [value, why, canary] of NOT_KEYS) {
+    const { broker, store } = await wire(t, { noHub: true, envFallback: true, env: { ANTHROPIC_API_KEY: value } })
+    await broker.start()
+    await assert.rejects(
+      broker.ref('anthropic-api-key', 'p', { envVar: 'ANTHROPIC_API_KEY' }),
+      (e: unknown) => e instanceof PolicyDenied && why.test(e.message) && !e.message.includes(canary),
+    )
+    assert.deepEqual(payloads(store, 'secret.accessed'), [], value)
+  }
+  // Control: a well-formed key still falls back.
+  const ok = await wire(t, { noHub: true, envFallback: true, env: { ANTHROPIC_API_KEY: 'sk-ant-FAKE0123456789abcdef' } })
+  await ok.broker.start()
+  const ref = await ok.broker.ref('anthropic-api-key', 'p', { envVar: 'ANTHROPIC_API_KEY' })
+  assert.equal(ok.broker.use(ref, (v) => v), 'sk-ant-FAKE0123456789abcdef')
+  SecretMask.clear()
+})
+
+test('source vault mints no reply that cannot be a key, and quotes none of them', async (t) => {
+  for (const [value, , canary] of NOT_KEYS) {
+    const { broker, store } = await wire(t, { secretReply: () => value })
+    await broker.start()
+    await assert.rejects(
+      broker.ref('anthropic-api-key', 'p'),
+      (e: unknown) => e instanceof PolicyDenied && /the vault returned/.test(e.message) && !e.message.includes(canary),
+    )
+    assert.deepEqual(payloads(store, 'secret.accessed'), [], value)
+  }
+})

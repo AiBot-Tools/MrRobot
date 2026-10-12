@@ -13,9 +13,13 @@
 // where a malicious link would have to be.
 //
 // Containment is compared with a separator appended, so `/data/aos-evil`
-// cannot pass as living under `/data/aos`.
+// cannot pass as living under `/data/aos`. And it is also decided by identity
+// (device and inode), because resolution keeps every non-symlink component as
+// typed: on case-insensitive APFS `/users/op/mrrobot/SOULS` is the souls
+// directory under a spelling no string test recognises, as is a firmlinked
+// `/System/Volumes/Data/...` path or a bind mount.
 
-import { realpathSync } from 'node:fs'
+import { realpathSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, resolve, sep } from 'node:path'
 
 import { ConfigError } from '../errors.js'
@@ -47,13 +51,37 @@ export function realpathNearest(p: string): string {
   }
 }
 
-/** True when `child` is `parent` itself or lies beneath it. */
-export function isUnder(parent: string, child: string): boolean {
+/** What two spellings of one directory share: device and inode. */
+export type Identify = (path: string) => string | undefined
+
+export const identify: Identify = (path) => {
+  try {
+    const st = statSync(path, { bigint: true })
+    return `${String(st.dev)}:${String(st.ino)}`
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * True when `child` is `parent` itself or lies beneath it: by spelling, or by
+ * identity — some ancestor of `child` (itself included) IS `parent`. The
+ * spelling test is the floor, so this can only find more containment than a
+ * string comparison, never less: a forbidden zone refuses more aliases, and an
+ * allowed zone admits only paths that are physically inside it.
+ */
+export function isUnder(parent: string, child: string, id: Identify = identify): boolean {
   const p = resolve(parent)
   const c = resolve(child)
   if (c === p) return true
   // The separator is what stops /data/aos-evil matching /data/aos.
-  return c.startsWith(p.endsWith(sep) ? p : p + sep)
+  if (c.startsWith(p.endsWith(sep) ? p : p + sep)) return true
+  const target = id(p)
+  if (target === undefined) return false
+  for (let d = c; ; d = dirname(d)) {
+    if (id(d) === target) return true
+    if (dirname(d) === d) return false
+  }
 }
 
 /**

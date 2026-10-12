@@ -164,6 +164,17 @@ test('assertNotProtected allows a path outside the roots', (t) => {
   assert.equal(isUnder(join(root, 'souls'), join(root, 'souls', 'a.md')), true)
   assert.equal(isUnder(join(root, 'souls'), join(root, 'souls')), true)
 
+  // By identity too: on case-insensitive APFS /r/SOULS IS /r/souls, and Node's
+  // realpath keeps the spelling as typed. A stat that answers by identity, as
+  // the filesystem would, stands in for that volume here.
+  const ids: Record<string, string> = { '/r/souls': 'S', '/r/SOULS': 'S', '/r': 'R', '/': '/' }
+  const id = (p: string): string | undefined => ids[p]
+  assert.equal(isUnder('/r/souls', '/r/SOULS/ceo.md', id), true)
+  assert.equal(isUnder('/r/souls', '/r/SOULS', id), true)
+  assert.equal(isUnder('/r/souls', '/r/souls-archive/old.md', id), false)
+  // Identity only adds containment: what the spelling says is inside stays inside.
+  assert.equal(isUnder('/nowhere/souls', '/nowhere/souls/a.md', () => undefined), true)
+
   // A relative path is refused outright rather than guessed at.
   assert.throws(() => assertNotProtected('souls/ceo.md', root), /needs an absolute path/)
 

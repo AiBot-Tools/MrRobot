@@ -389,17 +389,18 @@ const DOCKER = 'src/sandbox/docker.ts'
 
 const sandbox: Suite = {
   name: 'sandbox',
-  tests: ['test/sandbox-docker.test.ts', 'test/config.test.ts', 'test/config-files.test.ts'],
+  tests: ['test/sandbox-docker.test.ts', 'test/config.test.ts', 'test/config-files.test.ts', 'test/agents-souls.test.ts'],
   mutants: [
     { id: 'Z1', file: DOCKER, from: '    const spellings = [...new Set([home, realpathNearest(home)])]', to: '    const spellings = [home]', why: 'a HOME reached through a symlink passes the never-$HOME check (found on macOS)' },
     { id: 'Z2', file: DOCKER, from: '  if (mounts !== 1 || volumes !== 0) {', to: '  if (false) {', why: 'a second bind mount or a -v reaches docker' },
     { id: 'Z3', file: DOCKER, from: '      if (arg === bad || arg.startsWith(`${bad}=`)) {', to: '      if (false) {', why: '--privileged and friends reach docker' },
     { id: 'Z4', file: DOCKER, from: '      if (arg.includes(bad)) {', to: '      if (false) {', why: 'the docker socket can be mounted into a container' },
     { id: 'Z5', file: DOCKER, from: "      if (internal !== 'true') {", to: '      if (false) {', why: 'a domain whose network has a route out (to pmmcp on 192.168.5.2) is reported available' },
-    { id: 'Z6', file: 'src/config.ts', from: '    if (!within(real, fence)) {', to: '    if (false) {', why: 'the event log or a mount root may live anywhere in the repo, beside the source' },
+    { id: 'Z6', file: 'src/config.ts', from: '    if (!isUnder(fence, real)) {', to: '    if (false) {', why: 'the event log or a mount root may live anywhere in the repo, beside the source' },
     { id: 'Z7', file: 'src/config.ts', from: '    if (!gitignoresAos(repoRoot)) {', to: '    if (false) {', why: 'an in-repo event log is admitted while git would commit it' },
-    { id: 'Z8', file: 'src/config.ts', from: '  if (within(home, real)) {', to: '  if (false) {', why: 'a mount root above $HOME hands a container the home directory' },
-    { id: 'Z9', file: 'src/config.ts', from: '  if (within(repo, real)) {', to: '  if (false) {', why: 'a data dir or mount root above the repository contains it' },
+    { id: 'Z8', file: 'src/config.ts', from: '  if (isUnder(real, home)) {', to: '  if (false) {', why: 'a mount root above $HOME hands a container the home directory' },
+    { id: 'Z9', file: 'src/config.ts', from: '  if (isUnder(real, repo)) {', to: '  if (false) {', why: 'a data dir or mount root above the repository contains it' },
+    { id: 'Z10', file: 'src/agents/protected.ts', from: '    if (id(d) === target) return true', to: '    if (false) return true', why: 'a case-variant or firmlinked spelling of souls/, $HOME or the repo passes every containment check (APFS)' },
   ],
   control: { id: 'C', file: DOCKER, from: '    // Invariant 9, one flag at a time.', to: '    // Invariant 9, one flag at a time. (control)', why: 'comment only' },
 }
@@ -433,7 +434,7 @@ const dotenv: Suite = {
     { id: 'X13', file: DOTENV, from: '    SecretMask.register(fromFile.value)', to: '    void fromFile.value', why: 'a file-sourced value is not masked before anything can log it' },
     { id: 'X14', file: DOTENV, from: '    if (!gitignoresDotenv(options.repoRoot)) {', to: '    if (false) {', why: 'an in-repo .env git would commit is read anyway' },
     { id: 'X15', file: DOTENV, from: '    if (place !== \'root\' || basename(abs) !== DOTENV_FILE) {', to: '    if (false) {', why: 'any file inside the repo, the template included, is read as credentials' },
-    { id: 'X28', file: DOTENV, from: '  const repoId = id(repo)\n', to: '  const repoId = undefined\n', why: 'a differently spelled path to the repo (APFS case, a firmlink) skips the in-repo fence' },
+    { id: 'X28', file: DOTENV, from: '  if (!isUnder(repo, d, id)) return \'outside\'', to: '  if (!(d === repo || d.startsWith(repo + \'/\'))) return \'outside\'', why: 'a differently spelled path to the repo (APFS case, a firmlink) skips the in-repo fence' },
     { id: 'X16', file: DOTENV, from: '  return { path: abs, found: true, values, shadowed }', to: '  Object.assign(process.env, values)\n  return { path: abs, found: true, values, shadowed }', why: 'file-sourced values are written into process.env, where every child inherits them' },
     { id: 'X17', file: DOTENV, from: '      problems.push(`line ${String(n)}: not NAME=value`)', to: '      problems.push(`line ${String(n)}: not NAME=value: ${line}`)', why: 'a refusal quotes the offending line, which may be a pasted key' },
     { id: 'X18', file: DOTENV, from: '      problems.push(`line ${String(n)}: a name this kernel does not read: delete the line`)', to: '      problems.push(`line ${String(n)}: ${name} is a name this kernel does not read: delete the line`)', why: 'a refusal quotes an unaccepted name, which may be a pasted key' },

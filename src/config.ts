@@ -29,7 +29,7 @@ import { z } from 'zod'
 
 import { ConfigError } from './errors.js'
 import { rootGitignoreIgnores } from './gitignore.js'
-import { realpathNearest } from './agents/protected.js'
+import { isUnder, realpathNearest } from './agents/protected.js'
 import { DENY_KEYS } from './events/redact.js'
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
@@ -361,9 +361,6 @@ export function parseKernelConfig(input: unknown, options: LoadOptions): KernelC
   }
 }
 
-const within = (child: string, parent: string): boolean =>
-  child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep)
-
 /**
  * True when the repository's .gitignore ignores the top-level directory `.aos`,
  * read with git's rules and failing closed (src/gitignore.ts). Ignoring the
@@ -388,17 +385,19 @@ function assertDataLocation(target: string, field: string, repoRoot: string, all
   const home = realpathNearest(homedir())
   const fence = join(repo, allowed)
 
-  if (real === home) {
+  // isUnder decides by identity as well as spelling, so a case-variant or
+  // firmlinked spelling of $HOME or the repository is still recognised.
+  if (real === home || (isUnder(home, real) && isUnder(real, home))) {
     throw new ConfigError(`${field} must not be $HOME itself (${home})`)
   }
-  if (within(repo, real)) {
+  if (isUnder(real, repo)) {
     throw new ConfigError(`${field} resolves to ${real}, which contains the repository (${repo})`)
   }
-  if (within(home, real)) {
+  if (isUnder(real, home)) {
     throw new ConfigError(`${field} resolves to ${real}, which contains $HOME (${home})`)
   }
-  if (within(real, repo)) {
-    if (!within(real, fence)) {
+  if (isUnder(repo, real)) {
+    if (!isUnder(fence, real)) {
       throw new ConfigError(
         `${field} resolves to ${real}, inside the repository but outside ${fence}. ` +
           'Inside the repo, the event log and container mounts live only under .aos/, which git ignores.',

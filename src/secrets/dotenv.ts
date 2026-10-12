@@ -35,9 +35,10 @@
 //   Messages carry the path, line numbers and accepted names only, because the
 //   daemon's catch logs e.message and pino has no value mask of its own.
 
-import { closeSync, constants, fstatSync, openSync, readSync, realpathSync, statSync } from 'node:fs'
-import { basename, dirname, join, resolve, sep } from 'node:path'
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from 'node:fs'
+import { basename, dirname, join, resolve } from 'node:path'
 
+import { identify, isUnder, type Identify } from '../agents/protected.js'
 import type { KernelConfig } from '../config.js'
 import { ConfigError } from '../errors.js'
 import { SecretMask } from '../events/redact.js'
@@ -157,9 +158,6 @@ export function credentialEnv(
   return env
 }
 
-const within = (child: string, parent: string): boolean =>
-  child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep)
-
 function realpathOrSelf(p: string): string {
   try {
     return realpathSync(p)
@@ -168,36 +166,19 @@ function realpathOrSelf(p: string): string {
   }
 }
 
-/** What two spellings of one directory share: device and inode. */
-export type Identify = (path: string) => string | undefined
-
-const identify: Identify = (path) => {
-  try {
-    const st = statSync(path, { bigint: true })
-    return `${String(st.dev)}:${String(st.ino)}`
-  } catch {
-    return undefined
-  }
-}
-
 /**
- * Where `dir` sits relative to the repository, decided by identity rather than
- * by spelling. Symlinks are resolved first, but Node's JS realpath keeps every
- * other component as typed, so on case-insensitive APFS `/users/op/mrrobot` and
- * `/Users/op/MrRobot` are one directory and two strings — as are a firmlinked
- * `/System/Volumes/Data/...` path and a bind mount. A string comparison would
- * call the first spelling "outside" and skip the fence. Falls back to the
- * string comparison only if the repository itself cannot be stat'ed.
+ * Where `dir` sits relative to the repository, decided by identity as well as
+ * spelling (isUnder): Node's JS realpath keeps every non-symlink component as
+ * typed, so on case-insensitive APFS `/users/op/mrrobot` and `/Users/op/MrRobot`
+ * are one directory and two strings — as are a firmlinked
+ * `/System/Volumes/Data/...` path and a bind mount. A string comparison alone
+ * would call the first spelling "outside" and skip the fence.
  */
 export function placeInRepo(dir: string, repoRoot: string, id: Identify = identify): 'root' | 'inside' | 'outside' {
   const repo = realpathOrSelf(repoRoot)
-  const start = realpathOrSelf(dir)
-  const repoId = id(repo)
-  if (repoId === undefined) return start === repo ? 'root' : within(start, repo) ? 'inside' : 'outside'
-  for (let d = start; ; d = dirname(d)) {
-    if (id(d) === repoId) return d === start ? 'root' : 'inside'
-    if (dirname(d) === d) return within(start, repo) ? 'inside' : 'outside'
-  }
+  const d = realpathOrSelf(dir)
+  if (!isUnder(repo, d, id)) return 'outside'
+  return isUnder(d, repo, id) ? 'root' : 'inside'
 }
 
 /**

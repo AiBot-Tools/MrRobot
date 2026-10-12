@@ -373,8 +373,10 @@ export function oneCredential(
   path: string | undefined,
   options: Omit<DotenvOptions, 'wanted'>,
 ): string | undefined {
+  // As set, not trimmed: the daemon's env carries the shell value as set, and a
+  // caller that reports it (liveCredential) must see what the broker will.
   const fromShell = shellValue(options.shell, name)
-  if (fromShell !== undefined) return fromShell.trim()
+  if (fromShell !== undefined) return fromShell
   if (path === undefined) return undefined
   return loadDotenv(path, { ...options, wanted: [name] }).values[name]
 }

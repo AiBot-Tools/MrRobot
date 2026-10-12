@@ -96,6 +96,15 @@ export function assertTokenUsable(raw: string | undefined): string {
       'AOS_CONTROL_TOKEN is not set. The control plane refuses to start without one.',
     )
   }
+  // A bearer is an HTTP header: a smart quote or a zero-width space pasted
+  // with it would boot the daemon and fail every client with an error naming
+  // no credential.
+  if (/[^\x21-\x7e]/.test(token)) {
+    throw new ConfigError(
+      'AOS_CONTROL_TOKEN holds a character outside printable ASCII (a smart quote, a zero-width space): ' +
+        'retype it. Try: openssl rand -hex 32',
+    )
+  }
   if (token.length < MIN_TOKEN_LENGTH) {
     throw new ConfigError(
       `AOS_CONTROL_TOKEN is ${String(token.length)} characters after trimming; ` +

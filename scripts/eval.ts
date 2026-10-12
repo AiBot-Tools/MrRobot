@@ -24,6 +24,7 @@ import { parse as parseYaml } from 'yaml'
 
 import { parseKernelConfig } from '../src/config.js'
 import { parseProviders } from '../src/models/registry.js'
+import { assertTokenUsable } from '../src/control/auth.js'
 import { credentialNames, dotenvPathFrom, oneCredential } from '../src/secrets/dotenv.js'
 import { CEO_CHECKS } from '../src/eval/checks.js'
 import { runSuite, type EvalTarget } from '../src/eval/harness.js'
@@ -65,6 +66,14 @@ async function main(argv: readonly string[]): Promise<number> {
     )
     return 2
   }
+  // The daemon's own rules (length, printable ASCII), before anything spends.
+  try {
+    assertTokenUsable(token)
+  } catch (e) {
+    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`)
+    return 2
+  }
+
   const portArg = flag(argv, 'port')
   const port = portArg === undefined ? config.control.port : Number(portArg)
   if (!Number.isInteger(port) || port <= 0) {
@@ -81,7 +90,7 @@ async function main(argv: readonly string[]): Promise<number> {
 
   const target: EvalTarget = {
     port,
-    token,
+    token: token.trim(),
     dbPath: join(config.dataDir, 'events.db'),
   }
 

@@ -477,6 +477,19 @@ test('the D8 env fallback runs the same checks as source env: nothing it refuses
   SecretMask.clear()
 })
 
+test('a joined NAME=value line is blamed on the export from the env, and on the stored entry from the vault', async (t) => {
+  const joined = 'OPENROUTER_API_KEY=qJoinedCanary0123'
+  const env = await wire(t, { source: 'env', env: { ANTHROPIC_API_KEY: joined } })
+  await env.broker.start()
+  await assert.rejects(env.broker.ref('anthropic-api-key', 'p', { envVar: 'ANTHROPIC_API_KEY' }), /check how it was exported/)
+  const vault = await wire(t, { secretReply: () => joined })
+  await vault.broker.start()
+  await assert.rejects(
+    vault.broker.ref('anthropic-api-key', 'p'),
+    (e: unknown) => e instanceof PolicyDenied && /check the stored entry/.test(e.message) && !/exported/.test(e.message),
+  )
+})
+
 test('source vault mints no reply that cannot be a key, and quotes none of them', async (t) => {
   for (const [value, , canary] of NOT_KEYS) {
     const { broker, store } = await wire(t, { secretReply: () => value })

@@ -368,6 +368,18 @@ test('refuses to start with a token shorter than 32 characters (after trim)', (t
   assert.equal(assertTokenUsable(`  ${thirtyTwo}  `), thirtyTwo)
 })
 
+test('refuses a token holding a character outside printable ASCII, without quoting it', () => {
+  // A smart quote or a zero-width space pasted with the token would boot the
+  // daemon and then fail every client with "Invalid character in header".
+  const canary = 'qTokenCanary0123456789abcdefghijk'
+  for (const token of [`\u201C${canary}\u201D`, `${canary}\u200B`, `${canary}\u00E9`]) {
+    assert.throws(
+      () => assertTokenUsable(token),
+      (e: unknown) => e instanceof ConfigError && /outside printable ASCII/.test(e.message) && !e.message.includes('qTokenCanary'),
+    )
+  }
+})
+
 test('token is digested at boot and the raw value is not retained on the server object', async (t) => {
   const s = await serve(t)
 

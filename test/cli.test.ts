@@ -691,6 +691,25 @@ test('a second --dotenv is a usage error, as for the daemon and eval, not a sile
   }
 })
 
+test('run input after -- may mention --dotenv: only the options are checked for a second one', async (t) => {
+  const h = harness(t)
+  withProviders(h)
+  h.reply('run.start', { runId: 'run_1' })
+  h.emitAfter('run.start', { type: 'run.finished', payload: { runId: 'run_1', status: 'ok' } })
+  const argv = ['--dotenv', '.env', 'run', 'writer', '--config', h.configPath, '--', 'document', 'how', '--dotenv', 'works']
+  assert.equal(await runCli(argv, h.io), 0, h.errs.join('\n'))
+  assert.deepEqual(h.calls[0], { cmd: 'run.start', params: { agentId: 'writer', input: 'document how --dotenv works' } })
+})
+
+test('a shell token outside printable ASCII is refused before the wire, by name and unquoted', async (t) => {
+  const h = harness(t, { env: { AOS_CONTROL_TOKEN: `\u201C${'q'.repeat(40)}\u201D` } })
+  assert.equal(await runCli(['approvals', '--config', h.configPath], h.io), 1)
+  const err = h.errs.join('\n')
+  assert.match(err, /AOS_CONTROL_TOKEN holds a character outside printable ASCII/)
+  assert.equal(err.includes('q'.repeat(12)), false)
+  assert.deepEqual(h.connects, [])
+})
+
 test('a refused --dotenv is a refusal before the wire, naming the fix', async (t) => {
   const h = harness(t, { env: { AOS_CONTROL_TOKEN: undefined } })
   withProviders(h)

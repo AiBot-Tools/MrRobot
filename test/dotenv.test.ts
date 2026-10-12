@@ -114,6 +114,14 @@ test('a whitespace-only shell value is unset to every reader: the daemon, the CL
   }
 })
 
+test('a shell value is returned as set, not trimmed: the live tests see what the daemon\'s broker sees', (t) => {
+  const path = write(t, `AOS_CONTROL_TOKEN=${TOKEN}\n`)
+  const padded = ' sk-ant-padded0123456789\n'
+  const options = { repoRoot: REPO_ROOT, accepted: ACCEPTED, shell: { ANTHROPIC_API_KEY: padded } }
+  assert.equal(oneCredential('ANTHROPIC_API_KEY', path, options), padded)
+  assert.equal(credentialEnv(['ANTHROPIC_API_KEY'], options.shell, undefined)['ANTHROPIC_API_KEY'], padded)
+})
+
 test('only wanted names leave the loader: a caller wanting AOS_CONTROL_TOKEN never receives ANTHROPIC_API_KEY', (t) => {
   t.after(() => SecretMask.clear())
   const path = write(t, `AOS_CONTROL_TOKEN=${TOKEN}\nANTHROPIC_API_KEY=${KEY}\n`)
@@ -275,6 +283,8 @@ test('no refusal message contains any 8-character window of a value or a line', 
     `${canaryLine}=${canaryKey}`,
     `ANTHROPIC_API_KEY=${canaryKey}\nANTHROPIC_API_KEY=${canaryKey}`,
     `ANTHROPIC_API_KEY=AOS_CONTROL_TOKEN=${canaryKey}`,
+    `ANTHROPIC_API_KEY=\u201C${canaryKey}\u201D`,
+    `ANTHROPIC_API_KEY=${canaryKey}\u200B`,
   ]
   for (const text of fixtures) {
     const path = write(t, `${text}\n`)

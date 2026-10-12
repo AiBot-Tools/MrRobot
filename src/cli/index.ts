@@ -40,6 +40,7 @@ import { expandHome, parseKernelConfig, type KernelConfig } from '../config.js'
 import { parseProviders } from '../models/registry.js'
 import { credentialNames, dotenvPathFrom, oneCredential } from '../secrets/dotenv.js'
 import { connectControl, ControlCallError, type ControlClient } from './client.js'
+import { assertTokenUsable } from '../control/auth.js'
 import type { ApprovalItem, HoldItem } from '../control/protocol.js'
 
 /** Exactly these nine. A tenth is a new command, not a flag on an old one. */
@@ -169,6 +170,10 @@ async function withClient<T>(
           : `Export it, or add it to ${path}.`),
     )
   }
+  // The daemon's own rules (length, printable ASCII), here so a bad token is
+  // named before the wire instead of failing as an unreadable header.
+  assertTokenUsable(token)
+
   const connect = io.connect ?? connectControl
   const client = await connect({ port: config.control.port, token })
   try {
@@ -189,8 +194,10 @@ export async function runCli(argv: readonly string[], io: CliIo): Promise<number
     parsed = parseArgs({ args: [...argv], options: OPTIONS, allowPositionals: true, strict: true })
     // parseArgs keeps the last of a repeated option; the daemon and eval refuse
     // a second --dotenv, and so does this, so `npm run cli -- --dotenv x` cannot
-    // quietly replace the .env that package.json names.
-    dotenvPathFrom(argv, io.cwd)
+    // quietly replace the .env that package.json names. Only the options are
+    // scanned: after `--`, parseArgs reads run input, which may mention the flag.
+    const end = argv.indexOf('--')
+    dotenvPathFrom(end === -1 ? argv : argv.slice(0, end), io.cwd)
   } catch (e) {
     io.err(e instanceof Error ? e.message : String(e))
     io.err(USAGE)

@@ -71,8 +71,9 @@ export function isMessageNotCredential(value: string): boolean {
  * A value that is itself `NAME=...`. Node's own .env parser (the one behind
  * its env-file flag) gives a whitespace-only value the whole next line, and an
  * export like `export ANTHROPIC_API_KEY=$(grep ANTHROPIC .env)` keeps the name.
- * The kernel's own loader refuses such a line, so this fires on a shell value.
- * No provider key starts with an upper-case env-var name and an `=`.
+ * The kernel's own loader refuses such a line, so from the env this fires on a
+ * shell value; from the vault, on an entry stored that way. No provider key
+ * starts with an upper-case env-var name and an `=`.
  */
 export function looksLikeEnvLine(value: string): boolean {
   return /^[A-Z][A-Z0-9_]*=/.test(value)
@@ -88,9 +89,7 @@ export function notACredential(value: string): string | undefined {
   // A key sent as an HTTP header must be printable ASCII; a smart quote or a
   // zero-width space from a pasted key would otherwise fail far from here.
   if (/[^\x21-\x7e]/.test(value)) return 'contains a character outside printable ASCII (a smart quote, a zero-width space)'
-  if (looksLikeEnvLine(value)) {
-    return "holds a whole NAME=value line: check how it was exported (Node's own .env parser gives a blank value the next line; $(grep …) keeps the name)"
-  }
+  if (looksLikeEnvLine(value)) return 'holds a whole NAME=value line'
   return undefined
 }
 
@@ -316,7 +315,7 @@ export class SecretsBroker {
             ? 'the vault returned no value'
             : isMessageNotCredential(value)
               ? 'the vault returned a message, not a credential (pmmcp never returns plaintext)'
-              : `the vault returned a value that ${notACredential(value) ?? 'is not a credential'}`
+              : `the vault returned a value that ${notACredential(value) ?? 'is not a credential'}: check the stored entry`
       } catch (e) {
         vaultError = e instanceof Error ? e.message : String(e)
       }
@@ -343,7 +342,12 @@ export class SecretsBroker {
   /** Both env paths, source env and the D8 fallback, through one check. */
   #mintFromEnv(id: string, envVar: string, value: string, purpose: string): SecretRef {
     const problem = notACredential(value)
-    if (problem !== undefined) throw new PolicyDenied(id, `${envVar} ${problem}, so it is not a credential`)
+    if (problem !== undefined) {
+      const hint = looksLikeEnvLine(value)
+        ? ": check how it was exported (Node's own .env parser gives a blank value the next line; $(grep …) keeps the name)"
+        : ''
+      throw new PolicyDenied(id, `${envVar} ${problem}, so it is not a credential${hint}`)
+    }
     return this.#mint(id, 'env', value, purpose)
   }
 

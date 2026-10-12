@@ -35,7 +35,7 @@
 //   Messages carry the path, line numbers and accepted names only, because the
 //   daemon's catch logs e.message and pino has no value mask of its own.
 
-import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from 'node:fs'
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync, statSync } from 'node:fs'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 
 import type { KernelConfig } from '../config.js'
@@ -168,6 +168,38 @@ function realpathOrSelf(p: string): string {
   }
 }
 
+/** What two spellings of one directory share: device and inode. */
+export type Identify = (path: string) => string | undefined
+
+const identify: Identify = (path) => {
+  try {
+    const st = statSync(path, { bigint: true })
+    return `${String(st.dev)}:${String(st.ino)}`
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Where `dir` sits relative to the repository, decided by identity rather than
+ * by spelling. Symlinks are resolved first, but Node's JS realpath keeps every
+ * other component as typed, so on case-insensitive APFS `/users/op/mrrobot` and
+ * `/Users/op/MrRobot` are one directory and two strings — as are a firmlinked
+ * `/System/Volumes/Data/...` path and a bind mount. A string comparison would
+ * call the first spelling "outside" and skip the fence. Falls back to the
+ * string comparison only if the repository itself cannot be stat'ed.
+ */
+export function placeInRepo(dir: string, repoRoot: string, id: Identify = identify): 'root' | 'inside' | 'outside' {
+  const repo = realpathOrSelf(repoRoot)
+  const start = realpathOrSelf(dir)
+  const repoId = id(repo)
+  if (repoId === undefined) return start === repo ? 'root' : within(start, repo) ? 'inside' : 'outside'
+  for (let d = start; ; d = dirname(d)) {
+    if (id(d) === repoId) return d === start ? 'root' : 'inside'
+    if (dirname(d) === d) return within(start, repo) ? 'inside' : 'outside'
+  }
+}
+
 /**
  * Parse a credentials file. Pure: no I/O, no process.env, no mask.
  *
@@ -292,9 +324,9 @@ function readGuarded(path: string, uid: number | undefined): Buffer | undefined 
 export function loadDotenv(path: string, options: DotenvOptions): DotenvResult {
   const abs = resolve(path)
   const repo = realpathOrSelf(options.repoRoot)
-  const dir = realpathOrSelf(dirname(abs))
-  if (within(dir, repo)) {
-    if (dir !== repo || basename(abs) !== DOTENV_FILE) {
+  const place = placeInRepo(dirname(abs), options.repoRoot)
+  if (place !== 'outside') {
+    if (place !== 'root' || basename(abs) !== DOTENV_FILE) {
       throw new ConfigError(`the only credentials file read inside the repository is ${join(repo, DOTENV_FILE)}; got ${abs}`)
     }
     if (!gitignoresDotenv(options.repoRoot)) {

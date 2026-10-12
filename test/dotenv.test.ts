@@ -26,6 +26,7 @@ import {
   gitignoresDotenv,
   loadDotenv,
   parseDotenv,
+  placeInRepo,
   type DotenvOptions,
 } from '../src/secrets/dotenv.js'
 import { REPO_ROOT } from './helpers/kernel.js'
@@ -329,6 +330,44 @@ test('dotenvPathFrom reads --dotenv once, resolves it against the base, and refu
   assert.match(refusal(() => dotenvPathFrom(['--dotenv', '--config'], '/base')), /needs a path/)
   assert.match(refusal(() => dotenvPathFrom(['--dotenv='], '/base')), /needs a path/)
   assert.match(refusal(() => dotenvPathFrom(['--dotenv', 'a', '--dotenv', 'b'], '/base')), /may be given once/)
+})
+
+test('the in-repo fence knows the repository by identity, not by spelling', (t) => {
+  // On the operator's APFS volume /users/op/mrrobot and /Users/op/MrRobot are
+  // one directory; Node's JS realpath keeps the spelling as typed. A stat that
+  // answers by identity, the way the filesystem does, stands in for that here.
+  const ids: Record<string, string> = {
+    '/v/MrRobot': 'repo',
+    '/v/mrrobot': 'repo',
+    '/System/Volumes/Data/v/MrRobot': 'repo',
+    '/v/mrrobot/config': 'config',
+    '/v/other': 'other',
+    '/v': 'v',
+    '/System/Volumes/Data/v': 'v',
+    '/System/Volumes/Data': 'data',
+    '/System/Volumes': 'volumes',
+    '/System': 'system',
+    '/': 'root',
+  }
+  const id = (p: string): string | undefined => ids[p]
+  assert.equal(placeInRepo('/v/mrrobot', '/v/MrRobot', id), 'root')
+  assert.equal(placeInRepo('/System/Volumes/Data/v/MrRobot', '/v/MrRobot', id), 'root')
+  assert.equal(placeInRepo('/v/mrrobot/config', '/v/MrRobot', id), 'inside')
+  assert.equal(placeInRepo('/v/other', '/v/MrRobot', id), 'outside')
+  assert.equal(placeInRepo('/v', '/v/MrRobot', id), 'outside')
+
+  // And on the real filesystem: the repo, a directory in it, a symlink to it,
+  // and a sibling.
+  const base = tmpdir(t)
+  const repo = join(base, 'repo')
+  mkdirSync(join(repo, 'config'), { recursive: true })
+  symlinkSync(repo, join(base, 'link'))
+  mkdirSync(join(base, 'sibling'))
+  assert.equal(placeInRepo(repo, repo), 'root')
+  assert.equal(placeInRepo(join(repo, 'config'), repo), 'inside')
+  assert.equal(placeInRepo(join(base, 'link'), repo), 'root')
+  assert.equal(placeInRepo(join(base, 'sibling'), repo), 'outside')
+  assert.equal(placeInRepo(base, repo), 'outside')
 })
 
 test('daemonEnv without --dotenv never opens a trap .env in the repo root and returns exactly the credential names from the shell', (t) => {

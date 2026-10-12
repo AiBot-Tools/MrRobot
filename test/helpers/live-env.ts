@@ -1,0 +1,38 @@
+// The key a gated live test spends, from the shell or the operator's <repo>/.env.
+//
+// The ONLY test code allowed to open the repository's real .env, and only when
+// the run is the operator's gated live run (AOS_LIVE_TESTS=1). Every other test
+// either passes an explicit env or reads nothing: the guard has already removed
+// credential names from the offline process, and no entry point a test starts
+// is given --dotenv.
+
+import './guard.js'
+
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { parse as parseYaml } from 'yaml'
+
+import { parseKernelConfig } from '../../src/config.js'
+import { parseProviders } from '../../src/models/registry.js'
+import { credentialNames, oneCredential } from '../../src/secrets/dotenv.js'
+import { REPO_ROOT } from './kernel.js'
+
+/**
+ * A non-empty shell value for `name`, else <repo>/.env's (through the same
+ * loader and refusals as `npm run dev`), else undefined.
+ *
+ * @throws {Error} unless AOS_LIVE_TESTS=1 in `env` — and then opens nothing.
+ */
+export function liveCredential(
+  name: string,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  path: string = join(REPO_ROOT, '.env'),
+): string | undefined {
+  if (env['AOS_LIVE_TESTS'] !== '1') throw new Error('liveCredential is for AOS_LIVE_TESTS=1 only')
+  const read = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
+  const accepted = credentialNames(
+    parseKernelConfig(read('config/kernel.yaml'), { repoRoot: REPO_ROOT }),
+    parseProviders(read('config/providers.yaml')),
+  )
+  return oneCredential(name, path, { repoRoot: REPO_ROOT, accepted, shell: env })
+}

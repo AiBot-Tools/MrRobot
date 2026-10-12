@@ -34,6 +34,7 @@ import { Router } from '../src/models/router.js'
 import { freshProbe } from './helpers/probe.js'
 import { rejectedCallReplays } from './helpers/replay-body.js'
 import { withStore } from './helpers/store.js'
+import { liveCredential } from './helpers/live-env.js'
 
 /**
  * The ref actually shipped in providers.yaml, read rather than hard-coded.
@@ -50,6 +51,8 @@ function realRef(): string {
 }
 
 const LIVE = process.env['AOS_LIVE_TESTS'] === '1'
+// From the shell, else <repo>/.env — and only on the gated live run.
+const KEY = LIVE ? liveCredential('ANTHROPIC_API_KEY') : undefined
 const ANTHROPIC_HOST = 'api.anthropic.com'
 
 interface Row {
@@ -146,7 +149,7 @@ async function probeThenRun(
 
 test(
   'LLM half of the exit criterion: run ceo "reply with the word pong" finishes with non-zero cost against the real Claude entry and the chain verifies',
-  { skip: !LIVE ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)' : process.env['ANTHROPIC_API_KEY'] === undefined ? 'ANTHROPIC_API_KEY is not set' : false },
+  { skip: !LIVE ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)' : KEY === undefined ? 'ANTHROPIC_API_KEY is in neither the shell nor .env' : false },
   async (t) => {
     const revoke = allowHost(ANTHROPIC_HOST)
     t.after(revoke)
@@ -156,7 +159,7 @@ test(
     // shipped). That is why this test is not the exit criterion — it proves the
     // provider, not the pmmcp connection.
     const booted = await withKernel(t, {
-      env: { ANTHROPIC_API_KEY: process.env['ANTHROPIC_API_KEY'] },
+      env: { ANTHROPIC_API_KEY: KEY },
       sandboxDriver: fakeSandbox(),
     })
 
@@ -193,7 +196,7 @@ test(
     }
 
     // And the key is nowhere in it, though it went out on the wire.
-    const key = process.env['ANTHROPIC_API_KEY'] ?? ''
+    const key = KEY ?? ''
     assert.ok(key.length > 0)
     assert.equal(JSON.stringify(all).includes(key), false, 'the credential reached the event log')
   },
@@ -206,8 +209,8 @@ test(
   {
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
-      : process.env['PMMCP_URL'] === undefined || process.env['ANTHROPIC_API_KEY'] === undefined
-        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer) and ANTHROPIC_API_KEY (read -rs, never from a file)'
+      : process.env['PMMCP_URL'] === undefined || KEY === undefined
+        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer), and put ANTHROPIC_API_KEY in the shell or .env'
         : false,
   },
   async (t) => {
@@ -216,7 +219,7 @@ test(
 
     const ref = realRef()
     const pmmcpUrl = process.env['PMMCP_URL'] ?? ''
-    const key = process.env['ANTHROPIC_API_KEY'] ?? ''
+    const key = KEY ?? ''
 
     // pmmcp's get_secret returns only a masked sentence, by design, so the key
     // comes from the environment (secrets.source: env, as shipped) and pmmcp is
@@ -279,7 +282,7 @@ test(
 
 test(
   'a rejected tool call replayed to the real Messages API is accepted, with a tools field that omits it and with no tools field at all',
-  { skip: !LIVE ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)' : process.env['ANTHROPIC_API_KEY'] === undefined ? 'ANTHROPIC_API_KEY is not set' : false },
+  { skip: !LIVE ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)' : KEY === undefined ? 'ANTHROPIC_API_KEY is in neither the shell nor .env' : false },
   async (t) => {
     // Settles the one rule the docs leave open (test/helpers/replay-body.ts):
     // whether history may carry a tool_use for a tool the request does not
@@ -296,7 +299,7 @@ test(
     const ref = realRef()
     const card = parseProviders(parseYaml(readFileSync(`${REPO_ROOT}/config/providers.yaml`, 'utf8'))).entries[ref]
     assert.ok(card, `${ref} is not in providers.yaml`)
-    const key = process.env['ANTHROPIC_API_KEY'] ?? ''
+    const key = KEY ?? ''
     const store = withStore(t)
     const router = new Router({
       store,

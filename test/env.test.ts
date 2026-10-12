@@ -211,3 +211,35 @@ function parse(s: string): Semver {
 function cmp(a: Semver, b: Semver): number {
   return a.major - b.major || a.minor - b.minor || a.patch - b.patch
 }
+
+test('the test guard removes credential names from an offline test process, and keeps them only on the live run', () => {
+  // A key the operator exported in the shell that runs npm test must never be
+  // visible to an offline test. Spawned, because the guard runs at import.
+  const probe = (live: boolean): Record<string, unknown> => {
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        '--input-type=module',
+        '-e',
+        "await import('./test/helpers/guard.ts'); console.log(JSON.stringify({ key: process.env.ANTHROPIC_API_KEY ?? null, token: process.env.AOS_CONTROL_TOKEN ?? null, other: process.env.OPENROUTER_API_KEY ?? null, path: process.env.PATH === undefined ? null : 'kept' }))",
+      ],
+      {
+        encoding: 'utf8',
+        timeout: 30_000,
+        env: {
+          PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+          ANTHROPIC_API_KEY: 'qGuardCanaryKey',
+          AOS_CONTROL_TOKEN: 'qGuardCanaryToken',
+          OPENROUTER_API_KEY: 'qGuardCanaryOther',
+          ...(live ? { AOS_LIVE_TESTS: '1' } : {}),
+        },
+      },
+    )
+    assert.equal(result.status, 0, result.stderr)
+    return JSON.parse(result.stdout.trim().split('\n').pop() ?? '{}') as Record<string, unknown>
+  }
+  assert.deepEqual(probe(false), { key: null, token: null, other: null, path: 'kept' })
+  assert.deepEqual(probe(true), { key: 'qGuardCanaryKey', token: 'qGuardCanaryToken', other: 'qGuardCanaryOther', path: 'kept' })
+})

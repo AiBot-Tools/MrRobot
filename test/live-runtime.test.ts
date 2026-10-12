@@ -52,8 +52,11 @@ import {
 } from './helpers/runtime-bodies.js'
 import { withStore } from './helpers/store.js'
 import { tmpdir } from './helpers/tmpdir.js'
+import { liveCredential } from './helpers/live-env.js'
 
 const LIVE = process.env['AOS_LIVE_TESTS'] === '1'
+// From the shell, else <repo>/.env — and only on the gated live run.
+const KEY = LIVE ? liveCredential('ANTHROPIC_API_KEY') : undefined
 const WRITES = process.env['AOS_LIVE_PMMCP_WRITES'] === '1'
 const ANTHROPIC_HOST = 'api.anthropic.com'
 
@@ -140,8 +143,8 @@ test(
     // Reasons inline, where the hygiene rule reads them: each names what to set.
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
-      : !hasPmmcp() || process.env['ANTHROPIC_API_KEY'] === undefined
-        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer) and ANTHROPIC_API_KEY'
+      : !hasPmmcp() || KEY === undefined
+        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer), and put ANTHROPIC_API_KEY in the shell or .env'
         : !WRITES
           ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
           : false,
@@ -157,7 +160,7 @@ test(
     const { kernel, fx } = await withKernel(t, {
       env: {
         PMMCP_TOKEN: process.env['PMMCP_TOKEN'],
-        ANTHROPIC_API_KEY: process.env['ANTHROPIC_API_KEY'],
+        ANTHROPIC_API_KEY: KEY,
       },
       sandboxDriver: fakeSandbox(),
       kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `url: ${pmmcpUrl}`),
@@ -182,8 +185,8 @@ test(
   {
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
-      : process.env['ANTHROPIC_API_KEY'] === undefined
-        ? 'ANTHROPIC_API_KEY is not set'
+      : KEY === undefined
+        ? 'ANTHROPIC_API_KEY is in neither the shell nor .env'
         : false,
   },
   async (t) => {
@@ -194,7 +197,7 @@ test(
     // No pmmcp: this needs only a model, and the environment (secrets.source:
     // env, as shipped) is where the key comes from. Not an exit-criterion test.
     const { kernel, fx } = await withKernel(t, {
-      env: { ANTHROPIC_API_KEY: process.env['ANTHROPIC_API_KEY'] },
+      env: { ANTHROPIC_API_KEY: KEY },
       sandboxDriver: fakeSandbox(),
     })
     await probe(kernel, ref)

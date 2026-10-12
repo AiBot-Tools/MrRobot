@@ -13,6 +13,22 @@
 
 import net from 'node:net'
 
+/**
+ * Credentials never reach an offline test. Any name a provider key, the
+ * control token or the pmmcp bearer would use is removed from this test
+ * process's environment at import — so a key the operator exported in the
+ * shell that runs `npm test` cannot be picked up, logged or sent by accident.
+ * The gated live run (AOS_LIVE_TESTS=1) is the one exception: it is the only
+ * run that is meant to use a real key.
+ */
+export const CREDENTIAL_NAME = /^(ANTHROPIC|OPENAI|OPENROUTER|MOONSHOT)_|_API_KEY$|^AOS_CONTROL_TOKEN$|^PMMCP_TOKEN$/
+
+if (process.env['AOS_LIVE_TESTS'] !== '1') {
+  for (const name of Object.keys(process.env)) {
+    if (CREDENTIAL_NAME.test(name)) delete process.env[name]
+  }
+}
+
 /** Thrown instead of opening a connection the test suite must never make. */
 export class NetworkBlocked extends Error {
   readonly code = 'AOS_TEST_NETWORK_BLOCKED'

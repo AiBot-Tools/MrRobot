@@ -31,6 +31,7 @@ import {
 import { REPO_ROOT } from './helpers/kernel.js'
 import { tmpdir } from './helpers/tmpdir.js'
 import { daemonEnv } from '../src/main.js'
+import { liveCredential } from './helpers/live-env.js'
 
 const ACCEPTED = new Set(['AOS_CONTROL_TOKEN', 'ANTHROPIC_API_KEY'])
 const TOKEN = 'qTok3nVa1ueFor7estsOnly0123456789abcdef'
@@ -347,4 +348,21 @@ test('daemonEnv without --dotenv never opens a trap .env in the repo root and re
     refusal(() => daemonEnv(['--dotenv', '.env'], { repoRoot: repo, config, providers, shell })),
     /has mode 0644/,
   )
+})
+
+test('liveCredential refuses unless AOS_LIVE_TESTS=1 in the env it is given, and opens nothing then', (t) => {
+  // A trap path: opening it would be refused with chmod 600, so the gate's own
+  // error proves nothing was opened.
+  const trap = write(t, 'ANTHROPIC_API_KEY=x\n', 0o644)
+  for (const env of [{}, { AOS_LIVE_TESTS: '0' }, { AOS_LIVE_TESTS: 'true' }]) {
+    assert.throws(() => liveCredential('ANTHROPIC_API_KEY', env, trap), /for AOS_LIVE_TESTS=1 only/)
+  }
+})
+
+test('liveCredential prefers a non-empty shell value and otherwise reads the given .env', (t) => {
+  t.after(() => SecretMask.clear())
+  const path = write(t, `ANTHROPIC_API_KEY=${KEY}\n`)
+  assert.equal(liveCredential('ANTHROPIC_API_KEY', { AOS_LIVE_TESTS: '1', ANTHROPIC_API_KEY: 'fromTheShell' }, path), 'fromTheShell')
+  assert.equal(liveCredential('ANTHROPIC_API_KEY', { AOS_LIVE_TESTS: '1' }, path), KEY)
+  assert.equal(liveCredential('ANTHROPIC_API_KEY', { AOS_LIVE_TESTS: '1' }, join(tmpdir(t), 'absent.env')), undefined)
 })

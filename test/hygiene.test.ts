@@ -428,3 +428,66 @@ test('no source file writes to souls/ or AGENTS.md', () => {
   assert.equal(WRITE.test(souls.text), false, 'src/agents/souls.ts can write')
   assert.match(souls.text, /import \{ readFileSync \} from 'node:fs'/)
 })
+
+const SCRIPTS = files('scripts')
+
+test('only the entry points, the live helper and its test import secrets/dotenv.js; kernel.ts, config.ts and the broker never do', () => {
+  // The operator's .env is opened from exactly three entry points, by flag. A
+  // library module that imported the loader would be a fourth door with no
+  // argv to say whether it should open anything.
+  // Single-line imports and the closing line of a multi-line one alike.
+  const pattern = /(?:(?:^|\s)(?:import|export)[^\n]*|^\s*\}\s*)from\s+['"][^'"]*secrets\/dotenv\.js['"]|import\(\s*['"][^'"]*secrets\/dotenv\.js['"]/
+  const importers = [...SRC, ...TEST, ...SCRIPTS]
+    .filter((f) => codeLines(f).some((l) => pattern.test(l.text)))
+    .map((f) => f.path)
+    .sort()
+  assert.deepEqual(importers, [
+    'scripts/eval.ts',
+    'src/cli/index.ts',
+    'src/main.ts',
+    'test/dotenv.test.ts',
+    'test/helpers/live-env.ts',
+  ])
+})
+
+test('nothing in src/ or scripts/ writes process.env or uses Node\'s .env loaders, and the loader imports no write API', () => {
+  // Values reach the kernel only through bootKernel's env. Anything written
+  // into process.env is inherited by every child process and read by the
+  // Anthropic SDK's own ambient lookups.
+  const forbidden = [
+    /process\.env(\[[^\]]+\]|\.[A-Za-z_]+)\s*=[^=]/,
+    /Object\.assign\(\s*process\.env/,
+    /delete\s+process\.env/,
+    /loadEnvFile/,
+    /parseEnv\b/,
+    /from\s+['"]dotenv['"]/,
+    /--env-file/,
+  ]
+  for (const file of [...SRC, ...SCRIPTS]) {
+    for (const line of codeLines(file)) {
+      for (const pattern of forbidden) {
+        assert.equal(pattern.test(line.text), false, `${file.path}:${String(line.n)} matches ${String(pattern)}`)
+      }
+    }
+  }
+  const loader = SRC.find((f) => f.path === 'src/secrets/dotenv.ts')
+  assert.ok(loader, 'src/secrets/dotenv.ts is missing')
+  for (const write of ['writeFileSync', 'appendFileSync', 'createWriteStream', 'writeSync', 'copyFileSync', 'renameSync', 'unlinkSync', 'rmSync', 'O_WRONLY', 'O_RDWR', 'O_CREAT']) {
+    assert.equal(codeLines(loader).some((l) => l.text.includes(write)), false, `the loader uses ${write}`)
+  }
+})
+
+test('liveCredential is called only in test/live-*.test.ts and only behind LIVE', () => {
+  // The one test path that opens the repository's real .env must be reachable
+  // only on the operator's gated live run.
+  const calls = TEST.filter((f) => f.path !== 'test/helpers/live-env.ts' && f.path !== 'test/dotenv.test.ts').flatMap((f) =>
+    codeLines(f)
+      .filter((l) => l.text.includes('liveCredential('))
+      .map((l) => ({ path: f.path, n: l.n, text: l.text })),
+  )
+  assert.ok(calls.length >= 2, 'the live files no longer take their key through liveCredential')
+  for (const call of calls) {
+    assert.match(call.path, /^test\/live-[^/]+\.test\.ts$/, `${call.path}:${String(call.n)}`)
+    assert.match(call.text, /LIVE \?/, `${call.path}:${String(call.n)} calls liveCredential outside the LIVE gate`)
+  }
+})

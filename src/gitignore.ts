@@ -4,69 +4,107 @@
 //
 //   The question the kernel asks before it trusts an in-repo path: would
 //   `git add -A` leave <repo>/.env (a file) or <repo>/.aos (a directory) out?
-//   This reads the root .gitignore with git's rules from gitignore(5): comments,
-//   trailing-space trimming, `!` negation, a trailing `/` for directories only,
-//   anchoring by an inner `/`, `**`, `*`, `?`, bracket classes, and the last
-//   matching line wins. Where this reading and git's could differ it answers
-//   "not ignored": a false refusal costs the operator one .gitignore edit; a
-//   false "ignored" can put a key or the event log into a public commit.
+//   This reads the root .gitignore with git's rules (gitignore(5), and dir.c /
+//   wildmatch.c where the man page is silent): comments, trailing-space
+//   trimming, a line cut at its first NUL, `!` negation, a trailing `/` for
+//   directories only, anchoring by an inner `/`, a leading run of `**/`, `*`,
+//   `?`, bracket classes, and the last matching line wins.
 //
-//   Fail-closed choices, each a place git's answer depends on more than the
-//   text: an ignoring line counts only when it matches case-sensitively (git
-//   folds case under core.ignorecase, the macOS default) and has no trailing CR;
-//   a negating line counts when it matches under either case or with its CR
-//   stripped; a construct this does not model (a POSIX class like [[:alpha:]],
-//   an unterminated `[`, a trailing `\`, an escaped `/`) never ignores and
-//   always un-ignores. A symlinked .gitignore is no .gitignore, as in git 2.32+.
+//   Where this reading and git's could differ it answers "not ignored": a false
+//   refusal costs the operator one .gitignore edit; a false "ignored" can put a
+//   key or the event log into a public commit. So every line is judged twice,
+//   once as git reads it with core.ignorecase=false and once with true (the
+//   macOS default), and:
+//
+//     - an ignoring line counts only if it matches under BOTH, and only if it
+//       has no trailing CR (git strips one, older readers may not);
+//     - a negating line counts if it matches under EITHER, with or without
+//       its CR;
+//     - a pattern this does not model never ignores and always un-ignores:
+//       an anchored pattern holding a bracket (git lets `/` sit inside one)
+//       or a `**` that is not a whole leading segment (git's literal-prefix
+//       rule lets `.e**/nv` match `.env`), a POSIX class like [[:alpha:]], an
+//       unterminated `[`, a trailing `\`, an escaped `/`.
+//
+//   Also "not ignored": a symlinked .gitignore (git 2.32+ does not read one),
+//   one of 100 MiB or more (git 2.50 ignores the whole file), and, for a
+//   directory entry, a <repo>/<entry> that exists but is not a directory —
+//   git judges a symlink as a file, so `/.aos/` does not cover it, and what is
+//   written through it lands wherever it points.
 //
 //   Not consulted: .git/info/exclude and core.excludesFile. Both rank below the
 //   root .gitignore for a root entry, so they can never undo its verdict; they
 //   can only add ignores this check then fails to credit — the safe direction —
 //   and a check that leaned on them would pass here and fail on the next clone.
 //   Nor is the index: .gitignore does not apply to a tracked file, so a
-//   force-added .env is caught by test/config-files.test.ts, not here.
+//   force-added .env is caught by test/gitignore.test.ts, not here.
 
 import { lstatSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+
+/** git 2.50's PATTERN_MAX_FILE_SIZE; the file plus git's appended newline must stay under it. */
+const GIT_PATTERN_FILE_LIMIT = 100 * 1024 * 1024
 
 type Token =
   | { readonly kind: 'lit'; readonly ch: string }
   | { readonly kind: 'one' }
   | { readonly kind: 'star' }
-  | { readonly kind: 'class'; readonly negated: boolean; readonly test: (ch: string) => boolean }
+  | {
+      readonly kind: 'class'
+      readonly negated: boolean
+      readonly singles: readonly string[]
+      readonly ranges: readonly (readonly [string, string])[]
+    }
 
 /** True when the root .gitignore ignores `<repoRoot>/<entry>`; see the contract. */
 export function rootGitignoreIgnores(repoRoot: string, entry: string, kind: 'file' | 'dir'): boolean {
   const path = join(repoRoot, '.gitignore')
   let text: string
   try {
-    if (!lstatSync(path).isFile()) return false
+    const st = lstatSync(path)
+    if (!st.isFile() || st.size >= GIT_PATTERN_FILE_LIMIT - 1) return false
     // latin1: one char per byte, as git's wildmatch sees it.
     text = readFileSync(path, 'latin1')
   } catch {
     return false
+  }
+  if (kind === 'dir') {
+    try {
+      if (!lstatSync(join(repoRoot, entry)).isDirectory()) return false
+    } catch {
+      // Absent: the directory git would ignore once it is created.
+    }
   }
   if (text.startsWith('\xEF\xBB\xBF')) text = text.slice(3)
 
   let ignored = false
   for (const raw of text.split('\n')) {
     if (raw === '' || raw.startsWith('#')) continue
-    const negated = raw.startsWith('!')
-    if (negated) {
-      const forms = raw.endsWith('\r') ? [raw.slice(1), raw.slice(1, -1)] : [raw.slice(1)]
-      if (forms.some((f) => matches(f, entry, kind, true) !== false)) ignored = false
-    } else if (matches(raw, entry, kind, false) === true) {
-      ignored = true
+    if (raw.startsWith('!')) {
+      const body = raw.slice(1)
+      const forms = body.endsWith('\r') ? [body, body.slice(0, -1)] : [body]
+      const couldMatch = forms.some((f) => [false, true].some((fold) => matches(cutAtNul(f), entry, kind, fold) !== false))
+      if (couldMatch) ignored = false
+    } else {
+      const line = cutAtNul(raw)
+      if (matches(line, entry, kind, false) === true && matches(line, entry, kind, true) === true) ignored = true
     }
   }
   return ignored
 }
 
+/** git reads a pattern with strlen: it ends at the first NUL. */
+function cutAtNul(line: string): string {
+  const nul = line.indexOf('\0')
+  return nul === -1 ? line : line.slice(0, nul)
+}
+
 /**
- * Whether one pattern (without its `!`) matches a root entry: true, false, or
- * undefined when the pattern uses something this does not model.
+ * Whether one pattern (without its `!`) matches a root entry, as git would
+ * read it with core.ignorecase = `fold`: true, false, or undefined when the
+ * pattern uses something this does not model.
  */
-function matches(line: string, entry: string, kind: 'file' | 'dir', foldCase: boolean): boolean | undefined {
+function matches(line: string, entry: string, kind: 'file' | 'dir', fold: boolean): boolean | undefined {
   let pattern = trimTrailingSpaces(line)
   if (pattern === undefined) return undefined
   if (pattern === '') return false
@@ -78,16 +116,25 @@ function matches(line: string, entry: string, kind: 'file' | 'dir', foldCase: bo
   if (dirOnly && kind !== 'dir') return false
   if (pattern.includes('\\/')) return undefined
 
-  if (!pattern.includes('/')) return segmentMatches(pattern, entry, foldCase)
+  // No separator: matched against the entry's name at any depth.
+  if (!pattern.includes('/')) return segmentMatches(pattern, entry, fold)
 
-  // Anchored: relative to the root. A leading `**/` matches zero directories,
-  // and any other separator needs a directory the root entry does not have.
-  const segments = (pattern.startsWith('/') ? pattern.slice(1) : pattern).split('/')
-  while (segments.length > 1 && segments[0] === '**') segments.shift()
-  if (segments.length !== 1) return false
-  const only = segments[0] ?? ''
-  if (only === '**') return true
-  return segmentMatches(only, entry, foldCase)
+  // Anchored. A bracket may hold the `/` that anchors it, which splitting on
+  // `/` would get wrong: not modelled.
+  const anchored = pattern.startsWith('/') ? pattern.slice(1) : pattern
+  if (anchored.includes('[')) return undefined
+  const segments = anchored.split('/')
+  // A leading segment of two or more stars matches zero directories.
+  while (segments.length > 1 && /^\*{2,}$/.test(segments[0] ?? '')) segments.shift()
+  if (segments.length === 1) {
+    const only = segments[0] ?? ''
+    if (/^\*{2,}$/.test(only)) return true
+    return segmentMatches(only, entry, fold)
+  }
+  // Still a separator to cross. Without a `**`, crossing one takes a `/` the
+  // root entry's name does not have; with one, git's literal-prefix rule can
+  // make it match zero directories mid-pattern: not modelled.
+  return /\*{2,}/.test(anchored) ? undefined : false
 }
 
 /** git's trim_trailing_spaces: drop unescaped trailing spaces (not tabs). */
@@ -108,12 +155,10 @@ function trimTrailingSpaces(line: string): string | undefined {
   return lastSpace === -1 ? line : line.slice(0, lastSpace)
 }
 
-function segmentMatches(pattern: string, name: string, foldCase: boolean): boolean | undefined {
+function segmentMatches(pattern: string, name: string, fold: boolean): boolean | undefined {
   const tokens = tokenize(pattern)
   if (tokens === undefined) return undefined
-  const exact = globMatch(tokens, name, false)
-  if (exact || !foldCase) return exact
-  return globMatch(tokens, name, true)
+  return globMatch(tokens, name, fold)
 }
 
 function tokenize(pattern: string): Token[] | undefined {
@@ -126,6 +171,7 @@ function tokenize(pattern: string): Token[] | undefined {
       out.push({ kind: 'lit', ch: next })
       i++
     } else if (ch === '*') {
+      // Within one segment a run of stars is one star: the entry has no `/`.
       if (out.at(-1)?.kind !== 'star') out.push({ kind: 'star' })
     } else if (ch === '?') {
       out.push({ kind: 'one' })
@@ -141,7 +187,7 @@ function tokenize(pattern: string): Token[] | undefined {
   return out
 }
 
-/** A `[...]` class starting at `start`; undefined for what is not modelled. */
+/** A `[...]` class starting at `start`, read as wildmatch.c reads it; undefined for what is not modelled. */
 function bracket(pattern: string, start: number): { token: Token; end: number } | undefined {
   let i = start + 1
   let negated = false
@@ -175,14 +221,16 @@ function bracket(pattern: string, start: number): { token: Token; end: number } 
         hi = next
         i++
       }
+      // wildmatch.c tests the start as a member before it reads the `-`, so a
+      // reversed range like `z-a` still matches its first character.
+      singles.push(lo)
       ranges.push([lo, hi])
     } else {
       singles.push(lo)
     }
     i++
   }
-  const test = (c: string): boolean => singles.includes(c) || ranges.some(([lo, hi]) => c >= lo && c <= hi)
-  return { token: { kind: 'class', negated, test }, end: i }
+  return { token: { kind: 'class', negated, singles, ranges }, end: i }
 }
 
 function globMatch(tokens: readonly Token[], text: string, fold: boolean): boolean {
@@ -203,15 +251,27 @@ function globMatch(tokens: readonly Token[], text: string, fold: boolean): boole
   return at(0, 0)
 }
 
+const isUpper = (c: string): boolean => c >= 'A' && c <= 'Z'
+const isLower = (c: string): boolean => c >= 'a' && c <= 'z'
+
 /**
- * One token against one character. Folding is used only to widen what a
- * negating line matches, so each branch errs toward a match: a class tests
- * both cases, and a negated class only the lowered character.
+ * One token against one character, as wildmatch.c decides it. Under
+ * WM_CASEFOLD the text character is lowered; a literal is lowered too; a class
+ * member is compared with the lowered character as written (so `[E]` matches
+ * neither case), and a range also accepts the character's upper case — which
+ * is why a negated range like `[!A-Z]` matches 'e' only without folding.
  */
 function hit(token: Exclude<Token, { kind: 'star' }>, ch: string, fold: boolean): boolean {
   if (token.kind === 'one') return true
-  if (token.kind === 'lit') return fold ? token.ch.toLowerCase() === ch.toLowerCase() : token.ch === ch
-  if (!fold) return token.test(ch) !== token.negated
-  if (token.negated) return !token.test(ch.toLowerCase())
-  return token.test(ch) || token.test(ch.toLowerCase()) || token.test(ch.toUpperCase())
+  const t = fold && isUpper(ch) ? ch.toLowerCase() : ch
+  if (token.kind === 'lit') return (fold && isUpper(token.ch) ? token.ch.toLowerCase() : token.ch) === t
+  let matched = token.singles.includes(t)
+  for (const [lo, hi] of token.ranges) {
+    if (t >= lo && t <= hi) matched = true
+    else if (fold && isLower(t)) {
+      const up = t.toUpperCase()
+      if (up >= lo && up <= hi) matched = true
+    }
+  }
+  return matched !== token.negated
 }

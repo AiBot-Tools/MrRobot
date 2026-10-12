@@ -11,7 +11,7 @@ import './helpers/guard.js'
 
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 
@@ -56,9 +56,11 @@ const DOTENV_CASES: readonly (readonly [string, boolean, string])[] = [
   ['*\n', true, 'everything'],
   ['/**\n', true, 'everything, anchored'],
   ['**/.env\n', true, 'leading **/ matches zero directories'],
+  ['***/.env\n', true, 'so does a leading run of three stars'],
   ['*.env\n', true, '* matches the empty string and the leading dot'],
   ['.e[n]v\n', true, 'a bracket class'],
   ['.e[!x]v\n', true, 'a negated bracket class'],
+  ['.e[!E]v\n', true, 'a class member is not folded, so git applies [!E] to e under either setting'],
   ['.e?v\n', true, '?'],
   ['\\.env\n', true, 'an escaped ordinary character'],
   ['.env   \n', true, 'trailing spaces are trimmed'],
@@ -83,6 +85,13 @@ const DOTENV_CASES: readonly (readonly [string, boolean, string])[] = [
   ['.env*\n!**/.env\n', false, 'a **/ negation'],
   ['.env*\n!/.env*\n', false, 'an anchored negation'],
   ['.env\n!.env \n', false, 'a negation with trailing spaces'],
+  // Shapes the first version missed (verification of ff5ebaa): git applies each.
+  ['.env*\n!***/.env\n', false, 'a run of three stars is **/ to git'],
+  ['.env*\n!/***/.env\n', false, 'anchored, three stars'],
+  ['.env*\n!.**/*\n', false, "git's literal-prefix rule: .**/ can match zero directories"],
+  ['.env*\n!.e[n/]v\n', false, 'a / inside a bracket anchors the pattern but is a class member'],
+  ['.env*\n![!/]env\n', false, 'a negated class holding /'],
+  ['.env*\n!.env\0junk\n', false, 'git reads a pattern only up to its first NUL'],
 ]
 
 // Where the matcher answers false and git (at least sometimes) says true: the
@@ -94,6 +103,7 @@ const FAIL_CLOSED: readonly (readonly [string, string])[] = [
   ['.env\n!.ENV\n', 'a negation that matches only under core.ignorecase still un-ignores'],
   ['.env\n!.env\r\n', 'a negation with a CR still un-ignores'],
   ['.env\n!.e[[:alpha:]]v\n', 'an unmodelled negation still un-ignores'],
+  ['.e[!A-Z]v\n', 'an ignoring line git applies only WITHOUT core.ignorecase (folded, [!A-Z] refuses e)'],
 ]
 
 test('the matcher agrees with git check-ignore on what ignores <repo>/.env', (t) => {
@@ -111,6 +121,11 @@ test('every fail-closed choice answers "not ignored", whatever git says', (t) =>
     writeFileSync(join(repo, '.gitignore'), Buffer.from(text, 'latin1'))
     assert.equal(rootGitignoreIgnores(repo, '.env', 'file'), false, why)
   }
+  // The macOS default refuses [!A-Z] for 'e', so crediting that line would be
+  // a false "ignored" there.
+  writeFileSync(join(repo, '.gitignore'), '.e[!A-Z]v\n')
+  assert.equal(gitIgnores(repo, '.env', false), true)
+  assert.equal(gitIgnores(repo, '.env', true), false)
   // And git really does disagree on the ignorecase pair, which is why they are
   // here: the macOS default would ignore .ENV and honour !.ENV.
   writeFileSync(join(repo, '.gitignore'), '.ENV\n')
@@ -154,33 +169,93 @@ test('the matcher agrees with git on what ignores the directory <repo>/.aos', (t
 })
 
 test('soundness over generated .gitignore files: "ignored" is never claimed where git disagrees', (t) => {
+  // One subdirectory per generated file, each with its own .gitignore, .env
+  // and .aos: a .gitignore applies to the entries directly beside it exactly
+  // as the root one does to root entries, and git judges a whole batch in one
+  // `check-ignore --stdin` per core.ignorecase setting.
   const repo = gitRepo(t)
-  const POOL = [
-    '.env', '/.env', '.env*', '/.env*', '*', '**', '/**', '**/.env', '*.env', '.e*', '.en?', '.e[a-z]v', '.e[!a]v',
-    '.ENV', '.Env*', '.env/', '.env/**', 'foo/.env', ' .env', '.env\t', '.env  ', '.env\\ ', '\\.env', '\\!.env',
-    '.env\r', '.e[[:alpha:]]v', '#.env', '.aos', '/.aos/', '.aos/', '.a?s', '[.]aos',
+  const BASE = [
+    '.env', '.env*', '/.env', '/.env*', '*', '**/.env', '***/.env', '*.env', '.e[n]v', '.e[!A-Z]v', '.E*', '.env\r',
+    '.aos', '/.aos/', '.aos/', '.a?s', '.[!A-Z]os/', '.**', '.env/**', 'foo/.env',
   ]
-  // A fixed-seed generator, so a failure names a reproducible input.
+  const BITS = [
+    '.', 'e', 'n', 'v', 'E', 'V', 'a', 'o', 's', 'A', '*', '**', '***', '?', '[', ']', '!', '^', '-', '/', '\\', ' ',
+    '\t', '\r', '\0', '[!A-Z]', '[n/]', '[!/]', '[a-z]', '[E]', '[z-a]', '[--/]', '[:alpha:]', '#', '**/', '/**', '\\.',
+  ]
+  // mulberry32, fixed seed: reproducible, and unlike an LCG's low bits it
+  // reaches every combination.
   let seed = 0x5eed
   const next = (n: number): number => {
-    seed = (seed * 1103515245 + 12345) & 0x7fffffff
-    return seed % n
+    seed = (seed + 0x6d2b79f5) | 0
+    let x = Math.imul(seed ^ (seed >>> 15), seed | 1)
+    x ^= x + Math.imul(x ^ (x >>> 7), x | 61)
+    return Math.floor((((x ^ (x >>> 14)) >>> 0) / 4294967296) * n)
   }
-  const failures: string[] = []
-  for (let i = 0; i < 150; i++) {
+  const texts: string[] = []
+  for (let i = 0; i < 2500; i++) {
     const lines: string[] = []
-    const count = 1 + next(4)
-    for (let j = 0; j < count; j++) lines.push((next(3) === 0 ? '!' : '') + (POOL[next(POOL.length)] ?? ''))
-    const text = `${lines.join('\n')}\n`
-    writeFileSync(join(repo, '.gitignore'), text)
-    for (const [entry, kind] of [['.env', 'file'], ['.aos', 'dir']] as const) {
-      if (!rootGitignoreIgnores(repo, entry, kind)) continue
-      for (const ignorecase of [false, true]) {
-        if (!gitIgnores(repo, entry, ignorecase)) failures.push(`${entry} ignorecase=${String(ignorecase)}: ${JSON.stringify(text)}`)
+    for (let j = 0, count = 1 + next(4); j < count; j++) {
+      let line = next(3) === 0 ? '' : (BASE[next(BASE.length)] ?? '')
+      for (let k = 0, edits = next(4); k < edits; k++) {
+        const at = next(line.length + 1)
+        line = line.slice(0, at) + (BITS[next(BITS.length)] ?? '') + line.slice(at)
       }
+      lines.push((next(5) < 2 ? '!' : '') + line)
     }
+    const text = `${lines.join('\n')}\n`
+    const dir = join(repo, `c${String(i)}`)
+    mkdirSync(join(dir, '.aos'), { recursive: true })
+    writeFileSync(join(dir, '.aos', 'f'), 'x')
+    writeFileSync(join(dir, '.env'), 'x')
+    writeFileSync(join(dir, '.gitignore'), Buffer.from(text, 'latin1'))
+    texts.push(text)
   }
+  const paths = texts.flatMap((_, i) => [`c${String(i)}/.env`, `c${String(i)}/.aos`])
+  const ignoredBy = (ignorecase: boolean): Set<string> => {
+    const r = spawnSync('git', ['-C', repo, '-c', `core.ignorecase=${String(ignorecase)}`, 'check-ignore', '--stdin'], {
+      env: GIT_ENV,
+      encoding: 'utf8',
+      input: `${paths.join('\n')}\n`,
+      maxBuffer: 1 << 24,
+    })
+    assert.ok(r.status === 0 || r.status === 1, `git check-ignore failed: ${r.stderr}`)
+    return new Set(r.stdout.split('\n').filter((p) => p !== ''))
+  }
+  const git = { exact: ignoredBy(false), folded: ignoredBy(true) }
+  const failures: string[] = []
+  let claimed = 0
+  texts.forEach((text, i) => {
+    for (const [entry, kind] of [['.env', 'file'], ['.aos', 'dir']] as const) {
+      if (!rootGitignoreIgnores(join(repo, `c${String(i)}`), entry, kind)) continue
+      claimed += 1
+      const path = `c${String(i)}/${entry}`
+      if (!git.exact.has(path) || !git.folded.has(path)) failures.push(`${entry}: ${JSON.stringify(text)}`)
+    }
+  })
   assert.deepEqual(failures, [])
+  // A generator that never produces an "ignored" would pass vacuously.
+  assert.ok(claimed > 400, `only ${String(claimed)} "ignored" answers were exercised`)
+})
+
+test('a .aos that is a symlink is not ignored, even by /.aos/: git judges it a file', (t) => {
+  // `mv .aos data && ln -s data .aos`: git stages the link and everything in
+  // data/, so whatever is written through .aos would reach a commit.
+  const repo = gitRepo(t)
+  writeFileSync(join(repo, '.gitignore'), '/.aos/\n.aos\n')
+  rmSync(join(repo, '.aos'), { recursive: true })
+  mkdirSync(join(repo, 'data'))
+  symlinkSync('data', join(repo, '.aos'))
+  assert.equal(gitignoresAos(repo), false)
+})
+
+test('a .gitignore of 100 MiB or more ignores nothing: git 2.50 skips the whole file', (t) => {
+  const repo = gitRepo(t)
+  const path = join(repo, '.gitignore')
+  writeFileSync(path, '.env*\n/.aos/\n')
+  assert.equal(rootGitignoreIgnores(repo, '.env', 'file'), true)
+  truncateSync(path, 100 * 1024 * 1024) // sparse: costs no disk
+  assert.equal(rootGitignoreIgnores(repo, '.env', 'file'), false)
+  assert.equal(gitignoresAos(repo), false)
 })
 
 test('git tracks no credentials file: .env.example is the only .env* in the index', () => {

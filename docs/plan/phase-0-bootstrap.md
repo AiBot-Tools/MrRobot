@@ -70,11 +70,10 @@ All versions are `npm view` results from 2026-09-20 (deps §1, §2; CONFIRMED). 
 | `openai` 7.20.0 | raw `fetch` + zod Chat Completions adapter (T21) | providers §7: the SDK is Responses-first and may emit fields compat servers reject (llama.cpp throws on `best_of`/`suffix`); it imposes `engines.node >=22.0.0`; invariant 4 needs one logging transport regardless. Zero transitive deps if reversed (**D6**). |
 | `better-sqlite3` 13.0.3 | `node:sqlite` behind the one-file adapter `src/events/db.ts` | deps §4.1: node:sqlite provides sync API, WAL, triggers, `readOnly`; better-sqlite3 adds a 27 MB tarball and a native binary inside the trust boundary (**D3**). |
 | `dotenv` | operator sources `.env` (CLAUDE.md "needs .env sourced"); optional `--env-file-if-exists` (**D7**) | deps §4.5 |
-
-> Superseded 2026-10 (DECISIONS D7, D31): `dev`/`cli`/`eval` read `<repo>/.env` through `--dotenv` and `src/secrets/dotenv.ts`; nobody sources `.env`. The text below is the original plan.
-
 | `commander`, `yargs` | `util.parseArgs` (Stable since v20) for nine flat subcommands | deps §4.2 |
 | `pino-pretty` | ad hoc `npm run dev \| npx pino-pretty` | deps §2 |
+
+> Superseded 2026-10 (DECISIONS D7, D31): the `dotenv` row above, and every note in this plan that says the operator sources `.env`. `dev`/`cli`/`eval` now read `<repo>/.env` through `--dotenv` and `src/secrets/dotenv.ts` (still no `dotenv` package, and no `--env-file`); nobody sources `.env`. This plan is otherwise kept as written.
 
 ### 2.4 Stdlib choices made
 

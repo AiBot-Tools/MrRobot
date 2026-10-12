@@ -165,7 +165,10 @@ test("every STUBS entry is named in README's stub section", () => {
     assert.match(commit.trim(), /[0-9a-f]{7}/, `${label} claims a result with no commit`)
     assert.match(extra, /costMicroUsd`?: *[1-9]/, `${label} claims a result with no non-zero cost`)
   }
-  assert.ok(README.includes('AOS_LIVE_TESTS=1 ANTHROPIC_API_KEY='))
+  assert.ok(README.includes('AOS_LIVE_TESTS=1 npm test'))
+  // The key comes from .env or an export, never typed into a command line,
+  // where zsh writes it to ~/.zsh_history.
+  assert.equal(/ANTHROPIC_API_KEY=\S*\s+npm\b/.test(README), false, 'README puts a key on a command line')
   assert.ok(README.includes('PMMCP_URL='))
   assert.ok(README.includes('npm run cli -- run ceo'))
   // The Node warning that does not look like a version problem.

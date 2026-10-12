@@ -73,11 +73,26 @@ committed template: placeholders only, never edited to hold a real value, and it
 does not change when your `.env` does.
 
 ```bash
-(umask 077 && cp .env.example .env)   # creates .env as mode 0600
-$EDITOR .env                          # replace both replace-me-... values (openssl rand -hex 32 makes a token)
-npm run dev                           # logs: credentials: .env (AOS_CONTROL_TOKEN, ANTHROPIC_API_KEY)
-npm run cli -- agents                 # in a second shell; nothing to export
+test -e .env || (umask 077 && cp .env.example .env)   # a new .env, mode 0600; never overwrites one
+chmod 600 .env                                         # cp keeps an existing file's mode, so set it
+${EDITOR:-nano} .env                                   # replace both replace-me-... values (openssl rand -hex 32 makes a token)
+npm run dev                                            # logs: credentials: .env (AOS_CONTROL_TOKEN, ANTHROPIC_API_KEY)
+npm run cli -- agents                                  # in a second shell; nothing to export
 ```
+
+Use a plain-text editor: TextEdit's smart quotes turn `"` into `“`, which the
+loader refuses (a key is printable ASCII).
+
+**Upgrading from a sourced `.env`.** Before D31 the setup was `cp .env.example
+.env && set -a && . ./.env && set +a`. A `.env` made that way is mode 0644 and
+holds names this kernel now refuses (`AOS_DATA_DIR`, `AOS_LOG_LEVEL`,
+`PMMCP_TOKEN`, `OPENROUTER_API_KEY`, `MOONSHOT_API_KEY`, `LLAMA_API_KEY`,
+`AOS_LIVE_TESTS`, `PMMCP_URL`). `npm run dev` always reads the whole file, so it
+refuses to start with it even when every credential is exported (the CLI and
+eval open it only when the shell lacks the token). Edit it in place: keep only
+`AOS_CONTROL_TOKEN` and
+`ANTHROPIC_API_KEY`, run `chmod 600 .env`, stop sourcing it, and export
+`AOS_DATA_DIR` or `AOS_LOG_LEVEL` from the shell if you used them.
 
 How it is read (`src/secrets/dotenv.ts`, decision D31):
 
@@ -91,15 +106,19 @@ How it is read (`src/secrets/dotenv.ts`, decision D31):
   warns, by name, that it did.
 - Refused at startup, each with the fix in the message: a `.env` other users can
   read (`chmod 600 .env`), a symlink, another owner, a second hard link, more
-  than 64 KB, a `.gitignore` that stops ignoring it, any name but the two above,
-  a value still beginning `replace-me`, two lines joined into one, a name set
-  twice. It parses with its own strict grammar: Node's built-in `.env` parser
-  gives a whitespace-only value the whole next line.
+  than 64 KB, a `.gitignore` that stops ignoring it (read with git's own rules,
+  so `!*` or a leading space count), any name but the two above, a value still
+  beginning `replace-me`, a character outside printable ASCII, two lines joined
+  into one, a name set twice, a second `--dotenv`. It parses with its own strict
+  grammar: Node's built-in `.env` parser gives a whitespace-only value the whole
+  next line. An exported value that is empty or only whitespace counts as unset.
 - Live tests (`AOS_LIVE_TESTS=1 npm test`) take the key from the shell or
-  `.env`; every other test strips credential names from its own environment.
+  `.env`; every other test file strips credential names from its own process,
+  on the live run too.
 
-**Keep it safe.** This repository is public: never `git add -f .env`, and turn
-on GitHub secret scanning with push protection. `.env` is plaintext on disk:
+**Keep it safe.** This repository is public: never `git add -f .env` (`npm test`
+fails while one is tracked), and turn on GitHub secret scanning with push
+protection. `.env` is plaintext on disk:
 Time Machine, iCloud Desktop/Documents sync, and zipping or copying the folder
 all carry it, and any tool running as you can read it. Use a dedicated Anthropic
 key with a spend limit, and rotate it if the folder is ever copied. Do not run
@@ -110,8 +129,10 @@ unredacted.
 Provider keys reach the kernel through its env (`secrets.source: env`): each entry's own
 `auth.envVar`, resolved at boot. pmmcp's `get_secret` answers only with a masked
 sentence (`Secret 'x' exists (masked): ****abcd`), by design, so it cannot supply
-a key; the vault path stays in the code, dormant, and refuses any reply that
-contains whitespace rather than minting a sentence as a credential.
+a key; the vault path stays in the code, dormant. Whatever the source (the
+shell, `.env`, the vault, or the D8 fallback to the env), the broker refuses a
+value that cannot be a key: whitespace (pmmcp's masked sentence), a character
+outside printable ASCII, or a joined `NAME=value` line.
 
 With no pmmcp and no Docker the kernel boots **degraded** and says exactly what
 is missing. That is the designed behaviour, not a failure — see below.
@@ -460,12 +481,15 @@ namespace — and nothing is deleted afterwards, because the kernel has no delet
 and a test must not grow one. Inspect or clear that namespace yourself.
 
 ```bash
+# ANTHROPIC_API_KEY comes from .env (or a shell export, which wins). Never type
+# a key on the command line: zsh saves it to ~/.zsh_history.
+
 # model only (cheapest):
-AOS_LIVE_TESTS=1 ANTHROPIC_API_KEY=… npm test
+AOS_LIVE_TESTS=1 npm test
 
 # everything, including pmmcp writes to aos/agent/aos-live-test:
 AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_WRITES=1 \
-  PMMCP_URL=http://127.0.0.1:8766/mcp ANTHROPIC_API_KEY=… npm test
+  PMMCP_URL=http://127.0.0.1:8766/mcp npm test
 ```
 
 Run `npm run capture:pmmcp` first if you can: the goal-tools test will name any
@@ -485,7 +509,7 @@ catch them. `npm run falsify` applies each, runs its suite's tests, and puts the
 file back.
 
 ```bash
-npm run falsify                    # every suite (thirteen: see --list)
+npm run falsify                    # every suite (sixteen: see --list)
 npm run falsify -- recovery        # one suite
 npm run falsify -- --only D13,W3   # named mutants
 npm run falsify -- --list          # the catalog, touching nothing
@@ -508,9 +532,14 @@ mutant.
 Run it after changing delegation, crash recovery, tool-call replay, the memory
 namespace pin, goal tracking, anchor trust, the eval checks, the chain /
 canonicalizer / triggers (`integrity`), redaction, the cron scheduler, the agent
-registry, restart recovery of approvals and holds, or the container audit (`sandbox`)
-— the thirteen suites — and add a
-mutant whenever a new test exists to catch a specific bug. The `integrity` and
+registry, restart recovery of approvals and holds, the container audit and path
+containment (`sandbox`), the `.env` loader and the credential checks around it
+(`dotenv`, and `dotenvDefault` for how an entry point picks its file), or the
+`.gitignore` reading (`gitignore`) — the sixteen suites — and add a mutant
+whenever a new test exists to catch a specific bug. A mutant on how an entry
+point picks its credentials file must never run beside
+`test/entrypoints.test.ts`, which spawns entry points from this checkout, where
+your real `.env` lives; `test/falsify.test.ts` refuses a catalog that does. The `integrity` and
 `redaction` suites edit change-controlled files (chain hashing, the triggers,
 the redaction pass) and restore them; the operator approved keeping them in the
 catalog on that basis.
@@ -532,11 +561,12 @@ this repository can fill these in; they require the operator's machine, keys and
 money.
 
 **1. LLM half — the provider path only.** Proves the router, the adapter and the
-cost accounting against real Claude. Uses the env fallback (D8), so it can never
+cost accounting against real Claude, with no pmmcp connected, so it can never
 stand in for line 2.
 
 ```bash
-AOS_LIVE_TESTS=1 ANTHROPIC_API_KEY=… npm test
+# ANTHROPIC_API_KEY comes from .env (or a shell export, which wins)
+AOS_LIVE_TESTS=1 npm test
 ```
 
 - Result: _not yet run_

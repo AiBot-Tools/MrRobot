@@ -5,16 +5,20 @@ One index over every open question in this repository. Nothing in `docs/plan/` o
 session protocol and its change-control rule on dependencies.
 
 **Sources of truth.** This file is an index; the full reasoning lives in the section each
-row cites. `D*` rows come from `docs/plan/phase-0-bootstrap.md` §6. `Q*` rows come from
+row cites. `D1`–`D30` come from `docs/plan/phase-0-bootstrap.md` §6; `D31` and `D32` were
+decided here (2026-10) and are complete in their rows. `Q*` rows come from
 `docs/design/agent-fleet.md` §13. Where a row is clipped here, the source is complete.
 
 **How to answer.** Every row carries a conservatively chosen default. Reply "accept all
 defaults" and name only what you want changed, for example `D3: better-sqlite3` or
 `Q2: per-order approval only, no mandate`. Answers get recorded here and in the source.
 
-**Totals.** 30 Phase 0 plan decisions, 29 fleet design decisions, 16 of them blocking.
+**Totals.** 32 Phase 0 decisions (30 from the plan, D31 and D32 added later), 29 fleet
+design decisions, 16 of them blocking.
 
-**Status.** All 59 decisions answered on 2026-09-21. All defaults accepted except D13.
+**Status.** The original 59 answered on 2026-09-21, all defaults accepted except D13. Since
+then, by the operator (2026-10): D7 reversed, and D31 (credentials in `<repo>/.env`) and D32
+answered.
 
 ## 1. Blocking — answer before any code is written
 

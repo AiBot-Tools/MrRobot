@@ -408,3 +408,29 @@ test('source vault refuses pmmcp\'s masked sentence rather than minting it, and 
   await missing.broker.start()
   await assert.rejects(missing.broker.ref('anthropic-api-key', 'p'), /a message, not a credential/)
 })
+
+test('source env refuses a value that is a whole NAME=value line, never quotes it, and mints nothing', async (t) => {
+  // What Node's .env parser makes of `ANTHROPIC_API_KEY= ` followed by a line
+  // holding another key: the key's value IS the next line.
+  const joined = 'OPENROUTER_API_KEY=qJoinedLineCanary0123456789'
+  const { broker, store } = await wire(t, { source: 'env', env: { ANTHROPIC_API_KEY: joined } })
+  await broker.start()
+  await assert.rejects(
+    broker.ref('anthropic-api-key', 'p', { envVar: 'ANTHROPIC_API_KEY' }),
+    (e: unknown) =>
+      e instanceof PolicyDenied &&
+      /holds a whole NAME=value line/.test(e.message) &&
+      !e.message.includes('qJoinedLineCanary') &&
+      !e.message.includes('OPENROUTER'),
+  )
+  assert.deepEqual(payloads(store, 'secret.accessed'), [])
+
+  // Controls: an '=' that is not after a NAME is an ordinary key character.
+  for (const fine of ['sk-ant-FAKE0123456789abcdef==', 'abcDEF0123456789=']) {
+    const ok = await wire(t, { source: 'env', env: { ANTHROPIC_API_KEY: fine } })
+    await ok.broker.start()
+    const ref = await ok.broker.ref('anthropic-api-key', 'p', { envVar: 'ANTHROPIC_API_KEY' })
+    assert.equal(ok.broker.use(ref, (v) => v), fine)
+  }
+  SecretMask.clear()
+})

@@ -2,10 +2,12 @@
 //
 // Two sources, chosen by kernel.yaml `secrets.source`:
 //
-//   env (default)  each provider entry's own `auth.envVar`, read once at boot.
+//   env (default)  each provider entry's own `auth.envVar`, from the env the
+//                  kernel was booted with: the shell, or the operator's
+//                  <repo>/.env read by the entry point's --dotenv
+//                  (src/secrets/dotenv.ts; the broker never opens a file).
 //                  pmmcp's `get_secret` never returns plaintext — it answers
-//                  with a masked sentence — so the environment, filled from a
-//                  prompt and never from a file, is the working path.
+//                  with a masked sentence — so this is the working path.
 //
 //   vault          pmmcp's `get_secret`, then D8's envFallback. DORMANT: kept
 //                  for a pmmcp that one day returns a value to an authenticated
@@ -63,6 +65,16 @@ export type SecretSource = 'vault' | 'env'
  */
 export function isMessageNotCredential(value: string): boolean {
   return /\s/.test(value)
+}
+
+/**
+ * A value that is itself `NAME=...`: two lines of a .env joined into one. Node's
+ * own .env parser does exactly that to a whitespace-only value, which then
+ * takes the next line; a shell that sourced such a file carries it too. No
+ * provider key starts with an upper-case env-var name and an `=`.
+ */
+export function looksLikeEnvLine(value: string): boolean {
+  return /^[A-Z][A-Z0-9_]*=/.test(value)
 }
 
 /**
@@ -259,10 +271,16 @@ export class SecretsBroker {
       }
       const fromEnv = this.#env[envVar]
       if (fromEnv === undefined || fromEnv === '') {
-        throw new PolicyDenied(id, `${envVar} is not set (secrets.source: env)`)
+        throw new PolicyDenied(id, `${envVar} is not set (secrets.source: env): add it to .env or export it`)
       }
       if (isMessageNotCredential(fromEnv)) {
         throw new PolicyDenied(id, `${envVar} contains whitespace, so it is not a credential`)
+      }
+      if (looksLikeEnvLine(fromEnv)) {
+        throw new PolicyDenied(
+          id,
+          `${envVar} holds a whole NAME=value line, not a credential: in a .env, a value of only spaces swallows the line below it`,
+        )
       }
       return this.#mint(id, 'env', fromEnv, purpose)
     }

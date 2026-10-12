@@ -565,10 +565,11 @@ a second line. The `integrity` and
 the redaction pass) and restore them; the operator approved keeping them in the
 catalog on that basis.
 
-Last full run, against commit `1615934`: 153 of 153 mutants killed (delegation
+Last full run, against commit `96771ce`: 207 of 207 mutants killed (delegation
 18, recovery 12, replay 8, namespace 7, goals 15, anchor 6, eval 11, integrity
-21, redaction 12, schedule 13, registry 13, restart 8, sandbox 9), 13 of 13
-controls survived, exit 0. A result is a fact about that commit only; rerun it
+21, redaction 12, schedule 13, registry 13, restart 8, sandbox 15, dotenv 32,
+dotenvDefault 3, gitignore 13), 16 of 16 controls survived, exit 0, each kill by
+the test written for it. A result is a fact about that commit only; rerun it
 rather than trusting this line after a change.
 
 ---

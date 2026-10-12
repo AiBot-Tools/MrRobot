@@ -260,6 +260,25 @@ test('the catalog is well-formed: unique ids, real test files, and controls that
   assert.deepEqual(all.filter((id, i) => all.indexOf(id) !== i), [], 'a mutant id is reused across suites')
 })
 
+test('no mutant that could steer an entry point at a credentials file runs beside a test that spawns entry points from this checkout', () => {
+  // entrypoints.test.ts spawns the daemon, the CLI and eval with cwd = this
+  // checkout, which on the operator's Mac holds the real <repo>/.env. A mutant
+  // on an entry point, or one that writes a .env path into the code, would have
+  // a test-spawned process read the real keys before an assertion killed it.
+  // Such mutants belong in a suite of in-process tests against a trap repo.
+  const SPAWNS = 'test/entrypoints.test.ts'
+  const ENTRY = new Set(['src/main.ts', 'src/cli/index.ts', 'scripts/eval.ts', 'scripts/capture-pmmcp.ts'])
+  const NAMES_THE_FILE = /['"`]\.env['"`/]|DOTENV_FILE/
+  const hazards: string[] = []
+  for (const s of CATALOG) {
+    if (!s.tests.includes(SPAWNS)) continue
+    for (const mu of s.mutants) {
+      if (ENTRY.has(mu.file) || (NAMES_THE_FILE.test(mu.to) && !NAMES_THE_FILE.test(mu.from))) hazards.push(`${s.name}/${mu.id}`)
+    }
+  }
+  assert.deepEqual(hazards, [])
+})
+
 test('npm run falsify is a program: bad input is refused with usage, --list runs nothing', () => {
   const run = (args: string[]) =>
     spawnSync('npx', ['tsx', 'scripts/falsify.ts', ...args], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 60_000 })
@@ -267,7 +286,7 @@ test('npm run falsify is a program: bad input is refused with usage, --list runs
   const bogus = run(['no-such-suite'])
   assert.equal(bogus.status, 2, bogus.stderr)
   assert.match(bogus.stderr, /unknown suite: no-such-suite/)
-  assert.match(bogus.stderr, /suites: delegation, recovery, replay, namespace, goals, anchor, eval, integrity, redaction, schedule, registry, restart, sandbox, dotenv/)
+  assert.match(bogus.stderr, /suites: delegation, recovery, replay, namespace, goals, anchor, eval, integrity, redaction, schedule, registry, restart, sandbox, dotenv, dotenvDefault/)
 
   const badOnly = run(['--only', 'D99'])
   assert.equal(badOnly.status, 2)

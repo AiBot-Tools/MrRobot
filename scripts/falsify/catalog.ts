@@ -439,7 +439,6 @@ const dotenv: Suite = {
     { id: 'X19', file: DOTENV, from: '    if (parsed.value === \'\') out.delete(name)', to: '', why: 'a blank value is returned as the empty string instead of unset' },
     { id: 'X20', file: DOTENV, from: '    if (value.toLowerCase().startsWith(PLACEHOLDER_PREFIX)) {', to: '    if (false) {', why: 'an unfilled copy of .env.example sends its placeholder as a key' },
     { id: 'X21', file: DOTENV, from: '  if (fromShell !== \'\') return fromShell\n', to: '', why: 'the CLI opens the file even when the shell already has the token' },
-    { id: 'X22', file: 'src/main.ts', from: '  const path = dotenvPathFrom(argv, ctx.repoRoot)', to: '  const path = dotenvPathFrom(argv, ctx.repoRoot) ?? join(ctx.repoRoot, \'.env\')', why: 'a daemon started without --dotenv (every test) opens the repo\'s real .env' },
     { id: 'X23', file: 'src/secrets/broker.ts', from: '      if (looksLikeEnvLine(fromEnv)) {', to: '      if (false) {', why: 'a shell value that is a joined NAME=value line is minted as a key' },
     { id: 'X24', file: 'test/helpers/live-env.ts', from: '  if (env[\'AOS_LIVE_TESTS\'] !== \'1\') throw new Error', to: '  if (false) throw new Error', why: 'an offline test can open the repo\'s real .env' },
     { id: 'X25', file: 'test/helpers/guard.ts', from: 'if (process.env[\'AOS_LIVE_TESTS\'] !== \'1\') {\n  for (const name of Object.keys(process.env)) {', to: 'if (false) {\n  for (const name of Object.keys(process.env)) {', why: 'a key exported in the shell running npm test reaches every offline test' },
@@ -449,6 +448,27 @@ const dotenv: Suite = {
     file: DOTENV,
     from: "// The operator's credentials file: <repo>/.env, read by entry points only.",
     to: "// The operator's credentials file: <repo>/.env, read by entry points only. (control)",
+    why: 'comment only',
+  },
+}
+
+// X22 lives apart from the dotenv suite on purpose. That suite runs
+// test/entrypoints.test.ts, which spawns the daemon with cwd = this checkout —
+// where the operator keeps the real <repo>/.env. A mutant that defaults the
+// daemon's credentials file to <repo>/.env, run there, has a test-spawned
+// daemon read the real keys before any assertion can kill it. Here the only
+// test is the in-process one that points daemonEnv at a trap repo.
+const dotenvDefault: Suite = {
+  name: 'dotenvDefault',
+  tests: ['test/dotenv.test.ts'],
+  mutants: [
+    { id: 'X22', file: 'src/main.ts', from: '  const path = dotenvPathFrom(argv, ctx.repoRoot)', to: '  const path = dotenvPathFrom(argv, ctx.repoRoot) ?? join(ctx.repoRoot, \'.env\')', why: 'a daemon started without --dotenv opens <repo>/.env anyway' },
+  ],
+  control: {
+    id: 'C',
+    file: 'src/main.ts',
+    from: '// Daemon entry point: `npm run dev`.',
+    to: '// Daemon entry point: `npm run dev`. (control)',
     why: 'comment only',
   },
 }
@@ -468,4 +488,5 @@ export const CATALOG: readonly Suite[] = [
   restart,
   sandbox,
   dotenv,
+  dotenvDefault,
 ]

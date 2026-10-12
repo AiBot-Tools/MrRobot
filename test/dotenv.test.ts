@@ -366,3 +366,15 @@ test('liveCredential prefers a non-empty shell value and otherwise reads the giv
   assert.equal(liveCredential('ANTHROPIC_API_KEY', { AOS_LIVE_TESTS: '1' }, path), KEY)
   assert.equal(liveCredential('ANTHROPIC_API_KEY', { AOS_LIVE_TESTS: '1' }, join(tmpdir(t), 'absent.env')), undefined)
 })
+
+test('credentialEnv on its own: a non-empty shell value beats any file value, an empty one does not, and only the given names come back', () => {
+  // The loader already drops a name the shell sets, so this rule is enforced
+  // twice. Tested here without the loader, so neither copy can rot unseen.
+  const loaded = { path: '/x/.env', found: true, values: { A: 'fromFile', B: 'fileB', C: 'fileC' }, shadowed: [] }
+  assert.deepEqual(credentialEnv(['A', 'B', 'D'], { A: 'fromShell', B: '', D: undefined, E: 'stray' }, loaded), {
+    A: 'fromShell',
+    B: 'fileB',
+    D: undefined,
+  })
+  assert.deepEqual(credentialEnv(['A'], { A: 'fromShell' }, undefined), { A: 'fromShell' })
+})

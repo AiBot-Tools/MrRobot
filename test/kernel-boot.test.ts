@@ -56,6 +56,7 @@ import { anthropicEndTurn, fakeProvider } from './helpers/fake-provider.js'
 import { freshProbe } from './helpers/probe.js'
 import { writeProbeRecord } from '../src/models/probe.js'
 import { mockMcp } from './helpers/mock-mcp.js'
+import { SecretMask } from '../src/events/redact.js'
 
 
 /** Rows as bootKernel sees them: read-only reopen, ordered by seq. */
@@ -1062,4 +1063,65 @@ test('pmmcp is dialled with no bearer unless kernel.yaml declares a tokenEnv, an
   assert.ok(seen.length > 0, 'a set tokenEnv was never dialled')
   assert.ok(seen.every((h) => h.authorization === `Bearer ${bearer}`), 'the declared bearer was not sent')
   await withToken.kernel.shutdown()
+})
+
+test('a declared pmmcp bearer that cannot be a header is refused by name, never dialled, and no part of it reaches the log', async (t) => {
+  // openssl rand -base64 64 wraps at 64 columns: a newline mid-token. The HTTP
+  // library would throw with the whole header value in its message, and that
+  // message used to become a chained hub.degraded reason.
+  t.after(() => SecretMask.clear())
+  let dialled = 0
+  const server = createServer((req, res) => {
+    dialled += 1
+    req.resume()
+    res.writeHead(404).end()
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())))
+  const url = `url: http://127.0.0.1:${String((server.address() as AddressInfo).port)}/mcp`
+  const head = 'qBearerHeadCanary0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL'
+  const tail = 'qBearerTailCanaryZYXWVU98765=='
+  for (const token of [`${head}\n${tail}`, `${head} ${tail}`, `\u201C${head}${tail}\u201D`]) {
+    const booted = await withKernel(t, {
+      kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `${url}\n      tokenEnv: PMMCP_TOKEN`),
+      env: { PMMCP_TOKEN: token },
+    })
+    const reason = booted.kernel.status().subsystems.hub.reason ?? ''
+    assert.match(reason, /PMMCP_TOKEN (contains whitespace|contains a character outside printable ASCII)/, JSON.stringify(token))
+    await booted.kernel.shutdown()
+    const logged = allRows(booted.fx.dbPath).map((r) => r.payload).join('\n')
+    for (const secret of [head, tail]) {
+      for (let i = 0; i + 8 <= secret.length; i += 1) {
+        assert.equal(logged.includes(secret.slice(i, i + 8)), false, 'part of the bearer reached the event log')
+      }
+    }
+  }
+  assert.equal(dialled, 0, 'a bearer that cannot be a header was sent anyway')
+})
+
+test('a valid pmmcp bearer is masked before connecting, so a server that echoes it into an error leaves no trace in the log', async (t) => {
+  t.after(() => SecretMask.clear())
+  // An opaque value, nothing like a key shape, so only the exact-value mask
+  // can be what keeps it out: the pattern redactor would not recognise it.
+  const bearer = 'qOpaqueBearerCanary0123456789abcdefghij'
+  const server = createServer((req, res) => {
+    req.resume()
+    // A misbehaving server: it quotes the credential back in its refusal, which
+    // the MCP client puts in the error the hub records as its degraded reason.
+    // Bare, without the `Bearer ` the pattern redactor would recognise.
+    res.writeHead(401, { 'content-type': 'text/plain' }).end(`unauthorized: ${String(req.headers.authorization).replace(/^Bearer /, '')}`)
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())))
+  const url = `url: http://127.0.0.1:${String((server.address() as AddressInfo).port)}/mcp`
+  const booted = await withKernel(t, {
+    kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `${url}\n      tokenEnv: PMMCP_TOKEN`),
+    env: { PMMCP_TOKEN: bearer },
+  })
+  await booted.kernel.shutdown()
+  const logged = allRows(booted.fx.dbPath).map((r) => r.payload).join('\n')
+  assert.match(logged, /unauthorized/, 'the server\'s refusal never reached the log, so this proves nothing')
+  for (let i = 0; i + 8 <= bearer.length; i += 1) {
+    assert.equal(logged.includes(bearer.slice(i, i + 8)), false, 'part of the bearer reached the event log')
+  }
 })

@@ -54,7 +54,7 @@ import { type ToolViewsFile } from './mcp/tool-views.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 
 import { McpHub, streamableHttpTransport, type ClientFactory } from './mcp/hub.js'
-import { SecretsBroker, type SecretRef } from './secrets/broker.js'
+import { notACredential, SecretsBroker, type SecretRef } from './secrets/broker.js'
 import {
   parseProviders,
   routable,
@@ -848,6 +848,17 @@ async function connectHub(
         ok: false,
         reason: `${tokenEnv} is not set, so the kernel has no vault and no memory`,
       }
+    }
+    if (token !== undefined) {
+      // The same checks a provider key gets. A bearer holding a newline makes
+      // the HTTP library throw with the whole header value in its message, and
+      // that message becomes a chained hub.degraded reason — so refuse it here,
+      // by name, and mask the value before anything can quote it.
+      const problem = notACredential(token)
+      if (problem !== undefined) {
+        return { ok: false, reason: `${tokenEnv ?? 'the pmmcp bearer'} ${problem}, so it is not a bearer: the kernel has no vault and no memory` }
+      }
+      SecretMask.register(token)
     }
     const url = server.url
     clientFactory = async (): Promise<Client> => {

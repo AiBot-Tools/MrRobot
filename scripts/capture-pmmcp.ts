@@ -31,6 +31,7 @@ import { parse as parseYaml } from 'yaml'
 
 import { parseKernelConfig } from '../src/config.js'
 import { listAllTools, streamableHttpTransport } from '../src/mcp/hub.js'
+import { notACredential } from '../src/secrets/broker.js'
 import { VERSION } from '../src/version.js'
 
 export const CAPTURE_PATH = 'test/fixtures/pmmcp-listtools.json'
@@ -70,6 +71,13 @@ async function main(argv: readonly string[]): Promise<number> {
   const token = tokenEnv === undefined ? undefined : process.env[tokenEnv]
   if (tokenEnv !== undefined && (token === undefined || token.trim() === '')) {
     process.stderr.write(`${tokenEnv} is not set\n`)
+    return 1
+  }
+  // A bearer the HTTP library would refuse makes it throw with the whole header
+  // value in its message, which would land on this terminal: refuse by name.
+  const problem = token === undefined ? undefined : notACredential(token)
+  if (problem !== undefined) {
+    process.stderr.write(`${tokenEnv ?? 'the bearer'} ${problem}, so it is not a bearer\n`)
     return 1
   }
 

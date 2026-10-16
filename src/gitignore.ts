@@ -16,9 +16,11 @@
 //   once as git reads it with core.ignorecase=false and once with true (the
 //   macOS default), and:
 //
-//     - an ignoring line counts only if it matches under BOTH, and only if no
-//       CR is left once it is cut at its first NUL (git strips a trailing CR;
-//       older readers may not);
+//     - an ignoring line counts only if it matches under BOTH, and only as
+//       written once cut at its first NUL: a trailing CR is never stripped,
+//       so `.env\r` does not count (git strips one; older readers may not).
+//       A CR elsewhere, as in `.en[v\r]`, is an ordinary pattern character,
+//       as git reads it;
 //     - a negating line counts if it matches under EITHER, with or without
 //       its CR;
 //     - a pattern this does not model never ignores and always un-ignores:

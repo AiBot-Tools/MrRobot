@@ -67,12 +67,13 @@ npm test
 ```
 
 `node --version` must meet the floor above, `npm run typecheck` must be clean
-and `npm test` green. No block in this README carries a `#` comment: stock macOS
+and `npm test` green. No shell block in this README carries a `#` comment: stock macOS
 zsh does not treat one as a comment when you paste, and hands it to the command
 as arguments.
 
 The daemon needs `AOS_CONTROL_TOKEN` (at least 32 printable ASCII characters,
-no whitespace) and, to reach a
+with no whitespace, quote, backtick or `#`, which `.env` refuses;
+`openssl rand -hex 32` makes one) and, to reach a
 model, `ANTHROPIC_API_KEY`. Both live in **your own `.env` in the repository
 root**: git-ignored, mode 0600, written only by you. `.env.example` is the
 committed template: placeholders only, never edited to hold a real value, and it
@@ -591,12 +592,14 @@ It edits the working tree (src/ and two test helpers), so:
 `test/falsify.test.ts` drives the runner against real processes: a SIGKILL
 mid-mutant, each of the four restoring signals mid-mutant, a second signal
 during cleanup, a second run during the first one's baseline, six runners
-racing for one stale lock, a reused pid, a missing `ps`, an unreadable journal,
-and the program's usage errors; the `runner` suite proves those tests catch
-the bugs they name. `test/entrypoints.test.ts` proves the daemon's refusal and
-`test/env.test.ts` the test guard's. On every `npm test` it also checks that
+racing for one stale lock, a reused pid, a missing `ps`, and the program's
+usage errors; it also refuses an unreadable journal in-process, and the
+`runner` suite proves those tests catch the bugs they name.
+`test/entrypoints.test.ts` proves the daemon's refusals and `test/env.test.ts`
+the test guard's. On every `npm test`, `test/falsify.test.ts` also checks that
 every catalog anchor still matches exactly once — a refactor that moves one
-fails the suite instead of silently disabling its mutant.
+fails the suite instead of silently disabling its mutant — and that no
+catalog mutant could let a test open the real `.env`.
 
 Run it after changing delegation, crash recovery, tool-call replay, the memory
 namespace pin, goal tracking, anchor trust, the eval checks, the chain /

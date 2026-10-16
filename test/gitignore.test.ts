@@ -56,6 +56,7 @@ const DOTENV_CASES: readonly (readonly [string, boolean, string])[] = [
   ['*\n', true, 'everything'],
   ['/**\n', true, 'everything, anchored'],
   [`.env${'*'.repeat(4092)}\n`, true, 'a line of exactly 4 KiB is still modelled'],
+  ['.en[v\r]\n', true, 'a CR inside a class is a pattern character, not a trailing CR'],
   ['**/.env\n', true, 'leading **/ matches zero directories'],
   ['***/.env\n', true, 'so does a leading run of three stars'],
   ['*.env\n', true, '* matches the empty string and the leading dot'],

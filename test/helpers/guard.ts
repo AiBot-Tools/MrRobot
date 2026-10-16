@@ -46,36 +46,37 @@ if (!KEEPS_CREDENTIALS) {
 /**
  * A falsify run that died (a closed terminal, a SIGKILL, a power cut) leaves a
  * source file mutated, and its journal is replayed only by the next falsify
- * start. Testing that tree would test a planted bug. A journal whose runner is
- * still alive is a run in progress — the very run that started this test.
+ * start or `--recover`. Testing that tree would test a planted bug. The one
+ * exception is the run that wrote the journal: it hands its id to its own test
+ * processes (AOS_FALSIFY_RUN), and only they may test the tree it mutated. A
+ * pid alone proves nothing — after a crash or a reboot it can name anything.
  */
 function interruptedMutation(root: string): string | undefined {
   const path = join(root, '.falsify', 'journal.json')
   if (!existsSync(path)) return undefined
-  let journal: { file?: unknown; pid?: unknown } = {}
+  let journal: { file?: unknown; runId?: unknown } = {}
   try {
-    journal = JSON.parse(readFileSync(path, 'utf8')) as { file?: unknown; pid?: unknown }
+    journal = JSON.parse(readFileSync(path, 'utf8')) as { file?: unknown; runId?: unknown }
   } catch {
-    return path
+    // Unreadable: it cannot name the file, so it must not pretend to.
   }
-  if (typeof journal.pid === 'number') {
-    try {
-      process.kill(journal.pid, 0)
-      return undefined
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'EPERM') return undefined
-    }
+  if (typeof journal.runId === 'string' && journal.runId !== '' && process.env['AOS_FALSIFY_RUN'] === journal.runId) {
+    return undefined
   }
-  return typeof journal.file === 'string' ? journal.file : path
+  if (typeof journal.file !== 'string') {
+    return (
+      `${path} exists but is unreadable, so a falsify run may have left a source file mutated: ` +
+      `run \`git status\`, \`git checkout\` any source file it lists that you did not change, then delete ${join(root, '.falsify')}`
+    )
+  }
+  return (
+    `a falsify run is in progress or was interrupted, and ${journal.file} may be mutated: ` +
+    'run `npm run falsify -- --recover` (or git checkout the file and delete .falsify/) before testing'
+  )
 }
 
 const mutated = interruptedMutation(fileURLToPath(new URL('../..', import.meta.url)))
-if (mutated !== undefined) {
-  throw new Error(
-    `an interrupted falsify run left ${mutated} mutated: run \`npm run falsify -- --recover\` ` +
-      '(or git checkout the file and delete .falsify/journal.json) before testing',
-  )
-}
+if (mutated !== undefined) throw new Error(mutated)
 
 /** Thrown instead of opening a connection the test suite must never make. */
 export class NetworkBlocked extends Error {

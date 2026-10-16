@@ -22,19 +22,39 @@
 // reports can be trusted.
 //
 // Safety. The runner edits files in the working tree, so it is built so that no
-// exit path leaves a mutant behind:
-//   the original bytes are written to a journal BEFORE the edit, and a run that
-//     finds a journal restores it first — a SIGKILL mid-mutant is recovered by
-//     the next start;
+// exit path leaves a mutant behind, and no two runs share a tree:
+//   a run holds .falsify/lock for its whole length (created exclusively),
+//     naming its pid AND that process's start time, so a pid reused by an
+//     unrelated process after a crash or reboot never passes for a live run;
+//   the original bytes are written to a journal BEFORE the edit (to a temp
+//     file, fsync'd, then renamed), and a run that finds a journal restores it
+//     first — a SIGKILL or power cut mid-mutant is recovered by the next start
+//     or by `npm run falsify -- --recover`;
 //   restore happens in `finally`, and SIGINT, SIGTERM, SIGHUP (a closed
-//     terminal, a dropped SSH session) and SIGQUIT restore before exiting;
-//   the journal names the runner's pid, so the test guard and the daemon can
-//     tell a run in progress from one that died and left a file mutated;
+//     terminal, a dropped SSH session) and SIGQUIT restore, kill the running
+//     test process group, and release the lock before exiting;
+//   the journal names its run, and the run hands that id to its own test
+//     processes (AOS_FALSIFY_RUN), so test/helpers/guard.ts admits a mutated
+//     tree only for them; src/main.ts refuses to boot while any journal exists;
+//   test processes get no live-test flag and no credential from the runner's
+//     environment, so no mutant can turn a test into one that reads a real key;
 //   the test process runs in its own process group and the whole group is
 //     killed on timeout, so a hung child cannot outlive the verdict.
 
-import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs'
 import { dirname, join } from 'node:path'
 import ts from 'typescript'
 
@@ -100,16 +120,26 @@ export interface RunnerOptions {
   readonly log?: (line: string) => void
 }
 
-/** Where the journal lives, relative to the root: read by test/helpers/guard.ts and src/main.ts too. */
+/** Where the journal and the lock live, relative to the root: read by test/helpers/guard.ts and src/main.ts too. */
 export const JOURNAL_DIR = '.falsify'
 export const JOURNAL = 'journal.json'
+export const LOCK = 'lock.json'
+/** The variable a run sets in its own test processes, naming itself. */
+export const RUN_ENV = 'AOS_FALSIFY_RUN'
 
 interface Journal {
   readonly file: string
   /** The original bytes, base64 — exact, whatever the encoding. */
   readonly original: string
-  /** The runner that wrote it: alive means a run in progress, gone means one that died. */
+  /** The run that wrote it; only that run's own test processes may test the tree. */
+  readonly runId: string
+}
+
+interface Lock {
   readonly pid: number
+  /** The owner's start time as `ps` reports it: with the pid, an identity no reused pid shares. */
+  readonly started: string
+  readonly runId: string
 }
 
 /**
@@ -119,43 +149,180 @@ interface Journal {
 export const RESTORING_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const
 const SIGNAL_NUMBERS: Partial<Record<NodeJS.Signals, number>> = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGTERM: 15 }
 
-// ── journal ────────────────────────────────────────────────────────────────
+/** Credential names, as test/helpers/guard.ts scrubs them (falsify.test.ts keeps the two equal). */
+export const CHILD_CREDENTIAL_NAME = /^(ANTHROPIC|OPENAI|OPENROUTER|MOONSHOT)_|_API_KEY$|^AOS_CONTROL_TOKEN$|^PMMCP_TOKEN$/
+
+/**
+ * The environment a test process gets: the runner's, minus what must never
+ * reach a mutated test. NODE_TEST_CONTEXT would switch the nested run to the
+ * parent's binary protocol and leave no TAP to read; NODE_OPTIONS is the
+ * runner's own. AOS_LIVE_* would make a mutant that weakens the guard's live
+ * check (X31) turn an offline test into one that opens the real <repo>/.env,
+ * and a credential has no business in a mutation run at all.
+ */
+export function childEnv(env: NodeJS.ProcessEnv, extra: Readonly<Record<string, string>> = {}): NodeJS.ProcessEnv {
+  const kept = Object.entries(env).filter(
+    ([k]) =>
+      k !== 'NODE_TEST_CONTEXT' && k !== 'NODE_OPTIONS' && k !== RUN_ENV && !k.startsWith('AOS_LIVE_') && !CHILD_CREDENTIAL_NAME.test(k),
+  )
+  return { ...Object.fromEntries(kept), ...extra }
+}
+
+// ── journal and lock ───────────────────────────────────────────────────────
 
 function journalPath(root: string): string {
   return join(root, JOURNAL_DIR, JOURNAL)
 }
 
-/**
- * Put back whatever an interrupted run left mutated. Returns the file it
- * restored, or undefined when there was nothing to do.
- */
-export function recoverInterrupted(root: string): string | undefined {
-  const path = journalPath(root)
-  if (!existsSync(path)) return undefined
-  const journal = JSON.parse(readFileSync(path, 'utf8')) as Journal
-  writeFileSync(join(root, journal.file), Buffer.from(journal.original, 'base64'))
-  rmSync(path)
-  return journal.file
+function lockPath(root: string): string {
+  return join(root, JOURNAL_DIR, LOCK)
 }
 
-/** The pid of a runner that holds the journal and is still alive, if any. */
-export function liveRun(root: string): number | undefined {
-  const path = journalPath(root)
-  if (!existsSync(path)) return undefined
-  const pid = (JSON.parse(readFileSync(path, 'utf8')) as Partial<Journal>).pid
-  if (typeof pid !== 'number' || pid === process.pid) return undefined
+/** Write, fsync, rename, fsync the directory: the journal is whole or absent, never half. */
+function writeDurably(path: string, text: string): void {
+  mkdirSync(dirname(path), { recursive: true })
+  const tmp = `${path}.tmp`
+  const fd = openSync(tmp, 'w', 0o600)
   try {
-    process.kill(pid, 0)
-    return pid
-  } catch (e) {
-    return (e as NodeJS.ErrnoException).code === 'EPERM' ? pid : undefined
+    writeSync(fd, text)
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+  renameSync(tmp, path)
+  try {
+    const dir = openSync(dirname(path), 'r')
+    try {
+      fsyncSync(dir)
+    } finally {
+      closeSync(dir)
+    }
+  } catch {
+    // A platform that cannot fsync a directory: the rename is still atomic.
   }
 }
 
-function writeJournal(root: string, journal: Journal): void {
+/** Why a journal cannot be used, phrased as what the operator does next. */
+export class JournalUnreadable extends Error {}
+
+function readJournal(root: string): Journal | undefined {
   const path = journalPath(root)
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, JSON.stringify(journal))
+  if (!existsSync(path)) {
+    // A temp file with no journal: the run died before its rename, so before
+    // its edit. Nothing was mutated.
+    rmSync(`${path}.tmp`, { force: true })
+    return undefined
+  }
+  let parsed: Partial<Journal>
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<Journal>
+  } catch {
+    parsed = {}
+  }
+  if (typeof parsed.file !== 'string' || typeof parsed.original !== 'string') {
+    throw new JournalUnreadable(
+      `${path} is unreadable, so it cannot say which file a run left mutated: run \`git status\`, ` +
+        `\`git checkout\` any source file it lists as modified that you did not change, then delete ${dirname(path)}`,
+    )
+  }
+  return { file: parsed.file, original: parsed.original, runId: typeof parsed.runId === 'string' ? parsed.runId : '' }
+}
+
+/**
+ * Put back whatever an interrupted run left mutated. Returns the file it
+ * restored, or undefined when there was nothing to do.
+ *
+ * @throws {JournalUnreadable} when the journal cannot be parsed.
+ */
+export function recoverInterrupted(root: string): string | undefined {
+  const journal = readJournal(root)
+  if (journal === undefined) return undefined
+  writeFileSync(join(root, journal.file), Buffer.from(journal.original, 'base64'))
+  rmSync(journalPath(root))
+  return journal.file
+}
+
+/** The start time `ps` reports for `pid`, or undefined when there is no such process. */
+export function processStarted(pid: number): string | undefined {
+  const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    encoding: 'utf8',
+    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', LC_ALL: 'C' },
+  })
+  const out = typeof r.stdout === 'string' ? r.stdout.trim() : ''
+  return r.status === 0 && out !== '' ? out : undefined
+}
+
+function readLock(root: string): Lock | undefined {
+  try {
+    const lock = JSON.parse(readFileSync(lockPath(root), 'utf8')) as Partial<Lock>
+    if (typeof lock.pid !== 'number' || typeof lock.started !== 'string' || typeof lock.runId !== 'string') return undefined
+    return { pid: lock.pid, started: lock.started, runId: lock.runId }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The pid of a live run holding this tree's lock, if any. Live means the pid
+ * exists AND started when the lock says it did: after a crash or a reboot the
+ * same number can belong to anything.
+ */
+export function liveRun(root: string): number | undefined {
+  const lock = readLock(root)
+  if (lock === undefined || lock.pid === process.pid) return undefined
+  const started = processStarted(lock.pid)
+  if (started === undefined) return undefined
+  return lock.started === '' || started === lock.started ? lock.pid : undefined
+}
+
+/** Drop a lock whose owner is gone. Returns true when one was dropped. */
+export function clearStaleLock(root: string): boolean {
+  if (!existsSync(lockPath(root)) || liveRun(root) !== undefined) return false
+  rmSync(lockPath(root), { force: true })
+  return true
+}
+
+function acquireLock(root: string, runId: string): void {
+  mkdirSync(join(root, JOURNAL_DIR), { recursive: true })
+  const lock: Lock = { pid: process.pid, started: processStarted(process.pid) ?? '', runId }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let fd: number
+    try {
+      fd = openSync(lockPath(root), 'wx', 0o600)
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
+      const live = liveRun(root)
+      if (live !== undefined) throw new Error(`a falsify run is already in progress on ${root} (pid ${String(live)})`)
+      rmSync(lockPath(root), { force: true })
+      continue
+    }
+    try {
+      writeSync(fd, JSON.stringify(lock))
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    return
+  }
+  throw new Error(`could not take ${lockPath(root)}: another run is starting at the same moment`)
+}
+
+function releaseLock(root: string, runId: string): void {
+  if (readLock(root)?.runId === runId) rmSync(lockPath(root), { force: true })
+}
+
+/** Test process groups in flight, so a signal exit can kill them too. */
+const ACTIVE_GROUPS = new Set<number>()
+
+function killActiveGroups(): void {
+  for (const pid of ACTIVE_GROUPS) {
+    try {
+      process.kill(-pid, 'SIGKILL')
+    } catch {
+      // Already gone.
+    }
+  }
+  ACTIVE_GROUPS.clear()
 }
 
 // ── mutation ───────────────────────────────────────────────────────────────
@@ -211,20 +378,16 @@ export function parseTap(stdout: string): { failing: string[]; passing: string[]
 }
 
 /** The real test process: node:test under tsx, in its own process group. */
-export function nodeTestRunner(root: string): RunTests {
+export function nodeTestRunner(root: string, extraEnv: Readonly<Record<string, string>> = {}): RunTests {
   return (tests, timeoutMs) =>
     new Promise((resolve) => {
       const child = spawn(process.execPath, ['--import', 'tsx', '--test', '--test-reporter=tap', ...tests], {
         cwd: root,
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
-        // A runner started from inside node:test inherits NODE_TEST_CONTEXT,
-        // which switches the nested run to the parent's binary protocol and
-        // leaves no TAP to read. Options are the runner's own to set.
-        env: Object.fromEntries(
-          Object.entries(process.env).filter(([k]) => k !== 'NODE_TEST_CONTEXT' && k !== 'NODE_OPTIONS'),
-        ),
+        env: childEnv(process.env, extraEnv),
       })
+      if (child.pid !== undefined) ACTIVE_GROUPS.add(child.pid)
       let stdout = ''
       child.stdout.on('data', (chunk: Buffer) => {
         stdout += chunk.toString('utf8')
@@ -243,6 +406,7 @@ export function nodeTestRunner(root: string): RunTests {
       }, timeoutMs)
       child.on('close', (code) => {
         clearTimeout(timer)
+        if (child.pid !== undefined) ACTIVE_GROUPS.delete(child.pid)
         resolve({ timedOut, code, ...parseTap(stdout) })
       })
     })
@@ -272,15 +436,14 @@ export function judge(run: TestRun): { verdict: Verdict; detail: string[] } {
 
 export async function runSuites(suites: readonly Suite[], options: RunnerOptions): Promise<SuiteReport[]> {
   const { root, timeoutMs } = options
-  const runTests = options.runTests ?? nodeTestRunner(root)
+  const runId = randomUUID()
+  const runTests = options.runTests ?? nodeTestRunner(root, { [RUN_ENV]: runId })
   const log = options.log ?? (() => undefined)
 
-  // Another runner alive on this tree owns the journal: "recovering" would undo
-  // its mutant mid-run, and two runners would race on the same files.
-  const live = liveRun(root)
-  if (live !== undefined) throw new Error(`a falsify run is already in progress on ${root} (pid ${String(live)})`)
-  const recovered = recoverInterrupted(root)
-  if (recovered !== undefined) log(`restored ${recovered}, left mutated by an interrupted run`)
+  // The whole run holds the lock, baselines included: a second run started
+  // between two mutants would otherwise read one of this run's mutants as its
+  // "original" and write it back after this run had restored it.
+  acquireLock(root, runId)
 
   let current: Journal | undefined
   const restore = (): void => {
@@ -291,12 +454,16 @@ export async function runSuites(suites: readonly Suite[], options: RunnerOptions
   }
   const onSignal = (signal: NodeJS.Signals): void => {
     restore()
+    killActiveGroups()
+    releaseLock(root, runId)
     process.exit(128 + (SIGNAL_NUMBERS[signal] ?? 15))
   }
   for (const signal of RESTORING_SIGNALS) process.once(signal, onSignal)
 
   const reports: SuiteReport[] = []
   try {
+    const recovered = recoverInterrupted(root)
+    if (recovered !== undefined) log(`restored ${recovered}, left mutated by an interrupted run`)
     for (const suite of suites) {
       const files = [...new Set([...suite.mutants, suite.control].map((m) => m.file))]
       try {
@@ -333,8 +500,8 @@ export async function runSuites(suites: readonly Suite[], options: RunnerOptions
           log(`  ${mutant.id}: invalid — ${why}`)
           continue
         }
-        current = { file: mutant.file, original: original.toString('base64'), pid: process.pid }
-        writeJournal(root, current)
+        current = { file: mutant.file, original: original.toString('base64'), runId }
+        writeDurably(journalPath(root), JSON.stringify(current))
         try {
           writeFileSync(path, text.replace(mutant.from, () => mutant.to))
           const judged = judge(await runTests(suite.tests, timeoutMs))
@@ -348,6 +515,8 @@ export async function runSuites(suites: readonly Suite[], options: RunnerOptions
     }
   } finally {
     restore()
+    killActiveGroups()
+    releaseLock(root, runId)
     for (const signal of RESTORING_SIGNALS) process.removeListener(signal, onSignal)
   }
   return reports

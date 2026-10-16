@@ -9,7 +9,7 @@ import './helpers/guard.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import net from 'node:net'
-import { spawn, spawnSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -264,7 +264,7 @@ test('the test guard removes credential names from every test process except a l
   })
 })
 
-test('the test guard refuses a tree an interrupted falsify run left mutated, and allows a run in progress', (t) => {
+test('the test guard admits a mutated tree only for the falsify run that mutated it', (t) => {
   // The guard finds the repository from its own location, so a copy of it in a
   // temp tree with a journal stands in for the checkout.
   const root = tmpdir(t)
@@ -273,25 +273,31 @@ test('the test guard refuses a tree an interrupted falsify run left mutated, and
   const guard = join(root, 'test', 'helpers', 'guard.ts')
   writeFileSync(guard, readFileSync(fileURLToPath(new URL('./helpers/guard.ts', import.meta.url))))
   mkdirSync(join(root, '.falsify'))
-  const journal = (pid: number | undefined): void =>
-    writeFileSync(join(root, '.falsify', 'journal.json'), JSON.stringify({ file: 'src/policy/gate.ts', original: '', ...(pid === undefined ? {} : { pid }) }))
-  const load = (): ReturnType<typeof spawnSync> =>
+  const journal = (text: string): void => writeFileSync(join(root, '.falsify', 'journal.json'), text)
+  const load = (run?: string): ReturnType<typeof spawnSync> =>
     spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `await import(${JSON.stringify(guard)})`], {
       cwd: REPO_DIR,
       encoding: 'utf8',
       timeout: 30_000,
-      env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
+      env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', ...(run === undefined ? {} : { AOS_FALSIFY_RUN: run }) },
     })
 
-  const dead = spawnSync(process.execPath, ['-e', '0']).pid
-  for (const pid of [dead, undefined]) {
-    journal(pid)
-    const r = load()
-    assert.notEqual(r.status, 0, 'a dead run\'s journal was ignored')
-    assert.match(String(r.stderr), /interrupted falsify run left src\/policy\/gate\.ts mutated/)
+  journal(JSON.stringify({ file: 'src/policy/gate.ts', original: '', runId: 'run-a' }))
+  // The run's own test processes: admitted.
+  assert.equal(load('run-a').status, 0, 'the owning run was refused')
+  // Anyone else — an operator's npm test beside it, a dead run's leftovers, a
+  // different run — is refused, whatever pid the journal might once have named.
+  for (const run of [undefined, 'run-b', '']) {
+    const r = load(run)
+    assert.notEqual(r.status, 0, `admitted with AOS_FALSIFY_RUN=${String(run)}`)
+    assert.match(String(r.stderr), /src\/policy\/gate\.ts may be mutated/)
   }
-  const live = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'])
-  t.after(() => live.kill('SIGKILL'))
-  journal(live.pid)
-  assert.equal(load().status, 0, 'a run in progress was refused')
+  // A journal from before run ids, and an unreadable one, are refused too —
+  // the second without pretending to name a file.
+  journal(JSON.stringify({ file: 'src/policy/gate.ts', original: '', pid: 1 }))
+  assert.notEqual(load('').status, 0)
+  journal('')
+  const unreadable = load()
+  assert.notEqual(unreadable.status, 0)
+  assert.match(String(unreadable.stderr), /unreadable.*git status/)
 })

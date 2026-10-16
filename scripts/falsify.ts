@@ -20,7 +20,7 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { CATALOG } from './falsify/catalog.js'
-import { liveRun, problems, recoverInterrupted, render, runSuites, type Mutant, type Suite } from './falsify/runner.js'
+import { clearStaleLock, liveRun, problems, recoverInterrupted, render, runSuites, type Mutant, type Suite } from './falsify/runner.js'
 
 const USAGE = 'usage: npm run falsify -- [suite ...] [--only ID,ID] [--timeout MS] [--allow-dirty] [--list] [--recover] [--help]'
 
@@ -55,15 +55,34 @@ async function main(argv: readonly string[]): Promise<number> {
     process.stderr.write(`unknown option: ${unknownFlags.join(', ')}\n${USAGE}\n`)
     return 2
   }
+  // An option that takes a value must have one: `--only` with nothing after it
+  // would otherwise select every mutant in the catalog.
+  for (const name of valueOf) {
+    const i = argv.indexOf(name)
+    if (i === -1) continue
+    const value = argv[i + 1]
+    if (value === undefined || value === '' || value.startsWith('-')) {
+      process.stderr.write(`${name} needs a value\n${USAGE}\n`)
+      return 2
+    }
+  }
   if (argv.includes('--recover')) {
     const live = liveRun(root)
     if (live !== undefined) {
       process.stderr.write(`a falsify run is in progress (pid ${String(live)}); it restores its own file\n`)
       return 2
     }
-    const restored = recoverInterrupted(root)
-    process.stdout.write(restored === undefined ? 'nothing to recover\n' : `restored ${restored}\n`)
-    return 0
+    try {
+      const restored = recoverInterrupted(root)
+      const dropped = clearStaleLock(root)
+      process.stdout.write(
+        (restored === undefined ? 'nothing to recover' : `restored ${restored}`) + (dropped ? '; dropped a stale lock\n' : '\n'),
+      )
+      return 0
+    } catch (e) {
+      process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`)
+      return 1
+    }
   }
   const positional = argv.filter((a, i) => !a.startsWith('-') && !valueOf.has(argv[i - 1] ?? ''))
 
@@ -88,6 +107,12 @@ async function main(argv: readonly string[]): Promise<number> {
   const suites: Suite[] = CATALOG.filter((s) => positional.length === 0 || positional.includes(s.name))
     .map((s) => (only === undefined ? s : { ...s, mutants: s.mutants.filter((m) => only.includes(m.id)) }))
     .filter((s) => s.mutants.length > 0)
+  if (suites.length === 0) {
+    // `--only ,`, or ids outside the suites named: nothing would run, and an
+    // exit 0 would read as "every mutant was caught".
+    process.stderr.write(`the selection names no mutant\n${USAGE}\n`)
+    return 2
+  }
 
   const byId = new Map<string, Mutant>()
   for (const s of CATALOG) for (const m of [...s.mutants, s.control]) byId.set(`${s.name}/${m.id}`, m)

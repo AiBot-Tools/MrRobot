@@ -17,18 +17,22 @@
 // mutant reads as caught; drop the journal and a SIGKILL leaves a mutant in the
 // tree with nothing to recover it.
 
-import './helpers/guard.js'
+import { CREDENTIAL_NAME } from './helpers/guard.js'
 
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
 import { CATALOG } from '../scripts/falsify/catalog.js'
 import {
+  CHILD_CREDENTIAL_NAME,
+  childEnv,
+  JournalUnreadable,
   judge,
   liveRun,
+  processStarted,
   problems,
   recoverInterrupted,
   RESTORING_SIGNALS,
@@ -222,7 +226,8 @@ await runSuites([{ name: 'f', tests: [${JSON.stringify(join(root, 'mod.test.ts')
   assert.equal(recoverInterrupted(root), undefined, 'recovery is not idempotent')
 })
 
-test('a runner sent SIGHUP mid-mutant (a closed terminal) restores the file before it exits', async (t) => {
+/** A runner in its own process, on a fixture whose one mutant hangs its test. */
+function hangingRun(t: TestContext): { root: string; original: string; child: ReturnType<typeof spawn> } {
   const { root, original } = fixture(t)
   const driver = join(root, 'drive.ts')
   writeFileSync(
@@ -235,25 +240,130 @@ await runSuites([{ name: 'f', tests: [${JSON.stringify(join(root, 'mod.test.ts')
   )
   const child = spawn(process.execPath, ['--import', 'tsx', driver], { cwd: root, stdio: 'ignore', detached: true })
   t.after(() => spawnSync('pkill', ['-KILL', '-f', root]))
-  const journal = join(root, '.falsify', 'journal.json')
+  return { root, original, child }
+}
+
+async function untilMutated(root: string, original: string): Promise<void> {
   const deadline = Date.now() + 60_000
-  while (!(existsSync(journal) && readFileSync(join(root, 'mod.ts'), 'utf8') !== original)) {
+  while (!(existsSync(join(root, '.falsify', 'journal.json')) && readFileSync(join(root, 'mod.ts'), 'utf8') !== original)) {
     assert.ok(Date.now() < deadline, 'the runner never reached its mutant')
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
-  // The journal names the live runner, so a test or a daemon can tell this
-  // run from one that died.
-  assert.equal((JSON.parse(readFileSync(journal, 'utf8')) as { pid: number }).pid, child.pid)
-  assert.equal(liveRun(root), child.pid)
-  // And a second runner on the same tree refuses rather than "recovering" it.
-  await assert.rejects(runSuites([], { root, timeoutMs: 1_000 }), /already in progress/)
+}
 
-  child.kill('SIGHUP')
-  const code = await new Promise<number | null>((resolve) => child.once('exit', (c) => resolve(c)))
-  assert.equal(code, 129)
-  assert.equal(readFileSync(join(root, 'mod.ts'), 'utf8'), original, 'SIGHUP left the mutant in place')
-  assert.equal(existsSync(journal), false)
+test('every restoring signal mid-mutant restores the file, kills the hung test group, and releases the lock', async (t) => {
   assert.deepEqual([...RESTORING_SIGNALS], ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'])
+  const codes: Record<string, number> = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129, SIGQUIT: 131 }
+  for (const signal of RESTORING_SIGNALS) {
+    const { root, original, child } = hangingRun(t)
+    await untilMutated(root, original)
+    // The lock names the live runner by pid and start time, and the journal
+    // names its run, which is what lets the test guard tell its own children.
+    assert.equal(liveRun(root), child.pid, signal)
+    const journal = JSON.parse(readFileSync(join(root, '.falsify', 'journal.json'), 'utf8')) as { runId?: unknown }
+    assert.equal(typeof journal.runId, 'string', signal)
+    // And a second runner on the same tree refuses rather than "recovering" it.
+    await assert.rejects(runSuites([], { root, timeoutMs: 1_000 }), /already in progress/)
+
+    child.kill(signal)
+    const code = await new Promise<number | null>((resolve) => child.once('exit', (c) => resolve(c)))
+    assert.equal(code, codes[signal], signal)
+    assert.equal(readFileSync(join(root, 'mod.ts'), 'utf8'), original, `${signal} left the mutant in place`)
+    assert.equal(existsSync(join(root, '.falsify', 'journal.json')), false, signal)
+    assert.equal(existsSync(join(root, '.falsify', 'lock.json')), false, `${signal} left the lock`)
+    // The hung test ran detached in its own group; nothing of it may survive.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const left = spawnSync('pgrep', ['-f', root], { encoding: 'utf8' }).stdout.trim()
+    assert.equal(left, '', `${signal} left the test process group running`)
+  }
+})
+
+test('the lock is held for the whole run: a second runner refuses during the first one\'s baseline too', async (t) => {
+  const { root } = fixture(t)
+  // A baseline that takes a while: the window a per-mutant journal left open.
+  writeFileSync(join(root, 'slow.test.ts'), "import test from 'node:test'\ntest('slow', async () => { await new Promise((r) => setTimeout(r, 8000)) })\n")
+  const driver = join(root, 'drive.ts')
+  writeFileSync(
+    driver,
+    `import { runSuites } from ${JSON.stringify(join(REPO_ROOT, 'scripts/falsify/runner.ts'))}
+await runSuites([{ name: 'f', tests: [${JSON.stringify(join(root, 'slow.test.ts'))}], control: { id: 'C', file: 'mod.ts', from: '// fixture module', to: '// c', why: '' }, mutants: [] }],
+  { root: ${JSON.stringify(root)}, timeoutMs: 120000 })
+`,
+  )
+  const child = spawn(process.execPath, ['--import', 'tsx', driver], { cwd: root, stdio: 'ignore', detached: true })
+  t.after(() => spawnSync('pkill', ['-KILL', '-f', root]))
+  const deadline = Date.now() + 30_000
+  while (!existsSync(join(root, '.falsify', 'lock.json'))) {
+    assert.ok(Date.now() < deadline, 'the runner never took its lock')
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  assert.equal(existsSync(join(root, '.falsify', 'journal.json')), false, 'expected the baseline, with no mutant applied')
+  await assert.rejects(runSuites([], { root, timeoutMs: 1_000 }), /already in progress/)
+  child.kill('SIGTERM')
+  await new Promise((resolve) => child.once('exit', resolve))
+})
+
+test('a reused pid does not pass for a live run: liveness is the pid AND its start time', async (t) => {
+  const { root, original } = fixture(t)
+  // An unrelated live process holds the number a dead runner left in its lock.
+  const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'])
+  t.after(() => other.kill('SIGKILL'))
+  const pid = other.pid ?? 0
+  mkdirSync(join(root, '.falsify'))
+  const lock = (started: string): void =>
+    writeFileSync(join(root, '.falsify', 'lock.json'), JSON.stringify({ pid, started, runId: 'dead-run' }))
+  // The dead run had also left a file mutated.
+  writeFileSync(join(root, 'mod.ts'), MODULE.replace('a + b', 'a - b'))
+  writeFileSync(
+    join(root, '.falsify', 'journal.json'),
+    JSON.stringify({ file: 'mod.ts', original: Buffer.from(original).toString('base64'), runId: 'dead-run' }),
+  )
+
+  lock('Thu Jan  1 00:00:00 1970')
+  assert.equal(liveRun(root), undefined, 'a reused pid passed for the dead run')
+  // So recovery and a new run both go ahead.
+  const reports = await runSuites([suite([], CONTROL, root)], { root, timeoutMs: 30_000 })
+  assert.equal(readFileSync(join(root, 'mod.ts'), 'utf8'), original)
+  assert.deepEqual(problems(reports), [])
+
+  // With the true start time, the same pid IS the owner.
+  lock(processStarted(pid) ?? '')
+  assert.equal(liveRun(root), pid)
+  await assert.rejects(runSuites([], { root, timeoutMs: 1_000 }), /already in progress/)
+})
+
+test('an unreadable journal stops recovery with what to do, and a leftover temp journal means nothing was edited', (t) => {
+  const { root } = fixture(t)
+  mkdirSync(join(root, '.falsify'))
+  writeFileSync(join(root, '.falsify', 'journal.json'), '')
+  assert.throws(() => recoverInterrupted(root), (e: unknown) => e instanceof JournalUnreadable && /git status/.test(e.message))
+  // The journal is renamed into place only once whole; a temp file with no
+  // journal is a run that died before its edit.
+  rmSync(join(root, '.falsify', 'journal.json'))
+  writeFileSync(join(root, '.falsify', 'journal.json.tmp'), '{"file":')
+  assert.equal(recoverInterrupted(root), undefined)
+  assert.equal(existsSync(join(root, '.falsify', 'journal.json.tmp')), false)
+})
+
+test('test processes get no live-test flag and no credential from the runner, and their own run id', () => {
+  const env = childEnv(
+    {
+      PATH: '/usr/bin',
+      AOS_LIVE_TESTS: '1',
+      AOS_LIVE_PMMCP_WRITES: '1',
+      ANTHROPIC_API_KEY: 'k',
+      OPENROUTER_API_KEY: 'k',
+      AOS_CONTROL_TOKEN: 't',
+      PMMCP_TOKEN: 't',
+      NODE_OPTIONS: '--inspect',
+      NODE_TEST_CONTEXT: 'child',
+      AOS_FALSIFY_RUN: 'someone-else',
+    },
+    { AOS_FALSIFY_RUN: 'mine' },
+  )
+  assert.deepEqual(env, { PATH: '/usr/bin', AOS_FALSIFY_RUN: 'mine' })
+  // The same names the test guard scrubs, so the two cannot drift apart.
+  assert.equal(CHILD_CREDENTIAL_NAME.source, CREDENTIAL_NAME.source)
 })
 
 test('a hang is never a kill, and a failure with no named test is never a kill', () => {
@@ -345,6 +455,14 @@ test('npm run falsify is a program: bad input and unknown options are refused wi
     const r = run(typo)
     assert.equal(r.status, 2, `${typo.join(' ')}: ${r.stdout}`)
     assert.match(r.stderr, /unknown option/)
+    assert.doesNotMatch(r.stderr, /baseline/)
+  }
+  // An option that takes a value, given none, or a selection naming nothing,
+  // is refused: `--only` alone used to select all 207 mutants.
+  for (const bad of [['--only'], ['--timeout'], ['--only', '--list'], ['--only', ','], ['replay', '--only', 'D1']]) {
+    const r = run(bad)
+    assert.equal(r.status, 2, `${bad.join(' ')}: ${r.stdout}`)
+    assert.match(r.stderr, /needs a value|names no mutant/, bad.join(' '))
     assert.doesNotMatch(r.stderr, /baseline/)
   }
   const recover = run(['--recover'])

@@ -10,7 +10,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Writable } from 'node:stream'
 
-import { CENSOR, createLogger, REDACT_PATHS, resolveLevel } from '../src/log.js'
+import { CENSOR, createLogger, REDACT_PATHS, resolveLevel, scrubLogLine } from '../src/log.js'
+import { SecretMask } from '../src/events/redact.js'
 import {
   BudgetExceeded,
   ChainBroken,
@@ -95,14 +96,52 @@ test('top-level x-api-key is redacted via bracket path', () => {
 
 test('wildcard covers one level only (documented limit)', () => {
   // This asserts a LIMITATION, deliberately. pino's `*` matches exactly one
-  // level, so a credential nested two deep is NOT redacted. That is why no
-  // module may log raw payloads, and why the event log runs its own
-  // value-scrubbing pass instead of relying on these paths.
-  const out = logOne({ nested: { apiKey: FAKE }, deep: { deeper: { apiKey: FAKE } } })
+  // level, so a value the scrubber cannot recognise, nested two deep under a
+  // credential-looking key, is NOT redacted. That is why no module may log raw
+  // payloads. A recognisable one is caught by the value pass instead (below).
+  const OPAQUE = 'opaque-unregistered-value'
+  const out = logOne({ nested: { apiKey: OPAQUE }, deep: { deeper: { apiKey: OPAQUE, shaped: FAKE } } })
   const nested = out['nested'] as Record<string, unknown>
   const deep = out['deep'] as { deeper: Record<string, unknown> }
   assert.equal(nested['apiKey'], CENSOR, 'one level deep must be redacted')
-  assert.equal(deep.deeper['apiKey'], FAKE, 'two levels deep is NOT covered — documented limit')
+  assert.equal(deep.deeper['apiKey'], OPAQUE, 'two levels deep is NOT covered by path — documented limit')
+  assert.equal(deep.deeper['shaped'], CENSOR, 'a credential shape is censored by value at any depth')
+})
+
+test('a registered secret never reaches the process log: msg, error text, bindings, any depth', (t) => {
+  // A server that echoes a bearer in its 401 body makes the SDK throw with the
+  // bearer in e.message, and callers log e.message. pino's paths never look at
+  // values, so the value pass is what keeps it out of stdout.
+  t.after(() => SecretMask.clear())
+  const BEARER = 'qOpaqueBearerCanary0123456789abcdefghij'
+  assert.equal(SecretMask.register(BEARER), true)
+  const { lines, stream } = capture()
+  const logger = createLogger({ level: 'info', destination: stream }).child({ server: `pmmcp ${BEARER}` })
+  logger.warn({ err: `Streamable HTTP error: unauthorized: ${BEARER}`, deep: { a: { b: [BEARER] } } }, `connect failed: ${BEARER}`)
+  logger.error({ err: new Error(`unauthorized: ${BEARER}`) }, 'failed')
+  assert.equal(lines.length, 2)
+  for (const line of lines) {
+    for (let i = 0; i + 8 <= BEARER.length; i++) {
+      assert.equal(line.includes(BEARER.slice(i, i + 8)), false, `a piece of the bearer reached the log: ${line}`)
+    }
+    assert.ok(line.includes(CENSOR), line)
+    JSON.parse(line) // still one JSON record per line
+  }
+  const out = JSON.parse(lines[0] as string) as Record<string, unknown>
+  assert.equal(out['msg'], `connect failed: ${CENSOR}`)
+  assert.equal(out['server'], `pmmcp ${CENSOR}`)
+})
+
+test('the line scrubber finds a secret JSON escaping respelled, and scrubs a line it cannot parse', (t) => {
+  t.after(() => SecretMask.clear())
+  const QUOTED = 'a"b\\c-opaque-1234'
+  assert.equal(SecretMask.register(QUOTED), true)
+  const line = `${JSON.stringify({ level: 30, msg: `x ${QUOTED} y` })}\n`
+  assert.equal(line.includes(QUOTED), false, 'JSON escaping changed the spelling, as the test needs')
+  const scrubbed = scrubLogLine(line)
+  assert.deepEqual(JSON.parse(scrubbed), { level: 30, msg: `x ${CENSOR} y` })
+  assert.ok(scrubbed.endsWith('\n'))
+  assert.equal(scrubLogLine(`not json ${QUOTED}\n`), `not json ${CENSOR}\n`)
 })
 
 test('level from AOS_LOG_LEVEL defaults to info', () => {

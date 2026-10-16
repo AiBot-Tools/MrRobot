@@ -301,6 +301,8 @@ const redaction: Suite = {
     { id: 'S10', file: REDACT, from: '  /\\bgh[pousr]_[A-Za-z0-9]{20,}/g, // GitHub ghp_/gho_/ghu_/ghs_/ghr_\n', to: '', why: 'a GitHub token in a string is kept' },
     { id: 'S11', file: 'src/log.ts', from: "  'req.headers[\"x-api-key\"]',\n", to: '', why: 'pino logs the x-api-key header the Anthropic SDK sends' },
     { id: 'S12', file: 'src/log.ts', from: "  'req.headers.authorization',\n", to: '', why: 'pino logs a request Authorization header' },
+    { id: 'S13', file: 'src/log.ts', from: '      inner.write(scrubLogLine(line))', to: '      inner.write(line)', why: 'a bearer a server echoes into an error message reaches stdout and the launchd log in clear: pino never looks at values' },
+    { id: 'S14', file: 'src/log.ts', from: '    return redactString(line)\n', to: '    return line\n', why: 'a log line that is not JSON is written unscrubbed' },
   ],
   control: {
     id: 'C',

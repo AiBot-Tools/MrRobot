@@ -150,9 +150,11 @@ a key; the vault path stays in the code, dormant. Whatever the source (the
 shell, `.env`, the vault, or the D8 fallback to the env), the broker refuses a
 value that cannot be a key: whitespace (pmmcp's masked sentence), a character
 outside printable ASCII, or a joined `NAME=value` line. A pmmcp bearer, if
-`kernel.yaml` ever declares a `tokenEnv`, gets the same checks: one that fails
-is refused by name before anything is dialled, and one that passes is masked
-from the log before the first request.
+`kernel.yaml` ever declares a `tokenEnv`, gets the same checks, and one under 8
+characters is refused too, because the log's mask will not take a value that
+short. A bearer that fails is refused by name before anything is dialled; one
+that passes is masked before the first request, in the event log, the process
+log, and what `npm run capture:pmmcp` prints.
 
 With no pmmcp and no Docker the kernel boots **degraded** and says exactly what
 is missing. That is the designed behaviour, not a failure — see below.

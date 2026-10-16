@@ -48,7 +48,7 @@
 // provider entry.
 
 import { PolicyDenied, SecretsSchemaMismatch } from '../errors.js'
-import { SecretMask } from '../events/redact.js'
+import { MIN_MASK_LENGTH, SecretMask } from '../events/redact.js'
 import type { EventStore } from '../events/store.js'
 import { runScope } from '../runtime/scope.js'
 import type { McpHub } from '../mcp/hub.js'
@@ -90,6 +90,22 @@ export function notACredential(value: string): string | undefined {
   // zero-width space from a pasted key would otherwise fail far from here.
   if (/[^\x21-\x7e]/.test(value)) return 'contains a character outside printable ASCII (a smart quote, a zero-width space)'
   if (looksLikeEnvLine(value)) return 'holds a whole NAME=value line'
+  return undefined
+}
+
+/**
+ * Why a declared MCP bearer (kernel.yaml's tokenEnv, named `name`) must not be
+ * sent, as a phrase that never quotes it, or undefined — and then it has been
+ * registered with SecretMask, before anything can quote it. One check for the
+ * kernel and capture-pmmcp. A server that refuses with the bearer in its body
+ * puts it in the SDK's error, which the hub chains into the log and capture
+ * prints; the mask is what keeps it out, and it declines a value under
+ * MIN_MASK_LENGTH, so such a bearer is refused rather than sent unmasked.
+ */
+export function bearerRefusal(name: string, token: string): string | undefined {
+  const problem = notACredential(token)
+  if (problem !== undefined) return `${name} ${problem}, so it is not a bearer`
+  if (!SecretMask.register(token)) return `${name} is under ${String(MIN_MASK_LENGTH)} characters, so it cannot be masked`
   return undefined
 }
 

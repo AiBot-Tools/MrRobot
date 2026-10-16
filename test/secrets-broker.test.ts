@@ -32,7 +32,7 @@ import { parseToolViews } from '../src/mcp/tool-views.js'
 import { SecretMask, redactString, CENSOR } from '../src/events/redact.js'
 import { withRunScope } from '../src/runtime/scope.js'
 import { PolicyDenied, SecretsSchemaMismatch } from '../src/errors.js'
-import { assertSecretSchema, SecretRef, SecretsBroker } from '../src/secrets/broker.js'
+import { assertSecretSchema, bearerRefusal, SecretRef, SecretsBroker } from '../src/secrets/broker.js'
 
 const VIEWS = parseToolViews(
   parseYaml(`
@@ -500,4 +500,21 @@ test('source vault mints no reply that cannot be a key, and quotes none of them'
     )
     assert.deepEqual(payloads(store, 'secret.accessed'), [], value)
   }
+})
+
+test('bearerRefusal: a bearer that cannot be a header or cannot be masked is refused by name; one that can is masked before it is sent', (t) => {
+  t.after(() => SecretMask.clear())
+  const good = 'qOpaqueBearerCanary0123456789abcdefghij'
+  for (const [token, why] of [
+    [`${good}\n${good}`, /^PMMCP_TOKEN contains whitespace, so it is not a bearer$/],
+    [`\u201C${good}\u201D`, /^PMMCP_TOKEN contains a character outside printable ASCII/],
+    ['Qz7#kd!', /^PMMCP_TOKEN is under 8 characters, so it cannot be masked$/],
+  ] as const) {
+    const refusal = bearerRefusal('PMMCP_TOKEN', token)
+    assert.match(refusal ?? '', why)
+    assert.equal((refusal ?? '').includes(token.slice(0, 7)), false, 'the refusal quotes the bearer')
+  }
+  assert.equal(SecretMask.size, 0, 'a refused bearer was registered')
+  assert.equal(bearerRefusal('PMMCP_TOKEN', good), undefined)
+  assert.equal(redactString(`unauthorized: ${good}`), `unauthorized: ${CENSOR}`)
 })

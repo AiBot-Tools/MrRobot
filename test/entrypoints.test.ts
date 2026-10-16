@@ -26,6 +26,8 @@ import assert from 'node:assert/strict'
 import { spawnSync, spawn } from 'node:child_process'
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { fileURLToPath } from 'node:url'
 
 import { closeVerified, withStore } from './helpers/store.js'
@@ -313,17 +315,21 @@ test('the operator scripts are programs: each refuses with usage rather than doi
 
   const dir = tmpdir(t)
   const shipped = offlinePmmcp(readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8'))
-  const capture = (yaml: string, name: string): { status: number | null; stderr: string; out: string } => {
+  const capture = (
+    yaml: string,
+    name: string,
+    extra: Record<string, string> = {},
+  ): { status: number | null; stderr: string; printed: string; out: string } => {
     const configPath = join(dir, `${name}.yaml`)
     const out = join(dir, `${name}.json`)
     writeFileSync(configPath, yaml)
     const run = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/capture-pmmcp.ts', out, '--config', configPath], {
       cwd: ROOT,
-      env,
+      env: { ...env, ...extra },
       encoding: 'utf8',
       timeout: 60_000,
     })
-    return { status: run.status, stderr: run.stderr, out }
+    return { status: run.status, stderr: run.stderr, printed: `${run.stdout}${run.stderr}`, out }
   }
 
   // No tokenEnv, as shipped: it must attempt the connection, fail, and write nothing.
@@ -341,7 +347,64 @@ test('the operator scripts are programs: each refuses with usage rather than doi
   assert.equal(declared.status, 1, `capture-pmmcp.ts exited ${String(declared.status)}: ${declared.stderr}`)
   assert.match(declared.stderr, /PMMCP_TOKEN is not set/)
   assert.equal(existsSync(declared.out), false)
+
+  // A declared bearer that cannot be a header (openssl rand -base64 64 wraps
+  // mid-token), or that is too short to mask, is refused by name before any
+  // connection, and no piece of it is printed.
+  const withToken = shipped.replace(CLOSED_PMMCP_URL, `${CLOSED_PMMCP_URL}\n      tokenEnv: PMMCP_TOKEN`)
+  const head = 'qCaptureHeadCanary0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ'
+  const tail = 'qCaptureTailCanaryZYXWVU98765=='
+  for (const [token, why, name] of [
+    [`${head}\n${tail}`, /PMMCP_TOKEN contains whitespace, so it is not a bearer/, 'wrapped'],
+    ['Qz7#kd!', /PMMCP_TOKEN is under 8 characters/, 'short'],
+  ] as const) {
+    const refused = capture(withToken, name, { PMMCP_TOKEN: token })
+    assert.equal(refused.status, 1, refused.printed)
+    assert.match(refused.stderr, why)
+    assert.equal(existsSync(refused.out), false)
+    for (const piece of token.length < 16 ? [token] : [head, tail]) {
+      for (let i = 0; i + Math.min(8, piece.length) <= piece.length; i += 1) {
+        assert.equal(refused.printed.includes(piece.slice(i, i + 8)), false, `capture printed part of the bearer: ${refused.printed}`)
+      }
+    }
+  }
   t.diagnostic('both scripts refused as programs rather than exiting 0 silently')
+})
+
+test('capture-pmmcp masks its bearer: a server that echoes it into a refusal prints none of it', async (t) => {
+  // The SDK puts a refusal's body in its error, and capture prints that error.
+  // An opaque bearer, so only the exact-value mask can be what hides it.
+  const bearer = 'qCaptureEchoCanary0123456789abcdefghij'
+  const server = createServer((req, res) => {
+    req.resume()
+    res.writeHead(401, { 'content-type': 'text/plain' }).end(`unauthorized: ${String(req.headers.authorization).replace(/^Bearer /, '')}`)
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())))
+  const url = `url: http://127.0.0.1:${String((server.address() as AddressInfo).port)}/mcp`
+  const dir = tmpdir(t)
+  const configPath = join(dir, 'echo.yaml')
+  const out = join(dir, 'echo.json')
+  writeFileSync(
+    configPath,
+    offlinePmmcp(readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8')).replace(CLOSED_PMMCP_URL, `${url}\n      tokenEnv: PMMCP_TOKEN`),
+  )
+  // Async: the echoing server lives in this process and must keep answering.
+  const child = spawn(process.execPath, ['--import', 'tsx', 'scripts/capture-pmmcp.ts', out, '--config', configPath], {
+    cwd: ROOT,
+    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', PMMCP_TOKEN: bearer },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let printed = ''
+  child.stdout.on('data', (c: Buffer) => (printed += c.toString('utf8')))
+  child.stderr.on('data', (c: Buffer) => (printed += c.toString('utf8')))
+  const code = await new Promise<number | null>((resolve) => child.on('close', resolve))
+  assert.equal(code, 1, printed)
+  assert.match(printed, /unauthorized: \[REDACTED\]/, 'the echo never arrived, so this proves nothing')
+  for (let i = 0; i + 8 <= bearer.length; i += 1) {
+    assert.equal(printed.includes(bearer.slice(i, i + 8)), false, `capture printed part of the bearer: ${printed}`)
+  }
+  assert.equal(existsSync(out), false)
 })
 
 /** A kernel.yaml for a spawned daemon: its own data dir and port, pmmcp offline. */

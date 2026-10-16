@@ -46,7 +46,6 @@ import { Delegation } from './runtime/delegate.js'
 import { KernelTools } from './runtime/kernel-tools.js'
 import { GoalWriter } from './goals/writer.js'
 import { goalToolsUnusable } from './goals/tools.js'
-import { SecretMask } from './events/redact.js'
 
 import { AgentRegistry, type AgentRecord } from './agents/registry.js'
 import { loadSoul, type SoulBudgetTracker } from './agents/souls.js'
@@ -54,7 +53,7 @@ import { type ToolViewsFile } from './mcp/tool-views.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 
 import { McpHub, streamableHttpTransport, type ClientFactory } from './mcp/hub.js'
-import { notACredential, SecretsBroker, type SecretRef } from './secrets/broker.js'
+import { bearerRefusal, SecretsBroker, type SecretRef } from './secrets/broker.js'
 import {
   parseProviders,
   routable,
@@ -854,11 +853,8 @@ async function connectHub(
       // the HTTP library throw with the whole header value in its message, and
       // that message becomes a chained hub.degraded reason — so refuse it here,
       // by name, and mask the value before anything can quote it.
-      const problem = notACredential(token)
-      if (problem !== undefined) {
-        return { ok: false, reason: `${tokenEnv ?? 'the pmmcp bearer'} ${problem}, so it is not a bearer: the kernel has no vault and no memory` }
-      }
-      SecretMask.register(token)
+      const refusal = bearerRefusal(tokenEnv ?? 'the pmmcp bearer', token)
+      if (refusal !== undefined) return { ok: false, reason: `${refusal}: the kernel has no vault and no memory` }
     }
     const url = server.url
     clientFactory = async (): Promise<Client> => {

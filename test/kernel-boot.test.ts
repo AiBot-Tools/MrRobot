@@ -56,7 +56,7 @@ import { anthropicEndTurn, fakeProvider } from './helpers/fake-provider.js'
 import { freshProbe } from './helpers/probe.js'
 import { writeProbeRecord } from '../src/models/probe.js'
 import { mockMcp } from './helpers/mock-mcp.js'
-import { SecretMask } from '../src/events/redact.js'
+import { MIN_MASK_LENGTH, SecretMask } from '../src/events/redact.js'
 
 
 /** Rows as bootKernel sees them: read-only reopen, ordered by seq. */
@@ -1097,6 +1097,32 @@ test('a declared pmmcp bearer that cannot be a header is refused by name, never 
     }
   }
   assert.equal(dialled, 0, 'a bearer that cannot be a header was sent anyway')
+})
+
+test('a declared pmmcp bearer too short for the mask is refused by name and never dialled', async (t) => {
+  // SecretMask declines anything under MIN_MASK_LENGTH, so a short loopback dev
+  // bearer would be sent unmasked, and a server echoing it would chain it into
+  // the log for good.
+  t.after(() => SecretMask.clear())
+  let dialled = 0
+  const server = createServer((req, res) => {
+    dialled += 1
+    req.resume()
+    res.writeHead(401).end(`unauthorized: ${String(req.headers.authorization)}`)
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())))
+  const url = `url: http://127.0.0.1:${String((server.address() as AddressInfo).port)}/mcp`
+  const short = 'Qz7#kd!'
+  const booted = await withKernel(t, {
+    kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `${url}\n      tokenEnv: PMMCP_TOKEN`),
+    env: { PMMCP_TOKEN: short },
+  })
+  const reason = booted.kernel.status().subsystems.hub.reason ?? ''
+  assert.match(reason, new RegExp(`PMMCP_TOKEN is under ${String(MIN_MASK_LENGTH)} characters, so it cannot be masked`))
+  await booted.kernel.shutdown()
+  assert.equal(allRows(booted.fx.dbPath).map((r) => r.payload).join('\n').includes(short), false, 'the short bearer reached the event log')
+  assert.equal(dialled, 0, 'a bearer the log cannot mask was sent anyway')
 })
 
 test('a valid pmmcp bearer is masked before connecting, so a server that echoes it into an error leaves no trace in the log', async (t) => {

@@ -31,7 +31,8 @@ import { parse as parseYaml } from 'yaml'
 
 import { parseKernelConfig } from '../src/config.js'
 import { listAllTools, streamableHttpTransport } from '../src/mcp/hub.js'
-import { notACredential } from '../src/secrets/broker.js'
+import { redactString } from '../src/events/redact.js'
+import { bearerRefusal } from '../src/secrets/broker.js'
 import { VERSION } from '../src/version.js'
 
 export const CAPTURE_PATH = 'test/fixtures/pmmcp-listtools.json'
@@ -75,9 +76,11 @@ async function main(argv: readonly string[]): Promise<number> {
   }
   // A bearer the HTTP library would refuse makes it throw with the whole header
   // value in its message, which would land on this terminal: refuse by name.
-  const problem = token === undefined ? undefined : notACredential(token)
-  if (problem !== undefined) {
-    process.stderr.write(`${tokenEnv ?? 'the bearer'} ${problem}, so it is not a bearer\n`)
+  // One that passes is masked before it is sent, because a server that echoes
+  // it in a refusal puts it in the SDK's error, and that error is printed.
+  const refusal = token === undefined ? undefined : bearerRefusal(tokenEnv ?? 'the bearer', token)
+  if (refusal !== undefined) {
+    process.stderr.write(`${refusal}\n`)
     return 1
   }
 
@@ -116,7 +119,7 @@ if (entry !== undefined && fileURLToPath(import.meta.url) === resolve(entry)) {
   main(process.argv.slice(2))
     .then((code) => process.exit(code))
     .catch((e: unknown) => {
-      process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`)
+      process.stderr.write(`${redactString(e instanceof Error ? e.message : String(e))}\n`)
       process.exit(1)
     })
 }

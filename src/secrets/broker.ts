@@ -73,11 +73,16 @@ export function isMessageNotCredential(value: string): boolean {
  * export like `export ANTHROPIC_API_KEY=$(grep ANTHROPIC .env)` keeps the name.
  * The kernel's own loader refuses such a line, so from the env this fires on a
  * shell value; from the vault, on an entry stored that way. No provider key
- * starts with an upper-case env-var name and an `=`.
+ * starts with an upper-case env-var name and an `=` followed by a value. A
+ * run of `=` that ends the value is base32 or base64 padding (`MZXW6YQ=`), not
+ * a second line, and is not refused.
  */
 export function looksLikeEnvLine(value: string): boolean {
-  return /^[A-Z][A-Z0-9_]*=/.test(value)
+  return ENV_LINE.test(value)
 }
+
+/** `NAME=` and then something that is not padding to the end. Shared with the .env loader. */
+export const ENV_LINE = /^[A-Z][A-Z0-9_]*=(?!=*$)/
 
 /**
  * Why `value` cannot be a credential, as a phrase that never quotes it, or

@@ -245,6 +245,16 @@ test('grammar refuses by line number: inner whitespace, an unmatched quote, an u
   }
 })
 
+test('a padded base32 token is a value, not a joined NAME=value line', () => {
+  // `head -c 32 /dev/urandom | base32` starts with a capital about 80% of the
+  // time and ends in `=` padding, so it looks like `NAME=` to a naive check.
+  const B32 = 'HW37QR4WXHMPU2R7Y3KSNGPCLXTK3LNHIAVQ74H3B527O53Z4NWQ===='
+  assert.equal(parseDotenv(`AOS_CONTROL_TOKEN=${B32}\n`, ACCEPTED).get('AOS_CONTROL_TOKEN')?.value, B32)
+  assert.equal(parseDotenv('AOS_CONTROL_TOKEN=MZXW6YQ=\n', ACCEPTED).get('AOS_CONTROL_TOKEN')?.value, 'MZXW6YQ=')
+  // Something after the padding is a value again, and a joined line.
+  assert.match(refusal(() => parseDotenv('ANTHROPIC_API_KEY=ABC==x\n', ACCEPTED)), /holds a whole NAME=value line/)
+})
+
 test('a NUL byte or invalid UTF-8 is refused', (t) => {
   const nul = write(t, `ANTHROPIC_API_KEY=${KEY}\0\n`)
   assert.match(refusal(() => loadDotenv(nul, opts())), /contains a NUL byte/)

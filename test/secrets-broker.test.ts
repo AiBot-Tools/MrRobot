@@ -32,7 +32,7 @@ import { parseToolViews } from '../src/mcp/tool-views.js'
 import { SecretMask, redactString, CENSOR } from '../src/events/redact.js'
 import { withRunScope } from '../src/runtime/scope.js'
 import { PolicyDenied, SecretsSchemaMismatch } from '../src/errors.js'
-import { assertSecretSchema, bearerRefusal, SecretRef, SecretsBroker } from '../src/secrets/broker.js'
+import { assertSecretSchema, bearerRefusal, notACredential, SecretRef, SecretsBroker } from '../src/secrets/broker.js'
 
 const VIEWS = parseToolViews(
   parseYaml(`
@@ -517,4 +517,14 @@ test('bearerRefusal: a bearer that cannot be a header or cannot be masked is ref
   assert.equal(SecretMask.size, 0, 'a refused bearer was registered')
   assert.equal(bearerRefusal('PMMCP_TOKEN', good), undefined)
   assert.equal(redactString(`unauthorized: ${good}`), `unauthorized: ${CENSOR}`)
+})
+
+test('a padded base32 credential is minted, not refused as a joined line; a real joined line still is', (t) => {
+  t.after(() => SecretMask.clear())
+  const B32 = 'HW37QR4WXHMPU2R7Y3KSNGPCLXTK3LNHIAVQ74H3B527O53Z4NWQ===='
+  assert.equal(notACredential(B32), undefined)
+  assert.equal(notACredential('MZXW6YTBOI======'), undefined)
+  assert.equal(bearerRefusal('PMMCP_TOKEN', B32), undefined)
+  assert.equal(notACredential('OPENROUTER_API_KEY=qJoinedCanary0123'), 'holds a whole NAME=value line')
+  assert.equal(notACredential('ABC==x'), 'holds a whole NAME=value line')
 })

@@ -54,6 +54,7 @@ import type { KernelConfig } from '../config.js'
 import { ConfigError } from '../errors.js'
 import { SecretMask } from '../events/redact.js'
 import { rootGitignoreIgnores } from '../gitignore.js'
+import { ENV_LINE } from './broker.js'
 import type { ProvidersFile } from '../models/registry.js'
 
 export const DOTENV_FLAG = '--dotenv'
@@ -69,7 +70,6 @@ export const PLACEHOLDER_PREFIX = 'replace-me'
 
 const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 const LINE = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=(.*)$/
-const ENV_LINE = /^[A-Z][A-Z0-9_]*=/
 
 export interface DotenvOptions {
   /** The repository root, for the in-repo fence and the .gitignore check. */

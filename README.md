@@ -177,9 +177,11 @@ git ignores. The one exception is `~/.colima`, Colima's own home.
 so on first boot, or tightened at boot when npm made `.aos` first for its cache
 (at your umask's 0755); `events.db` and its `-wal`/`-shm` are made `0600`. `AOS_DATA_DIR` overrides it, relative to your shell's directory. Inside the
 repo, `config.ts` accepts a data dir or mount root only under `.aos/`, and only
-while `.gitignore` ignores `/.aos/`, and `.aos` (and `.aos/workspaces`) must be
-real directories spelled exactly so on disk: a symlinked one, which git does
-not ignore and would commit, or one stored as `.AOS`, is refused by name.
+while `.gitignore` ignores `/.aos/`. Whatever `kernel.yaml` or `AOS_DATA_DIR`
+names, `<repo>/.aos` itself must be a real directory spelled exactly so on disk:
+a symlinked `.aos`, which git does not ignore and would commit with the path it
+names, or one stored as `.AOS`, is refused by name at boot. What sits beneath a
+real `.aos`, a linked `workspaces` included, is ignored with it.
 Anywhere, it refuses `$HOME` itself or any folder that contains the repo or
 `$HOME`. An empty `HOME` counts as unset: those checks then use your account's
 home directory, never the current directory.

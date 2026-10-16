@@ -330,6 +330,7 @@ export function parseKernelConfig(input: unknown, options: LoadOptions): KernelC
   const inFile = (p: string): string => resolve(options.repoRoot, expandHome(p))
   const dataDir =
     options.dataDirOverride === undefined ? inFile(config.dataDir) : resolve(expandHome(options.dataDirOverride))
+  assertAosEntry(options.repoRoot)
   assertDataLocation(dataDir, 'dataDir', options.repoRoot, '.aos')
   const mountRoot = {
     trusted: inFile(config.sandbox.domains.trusted.mountRoot),
@@ -371,6 +372,33 @@ export function gitignoresAos(repoRoot: string): boolean {
 }
 
 /**
+ * <repo>/.aos as git judges it, whatever kernel.yaml or AOS_DATA_DIR point at.
+ * To git a symlink is a file, so `/.aos/` does not cover a linked .aos and
+ * `git add -A` stages the link with the path it names; nor does `/.aos/` cover
+ * one stored as .AOS (or any other folding of the name) under
+ * core.ignorecase=false, which writing to ./.aos on APFS would fill. Judged
+ * here, whether or not a configured path uses it, because the commit happens
+ * anyway. Only .aos itself: git never descends into an ignored directory, so
+ * what is beneath it, a link included, is ignored with it.
+ */
+export function assertAosEntry(repoRoot: string, readdir?: (dir: string) => readonly string[]): void {
+  const repo = realpathNearest(repoRoot)
+  const problem = entryProblem(repo, '.aos', readdir)
+  if (problem?.kind === 'link') {
+    throw new ConfigError(
+      `${join(repo, '.aos')} is a link: git does not ignore a link, and git add -A would commit it with the path it names. ` +
+        `Remove the link (rm ${join(repo, '.aos')}); to keep the data elsewhere, name that place as dataDir or a mountRoot in kernel.yaml, or in AOS_DATA_DIR`,
+    )
+  }
+  if (problem?.kind === 'spelling') {
+    throw new ConfigError(
+      `${join(repo, problem.actual)} is spelled ${problem.actual} on disk, not .aos: git judges the name as stored, ` +
+        `and /.aos/ does not cover it under core.ignorecase=false. Rename it to .aos`,
+    )
+  }
+}
+
+/**
  * Where the event log and the container mounts may live.
  *
  * Inside the repository: only under `<repo>/<allowed>`, and only while
@@ -385,38 +413,13 @@ export function assertDataLocation(
   allowed: string,
   // Seams for tests: an alias of $HOME or the repository cannot be made on a
   // case-sensitive filesystem without root.
-  opts: { readonly home?: string; readonly id?: Identify; readonly readdir?: (dir: string) => readonly string[] } = {},
+  opts: { readonly home?: string; readonly id?: Identify } = {},
 ): void {
   const id = opts.id ?? identify
   const real = realpathNearest(target)
   const repo = realpathNearest(repoRoot)
   const home = realpathNearest(opts.home ?? homeDirectory())
   const fence = join(repo, allowed)
-
-  // A path written under <repo>/.aos must find .aos (and .aos/workspaces) as
-  // plain directories spelled exactly so, before any link is followed: git
-  // ignores neither a linked .aos (it is a file to git, and the link itself
-  // would be committed) nor one stored as .AOS under core.ignorecase=false.
-  for (const spelledRepo of new Set([resolve(repoRoot), repo])) {
-    if (!isSpelledUnder(join(spelledRepo, allowed), resolve(target))) continue
-    let parent = spelledRepo
-    for (const part of allowed.split(sep)) {
-      const problem = entryProblem(parent, part, opts.readdir)
-      if (problem?.kind === 'link') {
-        throw new ConfigError(
-          `${join(parent, part)} is a link: git does not ignore a link, and would commit it. ` +
-            `Make it a real directory, or put the path it points to in kernel.yaml instead.`,
-        )
-      }
-      if (problem?.kind === 'spelling') {
-        throw new ConfigError(
-          `${join(parent, problem.actual)} is spelled ${problem.actual} on disk, not ${part}: git judges the name as stored, ` +
-            `and /.aos/ does not cover it under core.ignorecase=false. Rename it to ${part}`,
-        )
-      }
-      parent = join(parent, part)
-    }
-  }
 
   // Forbidden zones by identity as well as spelling (isUnder), so a
   // case-variant or firmlinked spelling of $HOME or the repository is still

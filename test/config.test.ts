@@ -16,7 +16,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse as parseYaml } from 'yaml'
 
-import { assertDataLocation, assertNoSecretKeys, expandHome, gitignoresAos, parseKernelConfig } from '../src/config.js'
+import { assertAosEntry, assertDataLocation, assertNoSecretKeys, expandHome, gitignoresAos, parseKernelConfig } from '../src/config.js'
 import { tmpdir } from './helpers/tmpdir.js'
 import { homeDirectory } from '../src/agents/protected.js'
 
@@ -261,13 +261,12 @@ test('$HOME and the repository are recognised under any spelling; .aos is admitt
   assert.doesNotThrow(() => check(join(repo, '.aos', 'x')))
 })
 
-test('a .aos that is a link is refused wherever it points: git does not ignore a link, and would commit it', (t) => {
+test('a .aos that is a link is refused wherever it points and whatever kernel.yaml names: git does not ignore a link, and would commit it', (t) => {
   // `/.aos/` in .gitignore matches directories only; to git a symlink is a
   // file, so `git add -A` stages the link (and its target path) whatever it
-  // points at — inside the repo, where the data would sit un-ignored too, or
-  // outside it.
-  const doc = (): { dataDir: string; sandbox: { domains: { hostile: { mountRoot: string } } } } =>
-    fixture('valid.yaml') as { dataDir: string; sandbox: { domains: { hostile: { mountRoot: string } } } }
+  // points at, and whether or not any configured path goes through it.
+  type Doc = { dataDir: string; sandbox: { domains: { trusted: { mountRoot: string }; hostile: { mountRoot: string } } } }
+  const doc = (): Doc => fixture('valid.yaml') as Doc
   const outside = tmpdir(t)
   mkdirSync(join(outside, 'workspaces', 'hostile'), { recursive: true })
   for (const target of ['aos-data', '.', outside]) {
@@ -277,38 +276,67 @@ test('a .aos that is a link is refused wherever it points: git does not ignore a
     symlinkSync(target, join(repo, '.aos'))
     const data = doc()
     data.dataDir = './.aos'
-    assert.throws(() => parse(data, repo), /\.aos is a link/, target)
+    assert.throws(() => parse(data, repo), /\.aos is a link.*Remove the link/, target)
     const mount = doc()
     mount.dataDir = tmpdir(t)
     mount.sandbox.domains.hostile.mountRoot = './.aos/workspaces/hostile'
     assert.throws(() => parse(mount, repo), /\.aos is a link/, target)
+    // Nothing configured under .aos at all (the refusal's old advice: name the
+    // target instead): the link is still in the repo, and still committed.
+    const elsewhere = doc()
+    elsewhere.dataDir = tmpdir(t)
+    elsewhere.sandbox.domains.trusted.mountRoot = tmpdir(t)
+    elsewhere.sandbox.domains.hostile.mountRoot = tmpdir(t)
+    assert.throws(() => parse(elsewhere, repo), /\.aos is a link/, target)
   }
-  // .aos/workspaces as a link is refused the same way.
+  // Spelled through an alias of the repository, which no spelling test of the
+  // configured path recognises: the entry is judged, not the path.
+  const repo = tmpdir(t)
+  writeFileSync(join(repo, '.gitignore'), '/.aos/\n')
+  symlinkSync(outside, join(repo, '.aos'))
+  const alias = join(tmpdir(t), 'alias')
+  symlinkSync(repo, alias)
+  const aliased = doc()
+  aliased.dataDir = join(alias, '.aos')
+  aliased.sandbox.domains.trusted.mountRoot = join(alias, '.aos', 'workspaces', 'trusted')
+  aliased.sandbox.domains.hostile.mountRoot = join(alias, '.aos', 'workspaces', 'hostile')
+  assert.throws(() => parse(aliased, alias), /\.aos is a link/)
+  assert.throws(() => parse(aliased, repo), /\.aos is a link/)
+})
+
+test('a link or any spelling beneath a real .aos is accepted: git never descends into an ignored directory', (t) => {
+  // `ln -s /Volumes/Big/workspaces .aos/workspaces`: /.aos/ excludes the whole
+  // directory, so nothing under it can be committed. Its target is a place the
+  // operator could name outright.
   const repo = tmpdir(t)
   writeFileSync(join(repo, '.gitignore'), '/.aos/\n')
   mkdirSync(join(repo, '.aos'))
-  symlinkSync(outside, join(repo, '.aos', 'workspaces'))
-  const mount = doc()
-  mount.dataDir = tmpdir(t)
-  mount.sandbox.domains.hostile.mountRoot = './.aos/workspaces/hostile'
-  assert.throws(() => parse(mount, repo), /workspaces is a link/)
+  const big = tmpdir(t)
+  mkdirSync(join(big, 'workspaces', 'trusted'), { recursive: true })
+  mkdirSync(join(big, 'workspaces', 'hostile'), { recursive: true })
+  symlinkSync(join(big, 'workspaces'), join(repo, '.aos', 'workspaces'))
+  assert.doesNotThrow(() => parse(fixture('valid.yaml'), repo))
 })
 
-test('a .aos stored under another case is refused: git judges the name as it is on disk', (t) => {
-  // On case-insensitive APFS ./.aos finds a directory stored as .AOS, which
-  // /.aos/ does not cover under core.ignorecase=false. A listing that answers
-  // with the stored spelling, as APFS's would, stands in for that volume.
+test('a .aos stored under another case or folding is refused: git judges the name as it is on disk', (t) => {
+  // On case-insensitive APFS ./.aos finds a directory stored as .AOS, or as
+  // .aoſ (U+017F folds to 's' under Unicode case folding, not under JS's
+  // toLowerCase), neither of which /.aos/ covers. A listing that answers with
+  // the stored spelling, as APFS's would, stands in for that volume.
   const repo = tmpdir(t)
-  writeFileSync(join(repo, '.gitignore'), '/.aos/\n')
+  for (const stored of ['.AOS', '.Aos', '.ao\u017F']) {
+    const readdir = (dir: string): string[] => (dir === realpathSync(repo) ? [stored, '.gitignore'] : [])
+    assert.throws(
+      () => assertAosEntry(repo, readdir),
+      new RegExp(`${stored.replace('.', '\\.')} on disk, not \\.aos.*Rename it to \\.aos`),
+      stored,
+    )
+  }
+  // The real listing: no .aos yet, which is a first boot, not a problem.
+  assert.doesNotThrow(() => assertAosEntry(repo))
   mkdirSync(join(repo, '.aos'))
-  const readdir = (dir: string): string[] => (dir === repo ? ['.AOS', '.gitignore'] : [])
-  assert.throws(
-    () => assertDataLocation(join(repo, '.aos', 'events'), 'dataDir', repo, '.aos', { readdir }),
-    /\.AOS on disk, not \.aos.*Rename it to \.aos/,
-  )
-  assert.doesNotThrow(() => assertDataLocation(join(repo, '.aos', 'events'), 'dataDir', repo, '.aos'))
+  assert.doesNotThrow(() => assertAosEntry(repo))
 })
-
 
 test('an empty HOME is treated as unset: the never-$HOME checks still see the real home directory', () => {
   // os.homedir() answers '' for HOME='', and '' resolves to the cwd — which

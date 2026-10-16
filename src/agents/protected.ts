@@ -45,6 +45,11 @@ export function homeDirectory(): string {
   throw new ConfigError('cannot tell the home directory: HOME is empty or relative and the passwd entry has none')
 }
 
+/** A name folded past any filesystem's case folding: compatibility forms, then upper, then lower. */
+function foldName(s: string): string {
+  return s.normalize('NFKC').toUpperCase().toLowerCase().normalize('NFKC')
+}
+
 /**
  * What is wrong with `<parent>/<name>` as git will see it, or undefined when it
  * is absent or a plain entry spelled exactly `name`. git judges the name as it
@@ -65,9 +70,12 @@ export function entryProblem(
     return undefined
   }
   if (!entries.includes(name)) {
-    // Absent as spelled. A case variant beside it is the same entry on APFS,
-    // and a trap on a case-sensitive disk: either way, say so.
-    const actual = entries.find((e) => e.toLowerCase() === name.toLowerCase())
+    // Absent as spelled. A variant beside it is the same entry on APFS, and a
+    // trap on a case-sensitive disk: either way, say so. APFS folds with
+    // Unicode's case folding, not JS's toLowerCase ('ſ' folds to 's'), so this
+    // folds more widely than either: a false match costs a rename, a missed one
+    // a committed log.
+    const actual = entries.find((e) => foldName(e) === foldName(name))
     return actual === undefined ? undefined : { kind: 'spelling', actual }
   }
   try {

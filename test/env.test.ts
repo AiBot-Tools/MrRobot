@@ -239,6 +239,9 @@ test('the test guard removes credential names from every test process except a l
       timeout: 30_000,
       env: {
         PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+        // The probe loads the real guard. Under a falsify run this process was
+        // admitted by its run id; a child it spawns belongs to the same run.
+        ...(process.env['AOS_FALSIFY_RUN'] === undefined ? {} : { AOS_FALSIFY_RUN: process.env['AOS_FALSIFY_RUN'] }),
         ANTHROPIC_API_KEY: 'qGuardCanaryKey',
         AOS_CONTROL_TOKEN: 'qGuardCanaryToken',
         OPENROUTER_API_KEY: 'qGuardCanaryOther',

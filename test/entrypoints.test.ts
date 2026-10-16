@@ -34,6 +34,7 @@ import { closeVerified, withStore } from './helpers/store.js'
 import { EventStore } from '../src/events/store.js'
 import { tmpdir } from './helpers/tmpdir.js'
 import { shadowCheckout } from './helpers/checkout.js'
+import { CEO_SUITE } from '../src/eval/suite.js'
 
 // Every program here runs from a copy of the checkout holding a trap .env,
 // never from the checkout itself, where the operator keeps the real one (see
@@ -311,6 +312,24 @@ test('the operator scripts are programs: each refuses with usage rather than doi
     assert.match(refused.stderr, why)
     assert.doesNotMatch(`${refused.stdout}${refused.stderr}`, /spends real money/)
     assert.equal(`${refused.stdout}${refused.stderr}`.includes(canary.slice(0, 12)), false)
+  }
+
+  // A token that passes those rules with a trailing CR or newline
+  // (`$(cat token.txt)` on a CRLF file) must be SENT trimmed too: otherwise
+  // Node refuses the Authorization header after eval has said it is spending.
+  // Port 9 is closed, so the run ends at the connect, having sent nothing.
+  const firstCase = CEO_SUITE[0]?.id ?? ''
+  for (const end of ['\r', '\n']) {
+    const padded = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/eval.ts', '--case', firstCase, '--port', '9'], {
+      cwd: ROOT,
+      env: { ...env, AOS_CONTROL_TOKEN: `${canary}${canary}${end}` },
+      encoding: 'utf8',
+      timeout: 60_000,
+    })
+    const printed = `${padded.stdout}${padded.stderr}`
+    assert.match(printed, /ECONNREFUSED/, printed)
+    assert.doesNotMatch(printed, /Invalid character in header content/)
+    assert.equal(printed.includes(canary.slice(0, 12)), false)
   }
 
   const dir = tmpdir(t)

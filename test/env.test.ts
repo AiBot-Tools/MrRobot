@@ -10,7 +10,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import net from 'node:net'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
@@ -307,4 +307,20 @@ test('the test guard admits a mutated tree only for the falsify run that mutated
   const unreadable = load()
   assert.notEqual(unreadable.status, 0)
   assert.match(String(unreadable.stderr), /unreadable.*git status/)
+
+  // Between mutants a live run holds only its lock, and the next mutant is
+  // seconds away: anyone but the run's own processes is refused then too.
+  rmSync(join(root, '.falsify', 'journal.json'))
+  const lock = (pid: number): void => writeFileSync(join(root, '.falsify', 'lock.json'), JSON.stringify({ pid, started: 'x', runId: 'run-a' }))
+  lock(process.pid)
+  assert.equal(load('run-a').status, 0, 'the run holding the lock was refused its own tests')
+  for (const run of [undefined, 'run-b']) {
+    const r = load(run)
+    assert.notEqual(r.status, 0, `admitted beside a live run with AOS_FALSIFY_RUN=${String(run)}`)
+    assert.match(String(r.stderr), new RegExp(`a falsify run \\(pid ${String(process.pid)}\\) holds this tree`))
+  }
+  // A lock whose pid is gone is a dead run's; with no journal the tree is clean.
+  const gone = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' })
+  lock(Number(gone.stdout))
+  assert.equal(load().status, 0, 'a dead run\'s lock refused a clean tree')
 })

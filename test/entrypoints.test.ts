@@ -267,6 +267,16 @@ test('the daemon will not start on a tree a falsify run has mutated, live or int
     })
     assert.equal(run.status, 1)
     assert.match(`${run.stdout}${run.stderr}`, /a falsify run is in progress or was interrupted/)
+    // Between mutants (a baseline) a live run holds only its lock: refused
+    // too, naming the run. A lock whose pid is gone is a dead run's, and the
+    // tree is clean once no journal is left.
+    rmSync(join(dir, 'journal.json'))
+    const lock = (pid: number): void => writeFileSync(join(dir, 'lock.json'), JSON.stringify({ pid, started: 'x', runId: 'other-run' }))
+    const env = { PATH: process.env['PATH'] ?? '/usr/bin:/bin', HOME: process.env['HOME'] ?? '' }
+    lock(process.pid)
+    const held = runEntry(CHECKOUT, 'src/main.ts', [], { env, timeout: 60_000 })
+    assert.equal(held.status, 1)
+    assert.match(`${held.stdout}${held.stderr}`, new RegExp(`a falsify run \\(pid ${String(process.pid)}\\) holds this tree`))
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

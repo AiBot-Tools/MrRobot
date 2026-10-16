@@ -582,7 +582,8 @@ It edits the working tree (src/ and two test helpers), so:
   or by `npm run falsify -- --recover`. Until then `npm run dev` refuses to
   start on any journal, and `npm test` refuses to run unless it is that run's
   own test process (`AOS_FALSIFY_RUN`), because a source file may still hold a
-  planted bug;
+  planted bug. Both also refuse while a live run holds the lock, between
+  mutants too, since its next mutant is seconds away;
 - an option it does not know, `--only` or `--timeout` with no value or given
   twice, a selection that names no mutant, and `--only` ids outside the suites
   named are refused, never read as "run everything" or as a clean pass.

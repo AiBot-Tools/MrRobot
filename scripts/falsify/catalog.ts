@@ -413,6 +413,9 @@ const sandbox: Suite = {
     { id: 'Z16', file: 'src/config.ts', from: "      if (problem?.kind === 'link') {", to: '      if (false) {', why: 'a linked .aos or .aos/workspaces, which git does not ignore and would commit, is admitted' },
     { id: 'Z17', file: 'src/config.ts', from: "      if (problem?.kind === 'spelling') {", to: '      if (false) {', why: 'a .aos stored as .AOS, which /.aos/ does not cover under core.ignorecase=false, is admitted' },
     { id: 'Z18', file: 'src/agents/protected.ts', from: "    return actual === undefined ? undefined : { kind: 'spelling', actual }", to: '    return undefined', why: 'an entry stored under another case than the one git is told to ignore passes as spelled right' },
+    { id: 'Z19', file: 'src/config.ts', from: '  const home = realpathNearest(opts.home ?? homeDirectory())', to: "  const home = realpathNearest(opts.home ?? process.env['HOME'] ?? '')", why: 'with HOME empty, the never-$HOME check on a data dir or mount root guards the cwd instead' },
+    { id: 'Z20', file: 'src/sandbox/confine.ts', from: '  const home = realpathNearest(opts.home ?? homeDirectory())', to: "  const home = realpathNearest(opts.home ?? process.env['HOME'] ?? '')", why: 'with HOME empty, every run\'s never-$HOME check guards the cwd, so the home directory can be mounted' },
+    { id: 'Z21', file: 'src/sandbox/docker.ts', from: '  const home = input.home ?? homeDirectory()', to: "  const home = input.home ?? process.env['HOME'] ?? ''", why: 'with HOME empty, the run-args audit skips its home check, so a command may name files under it' },
   ],
   control: { id: 'C', file: DOCKER, from: '    // Invariant 9, one flag at a time.', to: '    // Invariant 9, one flag at a time. (control)', why: 'comment only' },
 }

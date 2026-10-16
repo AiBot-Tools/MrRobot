@@ -27,6 +27,7 @@ import './helpers/guard.js'
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { userInfo } from 'node:os'
 import { join } from 'node:path'
 
 import { tmpdir } from './helpers/tmpdir.js'
@@ -187,6 +188,32 @@ test('a HOME reached through a symlink is still refused, under either spelling',
   // And a command argument naming home is refused whichever way it is spelled.
   assert.throws(() => argsFor(f, { command: [join(linkedHome, 'creds')] }, linkedHome), ConfigError)
   assert.throws(() => argsFor(f, { command: [join(f.realWorkspace, 'creds')] }, linkedHome), ConfigError)
+})
+
+test('an empty HOME is treated as unset: confinement and the run-args audit still see the passwd home', (t) => {
+  // os.homedir() answers '' for HOME='', which resolves to the cwd. confine
+  // then guarded the cwd instead of $HOME, and the audit skipped its home check
+  // entirely. Both must fall back to the passwd entry, as config.ts does.
+  const f = fixture(t)
+  const passwdHome = userInfo().homedir
+  const saved = process.env['HOME']
+  process.env['HOME'] = ''
+  t.after(() => {
+    if (saved === undefined) delete process.env['HOME']
+    else process.env['HOME'] = saved
+  })
+  const named = realpathSync(passwdHome).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  assert.throws(() => confineWorkspace(passwdHome, '/', f.repoRoot), new RegExp(`is or contains \\$HOME \\(${named}\\)`))
+  assert.throws(
+    () =>
+      buildRunArgs({
+        spec: spec(f, { command: ['cat', join(passwdHome, 'creds')] }),
+        domain: f.domain,
+        defaults: DEFAULTS,
+        repoRoot: f.repoRoot,
+      }),
+    /docker args reference the home directory/,
+  )
 })
 
 test('run args contain exactly one --mount and no -v, and it is the confined workspace', (t) => {

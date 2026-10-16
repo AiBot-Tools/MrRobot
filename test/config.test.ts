@@ -320,7 +320,10 @@ test('an empty HOME is treated as unset: the never-$HOME checks still see the re
     assert.equal(homeDirectory(), passwdHome)
     const doc = fixture('valid.yaml') as { dataDir: string }
     doc.dataDir = passwdHome
-    assert.throws(() => parse(doc), /must not be \$HOME itself|contains the repository/)
+    // Named by its passwd spelling: with the bug, the cwd stood in for $HOME,
+    // and on the Mac (repo under home) a looser match passed either way.
+    const named = realpathSync(passwdHome).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    assert.throws(() => parse(doc), new RegExp(`must not be \\$HOME itself \\(${named}\\)`))
   } finally {
     if (saved === undefined) delete process.env['HOME']
     else process.env['HOME'] = saved

@@ -487,21 +487,50 @@ test('nothing in src/ or scripts/ writes process.env or uses Node\'s .env loader
   }
 })
 
+/** The full text of every `name(...)` call in `text`, parentheses balanced, strings skipped. */
+function callTexts(text: string, name: RegExp): string[] {
+  const out: string[] = []
+  for (const m of text.matchAll(new RegExp(`(?:${name.source})\\(`, 'g'))) {
+    let depth = 0
+    let quote: string | undefined
+    for (let i = (m.index ?? 0) + m[0].length - 1; i < text.length; i += 1) {
+      const ch = text[i] ?? ''
+      if (quote !== undefined) {
+        if (ch === '\\') i += 1
+        else if (ch === quote) quote = undefined
+        continue
+      }
+      if (ch === "'" || ch === '"' || ch === '`') quote = ch
+      else if ('([{'.includes(ch)) depth += 1
+      else if (')]}'.includes(ch)) {
+        depth -= 1
+        if (depth === 0) {
+          out.push(text.slice(m.index ?? 0, i + 1))
+          break
+        }
+      }
+    }
+  }
+  return out
+}
+
 test('no test spawns an entry point from the real checkout, where the operator keeps .env', () => {
   // src/main.ts and the CLI take their repository from the cwd, eval from its
   // own file. Spawned from this checkout, one regression that defaults to
   // <repo>/.env reads the operator's keys; spawned from shadowCheckout(), it
-  // hits a trap. So a test that runs one as a program must use the copy.
-  // A spawn whose argv array names an entry point.
-  const SPAWNS_ENTRY = /\bspawn(?:Sync)?\(\s*[^,]+,\s*\[[^\]]*['"](?:src\/main\.ts|src\/cli\/index\.ts|scripts\/eval\.ts|scripts\/capture-pmmcp\.ts)['"]/
-  const spawners = TEST.filter((f) => SPAWNS_ENTRY.test(f.text))
-  assert.ok(spawners.some((f) => f.path === 'test/entrypoints.test.ts'), 'entrypoints.test.ts no longer runs entry points')
-  for (const file of spawners) {
-    assert.match(file.text, /shadowCheckout\(\)/, `${file.path} spawns an entry point without a shadow checkout`)
-    for (const line of codeLines(file)) {
-      assert.equal(/cwd:\s*(?:REPO_ROOT\b|REPO\b|process\.cwd\(\))/.test(line.text), false, `${file.path}:${String(line.n)} spawns from the real checkout`)
+  // hits a trap. So EVERY spawn that runs one must say `cwd: ROOT` itself — a
+  // missing cwd inherits the real checkout and is a violation too.
+  const ENTRY = /['"](?:src\/main\.ts|src\/cli\/index\.ts|scripts\/eval\.ts|scripts\/capture-pmmcp\.ts)['"]/
+  let checked = 0
+  for (const file of TEST) {
+    for (const call of callTexts(file.text, /\bspawn(?:Sync)?|\bexecFile(?:Sync)?|\bfork/)) {
+      if (!ENTRY.test(call)) continue
+      checked += 1
+      assert.match(file.text, /shadowCheckout\(\)/, `${file.path} spawns an entry point without a shadow checkout`)
+      assert.match(call, /\bcwd:\s*(?:ROOT|CHECKOUT\.root)\b/, `${file.path}: a spawn of an entry point without cwd: ROOT\n${call.slice(0, 160)}`)
     }
   }
+  assert.ok(checked >= 8, `only ${String(checked)} entry-point spawns were found; the matcher no longer sees them`)
 })
 
 test('no test runs npm or npx: npm writes its logs and cache under ~/.npm and calls the registry', () => {

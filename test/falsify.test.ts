@@ -557,6 +557,30 @@ test('no mutant that could steer an entry point at a credentials file runs besid
   assert.deepEqual(hazards, [])
 })
 
+test('no mutant can let a test open the real .env through liveCredential', () => {
+  // The runner withholds the live flag and every credential from its test
+  // processes, which defeats any mutant that widens the guard's
+  // KEEPS_CREDENTIALS. It cannot defeat one on liveCredential's own no-path
+  // gate: dotenv.test.ts hands liveCredential { AOS_LIVE_TESTS: '1' } itself,
+  // so with that gate gone the default path, the operator's real <repo>/.env,
+  // is opened. Such a mutant must never be in the catalog.
+  const LIVE_ENV = 'test/helpers/live-env.ts'
+  const GATE = 'if (path === undefined && !KEEPS_CREDENTIALS) {'
+  assert.ok(readFileSync(join(REPO_ROOT, LIVE_ENV), 'utf8').includes(GATE), 'the no-path gate moved; update this rule')
+  const LIVE_FLAG = "process.env['AOS_LIVE_TESTS'] === '1'"
+  const hazards: string[] = []
+  for (const s of CATALOG) {
+    for (const mu of s.mutants) {
+      // live-env.ts: nothing that touches the gate, its condition, or the default path.
+      if (mu.file === LIVE_ENV && /KEEPS_CREDENTIALS|path === undefined|REPO_ROOT, '\.env'/.test(mu.from)) hazards.push(`${s.name}/${mu.id}`)
+      // guard.ts: a mutant of the live check must keep it conditioned on the flag the runner strips.
+      if (mu.file === 'test/helpers/guard.ts' && mu.from.includes(LIVE_FLAG) && !mu.to.includes(LIVE_FLAG)) hazards.push(`${s.name}/${mu.id}`)
+      if (mu.file === 'test/helpers/guard.ts' && /export const KEEPS_CREDENTIALS/.test(mu.from)) hazards.push(`${s.name}/${mu.id}`)
+    }
+  }
+  assert.deepEqual(hazards, [])
+})
+
 test('npm run falsify is a program: bad input and unknown options are refused with usage; --list, --help and --recover run nothing', () => {
   const run = (args: string[]) =>
     spawnSync(process.execPath, ['--import', 'tsx', 'scripts/falsify.ts', ...args], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 60_000 })

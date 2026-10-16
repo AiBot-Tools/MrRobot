@@ -23,7 +23,7 @@
 //
 // Safety. The runner edits files in the working tree, so it is built so that no
 // exit path leaves a mutant behind, and no two runs share a tree:
-//   a run holds .falsify/lock for its whole length (created exclusively),
+//   a run holds .falsify/lock.json for its whole length (created exclusively),
 //     naming its pid AND that process's start time (from ps, in UTC and the
 //     C locale, so a zone change mid-run does not orphan it), so a pid reused
 //     by an unrelated process after a crash or reboot never passes for a live
@@ -42,9 +42,13 @@
 //     its child, a closing terminal sends SIGHUP twice) cannot kill cleanup;
 //   the journal names its run, and the run hands that id to its own test
 //     processes (AOS_FALSIFY_RUN), so test/helpers/guard.ts admits a mutated
-//     tree only for them; src/main.ts refuses to boot while any journal exists;
+//     tree only for them; src/main.ts refuses to boot while any journal exists
+//     or a live run holds the lock;
 //   test processes get no live-test flag and no credential from the runner's
-//     environment, so no mutant can turn a test into one that reads a real key;
+//     environment, so no mutant that widens the guard's live check can turn a
+//     test into one that reads a real key. That does not cover a mutant on
+//     liveCredential's own no-path gate (a test can hand it the flag itself),
+//     so the catalog holds none, and falsify.test.ts refuses one;
 //   the test process runs in its own process group and the whole group is
 //     killed on timeout, so a hung child cannot outlive the verdict.
 

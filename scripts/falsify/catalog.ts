@@ -545,6 +545,26 @@ const gitignore: Suite = {
   },
 }
 
+const RUNNER = 'scripts/falsify/runner.ts'
+
+// The runner itself. Its own tests drive real runner processes against
+// throwaway fixture trees, so a mutant here never touches this tree's files
+// beyond the one being mutated, which the outer run restores.
+const runner: Suite = {
+  name: 'runner',
+  tests: ['test/falsify.test.ts', 'test/env.test.ts'],
+  mutants: [
+    { id: 'F1', file: RUNNER, from: '  for (const signal of RESTORING_SIGNALS) process.on(signal, onSignal)', to: '  for (const signal of RESTORING_SIGNALS) process.once(signal, onSignal)', why: 'a second signal during cleanup (npm forwarding Ctrl-C, a closing terminal) kills the run mid-restore' },
+    { id: 'F2', file: RUNNER, from: "export const PS_CLOCK = { LC_ALL: 'C', TZ: 'UTC0' } as const", to: "export const PS_CLOCK = { LC_ALL: 'C' } as const", why: 'a start time rendered in local time stops matching its lock when the Mac changes zone, so a live run reads as dead' },
+    { id: 'F3', file: RUNNER, from: '  if (started === undefined) return lock.pid', to: '  if (started === undefined) return undefined', why: 'a live run that ps cannot vouch for reads as dead, and --recover writes over its mutant' },
+    { id: 'F4', file: RUNNER, from: '      if (judged !== undefined) breakStaleLock(root, judged)', to: '      rmSync(lockPath(root), { force: true })', why: 'runners started together on a stale lock each delete the lock another has just taken, and several mutate one tree' },
+    { id: 'F5', file: RUNNER, from: '  if (started === undefined) {\n    throw new Error(', to: '  if (false) {\n    throw new Error(', why: 'a run that cannot read its own start time takes a lock that matches any later process with its pid' },
+    { id: 'F6', file: 'scripts/falsify.ts', from: '  if (dropped.length > 0) {', to: '  if (false) {', why: '`dotenv --only X31,D1` drops D1 and still reports every mutant caught' },
+    { id: 'F7', file: 'scripts/falsify.ts', from: '    if (argv.filter((a) => a === name).length > 1) {', to: '    if (false) {', why: 'a second --only is ignored, and the mutants it named never run' },
+  ],
+  control: { id: 'C', file: RUNNER, from: '// ── the run ─', to: '// ── the run (control) ─', why: 'comment only' },
+}
+
 export const CATALOG: readonly Suite[] = [
   delegation,
   recovery,
@@ -562,4 +582,5 @@ export const CATALOG: readonly Suite[] = [
   dotenv,
   dotenvDefault,
   gitignore,
+  runner,
 ]

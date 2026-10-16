@@ -551,7 +551,7 @@ npm run falsify -- --only D13,W3
 npm run falsify -- --list
 ```
 
-In order: every suite (sixteen, see `--list`); one suite, or several
+In order: every suite (seventeen, see `--list`); one suite, or several
 space-separated; named mutants, across suites; the catalog, touching nothing.
 `--recover` restores what an interrupted run left and runs nothing else;
 `--timeout MS` bounds each test run (default 240000).
@@ -565,26 +565,34 @@ It edits the working tree (src/ and two test helpers), so:
 
 - it refuses a file with uncommitted changes (`--allow-dirty` to override);
 - it holds `.falsify/lock.json` for the whole run, naming its pid and that
-  process's start time, so a second run on the same tree refuses, and a pid
-  reused after a crash or reboot never passes for a live run;
+  process's start time (read from `ps` in UTC, so a zone change mid-run does
+  not orphan it), so a second run on the same tree refuses, and a pid reused
+  after a crash or reboot never passes for a live run. A live pid `ps` cannot
+  vouch for counts as a live run; a stale lock is broken only under
+  `.falsify/lock.break`, so runners started together on one cannot both take
+  it;
 - before every edit it writes the original bytes, tagged with its run id, to
   `.falsify/journal.json` (temp file, fsync, rename);
 - on SIGINT, SIGTERM, SIGHUP (a closed terminal) or SIGQUIT it restores the
-  file, kills the running test's whole process group, and releases the lock, and
-  it kills a hung test's group on timeout;
+  file, kills the running test's whole process group, and releases the lock,
+  and a second signal during that cleanup (npm forwards Ctrl-C; a closing
+  terminal sends SIGHUP twice) cannot cut it short; it kills a hung test's group
+  on timeout;
 - a run killed outright (SIGKILL, a power cut) is restored by the next start,
   or by `npm run falsify -- --recover`. Until then `npm run dev` refuses to
   start on any journal, and `npm test` refuses to run unless it is that run's
   own test process (`AOS_FALSIFY_RUN`), because a source file may still hold a
   planted bug;
-- an option it does not know, `--only` or `--timeout` with no value, and a
-  selection that names no mutant are refused, never read as "run everything" or
-  as a clean pass.
+- an option it does not know, `--only` or `--timeout` with no value or given
+  twice, a selection that names no mutant, and `--only` ids outside the suites
+  named are refused, never read as "run everything" or as a clean pass.
 
 `test/falsify.test.ts` drives the runner against real processes: a SIGKILL
-mid-mutant, each of the four restoring signals mid-mutant, a second run during
-the first one's baseline, a reused pid, an unreadable journal, and the program's
-usage errors. `test/entrypoints.test.ts` proves the daemon's refusal and
+mid-mutant, each of the four restoring signals mid-mutant, a second signal
+during cleanup, a second run during the first one's baseline, six runners
+racing for one stale lock, a reused pid, a missing `ps`, an unreadable journal,
+and the program's usage errors; the `runner` suite proves those tests catch
+the bugs they name. `test/entrypoints.test.ts` proves the daemon's refusal and
 `test/env.test.ts` the test guard's. On every `npm test` it also checks that
 every catalog anchor still matches exactly once — a refactor that moves one
 fails the suite instead of silently disabling its mutant.
@@ -594,8 +602,9 @@ namespace pin, goal tracking, anchor trust, the eval checks, the chain /
 canonicalizer / triggers (`integrity`), redaction, the cron scheduler, the agent
 registry, restart recovery of approvals and holds, the container audit and path
 containment (`sandbox`), the `.env` loader and the credential checks around it
-(`dotenv`, and `dotenvDefault` for how an entry point picks its file), or the
-`.gitignore` reading (`gitignore`) — the sixteen suites — and add a mutant
+(`dotenv`, and `dotenvDefault` for how an entry point picks its file), the
+`.gitignore` reading (`gitignore`), or the runner itself (`runner`) — the
+seventeen suites — and add a mutant
 whenever a new test exists to catch a specific bug. No test may let a mutant
 reach your real `.env`: `test/entrypoints.test.ts` runs every entry point from a
 temporary copy of the checkout holding a trap `.env` (and `hygiene.test.ts`

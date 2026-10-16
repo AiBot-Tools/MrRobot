@@ -60,6 +60,11 @@ async function main(argv: readonly string[]): Promise<number> {
   for (const name of valueOf) {
     const i = argv.indexOf(name)
     if (i === -1) continue
+    // Read once: a second `--only` would be silently ignored.
+    if (argv.filter((a) => a === name).length > 1) {
+      process.stderr.write(`${name} given more than once; join the values with commas\n${USAGE}\n`)
+      return 2
+    }
     const value = argv[i + 1]
     if (value === undefined || value === '' || value.startsWith('-')) {
       process.stderr.write(`${name} needs a value\n${USAGE}\n`)
@@ -111,6 +116,14 @@ async function main(argv: readonly string[]): Promise<number> {
     // `--only ,`, or ids outside the suites named: nothing would run, and an
     // exit 0 would read as "every mutant was caught".
     process.stderr.write(`the selection names no mutant\n${USAGE}\n`)
+    return 2
+  }
+  // Some ids outside the suites named: those would be dropped and the rest
+  // could still end in "every mutant was caught".
+  const selected = new Set(suites.flatMap((s) => s.mutants.map((m) => m.id)))
+  const dropped = (only ?? []).filter((id) => !selected.has(id))
+  if (dropped.length > 0) {
+    process.stderr.write(`not in the suites named (${positional.join(', ')}): ${dropped.join(', ')}\n${USAGE}\n`)
     return 2
   }
 

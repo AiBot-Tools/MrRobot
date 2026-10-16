@@ -29,10 +29,12 @@ import { CATALOG } from '../scripts/falsify/catalog.js'
 import {
   CHILD_CREDENTIAL_NAME,
   childEnv,
+  clearStaleLock,
   JournalUnreadable,
   judge,
   liveRun,
   processStarted,
+  PS_CLOCK,
   problems,
   recoverInterrupted,
   RESTORING_SIGNALS,
@@ -227,12 +229,13 @@ await runSuites([{ name: 'f', tests: [${JSON.stringify(join(root, 'mod.test.ts')
 })
 
 /** A runner in its own process, on a fixture whose one mutant hangs its test. */
-function hangingRun(t: TestContext): { root: string; original: string; child: ReturnType<typeof spawn> } {
+function hangingRun(t: TestContext, preamble = ''): { root: string; original: string; child: ReturnType<typeof spawn> } {
   const { root, original } = fixture(t)
   const driver = join(root, 'drive.ts')
   writeFileSync(
     driver,
-    `import { runSuites } from ${JSON.stringify(join(REPO_ROOT, 'scripts/falsify/runner.ts'))}
+    `${preamble}
+import { runSuites } from ${JSON.stringify(join(REPO_ROOT, 'scripts/falsify/runner.ts'))}
 await runSuites([{ name: 'f', tests: [${JSON.stringify(join(root, 'mod.test.ts'))}], control: { id: 'C', file: 'mod.ts', from: '// fixture module', to: '// c', why: '' },
   mutants: [{ id: 'hang', file: 'mod.ts', from: 'return a + b', to: 'for (;;) {}\\n  return a + b', why: '' }] }],
   { root: ${JSON.stringify(root)}, timeoutMs: 120000 })
@@ -276,6 +279,29 @@ test('every restoring signal mid-mutant restores the file, kills the hung test g
     const left = spawnSync('pgrep', ['-f', root], { encoding: 'utf8' }).stdout.trim()
     assert.equal(left, '', `${signal} left the test process group running`)
   }
+})
+
+test('a second signal during cleanup does not kill the run before it restores: npm forwards Ctrl-C, a closing terminal sends SIGHUP twice', async (t) => {
+  // The second signal is sent from inside the run's own exit, while its cleanup
+  // is done but the process is still alive: the worst moment for the default
+  // action to be back. A run whose listener is gone dies of it, by signal.
+  const { root, original, child } = hangingRun(
+    t,
+    `const realExit = process.exit.bind(process)
+process.exit = ((code) => {
+  process.kill(process.pid, 'SIGINT')
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300)
+  return realExit(code)
+})`,
+  )
+  await untilMutated(root, original)
+  child.kill('SIGINT')
+  const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve) =>
+    child.once('exit', (c, s) => resolve([c, s])),
+  )
+  assert.deepEqual([code, signal], [130, null], 'the second signal killed the run mid-cleanup')
+  assert.equal(readFileSync(join(root, 'mod.ts'), 'utf8'), original)
+  assert.equal(existsSync(join(root, '.falsify', 'lock.json')), false)
 })
 
 test('the lock is held for the whole run: a second runner refuses during the first one\'s baseline too', async (t) => {
@@ -332,6 +358,94 @@ test('a reused pid does not pass for a live run: liveness is the pid AND its sta
   await assert.rejects(runSuites([], { root, timeoutMs: 1_000 }), /already in progress/)
 })
 
+test('liveness does not depend on the zone or on ps: start times are UTC, and a live pid ps cannot vouch for is held', async (t) => {
+  // BSD ps and procps print local time; the Mac changes zone with its
+  // location, so a long run would stop matching its own lock.
+  assert.deepEqual({ ...PS_CLOCK }, { LC_ALL: 'C', TZ: 'UTC0' })
+  const utc = spawnSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], {
+    encoding: 'utf8',
+    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', LC_ALL: 'C', TZ: 'UTC0' },
+  }).stdout.trim()
+  assert.equal(processStarted(process.pid), utc)
+
+  const { root } = fixture(t)
+  const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'])
+  t.after(() => other.kill('SIGKILL'))
+  const pid = other.pid ?? 0
+  mkdirSync(join(root, '.falsify'))
+  writeFileSync(join(root, '.falsify', 'lock.json'), JSON.stringify({ pid, started: processStarted(pid), runId: 'live' }))
+  assert.equal(liveRun(root), pid)
+  // Without ps the live pid cannot be told from a reused one, so it is held:
+  // --recover and a second run refuse rather than write over a live mutant.
+  const savedPath = process.env['PATH']
+  process.env['PATH'] = join(root, 'no-such-dir')
+  t.after(() => {
+    process.env['PATH'] = savedPath
+  })
+  assert.equal(processStarted(pid), undefined)
+  assert.equal(liveRun(root), pid, 'a live run read as dead because ps could not answer')
+  assert.equal(clearStaleLock(root), false)
+  // And a run that cannot read its own start time takes no lock at all.
+  rmSync(join(root, '.falsify', 'lock.json'))
+  await assert.rejects(runSuites([], { root, timeoutMs: 1_000 }), /cannot read this process's start time/)
+  // A pid that is gone is dead, ps or no ps.
+  other.kill('SIGKILL')
+  await new Promise((resolve) => other.once('exit', resolve))
+  writeFileSync(join(root, '.falsify', 'lock.json'), JSON.stringify({ pid, started: 'x', runId: 'dead' }))
+  assert.equal(liveRun(root), undefined)
+})
+
+test('runners started together on a stale lock: exactly one takes it, the rest refuse', async (t) => {
+  // A lock left by a SIGKILL whose pid now belongs to an unrelated process (a
+  // reboot, a busy machine): judging it takes a ps call, and breaking it by
+  // check-then-delete let a late breaker delete the lock an earlier one had
+  // just taken, so both ran. The drivers wait at a common gate so they reach
+  // the lock within a millisecond of each other.
+  const { root } = fixture(t)
+  const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'])
+  t.after(() => other.kill('SIGKILL'))
+  mkdirSync(join(root, '.falsify'))
+  writeFileSync(join(root, '.falsify', 'lock.json'), JSON.stringify({ pid: other.pid, started: 'Thu Jan  1 00:00:00 1970', runId: 'stale' }))
+  const driver = join(root, 'race.ts')
+  writeFileSync(
+    driver,
+    `import { runSuites } from ${JSON.stringify(join(REPO_ROOT, 'scripts/falsify/runner.ts'))}
+const gate = Number(process.argv[2])
+if (Date.now() > gate) process.stdout.write('late\\n')
+while (Date.now() < gate) {}
+try {
+  await runSuites([{ name: 'f', tests: [], mutants: [], control: { id: 'C', file: 'mod.ts', from: '// fixture module', to: '// c', why: '' } }], {
+    root: ${JSON.stringify(root)},
+    timeoutMs: 10_000,
+    log: (line) => { if (line.endsWith(': baseline')) process.stdout.write('holding\\n') },
+    runTests: async () => {
+      await new Promise((r) => setTimeout(r, 3_000))
+      return { timedOut: false, code: 1, failing: [], passing: [] }
+    },
+  })
+} catch (e) {
+  process.stdout.write('refused: ' + (e instanceof Error ? e.message : String(e)) + '\\n')
+}
+`,
+  )
+  t.after(() => spawnSync('pkill', ['-KILL', '-f', driver]))
+  const gate = Date.now() + 8_000
+  const runs = Array.from({ length: 6 }, () => {
+    const child = spawn(process.execPath, ['--import', 'tsx', driver, String(gate)], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'] })
+    let out = ''
+    child.stdout.on('data', (c: Buffer) => (out += c.toString('utf8')))
+    return new Promise<string>((resolve) => child.on('close', () => resolve(out)))
+  })
+  const outs = await Promise.all(runs)
+  assert.equal(outs.filter((o) => o.includes('late')).length, 0, 'a driver missed the gate, so the race was not run')
+  assert.equal(outs.filter((o) => o.includes('holding')).length, 1, outs.join('---'))
+  for (const o of outs.filter((x) => !x.includes('holding'))) {
+    assert.match(o, /refused: .*(already in progress|starting on|removing a stale lock)/, o)
+  }
+  assert.equal(existsSync(join(root, '.falsify', 'lock.json')), false, 'the holder left its lock')
+  assert.equal(existsSync(join(root, '.falsify', 'lock.break')), false)
+})
+
 test('an unreadable journal stops recovery with what to do, and a leftover temp journal means nothing was edited', (t) => {
   const { root } = fixture(t)
   mkdirSync(join(root, '.falsify'))
@@ -377,10 +491,23 @@ test('a hang is never a kill, and a failure with no named test is never a kill',
 // ── the catalog, statically ────────────────────────────────────────────────
 
 test('every catalog anchor still matches exactly once and leaves a file that parses', () => {
+  // Under a falsify run (the runner suite mutates runner.ts and falsify.ts),
+  // one file holds a mutant right now; its anchors are judged against the
+  // original the run journaled, which is the source as committed.
+  let journaled: { file: string; text: string } | undefined
+  try {
+    const j = JSON.parse(readFileSync(join(REPO_ROOT, '.falsify', 'journal.json'), 'utf8')) as { file?: unknown; original?: unknown; runId?: unknown }
+    if (j.runId === process.env['AOS_FALSIFY_RUN'] && typeof j.file === 'string' && typeof j.original === 'string') {
+      journaled = { file: j.file, text: Buffer.from(j.original, 'base64').toString('utf8') }
+    }
+  } catch {
+    // No journal: nothing is mutated.
+  }
+  const source = (file: string): string => (journaled?.file === file ? journaled.text : readFileSync(join(REPO_ROOT, file), 'utf8'))
   const broken: string[] = []
   for (const s of CATALOG) {
     for (const mutant of [...s.mutants, s.control]) {
-      const why = unusable(mutant, readFileSync(join(REPO_ROOT, mutant.file), 'utf8'))
+      const why = unusable(mutant, source(mutant.file))
       if (why !== undefined) broken.push(`${s.name}/${mutant.id} (${mutant.file}): ${why}`)
     }
   }
@@ -436,7 +563,7 @@ test('npm run falsify is a program: bad input and unknown options are refused wi
   const bogus = run(['no-such-suite'])
   assert.equal(bogus.status, 2, bogus.stderr)
   assert.match(bogus.stderr, /unknown suite: no-such-suite/)
-  assert.match(bogus.stderr, /suites: delegation, recovery, replay, namespace, goals, anchor, eval, integrity, redaction, schedule, registry, restart, sandbox, dotenv, dotenvDefault, gitignore/)
+  assert.match(bogus.stderr, /suites: delegation, recovery, replay, namespace, goals, anchor, eval, integrity, redaction, schedule, registry, restart, sandbox, dotenv, dotenvDefault, gitignore, runner/)
 
   const badOnly = run(['--only', 'D99'])
   assert.equal(badOnly.status, 2)
@@ -467,9 +594,36 @@ test('npm run falsify is a program: bad input and unknown options are refused wi
     assert.match(r.stderr, /needs a value|names no mutant/, bad.join(' '))
     assert.doesNotMatch(r.stderr, /baseline/)
   }
+  // Some named ids outside the suites named, or a second --only, would be
+  // dropped while the rest still ended in "every mutant was caught".
+  for (const [bad, why] of [
+    [['dotenv', '--only', 'X31,D1', '--list'], /not in the suites named \(dotenv\): D1/],
+    [['--only', 'D1', '--only', 'X31', '--list'], /--only given more than once/],
+    [['--timeout', '5000', '--timeout', '6000', '--list'], /--timeout given more than once/],
+  ] as const) {
+    const r = run([...bad])
+    assert.equal(r.status, 2, `${bad.join(' ')}: ${r.stdout}`)
+    assert.match(r.stderr, why)
+  }
+  // --recover acts on this tree. Under a falsify run (the runner suite), the
+  // run that spawned this test holds the tree, and --recover must leave it be.
+  const journalPath = join(REPO_ROOT, '.falsify', 'journal.json')
+  const before = existsSync(journalPath) ? readFileSync(journalPath, 'utf8') : undefined
+  const ownRun = process.env['AOS_FALSIFY_RUN']
+  let lockedByOwnRun = false
+  try {
+    lockedByOwnRun = ownRun !== undefined && (JSON.parse(readFileSync(join(REPO_ROOT, '.falsify', 'lock.json'), 'utf8')) as { runId?: unknown }).runId === ownRun
+  } catch {
+    // No lock: no run holds this tree.
+  }
   const recover = run(['--recover'])
-  assert.equal(recover.status, 0, recover.stderr)
-  assert.match(recover.stdout, /nothing to recover/)
+  if (lockedByOwnRun) {
+    assert.equal(recover.status, 2, recover.stdout)
+    assert.match(recover.stderr, /a falsify run is in progress/)
+  } else {
+    assert.equal(recover.status, 0, recover.stderr)
+    assert.match(recover.stdout, /nothing to recover/)
+  }
   // None of it touched anything.
-  assert.equal(existsSync(join(REPO_ROOT, '.falsify', 'journal.json')), false)
+  assert.equal(existsSync(journalPath) ? readFileSync(journalPath, 'utf8') : undefined, before)
 })

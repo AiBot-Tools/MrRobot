@@ -24,15 +24,22 @@
 // Safety. The runner edits files in the working tree, so it is built so that no
 // exit path leaves a mutant behind, and no two runs share a tree:
 //   a run holds .falsify/lock for its whole length (created exclusively),
-//     naming its pid AND that process's start time, so a pid reused by an
-//     unrelated process after a crash or reboot never passes for a live run;
+//     naming its pid AND that process's start time (from ps, in UTC and the
+//     C locale, so a zone change mid-run does not orphan it), so a pid reused
+//     by an unrelated process after a crash or reboot never passes for a live
+//     run; a live pid ps cannot vouch for counts as held, never as dead; a
+//     run that cannot read its own start time takes no lock; a stale lock is
+//     removed only under .falsify/lock.break, after a re-read, so runners
+//     started together on one cannot each delete the other's fresh lock;
 //   the original bytes are written to a journal BEFORE the edit (to a temp
 //     file, fsync'd, then renamed), and a run that finds a journal restores it
 //     first — a SIGKILL or power cut mid-mutant is recovered by the next start
 //     or by `npm run falsify -- --recover`;
 //   restore happens in `finally`, and SIGINT, SIGTERM, SIGHUP (a closed
 //     terminal, a dropped SSH session) and SIGQUIT restore, kill the running
-//     test process group, and release the lock before exiting;
+//     test process group, and release the lock before exiting; the handlers
+//     stay registered until then, so a second signal (npm forwards Ctrl-C to
+//     its child, a closing terminal sends SIGHUP twice) cannot kill cleanup;
 //   the journal names its run, and the run hands that id to its own test
 //     processes (AOS_FALSIFY_RUN), so test/helpers/guard.ts admits a mutated
 //     tree only for them; src/main.ts refuses to boot while any journal exists;
@@ -52,6 +59,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
   writeSync,
 } from 'node:fs'
@@ -124,6 +132,8 @@ export interface RunnerOptions {
 export const JOURNAL_DIR = '.falsify'
 export const JOURNAL = 'journal.json'
 export const LOCK = 'lock.json'
+/** Held, exclusively and briefly, by whoever is removing a stale lock. */
+export const LOCK_BREAK = 'lock.break'
 /** The variable a run sets in its own test processes, naming itself. */
 export const RUN_ENV = 'AOS_FALSIFY_RUN'
 
@@ -242,14 +252,32 @@ export function recoverInterrupted(root: string): string | undefined {
   return journal.file
 }
 
-/** The start time `ps` reports for `pid`, or undefined when there is no such process. */
+/** How ps is told to render a start time: one zone and one locale, whatever the machine's. */
+export const PS_CLOCK = { LC_ALL: 'C', TZ: 'UTC0' } as const
+
+/**
+ * The start time `ps` reports for `pid`, or undefined when it reports none (no
+ * such process, or no ps to ask). Rendered in UTC and the C locale: both BSD
+ * ps and procps print local time, and the Mac moves its zone with its
+ * location, so a run hours long would otherwise stop matching its own lock.
+ */
 export function processStarted(pid: number): string | undefined {
   const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
     encoding: 'utf8',
-    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', LC_ALL: 'C' },
+    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', ...PS_CLOCK },
   })
   const out = typeof r.stdout === 'string' ? r.stdout.trim() : ''
   return r.status === 0 && out !== '' ? out : undefined
+}
+
+/** Whether a process with this pid exists at all (EPERM: it does, and is someone else's). */
+function pidExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM'
+  }
 }
 
 function readLock(root: string): Lock | undefined {
@@ -270,30 +298,99 @@ function readLock(root: string): Lock | undefined {
 export function liveRun(root: string): number | undefined {
   const lock = readLock(root)
   if (lock === undefined || lock.pid === process.pid) return undefined
+  if (!pidExists(lock.pid)) return undefined
   const started = processStarted(lock.pid)
-  if (started === undefined) return undefined
-  return lock.started === '' || started === lock.started ? lock.pid : undefined
+  // The pid is alive and ps cannot say when it started: it may well be the
+  // run. Fail closed: a false "dead" lets --recover or a second run write
+  // over a live run's mutant.
+  if (started === undefined) return lock.pid
+  return started === lock.started ? lock.pid : undefined
+}
+
+/** The lock file's bytes, or undefined when there is none. */
+function lockText(root: string): string | undefined {
+  try {
+    return readFileSync(lockPath(root), 'utf8')
+  } catch {
+    return undefined
+  }
+}
+
+/** How long an unreadable lock is taken for one a starting run is still writing. */
+const LOCK_WRITE_GRACE_MS = 10_000
+
+/**
+ * Remove the lock if it is still exactly `judged`, a lock already found stale.
+ * Under lock.break, taken exclusively: two runners that both judged the same
+ * stale lock must not both remove "it", because the second would be removing
+ * the fresh lock the first has taken since. Every removal of a lock that is
+ * not one's own happens under lock.break, so the lock cannot change between
+ * the re-read here and the removal.
+ */
+function breakStaleLock(root: string, judged: string): void {
+  const path = join(root, JOURNAL_DIR, LOCK_BREAK)
+  let fd: number
+  try {
+    fd = openSync(path, 'wx', 0o600)
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
+    throw new Error(`another run is removing a stale lock on ${root} at this moment; if none is, delete ${path} and try again`)
+  }
+  try {
+    closeSync(fd)
+    if (lockText(root) === judged) rmSync(lockPath(root), { force: true })
+  } finally {
+    rmSync(path, { force: true })
+  }
+}
+
+/**
+ * Why the lock at root may not be broken now, or undefined when it is stale.
+ * A live owner holds it; so does an unreadable lock written in the last few
+ * seconds, which is a run between creating the file and writing it.
+ */
+function lockHeld(root: string): string | undefined {
+  const live = liveRun(root)
+  if (live !== undefined) return `a falsify run is already in progress on ${root} (pid ${String(live)})`
+  if (readLock(root) === undefined) {
+    let age = Infinity
+    try {
+      age = Date.now() - statSync(lockPath(root)).mtimeMs
+    } catch {
+      // Gone already.
+    }
+    if (age < LOCK_WRITE_GRACE_MS) return `another falsify run is starting on ${root} at this moment`
+  }
+  return undefined
 }
 
 /** Drop a lock whose owner is gone. Returns true when one was dropped. */
 export function clearStaleLock(root: string): boolean {
-  if (!existsSync(lockPath(root)) || liveRun(root) !== undefined) return false
-  rmSync(lockPath(root), { force: true })
-  return true
+  const judged = lockText(root)
+  if (judged === undefined || lockHeld(root) !== undefined) return false
+  breakStaleLock(root, judged)
+  return lockText(root) === undefined
 }
 
 function acquireLock(root: string, runId: string): void {
   mkdirSync(join(root, JOURNAL_DIR), { recursive: true })
-  const lock: Lock = { pid: process.pid, started: processStarted(process.pid) ?? '', runId }
+  // Without its start time a lock cannot tell this run from a later process
+  // given the same pid, so a run that cannot read it does not take one.
+  const started = processStarted(process.pid)
+  if (started === undefined) {
+    throw new Error('cannot read this process\'s start time with ps, so a lock could not tell this run from a reused pid; is ps on PATH?')
+  }
+  const lock: Lock = { pid: process.pid, started, runId }
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let fd: number
     try {
       fd = openSync(lockPath(root), 'wx', 0o600)
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e
-      const live = liveRun(root)
-      if (live !== undefined) throw new Error(`a falsify run is already in progress on ${root} (pid ${String(live)})`)
-      rmSync(lockPath(root), { force: true })
+      const judged = lockText(root)
+      const held = lockHeld(root)
+      if (held !== undefined) throw new Error(held)
+      if (judged !== undefined) breakStaleLock(root, judged)
       continue
     }
     try {
@@ -452,13 +549,21 @@ export async function runSuites(suites: readonly Suite[], options: RunnerOptions
     rmSync(journalPath(root), { force: true })
     current = undefined
   }
+  // `on`, not `once`: once removes the listener before it runs, and with the
+  // last listener gone Node restores the default action, so a second signal
+  // during cleanup (npm forwards Ctrl-C to its child; a closing terminal sends
+  // SIGHUP twice) would kill the run mid-restore. With the listener kept, a
+  // later signal only queues behind the synchronous cleanup and its exit.
+  let exiting = false
   const onSignal = (signal: NodeJS.Signals): void => {
+    if (exiting) return
+    exiting = true
     restore()
     killActiveGroups()
     releaseLock(root, runId)
     process.exit(128 + (SIGNAL_NUMBERS[signal] ?? 15))
   }
-  for (const signal of RESTORING_SIGNALS) process.once(signal, onSignal)
+  for (const signal of RESTORING_SIGNALS) process.on(signal, onSignal)
 
   const reports: SuiteReport[] = []
   try {

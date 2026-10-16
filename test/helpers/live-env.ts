@@ -3,8 +3,10 @@
 // The ONLY test code allowed to open the repository's real .env, and only when
 // the run is the operator's gated live run (AOS_LIVE_TESTS=1). Every other test
 // either passes an explicit env or reads nothing: the guard has already removed
-// credential names from the offline process, and no entry point a test starts
-// is given --dotenv.
+// credential names from the offline process, and an entry point a test starts
+// with --dotenv runs from shadowCheckout()'s copy, whose .env is a trap.
+// dotenv.test.ts calls this with explicit trap paths; without one, it refuses
+// unless the guard kept credentials for this process (KEEPS_CREDENTIALS).
 
 import { KEEPS_CREDENTIALS } from './guard.js'
 

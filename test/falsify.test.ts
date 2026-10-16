@@ -407,11 +407,13 @@ test('the catalog is well-formed: unique ids, real test files, and controls that
 })
 
 test('no mutant that could steer an entry point at a credentials file runs beside a test that spawns entry points from this checkout', () => {
-  // entrypoints.test.ts spawns the daemon, the CLI and eval with cwd = this
+  // entrypoints.test.ts spawns the daemon, the CLI and eval from
+  // shadowCheckout()'s copy, against a trap .env. That copy is the first line;
+  // this is the second, in case a regression points a spawn back at this
   // checkout, which on the operator's Mac holds the real <repo>/.env. A mutant
-  // on an entry point, or one that writes a .env path into the code, would have
-  // a test-spawned process read the real keys before an assertion killed it.
-  // Such mutants belong in a suite of in-process tests against a trap repo.
+  // on an entry point, or one that writes a .env path into the code, would then
+  // have a test-spawned process read the real keys before an assertion killed
+  // it. Such mutants belong in a suite of in-process tests against a trap repo.
   const SPAWNS = 'test/entrypoints.test.ts'
   const ENTRY = new Set(['src/main.ts', 'src/cli/index.ts', 'scripts/eval.ts', 'scripts/capture-pmmcp.ts'])
   // `.env` not preceded by an identifier character (so not `process.env`):

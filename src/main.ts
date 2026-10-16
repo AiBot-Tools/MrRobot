@@ -112,9 +112,10 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
 
 /**
  * The env a daemon boots with: exactly the configured credential names, each
- * from a non-empty shell value or else the file `--dotenv` names. Without the
- * flag no file is opened — which is what keeps every test that spawns or
- * imports this module away from the operator's real .env.
+ * from a shell value that is not blank or else the file `--dotenv` names.
+ * Without the flag no file is opened, so importing this module opens nothing;
+ * a test that passes the flag runs from shadowCheckout()'s copy, against its
+ * trap .env, never from the operator's checkout.
  */
 export function daemonEnv(
   argv: readonly string[],

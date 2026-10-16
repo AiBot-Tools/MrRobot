@@ -91,7 +91,7 @@ test('loadDotenv returns the wanted names from a 0600 file and leaves process.en
   assert.equal(JSON.stringify(Object.entries(process.env).sort()), before, 'the loader wrote process.env')
 })
 
-test('a non-empty shell value wins over the file, and the name is reported as shadowed', (t) => {
+test('a shell value that is not blank wins over the file, and the name is reported as shadowed', (t) => {
   t.after(() => SecretMask.clear())
   const path = write(t, `AOS_CONTROL_TOKEN=${TOKEN}\nANTHROPIC_API_KEY=${KEY}\n`)
   const loaded = loadDotenv(path, opts({ shell: { ANTHROPIC_API_KEY: 'fromTheShell' } }))
@@ -472,7 +472,7 @@ test('liveCredential refuses unless AOS_LIVE_TESTS=1 in the env it is given, and
   }
 })
 
-test('liveCredential prefers a non-empty shell value and otherwise reads the given .env', (t) => {
+test('liveCredential prefers a shell value that is not blank and otherwise reads the given .env', (t) => {
   t.after(() => SecretMask.clear())
   const path = write(t, `ANTHROPIC_API_KEY=${KEY}\n`)
   assert.equal(liveCredential('ANTHROPIC_API_KEY', { AOS_LIVE_TESTS: '1', ANTHROPIC_API_KEY: 'fromTheShell' }, path), 'fromTheShell')
@@ -480,13 +480,14 @@ test('liveCredential prefers a non-empty shell value and otherwise reads the giv
   assert.equal(liveCredential('ANTHROPIC_API_KEY', { AOS_LIVE_TESTS: '1' }, join(tmpdir(t), 'absent.env')), undefined)
 })
 
-test('credentialEnv on its own: a non-empty shell value beats any file value, an empty one does not, and only the given names come back', () => {
+test('credentialEnv on its own: a shell value that is not blank beats any file value, an empty or blank one does not, and only the given names come back', () => {
   // The loader already drops a name the shell sets, so this rule is enforced
   // twice. Tested here without the loader, so neither copy can rot unseen.
   const loaded = { path: '/x/.env', found: true, values: { A: 'fromFile', B: 'fileB', C: 'fileC' }, shadowed: [] }
-  assert.deepEqual(credentialEnv(['A', 'B', 'D'], { A: 'fromShell', B: '', D: undefined, E: 'stray' }, loaded), {
+  assert.deepEqual(credentialEnv(['A', 'B', 'C', 'D'], { A: 'fromShell', B: '', C: ' \t', D: undefined, E: 'stray' }, loaded), {
     A: 'fromShell',
     B: 'fileB',
+    C: 'fileC',
     D: undefined,
   })
   assert.deepEqual(credentialEnv(['A'], { A: 'fromShell' }, undefined), { A: 'fromShell' })

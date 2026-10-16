@@ -5,11 +5,16 @@
 //   Who reads it: src/main.ts (npm run dev), src/cli/index.ts and scripts/eval.ts,
 //   and only when their argv carries `--dotenv <path>`. package.json passes
 //   `--dotenv .env` to those three scripts and to nothing else, and nothing here
-//   has a default path, so a test that boots or spawns an entry point opens no
-//   file. The one test reader is test/helpers/live-env.ts, which opens
-//   <repo>/.env only on the operator's gated live run (AOS_LIVE_TESTS=1), is
-//   called only from test/live-*.test.ts (hygiene.test.ts holds that), and only
-//   when the shell lacks the key.
+//   has a default path, so an entry point started without the flag opens no
+//   file. Tests that start one WITH it (entrypoints.test.ts) run from
+//   shadowCheckout()'s temporary copy, whose .env is a trap, and hygiene.test.ts
+//   holds every such spawn to that copy's cwd. The one test reader of the real
+//   file is test/helpers/live-env.ts: with no path it opens <repo>/.env only on
+//   the operator's gated live run (AOS_LIVE_TESTS=1, one test/live-*.test.ts
+//   file in its process), and only when the shell lacks the key. Its other
+//   callers (dotenv.test.ts) hand it explicit trap paths; hygiene.test.ts
+//   admits a pathless call there only as a thunk proving liveCredential's own
+//   refusal.
 //
 //   Who writes it: the operator. No code path writes it, or .env.example, which
 //   is the committed, placeholder-only template and never holds a real value.
@@ -24,9 +29,12 @@
 //   (credentialNames). Everything else is refused, not ignored.
 //
 //   What it refuses, before reading a byte: a symlink, anything that is not a
-//   regular file, a file owned by another user, a file group or others can read
-//   or write, a second hard link, more than 64 KiB, and — inside the repository —
-//   any path but <repo>/.env, or a .gitignore that no longer ignores it.
+//   regular file, a file owned by another user, a file whose mode lets group or
+//   others read or write it (the mode bits only: a macOS ACL is not read, so
+//   README says to clear one with chmod -N), a second hard link, more than
+//   64 KiB, and — inside the repository — any path but <repo>/.env, a .env
+//   stored on disk under another case (.Env), or a .gitignore that no longer
+//   ignores it.
 //
 //   Why not util.parseEnv: Node's parser (shared with --env-file) gives a
 //   whitespace-only value the WHOLE NEXT LINE — `ANTHROPIC_API_KEY= ` followed by
@@ -70,7 +78,7 @@ export interface DotenvOptions {
   readonly accepted: ReadonlySet<string>
   /** The names this caller actually wants back; a subset of `accepted`. */
   readonly wanted: readonly string[]
-  /** The process's own environment. A non-empty value here wins over the file. */
+  /** The process's own environment. A value here that is not blank wins over the file. */
   readonly shell: Readonly<Record<string, string | undefined>>
   /** Injected so a test can stand in for another user; defaults to process.getuid(). */
   readonly uid?: number
@@ -81,7 +89,7 @@ export interface DotenvResult {
   readonly found: boolean
   /** Wanted names taken from the file. Never holds an empty string. */
   readonly values: Readonly<Record<string, string>>
-  /** Wanted names set in BOTH the shell (non-empty) and the file: the shell won. */
+  /** Wanted names set in BOTH the shell (not blank) and the file: the shell won. */
   readonly shadowed: readonly string[]
 }
 
@@ -144,9 +152,10 @@ export function gitignoresDotenv(repoRoot: string): boolean {
 }
 
 /**
- * The env a kernel boots with: exactly `names`. Per name, a non-empty shell
- * value wins, then the file's, then unset. An exported empty string is unset —
- * it must not hide a value the operator put in the file.
+ * The env a kernel boots with: exactly `names`. Per name, a shell value that
+ * is not blank wins, then the file's, then unset. An exported empty or
+ * whitespace-only string is unset — it must not hide a value the operator put
+ * in the file.
  */
 export function credentialEnv(
   names: Iterable<string>,
@@ -290,7 +299,7 @@ function readGuarded(path: string, uid: number | undefined): Buffer | undefined 
     if (st.uid !== uid) throw new ConfigError(`${path} is owned by uid ${String(st.uid)}, not you (uid ${String(uid)})`)
     if ((st.mode & 0o077) !== 0) {
       const mode = (st.mode & 0o777).toString(8).padStart(4, '0')
-      throw new ConfigError(`${path} has mode ${mode}: other users can read or write it. Run: chmod 600 ${path}`)
+      throw new ConfigError(`${path} has mode ${mode}: its mode lets group or others read or write it. Run: chmod 600 ${path}`)
     }
     if (st.nlink !== 1) throw new ConfigError(`${path} has another hard link, which exposes it elsewhere`)
     if (st.size > DOTENV_MAX_BYTES) {
@@ -369,8 +378,8 @@ export function loadDotenv(path: string, options: DotenvOptions): DotenvResult {
 
 /**
  * One credential, for a client that needs only that one (the CLI and eval need
- * the control token, never a provider key): a non-empty shell value, else the
- * file at `path`, else undefined. Without a path no file is opened.
+ * the control token, never a provider key): a shell value that is not blank,
+ * else the file at `path`, else undefined. Without a path no file is opened.
  *
  * `accepted` must still be every credential name, so the operator's file —
  * which holds provider keys too — is not refused for containing them.

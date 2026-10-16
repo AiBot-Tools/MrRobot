@@ -45,7 +45,7 @@ mcp:
 
 secrets:
   # env: each provider entry's auth.envVar, from the env the kernel boots with:
-  # a non-empty shell export, else the operator's <repo>/.env, which the entry
+  # a shell export that is not blank, else the operator's <repo>/.env, which the entry
   # point reads through --dotenv (npm run dev passes it; the kernel and broker
   # never open a file). pmmcp's get_secret returns only a masked sentence, by
   # design, so `vault` cannot supply a key; it stays in the code, dormant.

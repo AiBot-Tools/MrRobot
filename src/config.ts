@@ -103,7 +103,7 @@ const Mcp = z
  * Where provider credentials come from.
  *
  * `env` (the default): each entry's own `auth.envVar`, from the env bootKernel
- * receives — a non-empty shell export, else the operator's <repo>/.env, read by
+ * receives — a shell export that is not blank, else the operator's <repo>/.env, read by
  * the entry point's --dotenv (src/secrets/dotenv.ts), never by this module.
  *
  * `vault`: pmmcp's `get_secret`, then `envFallback` if that is on (D8). Kept,

@@ -61,12 +61,18 @@ adapter (D6).
 
 ```bash
 npm install
-node --version                 # confirm the floor above
-npm run typecheck              # must be clean
-npm test                       # must be green
+node --version
+npm run typecheck
+npm test
 ```
 
-The daemon needs `AOS_CONTROL_TOKEN` (at least 32 characters) and, to reach a
+`node --version` must meet the floor above, `npm run typecheck` must be clean
+and `npm test` green. No block in this README carries a `#` comment: stock macOS
+zsh does not treat one as a comment when you paste, and hands it to the command
+as arguments.
+
+The daemon needs `AOS_CONTROL_TOKEN` (at least 32 printable ASCII characters,
+no whitespace) and, to reach a
 model, `ANTHROPIC_API_KEY`. Both live in **your own `.env` in the repository
 root**: git-ignored, mode 0600, written only by you. `.env.example` is the
 committed template: placeholders only, never edited to hold a real value, and it
@@ -84,8 +90,7 @@ overwrites one that exists; the second sets 0600 anyway, because `cp` keeps an
 existing file's mode; in the editor, replace both `replace-me-...` values
 (`openssl rand -hex 32` makes a token); `npm run dev` then logs `credentials:
 .env (AOS_CONTROL_TOKEN, ANTHROPIC_API_KEY)`, and `npm run cli -- agents` works
-from a second shell with nothing exported. The block has no inline comments on
-purpose: stock macOS zsh does not treat `#` as one when you paste.
+from a second shell with nothing exported.
 
 Any plain-text editor will do in place of nano, but not TextEdit: its smart
 quotes turn `"` into `“`, which the loader refuses (a key is printable ASCII).
@@ -116,7 +121,9 @@ How it is read (`src/secrets/dotenv.ts`, decision D31):
   name, that it did.
 - Refused at startup, each with the fix in the message: a `.env` whose mode lets
   group or others read or write it (`chmod 600 .env`), a symlink, another owner, a second hard link, more
-  than 64 KB, a `.gitignore` that stops ignoring it (read with git's own rules,
+  than 64 KB, a `.env` stored on disk under another case (`.Env`: git judges a
+  name as stored, and `.env*` does not cover it with `core.ignorecase=false`), a
+  `.gitignore` that stops ignoring it (read with git's own rules,
   so `!*` or a leading space count), any name but the two above, a value still
   beginning `replace-me`, a character outside printable ASCII, two lines joined
   into one, a name set twice, a second `--dotenv`. It parses with its own strict
@@ -142,7 +149,10 @@ sentence (`Secret 'x' exists (masked): ****abcd`), by design, so it cannot suppl
 a key; the vault path stays in the code, dormant. Whatever the source (the
 shell, `.env`, the vault, or the D8 fallback to the env), the broker refuses a
 value that cannot be a key: whitespace (pmmcp's masked sentence), a character
-outside printable ASCII, or a joined `NAME=value` line.
+outside printable ASCII, or a joined `NAME=value` line. A pmmcp bearer, if
+`kernel.yaml` ever declares a `tokenEnv`, gets the same checks: one that fails
+is refused by name before anything is dialled, and one that passes is masked
+from the log before the first request.
 
 With no pmmcp and no Docker the kernel boots **degraded** and says exactly what
 is missing. That is the designed behaviour, not a failure — see below.
@@ -164,8 +174,12 @@ git ignores. The one exception is `~/.colima`, Colima's own home.
 `dataDir` is `./.aos`, relative to the repo root, and is created `0700` on first
 boot. `AOS_DATA_DIR` overrides it, relative to your shell's directory. Inside the
 repo, `config.ts` accepts a data dir or mount root only under `.aos/`, and only
-while `.gitignore` ignores `/.aos/`. Anywhere, it refuses `$HOME` itself or any
-folder that contains the repo or `$HOME`.
+while `.gitignore` ignores `/.aos/`, and `.aos` (and `.aos/workspaces`) must be
+real directories spelled exactly so on disk: a symlinked one, which git does
+not ignore and would commit, or one stored as `.AOS`, is refused by name.
+Anywhere, it refuses `$HOME` itself or any folder that contains the repo or
+`$HOME`. An empty `HOME` counts as unset: those checks then use your account's
+home directory, never the current directory.
 
 > **Warning.** `.aos/` holds the only copy of the event log. Running
 > `git clean -fdx`, re-cloning over the folder, or deleting the folder destroys
@@ -186,16 +200,16 @@ of Node, npm, Docker and Colima are yours to keep or remove.
 
 ## Commands
 
-```bash
-npm run typecheck        # tsc --noEmit
-npm test                 # node --import tsx --test test/*.test.ts
-npm run dev              # daemon on 127.0.0.1:7777
-npm run build            # emits dist/
-npm run cli -- <cmd>
-npm run capture:pmmcp    # operator-only: record pmmcp's live tool schemas
-npm run eval             # operator-only: score the orchestration suite (SPENDS MONEY)
-npm run falsify          # mutation catalog: does the suite catch the bugs it claims to? (slow, offline)
-```
+| Command | What it does |
+|---|---|
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm test` | `node --import tsx --test test/*.test.ts` |
+| `npm run dev` | the daemon on 127.0.0.1:7777, reading `./.env` through `--dotenv` |
+| `npm run build` | emits `dist/` |
+| `npm run cli -- <cmd>` | the console: `agents`, `verify-chain`, `search`, `probe`, `run`, `kill`, `approve`, `deny`, `approvals` |
+| `npm run capture:pmmcp` | operator-only: record pmmcp's live tool schemas |
+| `npm run eval` | operator-only: score the orchestration suite (**spends money**) |
+| `npm run falsify` | the mutation catalog: does the suite catch the bugs it claims to? (slow, offline) |
 
 `eval` needs a running daemon (`npm run dev`) and `AOS_CONTROL_TOKEN`. It runs
 the orchestration suite in `src/eval/suite.ts` as real runs against whatever
@@ -492,14 +506,19 @@ never `aos/ceo`; the plan test runs a `live-ceo` orchestrator whose memory is th
 namespace — and nothing is deleted afterwards, because the kernel has no delete
 and a test must not grow one. Inspect or clear that namespace yourself.
 
+`ANTHROPIC_API_KEY` comes from `.env`, or from a shell export that is not blank,
+which wins. Never type a key on the command line: zsh saves it to
+`~/.zsh_history`. Run one of these, not both.
+
+The model only, which is cheapest:
+
 ```bash
-# ANTHROPIC_API_KEY comes from .env (or a shell export, which wins). Never type
-# a key on the command line: zsh saves it to ~/.zsh_history.
-
-# model only (cheapest):
 AOS_LIVE_TESTS=1 npm test
+```
 
-# everything, including pmmcp writes to aos/agent/aos-live-test:
+Everything, including pmmcp writes to `aos/agent/aos-live-test`:
+
+```bash
 AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_WRITES=1 \
   PMMCP_URL=http://127.0.0.1:8766/mcp npm test
 ```
@@ -521,30 +540,49 @@ catch them. `npm run falsify` applies each, runs its suite's tests, and puts the
 file back.
 
 ```bash
-npm run falsify                    # every suite (sixteen: see --list)
-npm run falsify -- recovery        # one suite
-npm run falsify -- --only D13,W3   # named mutants
-npm run falsify -- --list          # the catalog, touching nothing
+npm run falsify
+npm run falsify -- recovery
+npm run falsify -- --only D13,W3
+npm run falsify -- --list
 ```
+
+In order: every suite (sixteen, see `--list`); one suite, or several
+space-separated; named mutants, across suites; the catalog, touching nothing.
+`--recover` restores what an interrupted run left and runs nothing else;
+`--timeout MS` bounds each test run (default 240000).
 
 It exits 0 only when every mutant is **killed**, every suite's comment-only
 **control** survives, and every suite's unmutated baseline is green. **Hung** is
 not a kill (a hang is a test with no bound), and a mutant that leaves the file
 unparseable or stops the test files loading is **invalid**, never a kill.
 
-It edits the working tree (src/ and two test helpers), so: it refuses a file
-with uncommitted changes (`--allow-dirty` to override), writes the original bytes
-and its own pid to `.falsify/` before every edit, restores on SIGINT, SIGTERM,
-SIGHUP (a closed terminal) and SIGQUIT, and kills a hung test's whole process
-group. A run killed outright (SIGKILL, a power cut) is restored by the next
-start, or by `npm run falsify -- --recover`; until then `npm run dev` refuses to
-start and `npm test` refuses to run, because a source file may still hold a
-planted bug. A second run on a tree with a live one refuses, and an option it
-does not know is refused rather than ignored. `test/falsify.test.ts` proves each
-of those against real processes, and
-checks on every `npm test` that every catalog anchor still matches exactly once
-— a refactor that moves one fails the suite instead of silently disabling its
-mutant.
+It edits the working tree (src/ and two test helpers), so:
+
+- it refuses a file with uncommitted changes (`--allow-dirty` to override);
+- it holds `.falsify/lock.json` for the whole run, naming its pid and that
+  process's start time, so a second run on the same tree refuses, and a pid
+  reused after a crash or reboot never passes for a live run;
+- before every edit it writes the original bytes, tagged with its run id, to
+  `.falsify/journal.json` (temp file, fsync, rename);
+- on SIGINT, SIGTERM, SIGHUP (a closed terminal) or SIGQUIT it restores the
+  file, kills the running test's whole process group, and releases the lock, and
+  it kills a hung test's group on timeout;
+- a run killed outright (SIGKILL, a power cut) is restored by the next start,
+  or by `npm run falsify -- --recover`. Until then `npm run dev` refuses to
+  start on any journal, and `npm test` refuses to run unless it is that run's
+  own test process (`AOS_FALSIFY_RUN`), because a source file may still hold a
+  planted bug;
+- an option it does not know, `--only` or `--timeout` with no value, and a
+  selection that names no mutant are refused, never read as "run everything" or
+  as a clean pass.
+
+`test/falsify.test.ts` drives the runner against real processes: a SIGKILL
+mid-mutant, each of the four restoring signals mid-mutant, a second run during
+the first one's baseline, a reused pid, an unreadable journal, and the program's
+usage errors. `test/entrypoints.test.ts` proves the daemon's refusal and
+`test/env.test.ts` the test guard's. On every `npm test` it also checks that
+every catalog anchor still matches exactly once — a refactor that moves one
+fails the suite instead of silently disabling its mutant.
 
 Run it after changing delegation, crash recovery, tool-call replay, the memory
 namespace pin, goal tracking, anchor trust, the eval checks, the chain /
@@ -556,7 +594,8 @@ containment (`sandbox`), the `.env` loader and the credential checks around it
 whenever a new test exists to catch a specific bug. No test may let a mutant
 reach your real `.env`: `test/entrypoints.test.ts` runs every entry point from a
 temporary copy of the checkout holding a trap `.env` (and `hygiene.test.ts`
-refuses a spawn from the real tree), in-process loader tests are told their
+refuses any entry-point spawn that does not name that copy as its cwd),
+in-process loader tests are told their
 repository is a trap directory, and the live helper opens `<repo>/.env` only
 from a live test's own process. `test/falsify.test.ts` also refuses a catalog
 that puts an entry-point or `.env`-path mutant beside the entry-point spawns, as
@@ -586,8 +625,10 @@ money.
 cost accounting against real Claude, with no pmmcp connected, so it can never
 stand in for line 2.
 
+`ANTHROPIC_API_KEY` comes from `.env`, or from a shell export that is not blank,
+which wins.
+
 ```bash
-# ANTHROPIC_API_KEY comes from .env (or a shell export, which wins)
 AOS_LIVE_TESTS=1 npm test
 ```
 
@@ -601,8 +642,9 @@ the key resolved from the environment (`secret.accessed { source: 'env' }`), a
 fresh probe, then a run with non-zero cost, in that log order. pmmcp is the
 memory and goal store here, not the key store: its `get_secret` masks by design.
 
+The key comes from the same place.
+
 ```bash
-# ANTHROPIC_API_KEY comes from .env (or a shell export, which wins)
 AOS_LIVE_TESTS=1 PMMCP_URL=http://127.0.0.1:8766/mcp npm test
 ```
 
@@ -614,11 +656,15 @@ AOS_LIVE_TESTS=1 PMMCP_URL=http://127.0.0.1:8766/mcp npm test
 **3. The literal criterion, by hand.** The sentence in CLAUDE.md names the
 daemon and the CLI, so it is exercised as written rather than only in-process.
 
-```bash
-# shell 1, with pmmcp up
-npm run dev
+In one shell, with pmmcp up:
 
-# shell 2
+```bash
+npm run dev
+```
+
+In a second shell:
+
+```bash
 npm run cli -- run ceo "reply with the word pong"
 npm run cli -- verify-chain
 ```

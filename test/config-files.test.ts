@@ -496,22 +496,19 @@ test('package.json passes --dotenv .env to dev, cli and eval and to nothing else
   assert.equal(read('.npmrc').includes('env-file'), false)
 })
 
-test('the .env setup commands paste cleanly into stock macOS zsh: no inline # comments', () => {
+test('every README shell block pastes cleanly into stock macOS zsh: no # comments', () => {
   // zsh does not set INTERACTIVE_COMMENTS, so a pasted `cmd  # note` passes
-  // "#" and "note" to cmd, and an apostrophe in the note opens a quote that
-  // swallows the lines after it. The commands an operator copies carry none.
+  // "#" and "note" to cmd (`npm run typecheck # must be clean` fails a clean
+  // repo; `npm run falsify -- --list # ...` is refused as unknown suites), and
+  // an apostrophe in the note opens a quote that swallows the lines after it.
+  // So no block an operator copies carries one, whole-line or trailing.
   const readme = read('README.md')
-  const setup = readme.slice(readme.indexOf('## Setup'))
-  const block = /```bash\n([\s\S]*?)```/g
-  let found = false
-  for (const m of setup.matchAll(block)) {
-    const body = m[1] ?? ''
-    if (!body.includes('.env.example')) continue
-    found = true
-    for (const line of body.split('\n')) assert.equal(line.includes('#'), false, `README setup line carries a comment: ${line}`)
-    break
+  const blocks = [...readme.matchAll(/^```(?:bash|sh|zsh|shell)\n([\s\S]*?)^```/gm)].map((m) => m[1] ?? '')
+  assert.ok(blocks.length >= 8, `only ${String(blocks.length)} shell blocks found in README; the matcher no longer sees them`)
+  assert.ok(blocks.some((b) => b.includes('.env.example')), 'README has no shell block that creates .env')
+  for (const body of blocks) {
+    for (const line of body.split('\n')) assert.equal(line.includes('#'), false, `README shell line carries a comment: ${line}`)
   }
-  assert.ok(found, 'README Setup has no bash block that creates .env')
   // The same commands, quoted inside .env.example's own comments.
   const commands = read('.env.example')
     .split('\n')

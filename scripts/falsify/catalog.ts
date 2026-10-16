@@ -429,7 +429,7 @@ const dotenv: Suite = {
     'test/config-files.test.ts',
   ],
   mutants: [
-    { id: 'X1', file: DOTENV, from: '    if ((st.mode & 0o077) !== 0) {', to: '    if (false) {', why: 'a .env other users can read or write is loaded' },
+    { id: 'X1', file: DOTENV, from: '    if ((st.mode & 0o077) !== 0) {', to: '    if (false) {', why: 'a .env whose mode lets group or others read or write it is loaded' },
     { id: 'X2', file: DOTENV, from: 'constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK', to: 'constants.O_RDONLY | constants.O_NONBLOCK', why: 'a symlinked .env is followed to wherever it points' },
     { id: 'X3', file: DOTENV, from: '    if (!st.isFile()) throw', to: '    if (false) throw', why: 'a directory, device or FIFO is read as a .env' },
     { id: 'X4', file: DOTENV, from: '    if (st.uid !== uid) throw', to: '    if (false) throw', why: 'a .env owned by another user is trusted' },

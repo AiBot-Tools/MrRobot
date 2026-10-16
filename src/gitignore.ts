@@ -16,8 +16,9 @@
 //   once as git reads it with core.ignorecase=false and once with true (the
 //   macOS default), and:
 //
-//     - an ignoring line counts only if it matches under BOTH, and only if it
-//       has no trailing CR (git strips one, older readers may not);
+//     - an ignoring line counts only if it matches under BOTH, and only if no
+//       CR is left once it is cut at its first NUL (git strips a trailing CR;
+//       older readers may not);
 //     - a negating line counts if it matches under EITHER, with or without
 //       its CR;
 //     - a pattern this does not model never ignores and always un-ignores:
@@ -27,7 +28,8 @@
 //       unterminated `[`, a trailing `\`, an escaped `/`.
 //
 //   Also "not ignored": a symlinked .gitignore (git 2.32+ does not read one),
-//   one of 100 MiB or more (git 2.50 ignores the whole file), and, for a
+//   one of 100 MiB or more (git 2.50 drops a file whose size plus the newline
+//   it appends exceeds 100 MiB, i.e. exactly these), and, for a
 //   directory entry, a <repo>/<entry> that exists but is not a directory —
 //   git judges a symlink as a file, so `/.aos/` does not cover it, and what is
 //   written through it lands wherever it points.
@@ -42,7 +44,7 @@
 import { lstatSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-/** git 2.50's PATTERN_MAX_FILE_SIZE; the file plus git's appended newline must stay under it. */
+/** git 2.50's PATTERN_MAX_FILE_SIZE: git reads a file only while its size + 1 (an appended newline) is at most this. */
 const GIT_PATTERN_FILE_LIMIT = 100 * 1024 * 1024
 
 type Token =
@@ -62,7 +64,7 @@ export function rootGitignoreIgnores(repoRoot: string, entry: string, kind: 'fil
   let text: string
   try {
     const st = lstatSync(path)
-    if (!st.isFile() || st.size >= GIT_PATTERN_FILE_LIMIT - 1) return false
+    if (!st.isFile() || st.size >= GIT_PATTERN_FILE_LIMIT) return false
     // latin1: one char per byte, as git's wildmatch sees it.
     text = readFileSync(path, 'latin1')
   } catch {

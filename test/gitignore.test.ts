@@ -253,15 +253,21 @@ test('a .gitignore of 100 MiB or more ignores nothing: git 2.50 skips the whole 
   const path = join(repo, '.gitignore')
   writeFileSync(path, '.env*\n/.aos/\n')
   assert.equal(rootGitignoreIgnores(repo, '.env', 'file'), true)
-  truncateSync(path, 100 * 1024 * 1024) // sparse: costs no disk
+  // One byte under: git appends its newline, the total is exactly the limit,
+  // and `size > PATTERN_MAX_FILE_SIZE` lets it through (dir.c, v2.50.1).
+  truncateSync(path, 100 * 1024 * 1024 - 1) // sparse: costs no disk
+  assert.equal(rootGitignoreIgnores(repo, '.env', 'file'), true)
+  truncateSync(path, 100 * 1024 * 1024)
   assert.equal(rootGitignoreIgnores(repo, '.env', 'file'), false)
   assert.equal(gitignoresAos(repo), false)
 })
 
-test('git tracks no credentials file: .env.example is the only .env* in the index', () => {
+test('git tracks no credentials file: .env.example is the only .env* in the index, in any case', () => {
   // .gitignore does not apply to a tracked file, so a force-added .env passes
   // every ignore check and rides the next commit into this PUBLIC repository.
-  const tracked = spawnSync('git', ['ls-files', '-z', '--', '.env*', '**/.env*'], { cwd: REPO_ROOT, encoding: 'utf8' })
+  // Matched without case: on APFS a .Env is the same file to the loader.
+  const tracked = spawnSync('git', ['ls-files', '-z'], { cwd: REPO_ROOT, encoding: 'utf8', maxBuffer: 1 << 24 })
   assert.equal(tracked.status, 0, tracked.stderr)
-  assert.deepEqual(tracked.stdout.split('\0').filter((p) => p !== ''), ['.env.example'])
+  const envish = tracked.stdout.split('\0').filter((p) => /(^|\/)\.env/i.test(p))
+  assert.deepEqual(envish, ['.env.example'])
 })

@@ -282,7 +282,7 @@ test('the operator scripts are programs: each refuses with usage rather than doi
   // touches the operator's pmmcp or any daemon.
   const env = { PATH: process.env['PATH'] ?? '/usr/bin:/bin' }
 
-  const evalRun = spawnSync('npx', ['tsx', 'scripts/eval.ts'], {
+  const evalRun = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/eval.ts'], {
     cwd: ROOT,
     env,
     encoding: 'utf8',
@@ -297,7 +297,7 @@ test('the operator scripts are programs: each refuses with usage rather than doi
     const configPath = join(dir, `${name}.yaml`)
     const out = join(dir, `${name}.json`)
     writeFileSync(configPath, yaml)
-    const run = spawnSync('npx', ['tsx', 'scripts/capture-pmmcp.ts', out, '--config', configPath], {
+    const run = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/capture-pmmcp.ts', out, '--config', configPath], {
       cwd: ROOT,
       env,
       encoding: 'utf8',
@@ -473,7 +473,7 @@ test('the daemon refuses a group-readable or non-regular --dotenv before it boot
 test('eval.ts takes AOS_CONTROL_TOKEN from --dotenv in either form, refuses a second, and without it still names what is missing', (t) => {
   const creds = credsFile(tmpdir(t), `AOS_CONTROL_TOKEN=${FILE_TOKEN}\nANTHROPIC_API_KEY=${FILE_KEY}\n`)
   // An unknown case stops eval right after the token check, before any socket.
-  const run = spawnSync('npx', ['tsx', 'scripts/eval.ts', '--dotenv', creds, '--case', 'nope'], {
+  const run = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/eval.ts', '--dotenv', creds, '--case', 'nope'], {
     cwd: ROOT,
     env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
     encoding: 'utf8',
@@ -484,7 +484,7 @@ test('eval.ts takes AOS_CONTROL_TOKEN from --dotenv in either form, refuses a se
   assert.equal(`${run.stdout}${run.stderr}`.includes(FILE_TOKEN), false)
 
   // The --dotenv=path form is read, as the daemon reads it.
-  const eqForm = spawnSync('npx', ['tsx', 'scripts/eval.ts', `--dotenv=${creds}`, '--case', 'nope'], {
+  const eqForm = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/eval.ts', `--dotenv=${creds}`, '--case', 'nope'], {
     cwd: ROOT,
     env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
     encoding: 'utf8',
@@ -495,7 +495,7 @@ test('eval.ts takes AOS_CONTROL_TOKEN from --dotenv in either form, refuses a se
 
   // `npm run eval -- --dotenv other` puts a second flag after package.json's:
   // refused, as by the daemon and the CLI, rather than one silently ignored.
-  const twice = spawnSync('npx', ['tsx', 'scripts/eval.ts', '--dotenv', creds, '--dotenv', creds, '--case', 'nope'], {
+  const twice = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/eval.ts', '--dotenv', creds, '--dotenv', creds, '--case', 'nope'], {
     cwd: ROOT,
     env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
     encoding: 'utf8',

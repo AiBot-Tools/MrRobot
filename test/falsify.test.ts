@@ -429,7 +429,7 @@ test('no mutant that could steer an entry point at a credentials file runs besid
 
 test('npm run falsify is a program: bad input and unknown options are refused with usage; --list, --help and --recover run nothing', () => {
   const run = (args: string[]) =>
-    spawnSync('npx', ['tsx', 'scripts/falsify.ts', ...args], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 60_000 })
+    spawnSync(process.execPath, ['--import', 'tsx', 'scripts/falsify.ts', ...args], { cwd: REPO_ROOT, encoding: 'utf8', timeout: 60_000 })
 
   const bogus = run(['no-such-suite'])
   assert.equal(bogus.status, 2, bogus.stderr)

@@ -21,7 +21,9 @@ import { fileURLToPath } from 'node:url'
 const REPO = fileURLToPath(new URL('../..', import.meta.url)).replace(/\/$/, '')
 
 const COPIED_DIRS = ['src', 'scripts', 'config', 'agents', 'souls'] as const
-const COPIED_FILES = ['package.json', 'tsconfig.json', '.gitignore'] as const
+// .npmrc too, so anything that does reach npm keeps its cache in the copy's
+// .aos/, deleted with it, never in ~/.npm (the operator's footprint rule).
+const COPIED_FILES = ['package.json', 'tsconfig.json', '.gitignore', '.npmrc'] as const
 
 /** What the trap holds: refused for its mode before its content is ever parsed. */
 export const TRAP_DOTENV = 'NODE_OPTIONS=--require=/nonexistent/aos-dotenv-trap.js\n'

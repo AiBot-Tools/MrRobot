@@ -504,6 +504,18 @@ test('no test spawns an entry point from the real checkout, where the operator k
   }
 })
 
+test('no test runs npm or npx: npm writes its logs and cache under ~/.npm and calls the registry', () => {
+  // The operator's footprint rule keeps everything in the program folder, and
+  // npm honours this repo's .npmrc only when run from the repo root. Tests run
+  // programs as `node --import tsx <file>`, which needs neither.
+  for (const file of TEST) {
+    for (const line of codeLines(file)) {
+      assert.equal(/\bspawn(?:Sync)?\(\s*['"](?:npm|npx)['"]/.test(line.text), false, `${file.path}:${String(line.n)} spawns npm`)
+      assert.equal(/\bexec(?:File)?(?:Sync)?\(\s*['"](?:npm|npx)\b/.test(line.text), false, `${file.path}:${String(line.n)} runs npm`)
+    }
+  }
+})
+
 /** The top-level arguments of the first `name(` call on a line, or undefined. */
 function callArgs(text: string, name: string): string[] | undefined {
   const start = text.indexOf(`${name}(`)

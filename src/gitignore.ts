@@ -25,7 +25,10 @@
 //       an anchored pattern holding a bracket (git lets `/` sit inside one)
 //       or a `**` that is not a whole leading segment (git's literal-prefix
 //       rule lets `.e**/nv` match `.env`), a POSIX class like [[:alpha:]], an
-//       unterminated `[`, a trailing `\`, an escaped `/`.
+//       unterminated `[`, a trailing `\`, an escaped `/`, and a line longer
+//       than 4 KiB once cut at its NUL (matching costs memory in proportion
+//       to the line: one 100 MiB line exhausts Node's default heap, so the
+//       kernel would die at boot instead of refusing).
 //
 //   Also "not ignored": a symlinked .gitignore (git 2.32+ does not read one),
 //   one of 100 MiB or more (git 2.50 drops a file whose size plus the newline
@@ -46,6 +49,9 @@ import { join } from 'node:path'
 
 /** git 2.50's PATTERN_MAX_FILE_SIZE: git reads a file only while its size + 1 (an appended newline) is at most this. */
 const GIT_PATTERN_FILE_LIMIT = 100 * 1024 * 1024
+
+/** The longest pattern modelled. git has no such limit; no one writes such a line, and longer ones are not modelled (see the contract). */
+const MAX_MODELLED_LINE = 4096
 
 type Token =
   | { readonly kind: 'lit'; readonly ch: string }
@@ -107,6 +113,7 @@ function cutAtNul(line: string): string {
  * pattern uses something this does not model.
  */
 function matches(line: string, entry: string, kind: 'file' | 'dir', fold: boolean): boolean | undefined {
+  if (line.length > MAX_MODELLED_LINE) return undefined
   let pattern = trimTrailingSpaces(line)
   if (pattern === undefined) return undefined
   if (pattern === '') return false

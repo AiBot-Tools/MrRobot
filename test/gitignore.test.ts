@@ -55,6 +55,7 @@ const DOTENV_CASES: readonly (readonly [string, boolean, string])[] = [
   ['/.env*\n', true, 'anchored glob'],
   ['*\n', true, 'everything'],
   ['/**\n', true, 'everything, anchored'],
+  [`.env${'*'.repeat(4092)}\n`, true, 'a line of exactly 4 KiB is still modelled'],
   ['**/.env\n', true, 'leading **/ matches zero directories'],
   ['***/.env\n', true, 'so does a leading run of three stars'],
   ['*.env\n', true, '* matches the empty string and the leading dot'],
@@ -104,6 +105,8 @@ const FAIL_CLOSED: readonly (readonly [string, string])[] = [
   ['.env\n!.env\r\n', 'a negation with a CR still un-ignores'],
   ['.env\n!.e[[:alpha:]]v\n', 'an unmodelled negation still un-ignores'],
   ['.e[!A-Z]v\n', 'an ignoring line git applies only WITHOUT core.ignorecase (folded, [!A-Z] refuses e)'],
+  [`.env${'*'.repeat(4093)}\n`, 'an ignoring line longer than 4 KiB is not modelled'],
+  [`.env\n!x${'y'.repeat(4096)}\n`, 'a negation longer than 4 KiB still un-ignores'],
 ]
 
 test('the matcher agrees with git check-ignore on what ignores <repo>/.env', (t) => {

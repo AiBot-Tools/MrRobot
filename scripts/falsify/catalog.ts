@@ -523,6 +523,7 @@ const gitignore: Suite = {
     { id: 'I12', file: GITIGNORE, from: '    if (!st.isFile() || st.size >= GIT_PATTERN_FILE_LIMIT) return false', to: '    if (!st.isFile()) return false', why: 'a .gitignore git 2.50 skips as too large is credited' },
     { id: 'I13', file: GITIGNORE, from: '      if (up >= lo && up <= hi) matched = true', to: '      if (false) matched = true', why: 'git\'s folded range test is modelled wrongly, so `[!A-Z]` is credited where macOS git refuses it' },
     { id: 'I14', file: GITIGNORE, from: '    if (!st.isFile() || st.size >= GIT_PATTERN_FILE_LIMIT) return false', to: '    if (!st.isFile() || st.size >= GIT_PATTERN_FILE_LIMIT - 1) return false', why: 'a .gitignore one byte under 100 MiB, which git 2.50 reads, is judged to ignore nothing: the model drifts from git' },
+    { id: 'I15', file: GITIGNORE, from: '  if (line.length > MAX_MODELLED_LINE) return undefined\n', to: '', why: 'a pattern line of any length is matched as written: a huge one exhausts the heap at boot, and a long ignoring line is credited unmodelled' },
   ],
   control: {
     id: 'C',

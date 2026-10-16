@@ -189,6 +189,8 @@ const anchor: Suite = {
     { id: 'A4', file: STORE, from: '      if (consultedDisk) this.#trusted = true', to: '      this.#trusted = true', why: 'a pass without the on-disk anchor earns trust' },
     { id: 'A5', file: STORE, from: '    if (!this.#readOnly && this.#headFile !== undefined && this.#trusted) {', to: '    if (!this.#readOnly && this.#headFile !== undefined) {', why: 'an untrusted store anchors its tail on close' },
     { id: 'A6', file: STORE, from: '    if (this.#anchorEvery > 0 && row.seq % this.#anchorEvery === 0 && this.#trusted) {', to: '    if (this.#anchorEvery > 0 && row.seq % this.#anchorEvery === 0) {', why: 'an untrusted store moves the anchor while appending' },
+    { id: 'A7', file: 'src/kernel.ts', from: '  keepPrivate(config.dataDir, 0o700)\n', to: '', why: 'the event log sits in a .aos npm created at 0755, readable by every local account' },
+    { id: 'A8', file: 'src/kernel.ts', from: '  for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) keepPrivate(file, 0o600)\n', to: '', why: 'events.db and its WAL stay at the umask\'s 0644' },
   ],
   control: {
     id: 'C',

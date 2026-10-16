@@ -28,7 +28,7 @@
 // plane, and says precisely what is missing — because the alternative is an
 // operator who cannot ask the kernel why it will not start.
 
-import { mkdirSync } from 'node:fs'
+import { chmodSync, mkdirSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 
@@ -227,6 +227,10 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
   // rewrite the anchor can hide a truncation. Created after the token check, so
   // a boot that cannot legally serve still creates nothing.
   mkdirSync(config.dataDir, { recursive: true, mode: 0o700 })
+  // mkdir changes nothing on a directory that exists, and on the shipped flow
+  // one always does: npm creates .aos first, at the umask's 0755, for the cache
+  // .npmrc keeps in .aos/npm-cache. So the mode is enforced as it stands.
+  keepPrivate(config.dataDir, 0o700)
 
   const dbPath = join(config.dataDir, 'events.db')
   // The constructor compares every expected trigger's stored DDL against the
@@ -236,6 +240,9 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     anchorEvery: config.events.anchorEvery,
     headFile: join(config.dataDir, 'events.head'),
   })
+  // SQLite creates the database at the umask's 0644, and its -wal and -shm
+  // with the database's mode, so once the database is 0600 they follow.
+  for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) keepPrivate(file, 0o600)
 
   const subsystems: Partial<Record<SubsystemName, Subsystems[SubsystemName]>> = {}
   const degraded: string[] = []
@@ -824,6 +831,30 @@ function defaultDriver(config: KernelConfig, repoRoot: string): SandboxDriver {
     dockerConfig: join(config.dataDir, 'docker'),
     repoRoot,
   })
+}
+
+/**
+ * Make `path` unreadable to other accounts if it is not already: absent is
+ * fine (nothing to protect yet), anything else that cannot be tightened is a
+ * refusal, since the log would otherwise sit readable by every local account.
+ */
+function keepPrivate(path: string, mode: number): void {
+  let current: number
+  try {
+    current = statSync(path).mode & 0o777
+  } catch {
+    return
+  }
+  if ((current & 0o077) === 0) return
+  try {
+    chmodSync(path, mode)
+  } catch (e) {
+    throw new ConfigError(
+      `${path} has mode 0${current.toString(8)}, so other accounts can read it, and it could not be made 0${mode.toString(8)}: ` +
+        `${e instanceof Error ? e.message : String(e)}`,
+    )
+  }
+  log.info({ path, from: `0${current.toString(8)}`, to: `0${mode.toString(8)}` }, 'tightened a data path other accounts could read')
 }
 
 async function connectHub(

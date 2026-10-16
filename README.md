@@ -173,8 +173,9 @@ git ignores. The one exception is `~/.colima`, Colima's own home.
 | `.aos/npm-cache` | npm's cache (`.npmrc`); run npm from the repo root, because npm resolves a relative path against the shell's directory |
 | `~/.colima` | Colima's VMs and sockets; `colima-up.sh` also sets `COLIMA_CACHE_HOME=~/.colima/_cache`, which would otherwise be `~/Library/Caches/colima` |
 
-`dataDir` is `./.aos`, relative to the repo root, and is created `0700` on first
-boot. `AOS_DATA_DIR` overrides it, relative to your shell's directory. Inside the
+`dataDir` is `./.aos`, relative to the repo root, and is kept `0700`: created
+so on first boot, or tightened at boot when npm made `.aos` first for its cache
+(at your umask's 0755); `events.db` and its `-wal`/`-shm` are made `0600`. `AOS_DATA_DIR` overrides it, relative to your shell's directory. Inside the
 repo, `config.ts` accepts a data dir or mount root only under `.aos/`, and only
 while `.gitignore` ignores `/.aos/`, and `.aos` (and `.aos/workspaces`) must be
 real directories spelled exactly so on disk: a symlinked one, which git does

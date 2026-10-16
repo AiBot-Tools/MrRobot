@@ -23,7 +23,7 @@ import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { parse as parseYaml } from 'yaml'
 import { WebSocket } from 'ws'
 import { createServer, type IncomingHttpHeaders } from 'node:http'
@@ -292,6 +292,49 @@ test('boot creates dataDir 0700 when it does not exist', async (t) => {
   // responses and tool output, and the anchor beside it is trust-bearing —
   // anything that can rewrite it can hide a truncation.
   assert.equal(statSync(fx.dataDir).mode & 0o777, 0o700, 'dataDir is not 0700')
+  verifyAt(fx.dbPath)
+})
+
+test('boot makes an existing dataDir 0700 and the log 0600: npm leaves .aos at the umask\'s 0755', async (t) => {
+  // .npmrc puts npm's cache in .aos/npm-cache, so `npm install` and even a bare
+  // `npm run dev` create .aos before the kernel runs, and mkdir changes nothing
+  // on a directory that exists. The log must still end up private.
+  const fx = fixture(t)
+  rmSync(fx.dataDir, { recursive: true, force: true })
+  mkdirSync(join(fx.dataDir, 'npm-cache', '_logs'), { recursive: true, mode: 0o755 })
+  chmodSync(fx.dataDir, 0o755)
+  const boot = (): Promise<Awaited<ReturnType<typeof bootKernel>>> =>
+    bootKernel({
+      config: fx.config,
+      repoRoot: REPO_ROOT,
+      providers: fx.providers,
+      toolViews: fx.toolViews,
+      env: { AOS_CONTROL_TOKEN: TEST_TOKEN },
+      sandboxDriver: fakeSandbox(),
+    })
+  // Modes are read while the kernel runs (the -wal and -shm exist only then)
+  // and asserted after it is down, so a failure cannot leave it holding the
+  // process open.
+  const modes = (): Record<string, number> =>
+    Object.fromEntries(
+      [fx.dataDir, fx.dbPath, `${fx.dbPath}-wal`, `${fx.dbPath}-shm`]
+        .filter((p) => existsSync(p))
+        .map((p) => [p, statSync(p).mode & 0o777]),
+    )
+  const expected = (seen: Record<string, number>): Record<string, number> =>
+    Object.fromEntries(Object.keys(seen).map((p) => [p, p === fx.dataDir ? 0o700 : 0o600]))
+  const kernel = await boot()
+  const first = modes()
+  await kernel.shutdown()
+  assert.ok(fx.dbPath in first)
+  assert.deepEqual(first, expected(first), 'the data dir or the log is readable by other accounts')
+  // A log that predates this, at 0644 in a 0755 dir, is tightened on the next boot too.
+  chmodSync(fx.dbPath, 0o644)
+  chmodSync(fx.dataDir, 0o755)
+  const again = await boot()
+  const second = modes()
+  await again.shutdown()
+  assert.deepEqual(second, expected(second))
   verifyAt(fx.dbPath)
 })
 

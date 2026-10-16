@@ -10,7 +10,7 @@ import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -221,7 +221,10 @@ test('$HOME and the repository are recognised under any spelling; .aos is admitt
   // On the operator's APFS volume /users/op and /Users/op are one directory.
   // Real directories stand in for $HOME and the repo; an identity function
   // makes the "-ALIAS" spellings resolve to them, as the filesystem would.
-  const base = tmpdir(t)
+  // Resolved first: on macOS os.tmpdir() is under /var, a link to /private/var,
+  // and assertDataLocation compares resolved paths, so the aliases must be
+  // keyed by what it will actually see.
+  const base = realpathSync(tmpdir(t))
   const home = join(base, 'people', 'op')
   const repo = join(base, 'people', 'op', 'MrRobot')
   mkdirSync(join(repo, '.aos'), { recursive: true })

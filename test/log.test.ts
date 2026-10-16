@@ -45,16 +45,20 @@ function logOne(payload: Record<string, unknown>): Record<string, unknown> {
 const FAKE = 'sk-ant-api03-NOT-A-REAL-KEY'
 
 test('redacts authorization, x-api-key, apiKey, token, secret, password and env.* paths', () => {
+  // An opaque value the value pass cannot recognise and no one registered, so
+  // only the path list can be what censors it: each assertion here holds the
+  // path layer on its own, beneath the value scrubber.
+  const OPAQUE = 'opaque-credential-value-0123'
   const out = logOne({
-    authorization: `Bearer ${FAKE}`,
-    headers: { authorization: `Bearer ${FAKE}`, 'x-api-key': FAKE },
-    req: { headers: { authorization: `Bearer ${FAKE}`, cookie: 'session=abc', 'x-api-key': FAKE } },
-    apiKey: FAKE,
-    api_key: FAKE,
-    token: FAKE,
-    secret: FAKE,
+    authorization: OPAQUE,
+    headers: { authorization: OPAQUE, 'x-api-key': OPAQUE },
+    req: { headers: { authorization: OPAQUE, cookie: 'session=abc', 'x-api-key': OPAQUE } },
+    apiKey: OPAQUE,
+    api_key: OPAQUE,
+    token: OPAQUE,
+    secret: OPAQUE,
     password: 'hunter2',
-    env: { ANTHROPIC_API_KEY: FAKE, PATH: '/usr/bin' },
+    env: { ANTHROPIC_API_KEY: OPAQUE, PATH: '/usr/bin' },
   })
 
   const headers = out['headers'] as Record<string, unknown>
@@ -89,7 +93,7 @@ test('top-level x-api-key is redacted via bracket path', () => {
   // Hyphenated keys need bracket notation. A bare `x-api-key` path happens to
   // work at top level on this pino build but is undocumented, so the config
   // uses the bracket form and this test pins that behaviour.
-  const out = logOne({ 'x-api-key': FAKE })
+  const out = logOne({ 'x-api-key': 'opaque-header-value-0123' })
   assert.equal(out['x-api-key'], CENSOR)
   assert.ok(REDACT_PATHS.includes('["x-api-key"]'))
 })
@@ -155,7 +159,8 @@ test('level from AOS_LOG_LEVEL defaults to info', () => {
 test('child logger inherits redaction', () => {
   const { lines, stream } = capture()
   const child = createLogger({ level: 'info', destination: stream }).child({ runId: 'run-1' })
-  child.info({ authorization: `Bearer ${FAKE}`, headers: { 'x-api-key': FAKE } }, 'probe')
+  // Opaque values, so the child's PATH redaction is what is shown, not the value pass.
+  child.info({ authorization: 'opaque-credential-value-0123', headers: { 'x-api-key': 'opaque-header-value-0123' } }, 'probe')
   const out = JSON.parse(lines[0] as string) as Record<string, unknown>
   assert.equal(out['runId'], 'run-1')
   assert.equal(out['authorization'], CENSOR)

@@ -27,6 +27,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
+import ts from 'typescript'
+
+import { ENTRY_POINTS } from './helpers/checkout.js'
 
 const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
 
@@ -276,13 +279,16 @@ test('node:child_process is imported only by src/sandbox/docker.ts and four test
   // SIGKILLed mid-mutant is recovered from its journal, and the script refuses
   // bad input as a program. gitignore.test.ts holds src/gitignore.ts to git's
   // own `check-ignore`, the only authority on what a .gitignore means, and asks
-  // git's index whether a .env was force-added.
+  // git's index whether a .env was force-added. helpers/checkout.ts holds
+  // runEntry/spawnEntry, the one way a test runs an entry point, so that the
+  // cwd of every such run is the shadow copy's, set in one place.
   assert.deepEqual(importersOf([...SRC, ...TEST], 'node:child_process'), [
     'src/sandbox/docker.ts',
     'test/entrypoints.test.ts',
     'test/env.test.ts',
     'test/falsify.test.ts',
     'test/gitignore.test.ts',
+    'test/helpers/checkout.ts',
   ])
   // The composer asks for a driver and does not wire processes itself.
   assert.equal(importersOf(SRC, 'node:child_process').includes('src/kernel.ts'), false)
@@ -487,60 +493,129 @@ test('nothing in src/ or scripts/ writes process.env or uses Node\'s .env loader
   }
 })
 
-/** The full text of every `name(...)` call in `text`, parentheses balanced, strings skipped. */
-function callTexts(text: string, name: RegExp): string[] {
-  const out: string[] = []
-  for (const m of text.matchAll(new RegExp(`(?:${name.source})\\(`, 'g'))) {
-    let depth = 0
-    let quote: string | undefined
-    for (let i = (m.index ?? 0) + m[0].length - 1; i < text.length; i += 1) {
-      const ch = text[i] ?? ''
-      if (quote !== undefined) {
-        if (ch === '\\') i += 1
-        else if (ch === quote) quote = undefined
-        continue
-      }
-      if (ch === "'" || ch === '"' || ch === '`') quote = ch
-      else if ('([{'.includes(ch)) depth += 1
-      else if (')]}'.includes(ch)) {
-        depth -= 1
-        if (depth === 0) {
-          out.push(text.slice(m.index ?? 0, i + 1))
-          break
-        }
-      }
+/** A test file as the compiler reads it: comments are trivia, strings are nodes. */
+function parsed(file: SourceFile): ts.SourceFile {
+  return ts.createSourceFile(file.path, file.text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+}
+
+/** Every string a file spells out in code, and its line: literals and template text, never comments or import specifiers. */
+function codeStrings(source: ts.SourceFile): { value: string; node: ts.Node; line: number }[] {
+  const out: { value: string; node: ts.Node; line: number }[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) return
+    if (
+      ts.isStringLiteral(node) ||
+      ts.isNoSubstitutionTemplateLiteral(node) ||
+      ts.isTemplateHead(node) ||
+      ts.isTemplateMiddle(node) ||
+      ts.isTemplateTail(node)
+    ) {
+      out.push({ value: node.text, node, line: source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1 })
     }
+    ts.forEachChild(node, visit)
   }
+  visit(source)
   return out
 }
 
-test('no test spawns an entry point from the real checkout, where the operator keeps .env', () => {
+/** Every call in a file. */
+function calls(source: ts.SourceFile): ts.CallExpression[] {
+  const out: ts.CallExpression[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) out.push(node)
+    ts.forEachChild(node, visit)
+  }
+  visit(source)
+  return out
+}
+
+/** The name a call is made through: `spawnSync(...)` and `cp.spawnSync(...)` both give spawnSync. */
+function calleeName(call: ts.CallExpression): string | undefined {
+  const e = call.expression
+  if (ts.isIdentifier(e)) return e.text
+  if (ts.isPropertyAccessExpression(e)) return e.name.text
+  return undefined
+}
+
+/** Names that are node:child_process exports in this file, under any alias it imports them as. */
+function childProcessNames(source: ts.SourceFile): Set<string> {
+  const names = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork'])
+  for (const st of source.statements) {
+    if (!ts.isImportDeclaration(st) || !ts.isStringLiteral(st.moduleSpecifier)) continue
+    if (!/^(node:)?child_process$/.test(st.moduleSpecifier.text)) continue
+    const bindings = st.importClause?.namedBindings
+    if (bindings !== undefined && ts.isNamedImports(bindings)) for (const el of bindings.elements) names.add(el.name.text)
+  }
+  return names
+}
+
+const within = (node: ts.Node, outer: ts.Node): boolean => node.getStart() >= outer.getStart() && node.getEnd() <= outer.getEnd()
+
+test('no test runs an entry point except through runEntry/spawnEntry, which run it from the shadow checkout', () => {
   // src/main.ts and the CLI take their repository from the cwd, eval from its
-  // own file. Spawned from this checkout, one regression that defaults to
-  // <repo>/.env reads the operator's keys; spawned from shadowCheckout(), it
-  // hits a trap. So EVERY spawn that runs one must say `cwd: ROOT` itself — a
-  // missing cwd inherits the real checkout and is a violation too.
-  const ENTRY = /['"](?:src\/main\.ts|src\/cli\/index\.ts|scripts\/eval\.ts|scripts\/capture-pmmcp\.ts)['"]/
-  let checked = 0
+  // own file. Run from this checkout, one regression that defaults to
+  // <repo>/.env reads the operator's keys; run from shadowCheckout(), it hits
+  // a trap. The helpers set the cwd themselves and refuse one passed in, so
+  // what is left to hold is that no test names an entry point anywhere else.
+  // Read from the syntax tree: a comment, an apostrophe in one, or another
+  // spelling of the path cannot hide a run.
+  // A path to one: the whole string (`join('src', 'main.ts')`'s last part, a
+  // template, './src/main.ts'), or one with a directory inside a longer
+  // string (`execSync('node --import tsx src/main.ts')`). A bare file name in
+  // prose, like an assertion message, is not a path.
+  const ENTRY_NAME =
+    /^(?:\.{0,2}\/)?(?:[\w.-]+\/)*(?:main|index|eval|capture-pmmcp)\.ts$|(?:^|[\s'"=])(?:\.{0,2}\/)?(?:[\w.-]+\/)+(?:main|index|eval|capture-pmmcp)\.ts(?![\w.])/
+  const HELPER = new Set(['runEntry', 'spawnEntry'])
+  let viaHelper = 0
+  const seen = new Set<string>()
   for (const file of TEST) {
-    for (const call of callTexts(file.text, /\bspawn(?:Sync)?|\bexecFile(?:Sync)?|\bfork/)) {
-      if (!ENTRY.test(call)) continue
-      checked += 1
-      assert.match(file.text, /shadowCheckout\(\)/, `${file.path} spawns an entry point without a shadow checkout`)
-      assert.match(call, /\bcwd:\s*(?:ROOT|CHECKOUT\.root)\b/, `${file.path}: a spawn of an entry point without cwd: ROOT\n${call.slice(0, 160)}`)
+    if (file.path === 'test/helpers/checkout.ts') continue
+    const source = parsed(file)
+    const helperCalls = calls(source).filter((c) => HELPER.has(calleeName(c) ?? ''))
+    for (const s of codeStrings(source)) {
+      if (!ENTRY_NAME.test(s.value)) continue
+      const ok = helperCalls.some((c) => c.arguments[1] === s.node)
+      assert.ok(ok, `${file.path}:${String(s.line)} names an entry point (${s.value}) outside runEntry/spawnEntry`)
+      viaHelper += 1
+      seen.add(s.value)
+    }
+    // entrypoints.test.ts runs node only to run entry points, so no node run
+    // there may go around the helpers, whatever its argv holds or is built from.
+    if (file.path === 'test/entrypoints.test.ts') {
+      const spawners = childProcessNames(source)
+      for (const c of calls(source)) {
+        const first = c.arguments[0]
+        if (!spawners.has(calleeName(c) ?? '') || first === undefined) continue
+        assert.notEqual(first.getText(source), 'process.execPath', `${file.path}: a node run that goes around runEntry/spawnEntry`)
+      }
     }
   }
-  assert.ok(checked >= 8, `only ${String(checked)} entry-point spawns were found; the matcher no longer sees them`)
+  assert.ok(viaHelper >= 12, `only ${String(viaHelper)} entry-point runs were found; the rule no longer sees them`)
+  assert.deepEqual([...seen].sort(), [...ENTRY_POINTS].sort(), 'an entry point is no longer run as a program by any test')
 })
 
 test('no test runs npm or npx: npm writes its logs and cache under ~/.npm and calls the registry', () => {
   // The operator's footprint rule keeps everything in the program folder, and
   // npm honours this repo's .npmrc only when run from the repo root. Tests run
-  // programs as `node --import tsx <file>`, which needs neither.
+  // programs as `node --import tsx <file>`, which needs neither. Read from the
+  // syntax tree: a call split over lines, `/usr/bin/env npx`, or
+  // `const NPX = 'npx'` is caught as surely as a one-line spawnSync('npx').
   for (const file of TEST) {
-    for (const line of codeLines(file)) {
-      assert.equal(/\bspawn(?:Sync)?\(\s*['"](?:npm|npx)['"]/.test(line.text), false, `${file.path}:${String(line.n)} spawns npm`)
-      assert.equal(/\bexec(?:File)?(?:Sync)?\(\s*['"](?:npm|npx)\b/.test(line.text), false, `${file.path}:${String(line.n)} runs npm`)
+    const source = parsed(file)
+    const spawners = childProcessNames(source)
+    const strings = codeStrings(source)
+    // A constant naming npm is how a spawn hides it (`spawnSync(NPX, ...)`).
+    // A container's command, like a sandbox spec's ['npm', 'test'], runs in
+    // the container, not here, and is not flagged.
+    for (const s of strings) {
+      const named = ts.isVariableDeclaration(s.node.parent) && s.node.parent.initializer === s.node
+      assert.equal(named && /^np[mx]$/.test(s.value), false, `${file.path}:${String(s.line)} names npm as a program`)
+    }
+    for (const c of calls(source)) {
+      if (!spawners.has(calleeName(c) ?? '')) continue
+      for (const s of strings) {
+        if (within(s.node, c)) assert.equal(/(?:^|[\s/])np[mx](?:\s|$)/.test(s.value), false, `${file.path}:${String(s.line)} runs npm`)
+      }
     }
   }
 })

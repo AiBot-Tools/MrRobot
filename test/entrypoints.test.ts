@@ -33,7 +33,7 @@ import { fileURLToPath } from 'node:url'
 import { closeVerified, withStore } from './helpers/store.js'
 import { EventStore } from '../src/events/store.js'
 import { tmpdir } from './helpers/tmpdir.js'
-import { shadowCheckout } from './helpers/checkout.js'
+import { runEntry, shadowCheckout, spawnEntry } from './helpers/checkout.js'
 import { CEO_SUITE } from '../src/eval/suite.js'
 
 // Every program here runs from a copy of the checkout holding a trap .env,
@@ -62,9 +62,7 @@ function cli(args: readonly string[], env: Record<string, string>): {
   stdout: string
   stderr: string
 } {
-  const result = spawnSync(process.execPath, ['--import', 'tsx', 'src/cli/index.ts', ...args], {
-    cwd: ROOT,
-    encoding: 'utf8',
+  const result = runEntry(CHECKOUT, 'src/cli/index.ts', [...args], {
     timeout: 60_000,
     // A clean environment plus exactly what the command needs: inheriting the
     // test runner's env would let a stray AOS_DATA_DIR or token decide the result.
@@ -72,6 +70,14 @@ function cli(args: readonly string[], env: Record<string, string>): {
   })
   return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }
 }
+
+test('runEntry and spawnEntry run from the shadow copy only: a cwd passed in is refused, not honoured', () => {
+  // The cwd is the one thing that decides which .env an entry point can find;
+  // the helpers own it so that no call site can move it.
+  const anywhere = { cwd: '/' } as unknown as Parameters<typeof runEntry>[3]
+  assert.throws(() => runEntry(CHECKOUT, 'src/main.ts', [], anywhere), /shadow checkout only/)
+  assert.throws(() => spawnEntry(CHECKOUT, 'src/main.ts', [], anywhere as Parameters<typeof spawnEntry>[3]), /shadow checkout only/)
+})
 
 /** A data directory with a real, verifiable log in it. */
 function seeded(t: Parameters<typeof withStore>[0]): string {
@@ -154,10 +160,8 @@ test('npm run dev boots the daemon, serves the CLI over the socket, and shuts do
     AOS_CONTROL_TOKEN: token,
     AOS_DATA_DIR: dataDir,
   }
-  const daemon = spawn(process.execPath, ['--import', 'tsx', 'src/main.ts', '--config', configPath], {
-    cwd: ROOT,
+  const daemon = spawnEntry(CHECKOUT, 'src/main.ts', ['--config', configPath], {
     env,
-    stdio: ['ignore', 'pipe', 'pipe'],
   })
   let log = ''
   daemon.stdout.on('data', (d: Buffer) => {
@@ -243,10 +247,8 @@ test('the checkout these programs run from holds an armed trap .env, so a defaul
   // Pointed at it on purpose, the daemon must refuse it: that refusal is what a
   // regression or mutant that defaults to <repo>/.env would hit here, instead
   // of the operator's real file.
-  const run = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--dotenv', '.env'], {
-    cwd: ROOT,
+  const run = runEntry(CHECKOUT, 'src/main.ts', ['--dotenv', '.env'], {
     env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', HOME: process.env['HOME'] ?? '' },
-    encoding: 'utf8',
     timeout: 60_000,
   })
   assert.notEqual(run.status, 0)
@@ -259,10 +261,8 @@ test('the daemon will not start on a tree a falsify run has mutated, live or int
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'journal.json'), JSON.stringify({ file: 'src/policy/gate.ts', original: '', pid: 1 }))
   try {
-    const run = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts'], {
-      cwd: ROOT,
+    const run = runEntry(CHECKOUT, 'src/main.ts', [], {
       env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', HOME: process.env['HOME'] ?? '' },
-      encoding: 'utf8',
       timeout: 60_000,
     })
     assert.equal(run.status, 1)
@@ -285,10 +285,8 @@ test('the operator scripts are programs: each refuses with usage rather than doi
   // touches the operator's pmmcp or any daemon.
   const env = { PATH: process.env['PATH'] ?? '/usr/bin:/bin' }
 
-  const evalRun = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/eval.ts'], {
-    cwd: ROOT,
+  const evalRun = runEntry(CHECKOUT, 'scripts/eval.ts', [], {
     env,
-    encoding: 'utf8',
     timeout: 60_000,
   })
   assert.equal(evalRun.status, 2, `eval.ts exited ${String(evalRun.status)}: ${evalRun.stderr}`)
@@ -302,10 +300,8 @@ test('the operator scripts are programs: each refuses with usage rather than doi
     [canary.slice(0, 31), /31 characters after trimming/],
     [`${canary.slice(0, 20)} ${canary.slice(20)}`, /contains whitespace/],
   ] as const) {
-    const refused = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/eval.ts', '--case', 'nope'], {
-      cwd: ROOT,
+    const refused = runEntry(CHECKOUT, 'scripts/eval.ts', ['--case', 'nope'], {
       env: { ...env, AOS_CONTROL_TOKEN: token },
-      encoding: 'utf8',
       timeout: 60_000,
     })
     assert.equal(refused.status, 2, refused.stderr)
@@ -320,10 +316,8 @@ test('the operator scripts are programs: each refuses with usage rather than doi
   // Port 9 is closed, so the run ends at the connect, having sent nothing.
   const firstCase = CEO_SUITE[0]?.id ?? ''
   for (const end of ['\r', '\n']) {
-    const padded = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/eval.ts', '--case', firstCase, '--port', '9'], {
-      cwd: ROOT,
+    const padded = runEntry(CHECKOUT, 'scripts/eval.ts', ['--case', firstCase, '--port', '9'], {
       env: { ...env, AOS_CONTROL_TOKEN: `${canary}${canary}${end}` },
-      encoding: 'utf8',
       timeout: 60_000,
     })
     const printed = `${padded.stdout}${padded.stderr}`
@@ -342,10 +336,8 @@ test('the operator scripts are programs: each refuses with usage rather than doi
     const configPath = join(dir, `${name}.yaml`)
     const out = join(dir, `${name}.json`)
     writeFileSync(configPath, yaml)
-    const run = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/capture-pmmcp.ts', out, '--config', configPath], {
-      cwd: ROOT,
+    const run = runEntry(CHECKOUT, 'scripts/capture-pmmcp.ts', [out, '--config', configPath], {
       env: { ...env, ...extra },
-      encoding: 'utf8',
       timeout: 60_000,
     })
     return { status: run.status, stderr: run.stderr, printed: `${run.stdout}${run.stderr}`, out }
@@ -409,10 +401,8 @@ test('capture-pmmcp masks its bearer: a server that echoes it into a refusal pri
     offlinePmmcp(readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8')).replace(CLOSED_PMMCP_URL, `${url}\n      tokenEnv: PMMCP_TOKEN`),
   )
   // Async: the echoing server lives in this process and must keep answering.
-  const child = spawn(process.execPath, ['--import', 'tsx', 'scripts/capture-pmmcp.ts', out, '--config', configPath], {
-    cwd: ROOT,
+  const child = spawnEntry(CHECKOUT, 'scripts/capture-pmmcp.ts', [out, '--config', configPath], {
     env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', PMMCP_TOKEN: bearer },
-    stdio: ['ignore', 'pipe', 'pipe'],
   })
   let printed = ''
   child.stdout.on('data', (c: Buffer) => (printed += c.toString('utf8')))
@@ -465,10 +455,8 @@ test('the daemon and the CLI read AOS_CONTROL_TOKEN and a provider key that exis
 
   // No credential in the environment at all: only the file can supply them.
   const env = { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '', AOS_DATA_DIR: dataDir }
-  const daemon = spawn(process.execPath, ['--import', 'tsx', 'src/main.ts', '--config', configPath, '--dotenv', creds], {
-    cwd: ROOT,
+  const daemon = spawnEntry(CHECKOUT, 'src/main.ts', ['--config', configPath, '--dotenv', creds], {
     env,
-    stdio: ['ignore', 'pipe', 'pipe'],
   })
   let log = ''
   daemon.stdout.on('data', (d: Buffer) => {
@@ -539,10 +527,8 @@ test('the daemon and the CLI read AOS_CONTROL_TOKEN and a provider key that exis
 test('the daemon refuses a group-readable or non-regular --dotenv before it boots, naming the fix, and creates no log', (t) => {
   const run = (creds: string, dataDir: string): { status: number | null; out: string } => {
     const configPath = daemonConfig(dataDir, 7793)
-    const result = spawnSync(process.execPath, ['--import', 'tsx', 'src/main.ts', '--config', configPath, '--dotenv', creds], {
-      cwd: ROOT,
+    const result = runEntry(CHECKOUT, 'src/main.ts', ['--config', configPath, '--dotenv', creds], {
       env: { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '', AOS_DATA_DIR: dataDir },
-      encoding: 'utf8',
       timeout: 30_000,
     })
     return { status: result.status, out: `${result.stdout ?? ''}${result.stderr ?? ''}` }
@@ -575,10 +561,8 @@ test('the daemon refuses a group-readable or non-regular --dotenv before it boot
 test('eval.ts takes AOS_CONTROL_TOKEN from --dotenv in either form, refuses a second, and without it still names what is missing', (t) => {
   const creds = credsFile(tmpdir(t), `AOS_CONTROL_TOKEN=${FILE_TOKEN}\nANTHROPIC_API_KEY=${FILE_KEY}\n`)
   // An unknown case stops eval right after the token check, before any socket.
-  const run = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/eval.ts', '--dotenv', creds, '--case', 'nope'], {
-    cwd: ROOT,
+  const run = runEntry(CHECKOUT, 'scripts/eval.ts', ['--dotenv', creds, '--case', 'nope'], {
     env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
-    encoding: 'utf8',
     timeout: 60_000,
   })
   assert.equal(run.status, 2, run.stderr)
@@ -586,10 +570,8 @@ test('eval.ts takes AOS_CONTROL_TOKEN from --dotenv in either form, refuses a se
   assert.equal(`${run.stdout}${run.stderr}`.includes(FILE_TOKEN), false)
 
   // The --dotenv=path form is read, as the daemon reads it.
-  const eqForm = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/eval.ts', `--dotenv=${creds}`, '--case', 'nope'], {
-    cwd: ROOT,
+  const eqForm = runEntry(CHECKOUT, 'scripts/eval.ts', [`--dotenv=${creds}`, '--case', 'nope'], {
     env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
-    encoding: 'utf8',
     timeout: 60_000,
   })
   assert.equal(eqForm.status, 2, eqForm.stderr)
@@ -597,10 +579,8 @@ test('eval.ts takes AOS_CONTROL_TOKEN from --dotenv in either form, refuses a se
 
   // `npm run eval -- --dotenv other` puts a second flag after package.json's:
   // refused, as by the daemon and the CLI, rather than one silently ignored.
-  const twice = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/eval.ts', '--dotenv', creds, '--dotenv', creds, '--case', 'nope'], {
-    cwd: ROOT,
+  const twice = runEntry(CHECKOUT, 'scripts/eval.ts', ['--dotenv', creds, '--dotenv', creds, '--case', 'nope'], {
     env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' },
-    encoding: 'utf8',
     timeout: 60_000,
   })
   assert.equal(twice.status, 2, twice.stderr)

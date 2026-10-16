@@ -607,8 +607,9 @@ containment (`sandbox`), the `.env` loader and the credential checks around it
 seventeen suites — and add a mutant
 whenever a new test exists to catch a specific bug. No test may let a mutant
 reach your real `.env`: `test/entrypoints.test.ts` runs every entry point from a
-temporary copy of the checkout holding a trap `.env` (and `hygiene.test.ts`
-refuses any entry-point spawn that does not name that copy as its cwd),
+temporary copy of the checkout holding a trap `.env`, through `runEntry` /
+`spawnEntry`, which set that copy as the cwd themselves (and `hygiene.test.ts`
+reads every test's syntax tree to hold each entry-point run to them),
 in-process loader tests are told their
 repository is a trap directory, and the live helper opens `<repo>/.env` only
 from a live test's own process. `test/falsify.test.ts` also refuses a catalog

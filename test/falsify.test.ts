@@ -43,6 +43,7 @@ import {
   type Mutant,
   type Suite,
 } from '../scripts/falsify/runner.js'
+import { ENTRY_POINTS } from './helpers/checkout.js'
 import { REPO_ROOT } from './helpers/kernel.js'
 import { tmpdir } from './helpers/tmpdir.js'
 
@@ -542,7 +543,7 @@ test('no mutant that could steer an entry point at a credentials file runs besid
   // have a test-spawned process read the real keys before an assertion killed
   // it. Such mutants belong in a suite of in-process tests against a trap repo.
   const SPAWNS = 'test/entrypoints.test.ts'
-  const ENTRY = new Set(['src/main.ts', 'src/cli/index.ts', 'scripts/eval.ts', 'scripts/capture-pmmcp.ts'])
+  const ENTRY = new Set<string>(ENTRY_POINTS)
   // `.env` not preceded by an identifier character (so not `process.env`):
   // '.env', '/.env', `${base}/.env`, './.env' all count.
   const NAMES_THE_FILE = /(?<![\w$])\.env\b|DOTENV_FILE/

@@ -165,12 +165,16 @@ test('allowHost admits exactly the named host and nothing else', (t) => {
   })
   allowHost('a.example')
   // Allowed host: the guard steps aside, so connect() returns instead of
-  // throwing. The socket is destroyed at once — the point is that the tripwire
-  // did not fire, not that anything is reachable, and the suite still opens no
-  // connection of its own.
+  // throwing. The point is that the tripwire did not fire, not that anything
+  // is reachable: the lookup answers with an error itself, so not even a DNS
+  // query leaves the machine (destroy() does not cancel a lookup in flight).
   const allowedSocket = new net.Socket()
+  allowedSocket.on('error', () => undefined)
+  const noLookup: net.LookupFunction = (_host, _options, callback) => {
+    callback(new Error('no DNS in tests'), '', 4)
+  }
   assert.doesNotThrow(() => {
-    allowedSocket.connect(443, 'a.example')
+    allowedSocket.connect({ port: 443, host: 'a.example', lookup: noLookup })
   })
   allowedSocket.destroy()
   // Everything else is still refused, including a neighbouring name.

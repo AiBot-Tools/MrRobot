@@ -96,6 +96,11 @@ export function assertTokenUsable(raw: string | undefined): string {
       'AOS_CONTROL_TOKEN is not set. The control plane refuses to start without one.',
     )
   }
+  // A token is one unbroken string, as every other credential here is. Said
+  // plainly, not folded into the ASCII refusal below: a space IS printable.
+  if (/\s/.test(token)) {
+    throw new ConfigError('AOS_CONTROL_TOKEN contains whitespace: a token is one unbroken string. Try: openssl rand -hex 32')
+  }
   // A bearer is an HTTP header: a smart quote or a zero-width space pasted
   // with it would boot the daemon and fail every client with an error naming
   // no credential.

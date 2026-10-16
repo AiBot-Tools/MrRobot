@@ -380,6 +380,17 @@ test('refuses a token holding a character outside printable ASCII, without quoti
   }
 })
 
+test('refuses a token holding whitespace with that reason, not as a non-ASCII character', () => {
+  // A space is printable ASCII; the operator must not be sent hunting for an
+  // invisible character that is not there.
+  for (const token of ['correct horse battery staple tumble wagon', `${'x'.repeat(20)}\t${'y'.repeat(20)}`]) {
+    assert.throws(
+      () => assertTokenUsable(token),
+      (e: unknown) => e instanceof ConfigError && /contains whitespace/.test(e.message) && !/outside printable ASCII/.test(e.message),
+    )
+  }
+})
+
 test('token is digested at boot and the raw value is not retained on the server object', async (t) => {
   const s = await serve(t)
 

@@ -291,6 +291,26 @@ test('the operator scripts are programs: each refuses with usage rather than doi
   assert.equal(evalRun.status, 2, `eval.ts exited ${String(evalRun.status)}: ${evalRun.stderr}`)
   assert.match(evalRun.stderr, /AOS_CONTROL_TOKEN is not set/)
 
+  // A token the daemon would refuse is refused here too, by name, before eval
+  // prints that it is about to spend money and before anything is sent.
+  const canary = 'qEvalTokenCanary0123456789abcdefghijkl'
+  for (const [token, why] of [
+    [`\u201C${canary}\u201D`, /outside printable ASCII/],
+    [canary.slice(0, 31), /31 characters after trimming/],
+    [`${canary.slice(0, 20)} ${canary.slice(20)}`, /contains whitespace/],
+  ] as const) {
+    const refused = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/eval.ts', '--case', 'nope'], {
+      cwd: ROOT,
+      env: { ...env, AOS_CONTROL_TOKEN: token },
+      encoding: 'utf8',
+      timeout: 60_000,
+    })
+    assert.equal(refused.status, 2, refused.stderr)
+    assert.match(refused.stderr, why)
+    assert.doesNotMatch(`${refused.stdout}${refused.stderr}`, /spends real money/)
+    assert.equal(`${refused.stdout}${refused.stderr}`.includes(canary.slice(0, 12)), false)
+  }
+
   const dir = tmpdir(t)
   const shipped = offlinePmmcp(readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8'))
   const capture = (yaml: string, name: string): { status: number | null; stderr: string; out: string } => {

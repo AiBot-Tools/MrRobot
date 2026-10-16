@@ -353,6 +353,20 @@ test('inside the repository only <repo>/.env is read, and only while .gitignore 
   assert.deepEqual(loadDotenv(outside, inRepo).values, { ANTHROPIC_API_KEY: KEY })
 })
 
+test('an in-repo .env stored under another case is refused by name: git would stage it', (t) => {
+  // On APFS, opening <repo>/.env finds a file stored as .Env; git judges the
+  // stored name, which .env* does not cover under core.ignorecase=false. Here
+  // (case-sensitive) the variant is simply there beside a missing .env.
+  t.after(() => SecretMask.clear())
+  const repo = tmpdir(t)
+  writeFileSync(join(repo, '.gitignore'), '.env*\n!.env.example\n')
+  writeFileSync(join(repo, '.Env'), `ANTHROPIC_API_KEY=${KEY}\n`, { mode: 0o600 })
+  chmodSync(join(repo, '.Env'), 0o600)
+  const message = refusal(() => loadDotenv(join(repo, '.env'), opts({ repoRoot: repo })))
+  assert.match(message, /\.Env on disk, not \.env.*Rename it to \.env/)
+  assert.equal(message.includes(KEY), false)
+})
+
 test('credentialNames on the shipped config is exactly AOS_CONTROL_TOKEN and ANTHROPIC_API_KEY, and grows with a declared tokenEnv or envVar', () => {
   const read = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
   const config = parseKernelConfig(read('config/kernel.yaml'), { repoRoot: REPO_ROOT })

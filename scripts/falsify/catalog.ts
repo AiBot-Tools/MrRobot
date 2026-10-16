@@ -406,6 +406,9 @@ const sandbox: Suite = {
     { id: 'Z13', file: 'src/sandbox/confine.ts', from: '  if (!isSpelledUnder(realRoot, realWorkspace)) {', to: '  if (!isUnder(realRoot, realWorkspace, id)) {', why: 'a bind mount sharing the mountRoot\'s identity vouches for a workspace anywhere' },
     { id: 'Z14', file: 'src/sandbox/confine.ts', from: '  if (isUnder(realWorkspace, home, id)) {', to: '  if (false) {', why: 'a link or mount made after boot puts $HOME under the mountRoot and into a container' },
     { id: 'Z15', file: 'src/sandbox/confine.ts', from: '  if (isUnder(realWorkspace, repo, id)) {', to: '  if (false) {', why: 'a link or mount made after boot puts the repository (souls, .env) into a container' },
+    { id: 'Z16', file: 'src/config.ts', from: "      if (problem?.kind === 'link') {", to: '      if (false) {', why: 'a linked .aos or .aos/workspaces, which git does not ignore and would commit, is admitted' },
+    { id: 'Z17', file: 'src/config.ts', from: "      if (problem?.kind === 'spelling') {", to: '      if (false) {', why: 'a .aos stored as .AOS, which /.aos/ does not cover under core.ignorecase=false, is admitted' },
+    { id: 'Z18', file: 'src/agents/protected.ts', from: "    return actual === undefined ? undefined : { kind: 'spelling', actual }", to: '    return undefined', why: 'an entry stored under another case than the one git is told to ignore passes as spelled right' },
   ],
   control: { id: 'C', file: DOCKER, from: '    // Invariant 9, one flag at a time.', to: '    // Invariant 9, one flag at a time. (control)', why: 'comment only' },
 }
@@ -453,6 +456,7 @@ const dotenv: Suite = {
     { id: 'X36', file: 'src/control/auth.ts', from: '  if (/\\s/.test(token)) {', to: '  if (false) {', why: 'a passphrase token is refused as holding a non-ASCII character, sending the operator after one that is not there' },
     { id: 'X37', file: 'src/kernel.ts', from: "        return { ok: false, reason: `${tokenEnv ?? 'the pmmcp bearer'} ${problem}, so it is not a bearer: the kernel has no vault and no memory` }", to: "        void problem", why: 'a pmmcp bearer with a newline is sent, and the HTTP error quoting it lands in the chained log' },
     { id: 'X38', file: 'src/kernel.ts', from: '      SecretMask.register(token)\n    }\n    const url = server.url', to: '    }\n    const url = server.url', why: 'a valid pmmcp bearer is never masked, so any library error that quotes it is logged in clear' },
+    { id: 'X39', file: DOTENV, from: "    if (spelled?.kind === 'spelling') {", to: '    if (false) {', why: 'a .env stored as .Env, which .env* does not cover under core.ignorecase=false, is opened on the Mac and pushed by git add -A' },
     { id: 'X29', file: DOTENV, from: '    if (/[^\\x21-\\x7e]/.test(value)) {', to: '    if (false) {', why: 'a smart-quoted or zero-width-spaced key in .env is loaded and fails at the first request, naming nothing' },
     { id: 'X23', file: 'src/secrets/broker.ts', from: "  if (looksLikeEnvLine(value)) return 'holds a whole NAME=value line'", to: "  if (false) return 'holds a whole NAME=value line'", why: 'a shell value that is a joined NAME=value line is minted as a key' },
     { id: 'X26', file: 'src/secrets/broker.ts', from: '    return this.#mintFromEnv(id, envVar, fromEnv, purpose)\n  }\n\n  /** Both env paths', to: '    return this.#mint(id, \'env\', fromEnv, purpose)\n  }\n\n  /** Both env paths', why: 'the D8 env fallback mints a value source env would refuse' },

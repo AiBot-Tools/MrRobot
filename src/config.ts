@@ -28,7 +28,7 @@ import { z } from 'zod'
 
 import { ConfigError } from './errors.js'
 import { rootGitignoreIgnores } from './gitignore.js'
-import { homeDirectory, identify, isSpelledUnder, isUnder, realpathNearest, type Identify } from './agents/protected.js'
+import { entryProblem, homeDirectory, identify, isSpelledUnder, isUnder, realpathNearest, type Identify } from './agents/protected.js'
 import { DENY_KEYS } from './events/redact.js'
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
@@ -385,13 +385,38 @@ export function assertDataLocation(
   allowed: string,
   // Seams for tests: an alias of $HOME or the repository cannot be made on a
   // case-sensitive filesystem without root.
-  opts: { readonly home?: string; readonly id?: Identify } = {},
+  opts: { readonly home?: string; readonly id?: Identify; readonly readdir?: (dir: string) => readonly string[] } = {},
 ): void {
   const id = opts.id ?? identify
   const real = realpathNearest(target)
   const repo = realpathNearest(repoRoot)
   const home = realpathNearest(opts.home ?? homeDirectory())
   const fence = join(repo, allowed)
+
+  // A path written under <repo>/.aos must find .aos (and .aos/workspaces) as
+  // plain directories spelled exactly so, before any link is followed: git
+  // ignores neither a linked .aos (it is a file to git, and the link itself
+  // would be committed) nor one stored as .AOS under core.ignorecase=false.
+  for (const spelledRepo of new Set([resolve(repoRoot), repo])) {
+    if (!isSpelledUnder(join(spelledRepo, allowed), resolve(target))) continue
+    let parent = spelledRepo
+    for (const part of allowed.split(sep)) {
+      const problem = entryProblem(parent, part, opts.readdir)
+      if (problem?.kind === 'link') {
+        throw new ConfigError(
+          `${join(parent, part)} is a link: git does not ignore a link, and would commit it. ` +
+            `Make it a real directory, or put the path it points to in kernel.yaml instead.`,
+        )
+      }
+      if (problem?.kind === 'spelling') {
+        throw new ConfigError(
+          `${join(parent, problem.actual)} is spelled ${problem.actual} on disk, not ${part}: git judges the name as stored, ` +
+            `and /.aos/ does not cover it under core.ignorecase=false. Rename it to ${part}`,
+        )
+      }
+      parent = join(parent, part)
+    }
+  }
 
   // Forbidden zones by identity as well as spelling (isUnder), so a
   // case-variant or firmlinked spelling of $HOME or the repository is still

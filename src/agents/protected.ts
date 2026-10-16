@@ -19,9 +19,9 @@
 // directory under a spelling no string test recognises, as is a firmlinked
 // `/System/Volumes/Data/...` path or a bind mount.
 
-import { realpathSync, statSync } from 'node:fs'
+import { lstatSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { homedir, userInfo } from 'node:os'
-import { dirname, isAbsolute, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 
 import { ConfigError } from '../errors.js'
 
@@ -43,6 +43,38 @@ export function homeDirectory(): string {
   }
   if (isAbsolute(fromPasswd)) return fromPasswd
   throw new ConfigError('cannot tell the home directory: HOME is empty or relative and the passwd entry has none')
+}
+
+/**
+ * What is wrong with `<parent>/<name>` as git will see it, or undefined when it
+ * is absent or a plain entry spelled exactly `name`. git judges the name as it
+ * is on disk (readdir), not as a path was typed: on case-insensitive APFS
+ * `<repo>/.env` opens a file stored as `.Env`, which `.env*` does not cover
+ * under core.ignorecase=false; and a symlink is a file to git, so `/.aos/`
+ * does not cover a linked `.aos`, which `git add -A` would commit.
+ */
+export function entryProblem(
+  parent: string,
+  name: string,
+  readdir: (dir: string) => readonly string[] = (dir) => readdirSync(dir),
+): { readonly kind: 'link' } | { readonly kind: 'spelling'; readonly actual: string } | undefined {
+  let entries: readonly string[]
+  try {
+    entries = readdir(parent)
+  } catch {
+    return undefined
+  }
+  if (!entries.includes(name)) {
+    // Absent as spelled. A case variant beside it is the same entry on APFS,
+    // and a trap on a case-sensitive disk: either way, say so.
+    const actual = entries.find((e) => e.toLowerCase() === name.toLowerCase())
+    return actual === undefined ? undefined : { kind: 'spelling', actual }
+  }
+  try {
+    return lstatSync(join(parent, name)).isSymbolicLink() ? { kind: 'link' } : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** Directories, relative to the repository root, that agents may never write. */

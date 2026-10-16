@@ -41,7 +41,7 @@
 import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
 
-import { identify, isUnder, type Identify } from '../agents/protected.js'
+import { entryProblem, identify, isUnder, type Identify } from '../agents/protected.js'
 import type { KernelConfig } from '../config.js'
 import { ConfigError } from '../errors.js'
 import { SecretMask } from '../events/redact.js'
@@ -326,6 +326,13 @@ export function loadDotenv(path: string, options: DotenvOptions): DotenvResult {
   if (place !== 'outside') {
     if (place !== 'root' || basename(abs) !== DOTENV_FILE) {
       throw new ConfigError(`the only credentials file read inside the repository is ${join(repo, DOTENV_FILE)}; got ${abs}`)
+    }
+    const spelled = entryProblem(dirname(abs), DOTENV_FILE)
+    if (spelled?.kind === 'spelling') {
+      throw new ConfigError(
+        `${join(dirname(abs), spelled.actual)} is spelled ${spelled.actual} on disk, not ${DOTENV_FILE}: git judges the name as stored, ` +
+          `and .gitignore's .env* does not cover it under core.ignorecase=false. Rename it to ${DOTENV_FILE}`,
+      )
     }
     if (!gitignoresDotenv(options.repoRoot)) {
       throw new ConfigError(`${abs} is not ignored by ${join(repo, '.gitignore')}: add the line /.env before putting a key in it`)

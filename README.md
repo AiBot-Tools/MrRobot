@@ -623,12 +623,16 @@ a second line. The `integrity` and
 the redaction pass) and restore them; the operator approved keeping them in the
 catalog on that basis.
 
-Last full run, against commit `96771ce`: 207 of 207 mutants killed (delegation
-18, recovery 12, replay 8, namespace 7, goals 15, anchor 6, eval 11, integrity
-21, redaction 12, schedule 13, registry 13, restart 8, sandbox 15, dotenv 32,
-dotenvDefault 3, gitignore 13), 16 of 16 controls survived, exit 0, each kill by
-the test written for it. A result is a fact about that commit only; rerun it
-rather than trusting this line after a change.
+Last full run, against commit `2198209`: 236 of 236 mutants killed (delegation
+18, recovery 12, replay 8, namespace 7, goals 15, anchor 8, eval 11, integrity
+21, redaction 14, schedule 13, registry 13, restart 8, sandbox 23, dotenv 40,
+dotenvDefault 3, gitignore 15, runner 7), 17 of 17 controls survived, exit 0.
+Every kill names a behavioural test; none rests only on the anchor or catalog
+checks. The run before it, at `4a50262`, scored 234 of 236: S11 and S12 survived
+because the value scrubber masked the shaped values the path-redaction tests
+logged, and `2198209` gave those tests values only a path can catch. A result
+is a fact about that commit only; rerun it rather than trusting this line after
+a change.
 
 ---
 

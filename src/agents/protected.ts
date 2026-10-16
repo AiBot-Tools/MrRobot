@@ -20,9 +20,30 @@
 // `/System/Volumes/Data/...` path or a bind mount.
 
 import { realpathSync, statSync } from 'node:fs'
+import { homedir, userInfo } from 'node:os'
 import { dirname, isAbsolute, resolve, sep } from 'node:path'
 
 import { ConfigError } from '../errors.js'
+
+/**
+ * The operator's home directory, for the never-$HOME checks. os.homedir()
+ * answers '' when HOME is set but empty, and '' resolves to the cwd — which
+ * would quietly turn every "not $HOME" check into "not the repository". So an
+ * empty or relative HOME falls back to the passwd entry, and with no usable
+ * answer the caller is refused rather than compared against nothing.
+ */
+export function homeDirectory(): string {
+  const fromEnv = homedir()
+  if (isAbsolute(fromEnv)) return fromEnv
+  let fromPasswd = ''
+  try {
+    fromPasswd = userInfo().homedir
+  } catch {
+    // No passwd entry for this uid.
+  }
+  if (isAbsolute(fromPasswd)) return fromPasswd
+  throw new ConfigError('cannot tell the home directory: HOME is empty or relative and the passwd entry has none')
+}
 
 /** Directories, relative to the repository root, that agents may never write. */
 export const PROTECTED_ROOTS: readonly string[] = ['souls', 'agents', 'config']

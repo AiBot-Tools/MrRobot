@@ -37,7 +37,7 @@ import { promisify } from 'node:util'
 const execFileAsync = promisify(execFile)
 
 import { ConfigError } from '../errors.js'
-import { realpathNearest } from '../agents/protected.js'
+import { homeDirectory, realpathNearest } from '../agents/protected.js'
 import { confineWorkspace } from './confine.js'
 import type {
   ProbeResult,
@@ -87,7 +87,7 @@ export interface BuildArgsInput {
  */
 export function buildRunArgs(input: BuildArgsInput): string[] {
   const { spec, domain, defaults } = input
-  const home = input.home ?? process.env['HOME'] ?? ''
+  const home = input.home ?? homeDirectory()
 
   if (!spec.name.startsWith(CONTAINER_PREFIX)) {
     throw new ConfigError(`container name "${spec.name}" must start with ${CONTAINER_PREFIX}`)

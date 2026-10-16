@@ -15,10 +15,9 @@
 // path and mounted another.
 
 import { statSync } from 'node:fs'
-import { homedir } from 'node:os'
 
 import { ConfigError } from '../errors.js'
-import { assertNotProtected, identify, isSpelledUnder, isUnder, realpathNearest, type Identify } from '../agents/protected.js'
+import { assertNotProtected, homeDirectory, identify, isSpelledUnder, isUnder, realpathNearest, type Identify } from '../agents/protected.js'
 
 /**
  * Resolve a workspace path and prove it is allowed.
@@ -50,7 +49,7 @@ export function confineWorkspace(
   // Invariant 9 on every run, by identity: config.ts checked the mountRoot at
   // boot, and a link or mount made since can put $HOME or the repository
   // under it under a spelling no string comparison recognises.
-  const home = realpathNearest(opts.home ?? homedir())
+  const home = realpathNearest(opts.home ?? homeDirectory())
   if (isUnder(realWorkspace, home, id)) {
     throw new ConfigError(`mount confinement: ${realWorkspace} is or contains $HOME (${home})`)
   }

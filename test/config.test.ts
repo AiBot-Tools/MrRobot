@@ -11,13 +11,14 @@ import './helpers/guard.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, userInfo } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse as parseYaml } from 'yaml'
 
 import { assertDataLocation, assertNoSecretKeys, expandHome, gitignoresAos, parseKernelConfig } from '../src/config.js'
 import { tmpdir } from './helpers/tmpdir.js'
+import { homeDirectory } from '../src/agents/protected.js'
 
 // The real checkout, wherever it is: the location rules read its .gitignore.
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -279,6 +280,23 @@ test('a .aos that is a link is refused: what is written through it lands where g
   writeFileSync(join(loop, '.gitignore'), '/.aos/\n')
   symlinkSync('.', join(loop, '.aos'))
   assert.throws(() => parse(doc, loop), /is a link to|contains the repository/)
+})
+
+test('an empty HOME is treated as unset: the never-$HOME checks still see the real home directory', () => {
+  // os.homedir() answers '' for HOME='', and '' resolves to the cwd — which
+  // used to turn "not $HOME" into "not the repository".
+  const passwdHome = userInfo().homedir
+  const saved = process.env['HOME']
+  process.env['HOME'] = ''
+  try {
+    assert.equal(homeDirectory(), passwdHome)
+    const doc = fixture('valid.yaml') as { dataDir: string }
+    doc.dataDir = passwdHome
+    assert.throws(() => parse(doc), /must not be \$HOME itself|contains the repository/)
+  } finally {
+    if (saved === undefined) delete process.env['HOME']
+    else process.env['HOME'] = saved
+  }
 })
 
 test('rejects an allowedOrigins entry that is not tauri://localhost or loopback http(s)', () => {

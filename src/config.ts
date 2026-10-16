@@ -23,13 +23,12 @@
 // Every numeric field is positive and no field admits "unlimited". A budget
 // that can be switched off is not a budget.
 
-import { homedir } from 'node:os'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 import { z } from 'zod'
 
 import { ConfigError } from './errors.js'
 import { rootGitignoreIgnores } from './gitignore.js'
-import { identify, isSpelledUnder, isUnder, realpathNearest, type Identify } from './agents/protected.js'
+import { homeDirectory, identify, isSpelledUnder, isUnder, realpathNearest, type Identify } from './agents/protected.js'
 import { DENY_KEYS } from './events/redact.js'
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
@@ -260,8 +259,8 @@ export type KernelConfig = z.output<typeof KernelConfig>
 
 /** Expand a leading ~ to the current user's home directory. */
 export function expandHome(p: string): string {
-  if (p === '~') return homedir()
-  if (p.startsWith(`~${sep}`) || p.startsWith('~/')) return resolve(homedir(), p.slice(2))
+  if (p === '~') return homeDirectory()
+  if (p.startsWith(`~${sep}`) || p.startsWith('~/')) return resolve(homeDirectory(), p.slice(2))
   return p
 }
 
@@ -391,7 +390,7 @@ export function assertDataLocation(
   const id = opts.id ?? identify
   const real = realpathNearest(target)
   const repo = realpathNearest(repoRoot)
-  const home = realpathNearest(opts.home ?? homedir())
+  const home = realpathNearest(opts.home ?? homeDirectory())
   const fence = join(repo, allowed)
 
   // Forbidden zones by identity as well as spelling (isUnder), so a

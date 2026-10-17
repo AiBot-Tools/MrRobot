@@ -391,6 +391,22 @@ test('refuses a token holding whitespace with that reason, not as a non-ASCII ch
   }
 })
 
+test('refuses a token holding a quote, a backtick or #, which .env cannot hold, so shell and file agree', () => {
+  // A password-manager token like Q9#mZ... used to boot from the shell and be
+  // refused once moved into .env, where # and quotes mean something.
+  const canary = 'qTokenCanary0123456789abcdefghijk'
+  for (const ch of ['#', "'", '"', '`']) {
+    assert.throws(
+      () => assertTokenUsable(`${canary}${ch}${canary}`),
+      (e: unknown) => e instanceof ConfigError && /a quote, a backtick or #/.test(e.message) && !e.message.includes('qTokenCanary'),
+      ch,
+    )
+  }
+  // What openssl and base64 make is untouched: hex, and + / = from base64.
+  assert.doesNotThrow(() => assertTokenUsable('0123456789abcdef'.repeat(4)))
+  assert.doesNotThrow(() => assertTokenUsable('Qk9b+aZ3/xY0w8LrV2nT6mUe1sJdHcGf4iKpRoA5=='))
+})
+
 test('token is digested at boot and the raw value is not retained on the server object', async (t) => {
   const s = await serve(t)
 

@@ -110,6 +110,15 @@ export function assertTokenUsable(raw: string | undefined): string {
         'retype it. Try: openssl rand -hex 32',
     )
   }
+  // The operator's .env cannot hold these (they quote or comment a value
+  // there), so a token holding one would boot from the shell and be refused
+  // once moved into the file README sends it to. One rule wherever it lives.
+  if (/[#'"`]/.test(token)) {
+    throw new ConfigError(
+      'AOS_CONTROL_TOKEN holds a quote, a backtick or #, which .env cannot hold: a token must read the same from ' +
+        'the shell and the file. Try: openssl rand -hex 32',
+    )
+  }
   if (token.length < MIN_TOKEN_LENGTH) {
     throw new ConfigError(
       `AOS_CONTROL_TOKEN is ${String(token.length)} characters after trimming; ` +

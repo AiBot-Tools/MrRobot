@@ -72,7 +72,7 @@ zsh does not treat one as a comment when you paste, and hands it to the command
 as arguments.
 
 The daemon needs `AOS_CONTROL_TOKEN` (at least 32 printable ASCII characters,
-with no whitespace, quote, backtick or `#`, which `.env` refuses;
+with no whitespace, quote, backtick or `#`, from the shell and `.env` alike;
 `openssl rand -hex 32` makes one) and, to reach a
 model, `ANTHROPIC_API_KEY`. Both live in **your own `.env` in the repository
 root**: git-ignored, mode 0600, written only by you. `.env.example` is the

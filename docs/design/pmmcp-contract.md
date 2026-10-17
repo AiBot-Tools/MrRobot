@@ -1,19 +1,24 @@
 # pmmcp ↔ kernel contract: compartments
 
-Status: **draft, revision 3** (2026-10-17). Not implemented on either side.
+Status: **draft, revision 4** (2026-10-17). Not implemented on either side.
 
 - **Revision 1** wrote decisions D1–D7 on recommended defaults.
 - **Revision 2** encoded the operator's answers (2026-10-17) and fixed an
   adversarial review of revision 1.
-- **Revision 3** fixes a second review, of revision 2, by the same four
-  lenses (isolation red-team, pmmcp on the Python SDK, kernel fit, coherence
-  and intent), with a skeptic on every finding; 60 of 74 findings survived,
-  9 of them critical. The main changes:
-  - lineage is tracked for every run, and records operator releases (§2.4);
-  - copies, promotions, memory writes and briefs are judged on lineage;
-  - engineering briefs are written by the kernel and capped (§2.5);
-  - data delivered by a grant is never stored (§2.9);
-  - what protocol v1 can and cannot do is stated (§2.10).
+- **Revision 3** rebuilt lineage, copies and briefs after a second review.
+- **Revision 4** answers a third review (61 of 68 findings survived their
+  skeptics), whose critical findings all came from exceptions revision 3 had
+  added. It replaces them with one smaller core (§2.4), built on three
+  relations:
+  - **hold**: what a run may have in its context;
+  - **receive**: what a child may be started with;
+  - **store**: what may be written where. Foreign data is stored only where
+    the operator approved its exact bytes, or where an open set the operator
+    approved covers it.
+
+  It also drops the CEO's blanket clearance, the executive-child exemption,
+  and every way a release could become storage. Typed results are now strictly
+  kernel-derived, and grant data stays in the grantee's run.
 
 Short names for the design documents: AF = `docs/design/agent-fleet.md`;
 EX, EN, GR, OS, TR = `docs/design/sectors/` executive, engineering, growth,
@@ -46,7 +51,8 @@ What each wall can and cannot catch:
   chosen principal. It cannot catch a kernel that picks the wrong principal
   for a run. K3's binding and cross-check are the guard for that.
 - Once data is inside a run's context, only the kernel's lineage rules stop it
-  moving on (§2.4). pmmcp stores lineage and never sees a prompt.
+  moving on (§2.4). pmmcp stores lineage, filters on it, and never sees a
+  prompt.
 - The kernel-only principals reach only their fixed namespaces. `aos-promote`,
   `aos-collab` and `aos-brief` read nothing; `aos-goals` and `aos-goals-live`
   read only their goal namespaces. A kernel bug can still misuse them by
@@ -135,12 +141,19 @@ C = read in a primary source; I = inference.
 - TS SDK 1.30.0 (C: `types.js:1252-1259`; `client/index.js:479-557`;
   `validation/ajv-provider.js:4-15`; `ajv-formats/dist/formats.js:12,
   99-111`):
-  - it requires an **object-rooted** `outputSchema`;
+  - it requires an **object-rooted** `outputSchema`, and refuses the whole
+    `tools/list` otherwise;
   - it **throws** when a tool declares one and returns no `structuredContent`
     without `isError`;
   - it validates only the last page of a paginated `tools/list`;
   - it validates `format: date-time` strictly, so a timestamp without an
     offset fails.
+- pydantic emits a self-referential model as `{"$defs": {...}, "$ref":
+  "#/$defs/<Model>"}`, with no root `type`. `mcp` 1.29.1 and later, and 2.x,
+  copy the referenced definition onto the root. 1.27.2 to 1.29.0 publish the
+  schema unchanged (C: 1.30.0 `fastmcp/utilities/func_metadata.py:51-64, 450`;
+  2.3.0 `mcpserver/utilities/func_metadata.py:131`; 1.27.2
+  `func_metadata.py:410-430`).
 - Do not return `CallToolResult(isError=True)` from a v1 tool that declares an
   output schema. v1 validates `structuredContent` even on errors, and the
   validator's text replaces the message (C: `func_metadata.py:133-137`). v2
@@ -182,7 +195,7 @@ C = read in a primary source; I = inference.
 
 **The kernel today**
 
-- **Namespaces.**
+- **Namespaces and goals.**
   - One memory namespace per agent, from a fixed shape:
     `aos/ceo | aos/shared | aos/agent/<id>` (`src/agents/manifest.ts:28`).
   - Goals are written into the adopting agent's namespace
@@ -191,11 +204,12 @@ C = read in a primary source; I = inference.
   - No compartment concept exists anywhere in `src/`.
   - No pmmcp tool is exposed to any agent (`config/tool-views.yaml`).
 - **The gate.**
-  - It **checks** the `project_id` the model sends and never **sets** it
-    (`src/policy/gate.ts:122-145`). CLAUDE.md, README.md:389-390 and
-    tool-views.yaml:15-18 require it to set the id before `recall` or
-    `remember` is exposed. K2 meets that requirement.
-  - Its only `needs-human` rules are irreversible risk, and a tainted run
+  - It **checks** the `project_id` the model sends against exactly one
+    namespace, and never **sets** it (`src/policy/gate.ts:122-145`).
+    CLAUDE.md, README.md:389-390 and tool-views.yaml:15-18 require it to set
+    the id before `recall` or `remember` is exposed. K2 meets that
+    requirement.
+  - Its only `needs-human` rules are irreversible risk and a tainted run
     calling a non-read tool (`gate.ts:146-155`).
   - Kernel tools are `risk: write` (`tool-views.yaml:136-142`). The CEO is
     tier 2, which may hold only read and write tools (`agents/ceo/agent.yaml`;
@@ -209,13 +223,21 @@ C = read in a primary source; I = inference.
     (`registry.ts:150`, `src/runtime/loop.ts:437`).
   - A kernel tool runs only after the gate's ticket (`kernel-tools.ts:96,
     121`), and the execute step runs outside the run scope (`loop.ts:440-448`).
-  - Delegation is depth 1, and the CEO is the only orchestrator (AF:18,
-    AF:107).
-  - A delegation brief (≤ 8,000 characters) becomes the child's prompt
-    verbatim (`delegate.ts:51, 300-302`). The child's `finalText` comes back
-    to the parent (`:370`).
+  - A plan may name any active standard worker (`delegate.ts:172-176`), so
+    the CEO can delegate to the assistant today.
+  - A delegation brief (≤ 8,000 characters) becomes part of the child's
+    prompt, after a task header and the acceptance list
+    (`delegate.ts:51, 300-302`). The child's `finalText` comes back to the
+    parent, and so does a refusal or error `reason` of up to 500 bytes
+    (`delegate.ts:368-370`). A provider error's text can hold up to 500 bytes
+    of the response body (`src/models/openai-chat.ts:270`).
   - A delegated child does not inherit its parent's taint (`kernel.ts:613`).
+  - There is no `RunResult`, no deliverable and no `inputRefs` in code. These
+    exist only in EX §3, where every model-written field is self-reported
+    (EX:139-152).
 - **The log.**
+  - `run.finished` records status, reason, cost and counts, and no output text
+    (`src/events/types.ts:325-336`).
   - `llm.response` logs only the model's text, never its tool-call input
     (`src/models/anthropic.ts:224-252`). A tool call's arguments first reach
     the log in the next `llm.request`.
@@ -223,16 +245,20 @@ C = read in a primary source; I = inference.
     arguments (`src/policy/engine.ts:81`).
   - The event store refuses any payload whose canonical JSON exceeds
     `MAX_LOGGED_OUTPUT` (65,536 bytes) (`src/events/store.ts:147-159`).
-    Strings are JSON-escaped (`src/events/canonical.ts:46`), and
+    Strings are JSON-escaped (`src/events/canonical.ts:46`).
     `PAYLOAD_TEXT_BUDGET` (63,488 bytes) is the text budget a producer bounds
     to (`src/events/bound.ts:40`).
   - Boot re-parses stored `goal.created` rows and open `run.queued` rows with
     strict schemas (`kernel.ts:301, 482`; `tracker.ts:93, 135`).
-- **Protocol v1.**
-  - Its approval kinds are `tool` and `promotion` only
-    (`src/control/protocol.ts:123`).
+- **Approvals and protocol v1.**
+  - An approval is tied to a parked run and expires with it, and restart
+    settles every pending one (`src/policy/approvals.ts:115-132`).
+  - Protocol v1's approval kinds are `tool` and `promotion` (agent promotion)
+    only (`src/control/protocol.ts:123`).
   - `approval.approve` takes only `{approvalId}` (`protocol.ts:307-310`).
   - v1 has no revoke, suspend, close or override command (`protocol.ts:44-61`).
+- **Live tests.** The live tests take one `PMMCP_TOKEN` and build their own hub
+  (`test/live-runtime.test.ts:122, 162`; `test/live-anthropic.test.ts:230`).
 
 ## 2. The compartment model
 
@@ -242,8 +268,8 @@ Five sectors, two of which contain a sub-section:
 
 | Compartment | Holds | Agents (from docs/design) |
 |---|---|---|
-| `executive` | goal tree, adopted plans, mandates, CEO memory | ceo, planner, assistant, judge#exec², curator-executive |
-| `engineering` | **all coding data**: code knowledge, ADRs, module maps, design system, incident notes, indexed repositories and git history | eng-lead, prototyper, sre, architect, implementer, tester, reviewer, release, scout#eng² |
+| `executive` | goal tree, adopted plans, mandates, CEO memory | ceo, planner², assistant, judge#exec², curator-executive |
+| `engineering` | **all coding data**: code knowledge, ADRs, module maps, design system, incident notes, indexed repositories and git history | eng-lead, prototyper, sre, architect, implementer, tester, reviewer, release, scout#eng², judge#eng² |
 | `marketing` | marketing, social, community, sales: brand kit, ICP, drafts, CRM-adjacent notes | marketer, writer, community, sales, publisher, researcher, checker{brand,policy,facts}, reporter, focus-group, scout#growth², curator-marketing |
 | `marketing/clipping` | clipping and production: captions, renders, clip plans, media checks | producer, checker{media} |
 | `trading` | theses, signals, strategy cards, backtests, journals | quant, executor, bookkeeper, market-scout (scout#market²), critic (judge#critic²), curator-trading |
@@ -255,22 +281,23 @@ There are two kinds of sub-section:
 - **Open** (`marketing/clipping`). It is part of marketing. Every marketing
   agent reads it, and clipping agents read marketing. Both run under the
   marketing principal (P1), and for lineage a clipping run counts as
-  marketing (§2.4). Its own namespaces keep clipping work organised, and an
-  edit to the principals file would seal it later.
+  `marketing` everywhere: in the kernel and on the wire (§2.4, P7). Its own
+  namespaces keep clipping work organised, and an edit to the principals file
+  would seal it later.
 - **Sealed** (`security/code`). Only its own agents read it, and the CEO reads
   its kernel-filed, capped brief (§2.5). They hold the D5 read grant into
   engineering, so what they find stays away from warden, evaluator and
   comms-triage. comms-triage is always tainted and will take inbound SMS and
   Telegram.
 
-² **Template profiles** (§2.5). scout and judge are templates with one
-profile per compartment. A profile serves `engineering` only if its manifest,
-which the operator edits, gives it that compartment. That entry is the
-operator's statement that the profile does coding work.
+² **Template profiles** (§2.5). planner, scout and judge are templates; scout
+and judge have one profile per compartment. A profile serves `engineering`
+only if its manifest, which the operator edits, gives it that compartment.
+That entry is the operator's statement that the profile does coding work.
 
 **Curators** are standard, scheduled agents, one per compartment they curate.
 There is none for `engineering` or `security/code`. Engineering memory is
-curated by eng-lead, through promotion proposals (§2.8), or by the operator
+curated by promotions of eng-lead's deliverables (§2.8), or by the operator
 (R7).
 
 **The shipped fleet**:
@@ -319,19 +346,20 @@ aos/fleet/shared               knowledge every compartment reads (promotion, §2
 
 ### 2.3 Who may read and write what
 
-"Read" means recall, search and list. Writes into `shared`, `collab`, `fleet`,
-the engineering and `security/code` briefs, and the goal namespaces are made
-by the kernel with a kernel-only principal (P1).
+"Read" means recall (and `search`, if pmmcp serves it) and list. Writes into
+`shared`, `collab`, `fleet`, the engineering and `security/code` briefs, and
+the goal namespaces are made by the kernel with a kernel-only principal (P1),
+and every write obeys the store rule (§2.4).
 
 | Namespace | Read | Write |
 |---|---|---|
-| `aos/<c>/agent/<id>` | that agent, and `c`'s curator¹ | that agent, by a gated `remember` (§2.4, rule 2) |
-| `aos/<c>/shared` | agents of `c`; the CEO, except for `engineering` and `security/code` | **only** the kernel, for an operator-approved promotion (§2.8) |
-| `aos/<c>/brief` (every `c` except `executive`) | agents of `c`; the CEO | agents of `c`, by a gated `remember`; for `engineering` and `security/code`, **only** the kernel, from a finished run's summary (§2.5) |
+| `aos/<c>/agent/<id>` | that agent, and `c`'s curator¹ | that agent, by a gated `remember` |
+| `aos/<c>/shared` | agents of `c`; `security/code` for `aos/engineering/shared` (D5); the CEO, except for `engineering` and `security/code` | **only** the kernel, for an operator-approved promotion (§2.8) |
+| `aos/<c>/brief` (every `c` except `executive`) | agents of `c`; the CEO | agents of `c`, by a gated `remember`; for `engineering` and `security/code`, **only** the kernel, from a finished run's capped summary (§2.5) |
 | `aos/engineering/index/<repo>` | `engineering`; `security/code` (D5) | **only** the operator's indexing (P9) |
 | `aos/executive/ceo` | the CEO | the CEO, by a gated `remember` |
 | `aos/executive/goals` | the kernel; the CEO through `kernel.read_goals` | the kernel only (§2.6) |
-| `aos/collab/<effort>` | agents of the effort's member compartments; the CEO, except coding-lineage records not released to it (§2.7) | **only** the kernel, for an approved copy (§2.7) |
+| `aos/collab/<effort>` | agents of the effort's member compartments while it is live; the CEO, under its hold rule (§2.4) | **only** the kernel, for an approved or open-set-covered copy (§2.7) |
 | `aos/fleet/shared` | every agent | **only** the kernel, for an operator-approved promotion (§2.8) |
 
 "Agents of `c`" includes the parent sector's agents when `c` is the open
@@ -339,7 +367,14 @@ sub-section, and the sub-section's agents when `c` is `marketing`.
 
 ¹ pmmcp's wall is the compartment: any agent of `c` holds the principal that
 could read every `aos/<c>/agent/*`. Keeping an agent to its own namespace is
-the kernel's read set (K2). The CEO's memory is curated by the operator.
+the kernel's read set (K2). A curator reads its compartment's agent
+namespaces through `agent:<id>` labels (K2). The CEO's memory is curated by
+the operator.
+
+**Readers.** Wherever this contract speaks of the readers of a namespace (the
+store rule, copies, promotions, cards), they are the compartments in this
+table, plus every standing grant that reads the namespace, plus the CEO
+where the table lists it.
 
 Rules that apply across the table:
 
@@ -351,79 +386,175 @@ Rules that apply across the table:
   - every agent's read of `aos/fleet/shared`, which holds only promoted
     records;
   - the CEO's reads in this table (D2).
-- **The CEO's wider reach belongs to the CEO alone.** assistant and
-  curator-executive read no brief, no other compartment and no collaboration
-  space. A child the CEO delegates to in executive (planner, judge#exec,
-  worker-template) sees only what the CEO's brief carries (§2.4).
-- **Coding data leaves engineering only in ways the operator chose**. The
-  ways out are:
+- **The CEO's wider reach belongs to the CEO alone.** Every other executive
+  agent, whether a standard agent such as assistant or a template child such
+  as planner, holds executive data only (§2.4).
+- **Coding data leaves engineering only in ways the operator chose:**
   - the D5 grant;
-  - the CEO's reads of capped engineering briefs and summaries (D2, D6);
+  - the capped D6 channel to the CEO: summaries it asks for, and
+    kernel-filed briefs (§2.5);
   - an operator grant;
-  - an approved copy or promotion;
-  - an approved parked delegation.
+  - a copy or promotion the operator approved on its exact bytes;
+  - a parked delegation or parked result read the operator approved.
 
-  Lineage (§2.4) keeps it from moving further without the operator.
+  Lineage (§2.4) keeps it from moving any further without the operator.
 - **Approval cards.** A card, its preview and any held output carry the
   compartment and the lineage of the run that asked (K7). No agent-facing
   bundle (the assistant's digest, warden, a CEO continuation) carries any
   card's preview or held output, with one exception: the CEO's continuation
-  receives its own cards, and their lineage joins its run. Everywhere else a
-  bundle shows counts per compartment and class, nothing more.
+  receives its own cards. Everywhere else a bundle shows counts per
+  compartment and class, nothing more.
 
 ### 2.4 Lineage
 
 D2 gives the CEO as much visibility as it needs to decide, and D6 lets the
-operator show it file contents. The CEO then holds other compartments' data in
-its context. A model can repeat anything in its context into anything it
-writes. Lineage is the rule that keeps such data where the operator put it.
+operator show it file contents. Efforts let compartments work together. All
+three put one compartment's data into another's runs. A model can repeat
+anything in its context into anything it writes. Lineage keeps that data
+where the operator put it.
 
-**What lineage is**
+**Elements**
 
 - A run's lineage is a set of elements `(c, R)`.
-  - `c` is a compartment whose data entered the run's context. The open
-    sub-section counts as its sector.
-  - `R` is the set of compartments that an operator approval released that
-    data to. It is empty unless an approval says otherwise.
-- Elements with `c = executive` are recorded and never restrict anything.
-  Executive data may go to every compartment.
+  - `c` is the compartment the data came from: `executive`, `engineering`,
+    `marketing`, `trading`, `security` or `security/code`. The open
+    sub-section counts as `marketing`.
+  - `R` is the set of release entries operator decisions attached to that
+    data. It is empty unless an approval says otherwise. An entry is one of:
+    - a compartment name;
+    - `ceo`, which names the agent `ceo` alone;
+    - `effort:<id>`.
+  - An element may carry a grant mark, the id of the grant that delivered it
+    (§2.9).
+- Elements with `c = executive` never restrict anything. Executive data may go
+  to every compartment.
 - The kernel computes lineage for **every** run. The model never sets or sees
   it.
-- A run starts with `{(its compartment, ∅)}`, plus the lineage that its brief,
-  plan and `inputRefs` carried (after any release, rule 1).
+- A run starts with `{(its compartment, ∅)}` plus what its start admitted
+  (receive, below).
 
-**What a compartment may hold.** A run of compartment B may hold `(c, R)`
-when any of these is true:
+**Hold: what a run may have in its context.** A run of compartment B holds an
+element when its `c` is `executive`, or when any of these is true:
 
 - `c` is B;
 - B is in `R`;
+- `R` holds `effort:<e>`, e is live, and B is one of e's members;
 - `c` is covered by one of B's standing grants. Under D5, `security/code`
   holds engineering.
 
-Three kinds of agent are special:
+Two rules override that list:
 
-- **The CEO** may hold every element (D2).
-- **A child the CEO delegates to in executive** (planner, judge#exec,
-  worker-template) may hold every non-coding element for that run. It may not
-  hold an engineering or `security/code` element.
-- **Every other executive agent** holds executive data only.
+- **The CEO** holds every element whose `c` is not `engineering` or
+  `security/code`. It holds a coding element only when `ceo` is in `R`.
+- **A grant-marked element** is held only by the grantee run (§2.9).
 
-**What adds to it**
+Every other executive agent, standard or template child, holds by the list
+above, so it holds executive data only.
 
-- A recall hit adds the lineage in its provenance (P7). The kernel also adds
-  every lineage it logged for that record id (K11).
-- A child's summary adds the child's lineage.
-- A brief, a shared record or a collaboration record adds the lineage in its
-  provenance.
-- A granted read adds `(owning compartment, ∅)`, marked with the grant's id.
-- An approval card shown to the CEO adds the card's lineage.
+**Receive: what a child may be started with.** This covers a child the CEO
+delegates to, and any run the kernel starts. A child of compartment B, under
+objective O, receives an element when its `c` is `executive`, or when any of
+these is true:
 
-What does not add to it: the kernel's typed fields. These are status, cost,
-taint, the acceptance results and evidence verdicts the kernel computed, and
-deliverable kinds and refs. The kernel renders them, and no model wrote them.
+- `c` is B, or B is in `R`;
+- `R` holds `effort:<e>`, e is live, e is bound to O, and B is one of e's
+  members;
+- `c` is not a coding compartment, O's effort e is live, B is one of e's
+  members, and `c` is in e's open set. The child's copy of the element gains
+  `effort:<e>`.
+
+A child never receives a grant-marked element. Standing grants never admit a
+brief: a grant names namespaces, while lineage records only a compartment.
+
+**Store: what may be written where.** A write into namespace N is allowed
+only when every reader of N (§2.3) holds every element natively. That covers
+an agent's `remember`, a brief the kernel files, a goal, and any record the
+kernel writes. A reader X holds an element natively when its `c` is
+`executive`, or when any of these is true:
+
+- `c` is X, or one of X's standing grants covers `c`;
+- X is the CEO, and `c` is not a coding compartment or `ceo` is in `R`.
+
+Under this rule:
+
+- release entries other than `ceo` never count, so released data is never
+  stored in a reader's own namespaces;
+- a grant-marked element is never stored.
+
+The approved writes are the exception: a copy (§2.7) and a promotion (§2.8)
+store exactly the bytes their approval or open set covers. **So foreign data
+is stored only where the operator approved its exact bytes, or where an open
+set the operator approved covers it.**
+
+**What adds to a run's lineage**
+
+- **Recall hits.** A recall hit adds the lineage in its provenance (P7), plus
+  every lineage the kernel logged for that record id, and for each id in its
+  `mergedFrom` (K11).
+- **Reading another run's output.** `kernel.read_result` of a child adds the
+  child's lineage. So does the CEO's own card, shown in its continuation.
+- **The D6 channel.** When an engineering or `security/code` child's capped
+  summary is read, or its capped brief is filed (§2.5), the elements that run
+  holds natively gain `ceo` in `R`. Natively means its own compartment, and
+  for `security/code` its D5 grant.
+- **Grants.** A granted read adds `(owner, ∅)` and the lineage of every record
+  or deliverable it delivered, all grant-marked (§2.9).
+- **The goal tree.** `kernel.read_goals` adds the goals' lineage.
+- **Other inputs.** Bytes the kernel hands a run outside a brief add the
+  lineage of every run they came from. That includes a deliverable, an
+  evidence item and an event-log slice.
+
+**What does not add to a run's lineage:** values the kernel derived itself,
+and nothing else. These are:
+
+- run, task and goal ids;
+- the status and stop-reason enums;
+- cost and call counts;
+- taint;
+- gate counts;
+- the kernel's own acceptance and sha256 checks, as enums and counts;
+- deliverable refs the kernel minted (`<kind>:<runId>:<n>` with a sha256).
+
+Every string a model wrote is that run's text. That includes a summary,
+deliverable text, any URL or ref it chose, `failureHistory`, `proposedPlan`,
+`proposals`, evidence text, and any error or provider message. It reaches
+another run only through `kernel.read_result` or a brief.
+
+**The rules**
+
+1. **Delegation and kernel-started runs.** A child starts without a human
+   only when it receives every element of:
+   - its brief;
+   - its plan's task text;
+   - every input the kernel hands it.
+
+   Otherwise:
+   - a CEO delegation parks as `needs-human`. The kernel first logs
+     `delegation.parked`, with the child's full input, before the card (K5).
+     If the operator approves, each failing element gains B in `R`: the
+     operator released that input to that compartment.
+   - a run the kernel itself would start (a ready plan node, a milestone
+     judge) is not started. The kernel logs `start.withheld`, and the CEO may
+     delegate it instead.
+2. **Reading a result.** `kernel.read_result` hands the CEO a child's text
+   only when the CEO holds every element of the child's lineage, after the D6
+   channel. Otherwise it parks as `needs-human`. If the operator approves,
+   each failing element gains `ceo`.
+3. **Storing.** Every write obeys the store rule. A `remember` that fails it,
+   or that comes from a run holding a grant-marked element, is denied. A brief
+   the kernel would file is withheld (`brief.withheld`). A plan adoption from
+   a run holding a grant-marked element is refused.
+4. **Copies and promotions** are judged on the source's lineage, never on the
+   source run's compartment alone (§2.7, §2.8).
+5. **Plans and goals.** An adopted plan carries the adopting run's lineage,
+   and so does each goal written from it.
+
+Every one of these checks is computed by the kernel before the gate, and
+reaches the pure gate as a fact. So every refusal and every park is a
+`tool.gate` row (K2, K5, K9, K11).
 
 **The CEO's own memory.** A recall of `aos/executive/ceo` offers kernel
-labels that bound the lineage of the hits (K2; P7's `lineage_within`):
+labels that bound the lineage of the hits (K11; P7's `lineage_within`):
 
 - `own` returns records whose lineage is executive only;
 - `own:<c>` returns records whose lineage stays within executive and `c`;
@@ -431,59 +562,25 @@ labels that bound the lineage of the hits (K2; P7's `lineage_within`):
 
 The CEO chooses how much to read. Reading less never widens anything.
 
-**What it constrains.** Each check is computed by the kernel before the gate,
-from the log and the run scope, and reaches the pure gate as a fact (K9a).
-
-1. **Delegation.** The brief, the plan's task text and its `inputRefs` carry
-   the lineage of the run and of the plan they came from.
-   - **When a child may start.** A child in B starts without a human only when
-     B may *receive* every element:
-     - `c` is B, or B is in `R`;
-     - for an executive child of the CEO, any non-coding element;
-     - under the effort its objective is bound to (§2.7), an element whose
-       `c` is in the effort's open set, when B is a member.
-   - **Standing grants never admit a brief.** A grant names namespaces, while
-     lineage records only a compartment.
-   - **Parking.** Otherwise the delegation parks as `needs-human`. The kernel
-     logs `delegation.parked`, with the full brief, before the card (K5). If
-     the operator approves, the brief is released to B: each element becomes
-     `(c, R ∪ {B})`.
-   - **`inputRefs`.** An `inputRef` whose elements B may not receive is
-     refused, not parked, unless its exact bytes are an approved copy in an
-     effort with B as a member.
-2. **Memory.** A `remember` into namespace N is refused unless every element
-   of the run's lineage is held by every compartment that reads N (§2.3). For
-   example:
-   - a marketing run that read engineering data cannot store it in marketing
-     memory;
-   - a planner holding marketing data cannot store it in executive memory;
-   - the CEO can store anything in `aos/executive/ceo`.
-3. **Grants.** A run whose lineage holds a grant-marked element cannot
-   `remember` at all (§2.9). That covers the grantee, and any run that read
-   its summary. Grant elements pass on only through a per-item approval.
-4. **Copies and promotions.** §2.7 and §2.8 judge them on the source's
-   lineage, never on the source run's compartment alone.
-5. **Plans and goals.** An adopted plan carries the adopting run's lineage,
-   and so does each goal written from it. Showing the CEO the goal tree adds
-   that lineage to its run.
-
 **In practice**
 
-- The CEO reads typed results freely and can delegate anywhere.
-- **A single-compartment objective.** The CEO reads that compartment's brief
+- **Typed results.** The CEO reads them freely, and can still delegate
+  anywhere.
+- **A single-compartment objective.** The CEO reads that compartment's brief,
   and delegates into it without the operator.
-- **A cross-compartment objective.** The CEO opens an effort (§2.7) with
-  those compartments as members and the non-coding ones in its open set. The
+- **A cross-compartment objective.** The CEO opens an effort (§2.7) with those
+  compartments as members, and the non-coding ones in its open set. The
   operator approves that once. Delegations under the objective then carry
-  those compartments' data between members with no further approval.
-- **Coding data never moves through an open set.** Each crossing out of
-  engineering is an operator approval of exact bytes: a copy, a promotion or a
-  parked brief.
+  those compartments' data between members with no further approval. A member
+  never stores such data outside the collaboration space.
+- **Coding data never moves through an open set.** Outside the D6 channel,
+  each crossing out of engineering is an operator approval of exact bytes: a
+  copy, a promotion, a parked brief or a parked result read.
 - **Reading has a cost (R9).** If the CEO reads marketing's and trading's
   briefs with no effort open, every brief it then writes to either
   compartment parks.
 
-### 2.5 Templates, children and delegation
+### 2.5 Templates, children and results
 
 **A child's compartment**
 
@@ -491,12 +588,13 @@ from the log and the run scope, and reaches the pure gate as a fact (K9a).
 - A template declares one or more **profiles**. Each profile has exactly one
   compartment and its own `tools.allow`, and the operator edits both. Examples
   are `scout#eng` → engineering, `scout#growth` → marketing, `scout#market` →
-  trading, `judge#exec` → executive, and `judge#critic` → trading.
+  trading, `judge#exec` → executive, `judge#eng` → engineering, and
+  `judge#critic` → trading.
 - A plan task names a profile, as it names a standard agent. A template with
   one profile may be named bare. A plan that names a multi-profile template
   without a profile is refused.
-- No plan field sets a compartment. Which data the child may receive is still
-  decided by the lineage check (§2.4), never by the plan.
+- No plan field sets a compartment. Which data the child receives is still
+  decided by the receive rule (§2.4).
 - The registry refuses `schedule:` on a template, so every scheduled run
   belongs to a standard agent.
 
@@ -508,37 +606,45 @@ from the log and the run scope, and reaches the pure gate as a fact (K9a).
 - Tier, egress, tools and budget follow the parent ∩ template rule (EX:130).
 - Taint passes from parent to child (K5). Today it does not (`kernel.ts:613`).
 
-**What comes back to the CEO**
+**Results (K5)**
 
-- **Typed fields.** The kernel's typed `RunResult`: status, cost, taint, the
-  kernel's acceptance results, and evidence and deliverable refs.
-- **The summary.** It is at most 2,000 characters and is written by the
-  child's model. The CEO gets it only by asking, with `kernel.read_result`, and
-  asking adds the child's lineage to the CEO's run (§2.4).
+- **The result record.** When a child finishes, the kernel logs `run.result`:
+  - the typed fields (§2.4);
+  - kernel-minted refs to its deliverable, which is its final text as logged,
+    bounded by `PAYLOAD_TEXT_BUDGET`;
+  - its summary, the first 2,000 code points of that text, marked when cut.
+- **What `kernel.delegate` returns.** It returns only the typed fields. A stop
+  reason is an enum: `usdMax`, `maxLlmCalls`, `maxToolCalls`, `wallclock`,
+  `approval`, `killed` or `error`. Its text stays in the log.
+- **Reading the summary or deliverable.** The CEO reads either with
+  `kernel.read_result`, under §2.4 rule 2.
 - **Raw memory** never comes back.
 
 **Engineering text and D6**
 
-- Engineering and `security/code` text reaches the CEO in only two shapes, and
-  the kernel caps both at 2,000 characters:
-  - a summary the CEO asks for;
-  - a brief the kernel files from a finished run's summary into
+- Engineering and `security/code` text reaches the CEO, outside an operator
+  release, in only two shapes. The kernel caps both at 2,000 code points.
+  - **A summary** the CEO reads with `kernel.read_result`.
+  - **A brief** the kernel files from a finished run's summary into
     `aos/<c>/brief`, with the write-only `aos-brief` principal. It does so
     only for agents whose manifest sets `filesBrief: true`, which the operator
-    edits: eng-lead and security-reviewer by default. There is at most one
-    per run, and P2 caps it at pmmcp too.
-- Both caps count Unicode code points, in the kernel and in pmmcp alike.
+    edits, and only when the store rule passes. There is at most one per run,
+    and P2 caps it at pmmcp too.
 - Engineering and `security/code` agents never write their brief themselves,
   because K2 offers them no `brief` scope.
 - A summary or brief may name files, functions and errors. No artifact body is
   handed over.
-- **What stays possible (R8).** A model can quote up to 2,000 characters of
+- **What stays possible (R8).** A model can quote up to 2,000 code points of
   code in one summary or brief, and many briefs together can quote more.
-  Lineage keeps such a quote from going further. The stricter alternatives are
-  briefs the kernel renders from typed fields only, or an operator approval
-  for each engineering brief.
-- Otherwise, file contents reach the CEO only through an operator grant
-  (§2.9), or a copy the operator released to the CEO (§2.7).
+  Lineage keeps such a quote from going any further.
+- File contents otherwise reach the CEO only through an operator grant (§2.9),
+  or a copy or promotion the operator released to the CEO.
+
+**Milestone judges.** The kernel judges a milestone only through a judge
+profile whose compartment natively holds every element of the evidence's
+lineage. An engineering milestone needs `judge#eng`, and `judge#exec` judges
+no coding milestone. Otherwise the kernel logs `judge.skipped`, and the
+milestone waits for a human (EX:276).
 
 **Delegating to a template** is ephemeral spawning, which no tool does yet
 (CLAUDE.md). Building it widens what agents can reach, so it is ask-before.
@@ -559,8 +665,9 @@ from the log and the run scope, and reaches the pure gate as a fact (K9a).
     `progress_pct`.
   - Never description, acceptance criteria, related files, blockers or tags.
 - **Lineage.** A goal carries its plan's lineage in the kernel's
-  `goal.created` record. When a plan comes from a sector lead's `ProposedPlan`
-  (EX:59), its titles are that compartment's data and carry its lineage.
+  `goal.created` record. When the CEO adopts a plan it read from a child's
+  result, the plan carries that child's lineage too, because reading it added
+  that lineage to the CEO's run.
 - **How the CEO sees them.** The CEO sees the tree through `kernel.read_goals`,
   and the goals' lineage joins its run.
 - Sector agents never touch goals. The kernel moves task status from the run
@@ -572,7 +679,8 @@ from the log and the run scope, and reaches the pure gate as a fact (K9a).
 
 Data never moves between compartments. When agents of different compartments
 work together, the data they need is **copied** into a collaboration space,
-and the original stays where it is.
+and the original stays where it is. Members use what is in the space; they
+never store it in their own namespaces (store rule, §2.4).
 
 **Efforts**
 
@@ -591,141 +699,170 @@ and the original stays where it is.
 - `kernel.add_member` adds a member under the same approval. In protocol v1
   nothing else changes an effort before it expires (§2.10).
 - An objective has at most one effort.
-- An effort ends at its expiry or when its objective closes. The kernel then
-  stops offering it and refuses new copies. The space stays in pmmcp, and
-  nothing is deleted.
+- An effort ends at its expiry. The kernel cannot see an objective close in
+  pmmcp; closing early is protocol v2. When an effort ends, the kernel stops
+  offering it and refuses new copies. Its `effort:` releases stop counting for
+  hold and receive. The space stays in pmmcp, and nothing is deleted.
+- Efforts are logged (`effort.opened`, `effort.member.added`, `effort.ended`)
+  and projected from the log.
 - **Why `executive` is never a member.** Executive data goes to every
   compartment, so a copy released to executive would be released to all. The
-  CEO reads efforts under its own rule (Reading, below).
+  CEO reads efforts under its own hold rule.
 
 **Size**
 
 - There is no cap on a space.
 - A single copy must fit in one event. Its JSON-escaped length (`canonicalize`)
-  is at most `PAYLOAD_TEXT_BUDGET` (63,488 bytes), so `collab.copy.proposed`
-  fits under `MAX_LOGGED_OUTPUT` with its other fields and the operator can
-  read every byte. Larger material goes in as several copies.
+  is at most `PAYLOAD_TEXT_BUDGET` (63,488 bytes), so the proposal event fits
+  under `MAX_LOGGED_OUTPUT` with its other fields and the operator can read
+  every byte. Larger material goes in as several copies.
 - The kernel never truncates a copy. It refuses a source the log holds
-  truncated: a `tool.result` with `truncated: true`, or an `llm.response` cut
-  at the budget.
+  truncated.
 
 **A copy**
 
-An orchestrator files `kernel.copy_to_collab {effort, source}`. The source is
-bytes the kernel already holds: a finished run's deliverable or summary, as
-logged. To copy a stored memory, a run of the source compartment first
-recalls it into its deliverable. Workers do not file copies; letting them is a
-widening, and ask-before.
+The CEO files `kernel.copy_to_collab {effort, source, ceoRelease}`.
 
-1. **Resolving the source.** The kernel resolves the source (K9's prepare
-   step) only after the gate's deny rules have passed for this call: the tool
-   is exposed, it is in the caller's manifest, and the caller is an
-   orchestrator. A denied call resolves nothing and logs nothing. The kernel
-   refuses bytes the log's redactor would change, so the bytes the operator
-   reads are exactly the bytes that get written.
-2. **Logging.** The kernel logs `collab.copy.proposed`. It carries the full
-   bytes and their sha256; the source compartment, run, taint and lineage; and
-   the effort. The kernel then adds the sha256 to the call's arguments before
-   the gate hashes them, so an approval binds those exact bytes.
-3. **Approval** follows the source's lineage, as its `run.finished` recorded
-   it.
-   - **When no fresh approval is needed.** The calling run is clean, and every
-     element `(c, R)` is either already released to every member (each member
-     is `c` or is in `R`) or has its `c` in the effort's open set.
-   - **Otherwise** the operator approves this copy. An element whose `c` is
-     `engineering` or `security/code` is never covered by an open set, so every
-     coding copy is approved one at a time.
-   - **The card names every reader.** Those are the members, and the CEO if
-     the operator also releases the copy to it (`ceoRelease`). For a coding
-     copy, `ceoRelease` is the D6 override. The CEO reads a non-coding copy
-     anyway.
+- **The source** is a deliverable ref the kernel minted for a finished run
+  (§2.5): bytes the log already holds. To copy a stored memory, a run of the
+  source compartment first recalls it into its deliverable.
+- **`ceoRelease`** asks that the CEO may read the copy too.
+- **Who may file.** Workers do not file copies. Letting them is a widening,
+  and ask-before.
+
+1. **Preparing.** The kernel's prepare step (K9) runs only after the gate's
+   deny rules have passed for this call. It then:
+   - resolves the bytes;
+   - refuses bytes the log's redactor would change, so the bytes the operator
+     reads are exactly the bytes that get written;
+   - logs `kernel.proposed`, carrying the full arguments, the full bytes and
+     their sha256, the source compartment, run, taint and lineage, and every
+     reader of the copy: the members, and the CEO when `ceoRelease` is set;
+   - adds the sha256 to the arguments the gate hashes, so an approval binds
+     those exact bytes.
+
+   A denied call resolves nothing and logs nothing.
+2. **Coverage.** A copy needs no fresh approval only when all of these hold:
+   - the calling run is clean;
+   - `ceoRelease` is not set;
+   - no element of the source lineage is grant-marked;
+   - every member receives every element, under the effort's open set or
+     through earlier releases (receive rule, §2.4).
+
+   An element whose `c` is `engineering` or `security/code` is never covered
+   by an open set, so every coding copy is approved one at a time.
+3. **Approval.** Otherwise the operator approves this copy, having read the
+   `kernel.proposed` row. The operator can approve or deny it as filed: in v1,
+   a different `ceoRelease` means the CEO files again.
 4. **Writing.** The kernel writes the bytes into `aos/collab/<effort>` with the
    `aos-collab` principal (P1). The provenance is P7's, filled for the source
-   run, and every field below sits inside `provenance`:
-   - `runId`, `agentId` and `taint` of the source run;
+   run:
+   - its `runId`, `agentId` and `taint`;
    - `origin`: `untrusted` if that run was tainted, else `agent`;
-   - `lineage`: the source lineage, with each element's `R` extended by the
-     members. This is the release;
+   - `lineage`: the source lineage, with `effort:<id>` added to each element's
+     `R`, plus `ceo` when `ceoRelease` was approved. This is the release.
+     Grant marks are dropped, because the operator approved these bytes;
    - `observedAt`;
-   - `source {compartment, runId, sha256}`, `members`, `copiedBy`,
-     `approvedBy` and `ceoRelease`.
+   - `source {compartment, runId, sha256}`, `members`, `copiedBy` and
+     `approvedBy`.
 
 **Reading**
 
-- **Members.** Agents of a member compartment read the space. pmmcp returns a
-  record only to a principal whose compartment is among that record's
-  `members` (P2).
-- **The CEO** reads every record without coding lineage, and a coding-lineage
-  record only when `ceoRelease` is true. pmmcp enforces both.
-- **Lineage.** Reading adds the record's lineage (§2.4). A member may hold it,
-  because the copy released it to members. Passing it any further needs
-  another approval.
-- **A new member** sees only later copies. Members are stamped on each record,
-  and no tool rewrites a record. To give a new member an earlier copy, the CEO
-  files it again, under a new approval.
+- **Members** read the space while it is live. pmmcp returns a record only to
+  a principal whose compartment is among that record's `members` (P2).
+- **The CEO** reads every record its hold rule allows: every non-coding
+  record, and a coding one only with `ceo` in `R`. pmmcp enforces that too
+  (P2).
+- **Lineage.** Reading adds the record's lineage (§2.4). A member holds it
+  while the effort is live, may pass it within the effort, and stores none of
+  it.
+- **A new member** sees only later copies, because members are stamped on each
+  record and no tool rewrites a record. To give a new member an earlier copy,
+  the CEO files it again.
 
 **The fleet space.** `aos/fleet/shared` is written only by promotion (§2.8).
-A promotion releases to every compartment, and is always approved per item.
 
 ### 2.8 Promotion
 
 A promotion puts approved bytes into a curated namespace: a compartment's
 `shared`, or `aos/fleet/shared`.
 
-- **Who proposes.** A worker proposes a promotion only as a typed
-  `RunResult.proposals[]` entry: `{kind: promote, target: shared | fleet,
-  deliverableRef}`. The model never names a namespace. Letting a worker's
-  output start an approval is ask-before (K13).
-- **The target.** The kernel resolves it to one of three: the proposer's own
-  compartment's `shared`, `aos/security/shared` for a `security/code` proposer,
-  or `aos/fleet/shared`. It refuses anything else.
+- **Who files.** In v1, the CEO files `kernel.promote {source, target}`. The
+  source is a deliverable ref the kernel minted.
+- **Candidates.** A curator's or eng-lead's deliverables are candidates. The
+  kernel lists them in the CEO's continuation as typed refs only: ref, source
+  compartment, proposed target and sha256, with no text. A promotion
+  approved without a CEO run needs a run-independent approval, which is
+  protocol v2 (§2.10).
+- **The target** is relative to the source run's compartment:
+  - `own`: `aos/<c>/shared`, which is `aos/security/code/shared` for a
+    `security/code` source;
+  - `parent`: `aos/security/shared` for a `security/code` source, or
+    `aos/marketing/shared` for a clipping source;
+  - `fleet`: `aos/fleet/shared`.
+
+  The kernel refuses anything else.
 - **The source.** The kernel takes the source bytes as it does for a copy
-  (§2.7: size, redaction, truncation), logs `promote.proposed`, and hashes the
-  sha256. It refuses a source from a tainted run.
+  (§2.7: size, redaction, truncation, `kernel.proposed`, sha256 hashed). It
+  refuses a source from a tainted run.
+- **The card names every reader of the target** (§2.3), the CEO and
+  standing-grant readers included. Approving a coding-lineage promotion into a
+  namespace the CEO reads is a D6 release.
 - **Approval** is always per item, by the operator. No open set covers a
   promotion.
 - **The write** uses `aos-promote`. The provenance lineage is the source
-  lineage, with each element released to the target's readers. It also
-  carries `promotedFrom {runId, sha256}` and `approvedBy`.
-- **Effect.** The target's readers hold the promoted data because the
-  promotion released it. A `security/code` finding promoted into
-  `aos/security/shared`, for example, is released to warden, evaluator and
-  comms-triage, approved on its exact bytes.
+  lineage, with each element released to the target's reader compartments,
+  plus `ceo` when the CEO reads the target, and with grant marks dropped. It
+  also carries `promotedFrom {runId, sha256}` and `approvedBy`.
+- **Effect.** The target's readers hold the promoted data, but store none of
+  what they derive from it (store rule). A `security/code` finding promoted
+  into `aos/security/shared` is released to warden, evaluator and
+  comms-triage, and to the CEO, approved on its exact bytes.
 
 ### 2.9 Grants and overrides (D5, D6)
 
 **Grants**
 
-A grant lets a run read something its compartment cannot.
+A grant lets one run read something its compartment cannot.
 
-- **In v1.** The CEO requests one with `kernel.request_access {compartment,
-  what, reason}`. The grantee is the requesting run, and the grant ends with
-  that run. The operator approves it as a `HumanActor`. Grants the operator
-  issues to a named agent or objective, and revocation, are protocol v2
-  (§2.10).
+- **Requesting.** In v1, the CEO requests one with `kernel.request_access
+  {compartment, what, reason}`.
+  - The kernel logs `kernel.proposed` with the full arguments, and with the
+    lineage of every deliverable or record `what` names, so the operator sees
+    every compartment the bytes hold.
+  - The operator approves it as a `HumanActor`.
+  - The grantee is the requesting run, and the grant ends with that run.
+  - Grants the operator issues to a named agent or objective, and
+    revocation, are protocol v2 (§2.10).
 - **What `what` may name.**
   - Deliverables of that compartment, delivered from the bytes the log holds.
   - Its pmmcp records.
-  - Engineering files only as indexed records with a `source_path` (P9). The
+  - Engineering files only as indexed records with `source_paths` (P9). The
     kernel fills `source_paths` from the grant, and pmmcp filters on it
     inside the query. Until P9 ships that, a file grant is refused, and only
     deliverables can carry file contents.
-- **Execution.** The kernel performs the read through the owning
-  compartment's principal and delivers the result to the run. The run's
-  lineage gains `(c, ∅)`, marked with the grant's id.
-- **Nothing a grant delivers is stored.** A run whose lineage holds a
-  grant-marked element cannot `remember` (§2.4, rule 3). The grantee's summary
-  carries those elements, so a run that reads it cannot `remember` either, and
-  whatever comes from the grant reaches anyone else only through the operator.
-- **D6's override** is this grant to the CEO, or a copy with `ceoRelease`. In
-  v1 the operator starts it by telling the CEO, in `run.start`'s input, to
-  request it, and then approving.
+- **Reading.** The grantee reads with `kernel.read_grant {grantId, query?}`.
+  The kernel performs the read with `callKernelOnly` under the owning
+  compartment's principal. It renders the hits without provenance, as K11
+  does. It adds `(owner, ∅)` and the delivered data's own lineage to the
+  run, all grant-marked.
+- **Nothing a grant delivers moves or is stored without a per-item approval.**
+  - Only the grantee run holds a grant-marked element.
+  - No child receives one.
+  - No open set covers one.
+  - The store rule never passes one, so the grantee run cannot `remember`,
+    and cannot adopt a plan.
+  - Its outputs reach anyone else only through a copy or promotion the
+    operator approves on its exact bytes.
+- **D6's override** is this grant to the CEO, or a copy or promotion released
+  to the CEO. In v1 the operator starts a grant by telling the CEO, in
+  `run.start`'s input, to request it, and then approving.
 
 **The standing D5 grant**
 
 - `security/code` (security-reviewer, pentester) reads
   `aos/engineering/shared` and `aos/engineering/index/*`, read-only, through
-  `aos-security-code` (P1).
+  `aos-security-code` (P1), with `index:<repo>` labels (K2).
 - Its findings stay in `aos/security/code/*`, and its briefs are kernel-filed
   and capped (§2.5).
 - A finding reaches `aos/security/shared` only by promotion (§2.8). It reaches
@@ -739,19 +876,17 @@ A grant lets a run read something its compartment cannot.
 The operator can overrule every security agent. No security agent can overrule
 the operator.
 
-- **In v1.**
-  - A security agent's block on a tool call is a pending card. The operator
-    resolves it with `approval.approve`, which logs `approval.resolved` and
-    carries no reason.
-  - A held output is released with `quarantine.release`.
+- **In v1.** Security agents' blocks and vetoes do not exist in code yet. When
+  they are built, each block on a tool call is a pending card. The operator
+  resolves it with `approval.approve`, which logs `approval.resolved` and
+  carries no reason. A held output is released with `quarantine.release`,
+  which today hands it to the operator only (`src/policy/quarantine.ts:94-117`).
 - **From v2 (ask-before):**
   - `override.applied {by, target, reason}`, logged as its own event;
   - a fleet halt and resume;
   - an override of a security veto;
   - the rule that a security agent cannot raise the same block again on an
     action whose block the operator overrode.
-
-  Neither the halt nor the veto exists in code yet.
 - **Cutting the D5 grant.**
   - In v1, the operator kills any `security/code` run with `run.kill`, removes
     the grant from `kernel.yaml`, and restarts the daemon. The daemon reads its
@@ -767,16 +902,18 @@ the operator.
 
 ### 2.10 What protocol v1 covers
 
-**Covered.** In each case below, the CEO files a kernel tool and the operator
-answers with `approval.approve` or `approval.deny`, after reading the logged
-bytes with `events.query`:
+**Covered.** In each case the CEO files a kernel tool, which parks for a human
+(K2's facts). The kernel logs the full arguments and bytes in `kernel.proposed`
+before the card. The operator reads them with `events.query`, then answers
+with `approval.approve` or `approval.deny`. The covered cases:
 
 - opening an effort, with its members, open set and expiry;
 - adding a member;
 - a copy, with or without `ceoRelease`;
 - a promotion;
 - a grant request;
-- a parked delegation.
+- a parked delegation;
+- a parked result read.
 
 **Not covered.** Each of these needs a protocol v2 command, which is
 ask-before, with a version bump and a migration note:
@@ -784,6 +921,9 @@ ask-before, with a version bump and a migration note:
 - revoking a grant, an open set or an effort before its expiry;
 - suspending D5 live;
 - a grant the operator issues;
+- an approval tied to no live run, such as a curator's promotion with no CEO
+  run;
+- choosing a different `ceoRelease` from the one the CEO filed;
 - an override that records a reason;
 - a fleet halt and resume;
 - an override of a security veto;
@@ -810,6 +950,10 @@ mode 0600. The real file spells out every compartment; `…` marks repetition
 here.
 
 ```yaml
+operator_token_file: "/Users/<op>/.config/pmmcp/operator.token"   # absolute; outside every repo and index root
+index_roots:                                    # P9; the operator edits these
+  aos/engineering/index/aos-kernel: {path: "/Users/<op>/src/MrRobot", trust: operator}
+  aos/engineering/index/somelib:    {path: "/Users/<op>/src/vendor/somelib", trust: untrusted}
 principals:
   # one per compartment, except: executive has two (aos-ceo for the agent
   # `ceo` alone, aos-executive for the rest), and marketing/clipping uses
@@ -839,14 +983,14 @@ principals:
             "aos/collab/", "aos/fleet/shared"]
     write: ["aos/security/code/agent/"] # its brief is kernel-written (aos-brief)
     profile: sector-memory
-  - id: aos-executive                   # assistant, curator-executive, and the CEO's executive children
+  - id: aos-executive                   # every executive agent except `ceo`
     compartment: executive
     read:  ["aos/executive/agent/", "aos/executive/shared", "aos/fleet/shared"]
     write: ["aos/executive/agent/"]
     profile: sector-memory
   - id: aos-ceo                         # the agent `ceo` only
     compartment: executive
-    collab_all: true                    # every effort; coding-lineage records only with ceo_release (P2)
+    collab_all: true                    # every effort, under the CEO hold rule (P2)
     read:  ["aos/executive/ceo", "aos/executive/shared",
             "aos/engineering/brief", "aos/marketing/brief", "aos/marketing/clipping/brief",
             "aos/trading/brief", "aos/security/brief", "aos/security/code/brief",
@@ -876,30 +1020,37 @@ principals:
     read:  []
     write: ["aos/engineering/brief", "aos/security/code/brief"]
     profile: write-only
-  # the operator's own clients (recommended, §8): never aos/
+  # the operator's own MCP clients (recommended, §8): never aos/
   - id: operator-clients
+    token_sha256: "<hex>"
     own_projects: true
     profile: sector-memory
   # the operator's pmmcp CLI; never configured in any MCP client the kernel runs
   - id: operator
+    token_sha256: "<hex>"
     all: true
     profile: all
 ```
 
 **Startup checks.** pmmcp refuses to start when any of these holds:
 
-- an entry other than `operator` has `all: true` or `profile: all`, or
-  `operator` lacks either;
-- an entry other than `operator` lacks `token_sha256`, `profile`, or (except
-  `operator-clients`) `read` and `write`;
-- an entry names a profile not in P3's table;
-- two entries share an `id` or a `token_sha256`;
-- more than one entry has `collab_all`, or the one that has it is not
-  `aos-ceo`;
-- an entry other than `operator` and `operator-clients` has a prefix that does
-  not start with `aos/`;
-- `operator-clients` has `all`, `collab_all`, `compartment`, any prefix, or a
-  profile other than `sector-memory`.
+- **The file itself.**
+  - It lacks `operator_token_file`, or that value is not an absolute path.
+  - An `index_roots` entry lacks `path` or `trust`.
+- **Fields every entry must carry.**
+  - An entry lacks `token_sha256` or `profile`.
+  - An entry other than `operator` and `operator-clients` lacks `read` and
+    `write`.
+  - An entry names a profile not in P3's table.
+- **Duplicates.** Two entries share an `id` or a `token_sha256`.
+- **The operator.** An entry other than `operator` has `all: true` or
+  `profile: all`, or `operator` lacks either.
+- **`collab_all`.** More than one entry has it, or the one that has it is not
+  `aos-ceo`.
+- **Prefixes.** An entry other than `operator` and `operator-clients` has a
+  prefix that does not start with `aos/`.
+- **`operator-clients`.** It has `all`, `collab_all`, `compartment`, any
+  prefix, or a profile other than `sector-memory`.
 
 **Token check**
 
@@ -910,8 +1061,9 @@ principals:
   required field, and a tool can read it, so it must not hold the bearer.
 - No match, or no token: HTTP 401 `invalid_token`. The body never echoes the
   token, and the server never logs it.
-- The operator token lives in a named location outside every repository and
-  every index root (P9 refuses a root containing it).
+- The operator token's plaintext lives only in `operator_token_file`, owned by
+  the operator, mode 0600. pmmcp's CLI reads it there. The server reads only
+  the path, so that P9 can refuse a root that contains it.
 
 **SDK configuration**
 
@@ -930,8 +1082,10 @@ principals:
 
   `RequireAuthMiddleware` with no scopes admits every principal (§1), so a
   route wrapped only in it would bypass P2 and P3.
-- **Version pin.** Pin `mcp>=1.27.2,<2` while pmmcp imports
-  `mcp.server.fastmcp`, or port it to `MCPServer` and pin `mcp>=2.3,<3` (§1).
+- **Version pin.** Pin `mcp>=1.29.1,<2` while pmmcp imports
+  `mcp.server.fastmcp`, or port it to `MCPServer` and pin `mcp>=2.3,<3`.
+  - 1.27.2 adds the session-owner binding.
+  - 1.29.1 adds the inlining of a root `$ref`, which P6 needs (§1).
 
 **The other network surfaces**
 
@@ -968,7 +1122,8 @@ kernel bug could read anything.
   `aos/engineering/*`.
 - **Other surfaces.** Requests without a token to 8765, and to Qdrant's REST
   and gRPC ports, are refused.
-- **Startup.** pmmcp refuses to start on each of the startup checks above.
+- **Startup.** pmmcp refuses to start on each of the startup checks above,
+  including an `operator` entry without `token_sha256`.
 
 **Kernel impact.** K3. The token name of each kernel-held principal enters
 `.env` through `credentialNames`. The operator token's name appears nowhere in
@@ -995,14 +1150,15 @@ this repository.
   ^aos/fleet/shared$
   ```
 
-  The id must be ASCII and is compared exactly as received. The string that
-  passed validation is used unchanged for the check, for storage, for the
-  Qdrant filter and in SQL. Match with Python's `re.fullmatch`, or end the
-  pattern with `\Z`: under `re.match`, `$` also matches before a final
-  newline.
+  - The id must be ASCII and is compared exactly as received.
+  - The string that passed validation is used unchanged for the check, for
+    storage, for the Qdrant filter and in SQL.
+  - Match with Python's `re.fullmatch`, or end the pattern with `\Z`. Under
+    `re.match`, `$` also matches before a final newline.
 - **`operator-clients`.** For it, `project_id` must fullmatch
-  `^[a-z0-9][a-z0-9/-]{0,127}$`, must not begin with `aos`, and must contain
-  no `//` and no trailing `/`.
+  `^[a-z0-9][a-z0-9/-]{0,127}$`, must not be `aos` or begin with `aos/`, and
+  must contain no `//` and no trailing `/`. `own_projects: true` matches every
+  such id, for reads and writes.
 - **Read or write.** pmmcp classifies every tool as read or write. A read must
   match one of the principal's `read` prefixes, and a write one of its `write`
   prefixes.
@@ -1019,34 +1175,38 @@ this repository.
 - **Collaboration members.**
   - A read under `aos/collab/` returns a record only when the record's
     `provenance.members` include the principal's `compartment`.
-  - The `collab_all` principal gets every record, except one whose lineage
-    names `engineering` or `security/code` and whose `ceo_release` is not true.
   - `operator` gets every record.
   - A write under `aos/collab/` must carry `provenance.members` (non-empty,
     each a compartment that some principal in the principals file holds, never
     `executive`) and `provenance.source`. Otherwise it is refused with
     `invalid_provenance`.
+- **The CEO's hold rule** (`collab_all`, §2.4). In every namespace it reads,
+  `aos-ceo` gets no record that holds a lineage element whose `c` is
+  `engineering` or `security/code` and whose `R` lacks `ceo`. Under
+  `aos/collab/` it gets every other record, whatever its members.
 - **Brief cap.** A write into `aos/engineering/brief` or
   `aos/security/code/brief` whose content exceeds 2,000 code points is refused
   with `content_too_long`.
 - **Search filters inside the query.** It is a Qdrant `must` exact match on
-  the validated `project_id`, plus the members and lineage rules above under
-  `aos/collab/`, and P7's filters. Records whose `project_id` is null or
-  different are never candidates. A query must not be able to rank or count
-  results from another compartment. Timing is covered in §8.
+  the validated `project_id`, plus the members and CEO rules above, plus P7's
+  and P9's filters. Records whose `project_id` is null or different are never
+  candidates. A query must not be able to rank or count results from another
+  compartment. Timing is covered in §8.
 - **Similarity work never mixes records.**
   - Deduplication on `remember`, related-memory links, consolidation and
-    `repair_and_heal` compare records of one `project_id` only, and only
-    records whose provenance is equal in every field except `runId`,
-    `agentId` and `observedAt`.
+    `repair_and_heal` compare records of one `project_id` only. Within that,
+    they compare only records whose provenance is equal in every field except
+    `runId`, `agentId` and `observedAt`, and whose `source_paths` and `commit`
+    are equal or absent on both (P9).
+  - Records whose `source_paths` differ are never merged, rewritten into one,
+    or folded together. This holds for every principal, the operator included.
+    A re-index replaces only the records of the same `source_paths`.
   - For every principal except `operator`, pmmcp never changes a stored
     record's `project_id`, content or provenance after the write.
   - Writes by `aos-promote`, `aos-collab` and `aos-brief` are never
     deduplicated, merged or rewritten. They stay the bytes the operator
     approved.
-  - A merge the operator runs by hand records the union of the lineages,
-    `taint: true` and `origin: untrusted` if either record has them, and the
-    intersection of the `members`.
+  - A hand merge by the operator follows P7's merge rule.
   - A recall hit's content is the text of one record only.
 - **Order of checks.** Principal, then namespace, then existence, then
   everything else. An id-addressed object outside the principal's read set
@@ -1072,28 +1232,33 @@ For every sector principal:
   another compartment.
 - With `aos-security-code`, `remember` into `aos/engineering/*` is refused.
 - A `project_id` holding `..`, `//`, a trailing `/`, uppercase, U+0456, `%2F`,
-  whitespace or NUL is refused, each case on its own.
+  whitespace, NUL or a final newline is refused, each case on its own.
 
 Isolation and answers:
 
-- A memory seeded in `aos/engineering/agent/<id>` appears, under any query in
-  a sweep test, only to `aos-engineering` and `operator`.
-- One seeded in `aos/engineering/shared` or `aos/engineering/index/x` appears
-  only to `aos-engineering`, `aos-security-code` and `operator`.
-- One seeded in `aos/engineering/brief` appears only to `aos-engineering`,
-  `aos-ceo` and `operator`.
-- Collaboration records:
-  - one with members `[engineering, marketing]` and no coding lineage is
-    returned to `aos-marketing` and `aos-ceo`, never to `aos-trading`;
-  - one with engineering lineage and no `ceo_release` is never returned to
-    `aos-ceo`;
-  - no collaboration record is returned to `aos-executive`.
-- An `aos-collab` write whose `members` include `executive` is refused.
-- A 2,001-character `remember` into `aos/engineering/brief` from `aos-brief`
-  is refused.
-- Near-duplicate records whose provenance differs stay two records.
-- An existing goal id in another project and a nonexistent goal id get
-  byte-identical answers.
+- **Seeded memories reach only their readers**, under any query, in a sweep
+  test:
+  - one seeded in `aos/engineering/agent/<id>` appears only to
+    `aos-engineering` and `operator`;
+  - one seeded in `aos/engineering/shared` or `aos/engineering/index/x`
+    appears only to `aos-engineering`, `aos-security-code` and `operator`;
+  - one seeded in `aos/engineering/brief` with `ceo` in its `R` appears only
+    to `aos-engineering`, `aos-ceo` and `operator`.
+- **Collaboration records.**
+  - One with members `[engineering, marketing]` and no coding lineage is
+    returned to `aos-marketing` and `aos-ceo`, never to `aos-trading`.
+  - One with engineering lineage and no `ceo` in `R` is never returned to
+    `aos-ceo`. With `ceo` in `R` it is.
+  - No collaboration record is returned to `aos-executive`.
+  - An `aos-collab` write whose `members` include `executive` is refused.
+- **Brief cap.** A 2,001-code-point `remember` into `aos/engineering/brief`
+  from `aos-brief` is refused.
+- **Similarity.**
+  - Near-duplicate records whose provenance differs stay two records.
+  - Two index records of different files with near-identical content stay
+    two records after indexing, consolidation and `repair_and_heal`.
+- **Not found.** An existing goal id in another project and a nonexistent goal
+  id get byte-identical answers.
 
 ### P3. A tool profile per principal
 
@@ -1118,7 +1283,7 @@ FastMCP dispatches any registered tool by name (`lowlevel/server.py:482-496,
 | Profile | Tools |
 |---|---|
 | `goals` | `create_goal`, `update_goal`, `get_goal_tree`, `list_goals` |
-| `sector-memory` | `recall`, `remember`, `search` (if it exists) |
+| `sector-memory` | `recall`, `remember`; and `search` once it meets P6, P7 and P9 exactly as `recall` does |
 | `write-only` | `remember` |
 | `all` (operator only) | everything |
 
@@ -1186,8 +1351,7 @@ goal. The kernel guards against this only with its own `goal.created` log.
 - Under any sector token, every goal tool gets `tool_not_in_profile`. That is
   P3's check, not P4's.
 
-**Kernel impact.** K6b. `GoalArgs`, the writer, the double and its tests gain
-the argument. The kernel's owner check stays, as defence in depth.
+**Kernel impact.** K6b, in three commits around this one (§6).
 
 ### P5. Real errors
 
@@ -1208,7 +1372,8 @@ the argument. The kernel's owner check stays, as defence in depth.
   - `goal_not_found`, `not_found`, `invalid_transition`, `invalid_status`,
     `parent_not_found`, `invalid_goal_type`, `progress_out_of_range`;
   - `namespace_denied`, `project_id_required`, `tool_not_in_profile`,
-    `provenance_required`, `invalid_provenance`, `content_too_long`;
+    `provenance_required`, `invalid_provenance`, `content_too_long`,
+    `use_merge`;
   - `internal_error`.
 - **Argument errors.** A required argument that is missing or malformed is
   refused by the SDK, with pydantic's text and no code. The kernel treats an
@@ -1235,20 +1400,35 @@ forms.
 
 **Change**
 
-- `create_goal`, `update_goal`, `get_goal_tree`, `list_goals`, `recall` and
-  `remember` return typed Pydantic models, so the SDK publishes an
-  `outputSchema` and `structuredContent`:
+- **The goal tools ship first** (§6 step 2): `create_goal`, `update_goal`,
+  `get_goal_tree` and `list_goals` return typed Pydantic models.
   - `create_goal` and `update_goal` → `{goal_id, project_id, status,
-    progress_pct}`;
-  - `get_goal_tree` → `{goal_id, children: [...]}`, with ids;
-  - `recall` → `{hits: [{id, project_id, content, provenance,
-    source_path?}]}`. In the provenance model `runId` and `agentId` are
-    `str | None`, and every other field is required;
-  - `remember` → `{id, project_id}` and nothing else: no duplicate, related or
-    merged record's id, content, provenance or count. A write-only principal's
-    reply therefore carries nothing read from storage, which §0 and §8 rely
-    on.
-- Every root is an **object**, which TS 1.30 requires (wrap lists).
+    progress_pct}`.
+  - `get_goal_tree` → `{goal_id, children: [GoalNode]}`, with ids. The root is
+    a separate, non-recursive model. Only `GoalNode` refers to itself.
+- **The memory tools ship with P7** (§6 step 5): `recall`, `search` (if it
+  exists) and `remember`.
+  - `recall` and `search` → `{hits: [{id, project_id, content, provenance,
+    source_paths?, commit?}]}`.
+  - `remember` → `{id, project_id}` and nothing else. `id` names the record
+    that holds the content after the call: the new record, or the existing
+    record pmmcp deduplicated the write into under P2's rule. The reply
+    carries no other record's id, and no content, provenance or count.
+    `aos-promote`, `aos-collab` and `aos-brief` are never deduplicated, so a
+    write-only principal's reply always names a new record and carries
+    nothing read from storage.
+- **The provenance model.**
+  - Required on every hit: `writer`, `taint`, `origin`, `lineage` and
+    `observedAt`.
+  - Nullable: `runId`, `agentId` and `compartment`. `compartment` is null for a
+    principal that has none.
+  - Optional, present only when the record was written with them: `source`,
+    `members`, `copiedBy`, `approvedBy`, `promotedFrom`, `briefOf` and
+    `mergedFrom` (a list of ids, default `[]`).
+  - A hit returned to `operator` may have `provenance: null` for a record
+    stored before P7.
+- Every root is an **object**, which TS 1.30 requires. Wrap lists, and never
+  make a self-referential model the root.
 - Every datetime is timezone-aware (Pydantic `AwareDatetime`) and serializes
   with `Z` or an offset. `observedAt` is UTC.
 - The serialized JSON is also returned as a text block.
@@ -1260,14 +1440,18 @@ carries the provenance lineage needs (K11).
 
 **Acceptance**
 
-- Each listed `outputSchema` has `type: object`.
-- The kernel's default `Client` (Ajv with ajv-formats) validates every one of
-  these results without throwing. That includes:
-  - a recall hit carrying provenance;
-  - a hit on an indexed record;
-  - a goal carrying timestamps.
-- A `remember` that duplicates an existing record returns exactly
-  `{id, project_id}`.
+- **Schemas.** Each listed `outputSchema` has `type: object` at the root, not
+  only a `$ref`. That includes `get_goal_tree`'s.
+- **Validation.** The kernel's default `Client` (Ajv with ajv-formats)
+  validates every result without throwing:
+  - a goal carrying timestamps;
+  - recall hits on an agent record, a filed brief, a collaboration copy, a
+    promoted fleet record and an indexed record.
+- **`remember`.**
+  - A `remember` that pmmcp deduplicates returns exactly `{id, project_id}`
+    with the existing record's id.
+  - The same `remember` under a write-only principal returns a new id, and
+    leaves the existing record unchanged.
 
 **Kernel impact.** K8, K11.
 
@@ -1282,44 +1466,63 @@ carries the provenance lineage needs (K11).
 - **Required provenance.** From every principal except `operator` and
   `operator-clients`, `remember` requires `provenance {runId, agentId, taint,
   origin: operator|agent|untrusted|system, lineage: [{c, R}], observedAt}`.
-  Without it, the call is refused with `provenance_required`.
+  Without it, the call is refused with `provenance_required`. `R` holds
+  compartment names, `ceo` and `effort:<id>` entries (§2.4).
 - **Extra fields for kernel writes.**
-  - `aos-collab` writes add `source`, `members`, `copiedBy`, `approvedBy` and
-    `ceo_release` (§2.7).
+  - `aos-collab` writes add `source`, `members`, `copiedBy` and `approvedBy`
+    (§2.7).
   - `aos-promote` writes add `promotedFrom` and `approvedBy` (§2.8).
   - `aos-brief` writes add `briefOf {runId}`.
 - **Server stamps.** pmmcp stamps `writer` (the principal id) and
   `compartment` itself, server side, and ignores any value a call sends for
-  them.
-- **Lineage check.** pmmcp refuses with `invalid_provenance` a `lineage`
-  element whose `c` is not a compartment of P2's grammar. When the writer has
-  a compartment, it also refuses a `lineage` that names neither that
-  compartment nor an open sub-section of it.
-  - An open sub-section is a grammar compartment `<c>/<x>` that no principal
-    has as its `compartment`. Here it counts as `<c>`: today
-    `marketing/clipping` counts as `marketing`.
-  - Once a principal names the sub-section, it is sealed and stops counting
-    as its sector.
+  them. For a principal with no compartment, `compartment` is null.
+- **Lineage check.** pmmcp refuses with `invalid_provenance`:
+  - an empty `lineage`;
+  - an element whose `c` is not one of `executive`, `engineering`,
+    `marketing`, `trading`, `security` and `security/code`. The kernel always
+    sends the open sub-section as `marketing`;
+  - when the writer has a compartment, a `lineage` that does not name it
+    (`marketing` for `aos-marketing`);
+  - for `aos-collab`, a `lineage` that does not name `source.compartment`.
 - **Records no agent wrote.** pmmcp stamps the provenance itself, and ignores
   any value sent, on every record the `operator` or `operator-clients`
-  principal stores. That includes everything `index_project` and
-  `index_git_history` store. The stamp is `{runId: null, agentId: null,
-  origin: operator, taint: false, lineage: [{c: <the namespace's compartment>,
-  R: []}], observedAt}`.
+  principal stores, except a merge. That includes everything `index_project`
+  and `index_git_history` store. The stamp is `{runId: null, agentId: null,
+  origin, taint, lineage: [{c, R: []}], observedAt}`:
+  - **origin and taint.** `origin: operator, taint: false`, except a record
+    indexed from a root whose `trust` is `untrusted` (P9). That record is
+    `origin: untrusted, taint: true`.
+  - **`c`** is the compartment the namespace names
+    (`aos/engineering/index/…` names `engineering`). For `aos/fleet/shared`
+    and `aos/collab/<effort>`, which name none, `c` is `executive`, because
+    the operator chose to put the record there. For an `operator-clients`
+    project, the lineage is `[]`, and no kernel principal can read it.
+- **Hand merges.** A merge the operator runs is a pmmcp operation that names
+  the ids of the records it replaces, all in one `project_id`. It is never a
+  `remember` of combined text. Its provenance is:
+  - the union of the inputs' lineages;
+  - `taint: true` and `origin: untrusted` if any input has them;
+  - the intersection of the inputs' `members`;
+  - `mergedFrom`: every input id, plus every id in the inputs' own
+    `mergedFrom`.
+
+  Under `aos/`, an operator `remember` whose text came from existing records
+  and that names no `mergedFrom` is refused with `use_merge`.
 - **No provenance, no hit.** A record with no provenance, such as one stored
-  before P7, is never returned to a principal other than `operator`.
+  before P7, is never returned to a principal other than `operator`. The
+  exception is `operator-clients`, for a `project_id` that passes its grammar.
 - **Untrusted text is excluded by default.** For every principal except
-  `operator`, `recall` leaves out hits whose origin is `untrusted` or whose
-  taint is `true` (`must_not`), unless the call passes `include_untrusted:
-  true`.
-- **`lineage_within: [compartments]`.** When given, `recall` returns only
+  `operator`, a memory read leaves out hits whose origin is `untrusted` or
+  whose taint is `true` (`must_not`), unless the call passes
+  `include_untrusted: true`.
+- **`lineage_within: [compartments]`.** When given, a memory read returns only
   hits whose every lineage element has its `c` in the list.
-- **Filters are part of the query.** Both filters are part of P2's query
-  filter, never applied to hits afterwards.
+- **Filters are part of the query.** All of these filters are part of P2's
+  query filter, never applied to hits afterwards.
 - **What a hit returns.** Each hit returns its provenance.
 - **Who fills what.** The kernel fills every provenance field,
-  `include_untrusted`, `lineage_within` and `source_paths` (P9). The model
-  sees none of them, neither in its tool schema (K2) nor in a result (K11).
+  `include_untrusted`, `lineage_within` and `source_paths`. The model sees none
+  of them, neither in its tool schema (K2) nor in a result (K11).
 
 **Why**
 
@@ -1331,36 +1534,42 @@ carries the provenance lineage needs (K11).
 **Acceptance**
 
 - **Untrusted text.**
-  - An untrusted or tainted memory never appears in a recall without
+  - An untrusted or tainted memory never appears in a read without
     `include_untrusted`, under any query.
   - A clean record and a tainted near-duplicate in one project stay two
     records.
+  - An index record from a `trust: untrusted` root never appears without
+    `include_untrusted`. One from a `trust: operator` root does.
 - **Lineage.**
   - Near-duplicates with lineage `[executive, engineering]` and `[executive]`
     never come back as one hit carrying `[executive]`.
-  - A recall with `lineage_within: [executive]` returns no record whose
-    lineage names another compartment.
+  - An operator hand merge of such records stores the union and a
+    `mergedFrom` holding both ids. A read with `lineage_within: [executive]`
+    does not return it.
+  - A read with `lineage_within: [executive]` returns no record whose lineage
+    names another compartment.
 - **Server stamps.**
   - A call under the marketing token that claims `compartment: engineering` is
     stored as marketing.
   - Under the marketing token, a `remember` into
-    `aos/marketing/clipping/agent/producer` with lineage `[{c:
-    marketing/clipping}]` is stored. With lineage `[{c: engineering}]` it is
+    `aos/marketing/clipping/agent/producer` with lineage `[{c: marketing}]` is
+    stored. With lineage `[{c: engineering}]`, or with an empty lineage, it is
     refused.
 - **Missing provenance.**
-  - A record stored without provenance never appears in a non-operator
-    recall.
+  - A record stored without provenance never appears in a non-operator read.
   - An index record recalled under `aos-security-code` carries lineage
     `[{c: engineering}]`.
+- **`search`.** Each check above is repeated with `search` when pmmcp serves
+  it.
 
 ### P8. Protocol era
 
 - pmmcp keeps serving 2025-11-25 Streamable HTTP while the kernel is on TS SDK
   1.30.
 - **On 2025-11-25**, P2's principal relies on the SDK's session-owner binding
-  (`mcp>=1.27.2`). P1's cross-token 404 test is what keeps that safe, so it
-  stays in pmmcp's suite. The alternative is `stateless_http=True`, which
-  checks the token on every request.
+  (`mcp>=1.27.2`; P1 pins 1.29.1 for P6). P1's cross-token 404 test is what
+  keeps that safe, so it stays in pmmcp's suite. The alternative is
+  `stateless_http=True`, which checks the token on every request.
 - **On 2026-07-28** there are no sessions, and the token is checked on every
   request.
 - Moving the kernel to a 2026-07-28 client is a new dependency
@@ -1371,35 +1580,55 @@ carries the provenance lineage needs (K11).
 **Change**
 
 - `index_project` and `index_git_history` are operator-only (profile `all`).
-- **Roots.** Sources come from an operator-owned `index_roots` map in the
-  principals file, `aos/engineering/index/<repo>` → absolute path, and never
-  from a tool argument.
+- **Roots.** Sources come from the principals file's `index_roots` map,
+  `aos/engineering/index/<repo>` → `{path, trust}`, and never from a tool
+  argument.
+  - `trust` is required: `operator` only for a root whose files and commits
+    the operator wrote or merged, and `untrusted` for a third-party repository,
+    a vendored dependency or a fork.
+  - An untrusted root's records are stamped untrusted (P7), so only an
+    already-tainted run reads them.
 - **Resolving a root.** pmmcp resolves each root once with `realpath`. It
-  refuses a root that is, contains, or lies inside a forbidden zone below. The
-  exception: a root may lie under `$HOME`.
-- **Symlinks.** Within a root, pmmcp never follows a symlink. A symlinked file
-  or directory is skipped, not read:
-  - the walk uses `os.walk(followlinks=False)`;
-  - each file is opened with `O_NOFOLLOW` and checked with `fstat` after it is
-    opened, so a link swapped in after the walk is not read either.
-- **Comparison.** Forbidden zones and files are compared by device and inode
-  as well as by spelling, because APFS is case-insensitive.
-- **Forbidden.** Each of these is refused as a root and skipped within one:
-  - `$HOME` and every ancestor of it;
+  refuses a root that is `$HOME` or an ancestor of `$HOME`. It also refuses a
+  root that is, contains or lies inside any of these:
+  - pmmcp's own storage;
+  - the principals file's directory;
+  - `operator_token_file`;
+  - a `.aos/` directory, matched case-insensitively.
+
+  Every other root is accepted, whether or not it lies under `$HOME`.
+- **The walk.**
+  - It uses `os.fwalk(root, follow_symlinks=False)`, and enters a subdirectory
+    only after `samestat` confirms that the opened directory is the one it
+    `lstat`ed. A directory swapped for a symlink during the walk is not
+    entered.
+  - Each file is opened relative to its directory's descriptor, with
+    `os.open(name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK, dir_fd=<fd>)`.
+  - After opening, `fstat` must show a regular file with `st_nlink == 1`,
+    whose `(st_dev, st_ino)` is not a forbidden file's; otherwise the file is
+    skipped. A hard link can name a file outside the root without being a
+    symlink.
+- **Forbidden within an accepted root.** The walk skips each of these and
+  never reads one. They are compared by device and inode as well as by
+  spelling, because APFS is case-insensitive:
   - any `.aos/` directory;
   - any `.env*` file, matched case-insensitively;
-  - the principals file's directory;
-  - the file or keychain item from which pmmcp's CLI reads the operator token
-    (P1 names its location);
+  - the principals file's directory and `operator_token_file`;
   - pmmcp's own storage: its SQLite files with their `-wal` and `-shm`,
     Qdrant's storage and snapshot directories, and every backup directory;
   - files matching credential patterns.
 
   Today's default ignore list skips only an exact `.env` (README.md:142-145).
-- **`source_path`.** Every index record stores it: the path relative to its
-  root, plus the commit id for git history. `recall` returns it in each hit,
-  and accepts `source_paths: [...]`. When that is given, `recall` returns only
-  records whose `source_path` is in the list, filtered inside the query.
+- **`source_paths`.** Every index record stores `source_paths`, a non-empty
+  list of paths relative to its root.
+  - A file record stores its one path.
+  - A git-history record also stores `commit`, and pmmcp splits a commit into
+    one record per touched file: that file's hunks plus the commit message,
+    with that one path.
+  - A memory read returns `source_paths`, and `commit` when it is set, in each
+    hit.
+  - It accepts `source_paths: [...]`. When that is given, it returns only
+    records whose every stored path is in the list, filtered inside the query.
 
 **Why**
 
@@ -1407,86 +1636,106 @@ carries the provenance lineage needs (K11).
   If the kernel could call one, it could pull any directory, another
   compartment's export or a credential into engineering.
 - The content of a root comes from more people than the operator: an agent's
-  merged change, or a third-party repository. A committed symlink must not
-  pull in a file outside the root.
+  merged change, or a third-party repository. A committed symlink, a hard
+  link or a swapped directory must not pull in a file outside the root, and
+  third-party text must stay untrusted.
 
 **Acceptance**
 
-- A root holding any of the following indexes none of them, and the walk
-  terminates:
+- **Links and swaps.** A root holding any of the following indexes none of
+  them, and the walk terminates:
   - a symlink named `notes.md` that points to a `.env` file;
   - a relative symlink to a file outside the root;
   - a symlinked directory that points to the root's own parent;
+  - a directory replaced by a symlink after the walk lists it;
+  - a hard link to a file outside the root;
   - a symlink to pmmcp's database.
-- A root that is `$HOME` or its parent, or that contains pmmcp's storage or
-  the principals file, is refused.
-- A recall with `source_paths: [a]` returns no hit from any other file.
+- **Roots.**
+  - A root that is `$HOME` or its parent is refused.
+  - A root that contains pmmcp's storage, the principals file, the operator
+    token file or a `.aos/` directory is refused.
+  - A root outside `$HOME` that commits `.env.example` is accepted, and that
+    file is not indexed.
+- **`source_paths`.**
+  - A read with `source_paths: [a]` returns no hit from any other file.
+  - It returns no git-history record carrying a change to another file.
 
 **Kernel impact.** The kernel never calls these tools, and `tool-views.yaml`
 keeps them kernel-only (invariant 7 names `index_project`). File grants
-(§2.9) depend on `source_path`.
+(§2.9) depend on `source_paths`.
 
 ## 4. Kernel changes
 
 Each item has its acceptance test. Rules that apply to all of them:
 
 - **Session protocol.** One task, one test, one commit.
+- **Gate facts.** Every access decision the kernel makes (reserved arguments,
+  delegation and result-read fits, copy coverage, the store rule,
+  `human: always`) is computed before `decide()` from the log and the run
+  scope, and reaches the pure gate as a fact. The model never sets one.
+  - A fact that denies is checked before the needs-human rules (4 and 5).
+  - A fact that parks is checked after rule 5, so a tainted run always needs
+    a human.
+  - Every outcome is a `tool.gate` row.
+  - Each new fact is a gate change, so it is ask-before, and ships with a
+    falsify mutant.
 - **Mutation coverage.** Each K commit updates `scripts/falsify/catalog.ts` in
-  the same commit, with at least one mutant per new refusal or gate rule.
-  Several items touch anchored lines:
+  the same commit, with at least one mutant per new refusal or fact. Several
+  items touch anchored lines:
   - K1: `kernel.ts` (N6);
   - K2: `gate.ts` (N1–N3);
   - K6b and K8: `writer.ts:119, 335` (G13, G15).
-- **Changed or deleted tests (ask-before).**
-  - K2 changes what `policy-namespace.test.ts:71-92` asserts. A model-sent
-    `project_id` becomes a denial, and an absent one becomes a fill.
+- **Changed or deleted tests (ask-before).** Each K commit lists every test
+  assertion it changes or deletes. Known now:
+  - K1 and K2 change `policy-namespace.test.ts`. A model-sent `project_id`
+    becomes a denial, and an absent one becomes a fill.
+  - K1 and K2 change the registry tests that pin `MEMORY_PROJECT`.
   - K8 deletes from `pmmcp-drift.test.ts`:
     - the keyArg test (`:128-146`);
     - the keyArg, pinned-name and tool-count assertions (`:109-111`, `:125`);
     - the no-capture block's `get_secret` and 49-tool claims (`:73-85`).
-
-    After P3, no kernel principal's listing shows those tools.
+  - K8 changes `hygiene.test.ts`'s list of `.env` readers.
 - **Old rows.** The operator's log is permanent, every payload schema is
   strict, and boot re-parses stored rows (§1).
-  - A field that K6a, K6b, K7 or K11 adds to an existing payload is added by a
-    new schema version (`schemaVersion: 2`), never by editing v1. The kernel
+  - A field that a K item adds to an existing payload is added by a new
+    schema version (`schemaVersion: 2`), never by editing v1. The kernel
     appends only v2.
-  - Code that re-parses stored rows (the tracker, `eval/observe.ts`,
-    `eval/checks.ts`) parses the union of v1 and v2.
+  - Code that re-parses stored rows parses the union of v1 and v2. That code
+    is the tracker, `eval/observe.ts` and `eval/checks.ts`.
   - A v1 row has no compartment. Its lineage is unknown, and every lineage
     check treats unknown as failing.
-  - `principal` on `hub.*`, and `projectId` on `tool.gate` and `tool.call`,
-    are optional v1 fields. A non-pmmcp tool has no `projectId`.
-  - The acceptance of each of these items boots once over a fixture log
-    written by the commit before it, then passes `verifyChain`.
-- **Ask-before for reach and approvals.** Each of these is ask-before, and is
-  flagged where it occurs:
-  - widenings: delegation to templates (K5), and any kernel tool offered to
+  - Optional v1 fields need no new version: `principal` on `hub.*`, and
+    `projectId` on `tool.gate` and `tool.call`.
+  - Pending approvals do not survive a restart (§1), so no approval field
+    needs restoring.
+  - The acceptance of each such item boots once over a fixture log written by
+    the commit before it, then passes `verifyChain`.
+- **Ask-before for reach and approvals.** Each of these is ask-before:
+  - widenings: delegation to templates, and any kernel tool offered to
     workers;
-  - gate changes that compute new facts (K9a);
-  - a path that settles an approval from a standing decision (K9);
-  - worker output that starts an approval (K13).
+  - each new gate fact;
+  - a path that lets a call proceed without a human because of an earlier
+    decision, such as an open set (K9).
 - **Exposure.** Exposing any pmmcp tool to an agent, or a new kernel tool to
   the CEO, is a `tool-views.yaml` exposure change, so it is ask-before. This
   contract is what makes such changes safe to propose.
 
 | # | Change | Acceptance test |
 |---|---|---|
-| K1 | **Compartments, profiles and derived namespaces.** **Manifests:** a standard agent declares `compartment`. A template declares `profiles` (each with exactly one `compartment` and its own `tools.allow`) and has no memory block. **Namespaces:** `memory.projectId` is derived, never declared: `aos/<c>/agent/<id>`, or `aos/executive/ceo` for the agent whose id is `ceo`. `MEMORY_PROJECT` becomes the §2.2 grammar. **The registry refuses:** a template without profiles; a profile without exactly one compartment; `schedule:` on a template; a child whose profile is not in its template; and a manifest with id `ceo` that is not an `executive` orchestrator. **Fleet and eval:** curators become standard agents per compartment. The shipped fleet takes its §2.1 places, with manifest version bumps and history frozen. `ceo-objective-fanout` is rewritten in marketing terms. | `agents-registry.test.ts`: a manifest that declares `memory.projectId` fails to load; a template without profiles fails; a plan naming bare `scout` with two profiles is refused; a scheduled template fails; the four shipped manifests load with their compartments; derived namespaces are unique. |
-| K2 | **The kernel sets `project_id`.** The model's schema for a pmmcp memory tool loses the reserved arguments: `project_id`, `provenance`, `include_untrusted`, `lineage_within` and `source_paths`. In their place a read gets a kernel enum, `scope`, which the loop computes on every turn from the run's compartment, efforts and live grants: `own`; `shared:<c>` and `brief:<c>` for each such namespace in the agent's read set; `fleet`; `effort:<id>`; `grant:<id>`; and for the CEO `own:<c>` and `own:all` (§2.4). Each label maps to exactly one `project_id`. A write takes `scope: own`, or `brief:<own compartment>` outside executive, engineering and `security/code`. In `RunLoop.#handleToolCall`, before the gate input is built, the kernel records which reserved names the model sent as a scope fact, `reservedArgs`, and the gate denies when it is not empty. This is the first gate fact (K9a adds the rest). The kernel then maps the label, and fills every reserved argument into the arguments the gate hashes and the hub sends. `include_untrusted` is true only for a run that is already tainted. The hub never adds or rewrites an argument. `namespaceArg: none` is refused for any tool whose live schema declares `project_id`. | `policy-namespace.test.ts`: a model-sent `project_id` writes a `tool.gate` deny row, even the agent's own; `scope: shared:marketing` reaches the double as `aos/marketing/shared`; the CEO's `brief:trading` reaches it as `aos/trading/brief`; an engineering agent has no `brief` scope; a write naming a read scope is denied; the hub refuses when `project_id` changed after the ticket; a clean run's recall never carries `include_untrusted`; a revoked grant's label is gone from the next turn's schema. |
-| K3 | **One pmmcp client per principal.** **Binding:** `kernel.yaml` binds each kernel-held principal to what may use it (`mcp.servers.pmmcp.principals.<id>: {tokenEnv, compartments, agents?}`). `aos-ceo` serves the agent `ceo` alone; `aos-executive` every other executive agent; `aos-marketing` both `marketing` and `marketing/clipping`; each other sector principal its own compartment. The kernel-only principals serve no agent. Boot refuses a config in which a registered agent or a profile resolves to zero principals or to more than one. `RunAgent` and `RunScope` gain `compartment` and `principal`. **Calls:** the hub keys clients by (serverId, principal). The loop runs the hub branch of the execute step inside `#inScope`; the kernel-tool branch stays outside, because `kernel.delegate` appends the child's `run.queued`. The hub refuses an agent call when `runScope()` is undefined, when `ticket.runId` differs from the scope's, when the principal is not bound to the scope's agent and compartment, or when the principal is kernel-only. `callKernelOnly`, `describe` and `status` take an explicit principal. **Profiles:** at connect, each client's `tools/list` is compared with its P3 profile and any difference is recorded in `hub.tools.classified{principal}`; the check that degrades lands in its own commit with P3 (§6). **Failures:** a declared `tokenEnv` that is unset degrades that principal by name and boot goes on; a 401 degrades it by name and never retries the same token. Fix the stuck-degraded hub, and retry when pmmcp is down at boot. | `mcp-hub.test.ts`: two runs of different compartments in parallel each reach the double under their own principal; the planner's recall goes out under `aos-executive` and is refused `aos/marketing/brief`; an agent call outside a run scope, or with another run's ticket, is refused; `kernel.delegate` still starts its child; a config in which the assistant resolves to both `aos-ceo` and `aos-executive` fails to boot; a boot with one principal's token unset degrades only that principal. |
-| K4 | **Compartments per tool.** `tool-views.yaml` gains `compartments: [...]` on every agent-exposed tool. It is required: an exposed tool without it fails to parse, and there is no default. `tools.servers` is enforced for MCP servers, and the `kernel` server is exempt. The CEO's kernel tools get `compartments: [executive]`: `adopt_plan`, `delegate`, `read_result`, `read_goals`, `open_effort`, `add_member`, `copy_to_collab` and `request_access`. A template profile whose `allow` holds a tool not permitted in its compartment fails to load, and the check runs again when a child is bound. Changing any exposure is ask-before. | `config-files.test.ts`: an engineering-only tool in a marketing agent's `allow` fails to load; an exposed tool without `compartments` fails to parse; the shipped CEO loads; a marketing profile with an engineering tool fails. |
-| K5 | **Delegation.** A child's compartment comes from its manifest or its profile (§2.5). Taint is inherited. The result is a typed `RunResult`, and `kernel.read_result` returns the summary and adds the child's lineage. The lineage check (§2.4, rule 1) covers the brief, the plan and `inputRefs`. A failing brief parks through K9a, after the kernel logs `delegation.parked {parentRunId, taskId, target, targetCompartment, lineage, brief, taskText, inputRefs}`. The kernel refuses a brief the redactor would change. A failing `inputRef` is refused, never parked, unless its exact bytes are an approved copy in an effort with the child's compartment as a member. Approval releases the brief to the child (§2.4). At `run.finished` of an engineering or `security/code` run whose manifest sets `filesBrief: true`, the kernel files the run's summary (≤ 2,000 code points) as its brief with `aos-brief`. Delegating to templates is ask-before. | `delegation.test.ts`: a tainted parent's child starts tainted; the CEO's tool result holds no summary until `read_result`; after the CEO reads an engineering summary, a brief to a marketing child, to a `security/code` child and to the planner each park; `delegation.parked` precedes `approval.requested` and its brief is byte-identical to the child's input, a seeded phrase in the last 100 characters included; a clean CEO run reaches `approval.requested` for such a brief; an engineering resultRef as an `inputRef` to a marketing child is refused with no card, and accepted after an approved copy into an effort with both as members; no plan field changes a child's compartment; an eng-lead run's summary lands in `aos/engineering/brief` through `aos-brief`, and one over 2,000 code points is not filed. |
-| K6a | **The goals' namespace**, with K1. `goals.projectId` in `kernel.yaml` (default `aos/executive/goals`). `delegate.ts:185, 203`, `kernel.ts:476` and `tracker.ts:203` use it, never an agent's namespace. The writer uses `aos-goals` and sends only the §2.6 fields. `test/helpers/runtime-bodies.ts` exports `liveKernelYaml(base)`, which sets `goals.projectId: aos/executive/live-test` and binds the writer to `aos-goals-live`. `runtime-bodies.test.ts` and `live-runtime.test.ts` build their config through it. liveFleet declares `compartment: executive` for live-ceo. | `goals-writer.test.ts`: every `goal.created` row from a CEO plan carries `aos/executive/goals`; no adoption path passes an agent's namespace to `materialise`; a `runtime-bodies.test.ts` boot through `liveKernelYaml` writes every goal to `aos/executive/live-test`. |
-| K6b | **Goals under P4.** The writer adds `project_id` to update and tree calls and keeps the owner check. `requiredArgs` adds `projectId` to `updateStatus` and `get`, so a pre-P4 pmmcp degrades goals at boot, by name. `goal.created` carries the plan's lineage. `kernel.read_goals` returns the tree and adds its lineage. | `goals-writer.test.ts` against the P4 double; a pre-P4 double degrades goals, with a reason naming `update_goal`'s missing `project_id`. |
-| K7 | **Events.** `compartment` (and `principal`, where a client is used) on `run.queued`, `run.started`, `tool.gate`, `agent.registered` and `delegation.admitted`. An optional `principal` on `hub.connected`, `hub.degraded` and `hub.tools.classified`. `tool.gate` and `tool.call` carry the `projectId` the kernel filled. Lineage is carried by `run.finished`, the delegation events, `approval.requested` and the hold event, and the approval projection keeps it across a restart. All of this follows the old-rows rule. `status.get` keeps its one `hub` key: it is degraded when any principal is, with a reason that names them, so protocol v1 holds. | `events-types.test.ts`; a booted kernel whose marketing token is refused emits `hub.degraded{principal: aos-marketing}`, and `status.get` names it; an allowed recall's `tool.gate` row names `aos/marketing/agent/writer`; a boot over a pre-K7 log succeeds. |
-| K8 | **The double and the drift guard.** **The double** models principals (read, write, compartment, members, `collab_all`, `ceo_release`), profiles enforced at dispatch, the grammar, the brief cap, `isError` codes in both wire forms, structured output, provenance stamping, the operator stamp, the untrusted default and `lineage_within`. **Capture:** `capture:pmmcp` passes `--dotenv .env` and reads each kernel-held principal's token with `oneCredential`, as `scripts/eval.ts` does. It writes one fixture per principal (`test/fixtures/pmmcp-listtools.<principal>.json`), with `outputSchema` and the resource and prompt lists. CLAUDE.md's and README's lists of `.env` readers add it. `compareCapture` checks each fixture against its P3 profile. The deleted drift assertions (§4 rules) move to a capture the operator takes with pmmcp's own tooling. No script here reads the operator token. **Structured content:** `callKernelOnly` returns `structuredContent`, and `McpHub.call` keeps it for K11. **Writer:** it first accepts both the P6 result and today's prose, for create and for update; a later commit removes the prose. | `mcp-pmmcp-double.test.ts`, `pmmcp-drift.test.ts`. |
-| K9 | **Collaboration efforts and copies** (§2.7). `kernel.open_effort`, `kernel.add_member` and `kernel.copy_to_collab` are orchestrator kernel tools. **Prepare step:** `KernelToolHandler` gains an optional `prepare(args, ctx)`. `RunLoop.#handleToolCall` calls the pure `decide()` on the model's arguments first. If that denies, or the agent is not an orchestrator, or the model supplied a `sha256`, the call is denied and `prepare` never runs. Otherwise `prepare` resolves the source, refuses what §2.7 refuses, logs `collab.copy.proposed`, and returns the arguments with `sha256` added. The gate input is built from those. **Coverage:** whether a copy needs a fresh approval is the kernel-computed fact `copyCovered` (K9a). It is true only for a clean run whose source lineage is fully released to the members or in the open set. **Write:** it uses `aos-collab` with the §2.7 provenance, and the kernel keeps only `{id, project_id}` from the reply. **Projection:** effort records (members, open set, expiry, status) are projected from the log, so they survive a restart. | `collab.test.ts`: without approval nothing is written; a copy whose escaped length is exactly `PAYLOAD_TEXT_BUDGET`, holding newlines and quotes and ending in a seeded phrase, is in the log in full before approval and lands byte-identical; one escaped byte more is refused with nothing logged; a truncated source is refused; a worker's or an unlisted caller's call resolves nothing and logs no `collab.copy.proposed`; a copy from a tainted run lands `untrusted`; a CEO copy whose lineage holds engineering is approved per copy, even with marketing in the open set; a tainted CEO run's covered copy still parks; a non-member's recall returns nothing; a new member sees only later copies. |
-| K9a | **Gate facts.** The gate stays pure. Every fact is computed by the kernel before `decide()` runs, and the model never sets one. The facts: `human: always` on a tool view (`open_effort`, `add_member`, `request_access`, with `risk: write`, so the tier-2 CEO still loads); `delegationFits` for `kernel.delegate`; and `copyCovered` for `kernel.copy_to_collab`. `reservedArgs` came with K2. The rules run after rule 5, the taint rule, so a tainted run always needs a human. Changing the gate, and settling a call from a standing decision, are ask-before, with a falsify mutant per rule, one of which moves `copyCovered` ahead of the taint rule. | `policy-gate.test.ts`: each fact's verdict; a clean CEO's `open_effort` and `add_member` park; a lineage-failing delegation from a clean CEO parks; the shipped CEO loads with all eight kernel tools. |
-| K10 | **Grants and overrides** (§2.9). `kernel.request_access` grants to the requesting run, for that run. A grant read goes through the owning principal and adds `(c, ∅)` marked with the grant's id. A run whose lineage holds a grant-marked element has every `remember` denied before the gate. A file grant is refused until P9's `source_path` ships; then the kernel fills `source_paths`. The D5 grant lives in config (`grants: [{compartment: security/code, reads: [aos/engineering/shared, aos/engineering/index/*]}]`), read at boot. In v1, overrides are approvals (§2.9). The v2 commands (§2.10) are ask-before and ship after the operator approves the bump. | `grants.test.ts`: a grant read happens only after approval, only for the requesting run, and never after it ends; the CEO's lineage gains the compartment; that run's `remember` is denied in every scope; a file grant before P9 is refused; with P9, a grant on one indexed file returns no hit from another; comms-triage's run never reaches `aos-security-code`'s client. |
-| K11 | **Lineage** (§2.4). **Run state:** `RunScope` gains `lineage`, a set of `(c, R)` elements the kernel computes for every run. **Reading recall hits:** on the agent path, `McpHub.call` keeps `structuredContent`. For a pmmcp memory read, the hub renders the model's text from it as each hit's `id`, `project_id` and `content`, with no provenance, and `tool.result.text` logs the same bytes (D18). The hub returns the union of the hits' lineage, computed before any truncation, and logs it on `tool.result` as `lineageAdded`. A memory read with missing or invalid `structuredContent`, or with a hit lacking lineage, fails closed: it is an error to the model and passes no content. **Stamping:** the kernel logs each `remember`'s returned id with the lineage it stamped, and on recall unions that into the hit's lineage (defence against a server-side merge). Every `remember` stamps the provenance (runId, agentId, taint, `origin` `untrusted` if tainted else `agent`, lineage, `observedAt`). **Rules:** the write rule (§2.4, rule 2) is a denial before the gate. Summaries, grants, briefs, collaboration records, cards and goals add lineage as §2.4 says. The CEO's `own:*` labels fill `lineage_within`. | `lineage.test.ts`: a CEO run that read typed results only delegates to marketing with no human; one that read a marketing brief and a trading brief parks a brief to either with no effort, and passes one under an effort with both in its open set; a marketing run that recalled an engineering-sourced copy has its `remember` into marketing memory denied; a recall hit's `tool.result.text` holds no `provenance` key; a double that answers `remember` with an existing id still makes a later recall add the remembered lineage; a recall without `structuredContent` reaches the model as an error. |
+| K1 | **Compartments, profiles and derived namespaces.** **Manifests:** a standard agent declares `compartment`. A template declares `profiles` (each with exactly one `compartment` and its own `tools.allow`) and has no memory block. A manifest may set `filesBrief` (§2.5). **Namespaces:** `memory.projectId` is derived, never declared: `aos/<c>/agent/<id>`, or `aos/executive/ceo` for the agent whose id is `ceo`. `MEMORY_PROJECT` becomes the §2.2 grammar. **The registry refuses:** a template without profiles; a profile without exactly one compartment; `schedule:` on a template; a child whose profile is not in its template; a manifest with id `ceo` that is not an `executive` orchestrator; and `filesBrief` outside engineering and `security/code`. **Fleet and eval:** curators become standard agents per compartment. The shipped fleet takes its §2.1 places, with manifest version bumps and history frozen. liveFleet's live-ceo declares `compartment: executive`. `ceo-objective-fanout` is rewritten in marketing terms. | `agents-registry.test.ts`: a manifest that declares `memory.projectId` fails to load; a template without profiles fails; a plan naming bare `scout` with two profiles is refused; a scheduled template fails; the four shipped manifests load with their compartments; derived namespaces are unique. |
+| K2 | **The kernel sets `project_id`.** **Schema:** the model's schema for a pmmcp memory tool loses the reserved arguments: `project_id`, `provenance`, `include_untrusted`, `lineage_within` and `source_paths`. **Scope labels:** in their place a read gets a kernel enum, `scope`. The loop computes it on every turn from the run's scope, and each label maps to exactly one `project_id`. This commit builds the mechanism with these labels: `own`; `shared:<c>` and `brief:<c>` for each such namespace in the agent's read set; `index:<repo>` for engineering and `security/code`; `agent:<id>` for a curator's compartment; and `fleet`. K9 adds `effort:<id>`, and K11 adds the CEO's `own:<c>` and `own:all`. A write takes `scope: own`, or `brief:<own compartment>` for marketing, trading and security agents. **Filling:** in `RunLoop.#handleToolCall`, before the gate input is built, the kernel records which reserved names the model sent (`reservedArgs`, a deny fact). It then maps the label and fills every reserved argument into the arguments the gate hashes and the hub sends. `include_untrusted` is true only for a run that is already tainted. **Gate:** rule 3b checks the filled `project_id` against `ScopeInput.projectIds`, the set the label map allows for this call, rather than the one `projectId`. The hub never adds or rewrites an argument. `namespaceArg: none` is refused for any tool whose live schema declares `project_id`. **`human: always`:** this commit adds it as a view fact, used by K5, K9, K10 and K13. | `policy-namespace.test.ts`: a model-sent `project_id` writes a `tool.gate` deny row, even the agent's own, and even in a tainted run; `scope: shared:marketing` reaches the double as `aos/marketing/shared`; the CEO's `brief:trading` reaches it as `aos/trading/brief`; a reviewer's `index:aos-kernel` reaches `aos/engineering/index/aos-kernel`; an engineering agent has no `brief` scope; a write naming a read scope is denied; the hub refuses when `project_id` changed after the ticket; a clean run's recall never carries `include_untrusted`. |
+| K3 | **One pmmcp client per principal.** **Binding:** `kernel.yaml` binds each kernel-held principal to what may use it (`mcp.servers.pmmcp.principals.<id>: {tokenEnv, compartments, agents?}`). `aos-ceo` serves the agent `ceo` alone; `aos-executive` every other executive agent; `aos-marketing` both `marketing` and `marketing/clipping`; each other sector principal its own compartment. The kernel-only principals serve no agent. Boot refuses a config in which a registered agent or a profile resolves to zero principals or to more than one. `RunAgent` and `RunScope` gain `compartment` and `principal`, and K7 adds the event fields they need. **Calls:** the hub keys clients by (serverId, principal). The loop runs the hub branch of the execute step inside `#inScope`; the kernel-tool branch stays outside, because `kernel.delegate` appends the child's `run.queued`. The hub refuses an agent call when `runScope()` is undefined, when `ticket.runId` differs from the scope's, when the principal is not bound to the scope's agent and compartment, or when the principal is kernel-only. `callKernelOnly`, `describe` and `status` take an explicit principal: the goal writer uses `aos-goals`, grant reads the owning principal. **Profiles:** at connect, each client's `tools/list` is compared with its P3 profile, and any difference is recorded in `hub.tools.classified{principal}`. The check that degrades lands in its own commit, with P3 (§6). **Failures:** a declared `tokenEnv` that is unset degrades that principal by name, and boot goes on; a 401 degrades it by name and never retries the same token. Fix the stuck-degraded hub, and retry when pmmcp is down at boot. **Live tests:** `test/helpers/live-env.ts` and the live tests move from `PMMCP_TOKEN` to per-principal token names, and their hand-built hubs get the binding. | `mcp-hub.test.ts`: two runs of different compartments in parallel each reach the double under their own principal; the planner's recall goes out under `aos-executive` and is refused `aos/marketing/brief`; an agent call outside a run scope, or with another run's ticket, is refused; `kernel.delegate` still starts its child; a config in which the assistant resolves to both `aos-ceo` and `aos-executive` fails to boot; a boot with one principal's token unset degrades only that principal. |
+| K4 | **Compartments per tool.** `tool-views.yaml` gains `compartments: [...]` on every agent-exposed tool. It is required: an exposed tool without it fails to parse, and there is no default. `tools.servers` is enforced for MCP servers, and the `kernel` server is exempt. The CEO's kernel tools get `compartments: [executive]`: `adopt_plan`, `delegate`, `read_result`, `read_goals`, `open_effort`, `add_member`, `copy_to_collab`, `promote`, `request_access` and `read_grant`. A template profile whose `allow` holds a tool not permitted in its compartment fails to load, and the check runs again when a child is bound. Changing any exposure is ask-before. | `config-files.test.ts`: an engineering-only tool in a marketing agent's `allow` fails to load; an exposed tool without `compartments` fails to parse; the shipped CEO loads; a marketing profile with an engineering tool fails. |
+| K5 | **Delegation and results.** **Child compartment:** it comes from its manifest or its profile (§2.5), and taint is inherited. **Results:** at a child's end the kernel logs `run.result`, with the typed fields, kernel-minted deliverable refs to its final text, and a summary capped at 2,000 code points. `kernel.delegate` returns the typed fields only, with the stop reason as an enum. `kernel.read_result {runId, part: summary\|deliverable}` hands the text over under §2.4 rule 2. It parks through the `resultReadFits` fact, and applies the D6 channel for an engineering or `security/code` child. **Briefs:** at `run.finished` of an engineering or `security/code` run whose manifest sets `filesBrief: true`, the kernel files the summary with `aos-brief`, applying the D6 channel and then the store rule. Otherwise it logs `brief.withheld`. **Delegation check:** the receive rule (§2.4 rule 1) is the `delegationFits` fact. When it fails, the kernel first logs `delegation.parked {parentRunId, taskId, target, targetCompartment, lineage, childInput}` with the child's full input, then parks the call. The kernel refuses a brief the redactor would change. Approval releases the failing elements to the child's compartment. **Kernel-started runs** follow the same rule, and are withheld with `start.withheld` (§2.4). Milestone judges follow §2.5. Delegating to templates is ask-before. | `delegation.test.ts`: a tainted parent's child starts tainted; `kernel.delegate`'s result holds no model-written string, not even a provider error's text; an engineering child whose deliverable, failureHistory or error text holds a seeded phrase leaves no trace of it in the CEO's context until `read_result`, which adds engineering with `ceo`; after that, a brief to a marketing child, a `security/code` child, the planner and the assistant each park; `delegation.parked` precedes `approval.requested`, and its `childInput` is byte-identical to the child's input, a seeded phrase in the last 100 characters included; `read_result` of a marketing child that read an unreleased engineering copy parks; an eng-lead summary lands in `aos/engineering/brief` through `aos-brief` with `ceo` in `R`; one whose lineage holds trading under an effort is withheld. |
+| K6a | **The goals' namespace**, with K1. `goals.projectId` in `kernel.yaml` (default `aos/executive/goals`). `delegate.ts:185, 203`, `kernel.ts:476` and `tracker.ts:203` use it, never an agent's namespace. The writer sends only the §2.6 fields. Until K3 it uses today's single client. `test/helpers/runtime-bodies.ts` exports `liveKernelYaml(base)`, which sets `goals.projectId: aos/executive/live-test`. `runtime-bodies.test.ts` and `live-runtime.test.ts` build their config through it. K3 binds the live writer to `aos-goals-live`. | `goals-writer.test.ts`: every `goal.created` row from a CEO plan carries `aos/executive/goals`; no adoption path passes an agent's namespace to `materialise`; a `runtime-bodies.test.ts` boot through `liveKernelYaml` writes every goal to `aos/executive/live-test`. |
+| K6b | **Goals under P4**, in three commits around P4 (§6). **(1)** The writer sends `project_id` to update and tree calls when the tool's live schema declares it, and keeps the owner check either way. **(2)** P4 ships in pmmcp. **(3)** `requiredArgs` adds `projectId` to `updateStatus` and `get`, so a pmmcp without P4 degrades goals at boot, by name. Throughout, `goal.created` carries the plan's lineage, and `kernel.read_goals` returns the tree and adds its lineage. A plan adoption from a run holding a grant-marked element is refused. | `goals-writer.test.ts` against the pre-P4 and the P4 double after commit (1); after commit (3), a pre-P4 double degrades goals with a reason naming `update_goal`'s missing `project_id`. |
+| K7 | **Events.** All of these follow the old-rows rule. **Run and gate events:** `compartment` and `principal` on `run.queued`, `run.started`, `tool.gate`, `agent.registered` and `delegation.admitted`. `tool.gate` and `tool.call` carry the `projectId` the kernel filled. **Hub events:** an optional `principal` on `hub.connected`, `hub.degraded` and `hub.tools.classified`. **Lineage:** `run.finished`, `run.result`, the delegation events, `approval.requested` and the hold event carry it. **New events:** `run.result`, `kernel.proposed`, `delegation.parked`, `start.withheld`, `brief.withheld`, `judge.skipped`, `effort.opened`, `effort.member.added` and `effort.ended`. **Status:** `status.get` keeps its one `hub` key. It is degraded when any principal is, with a reason that names them, so protocol v1 holds. | `events-types.test.ts`; a booted kernel whose marketing token is refused emits `hub.degraded{principal: aos-marketing}`, and `status.get` names it; an allowed recall's `tool.gate` row names `aos/marketing/agent/writer`; a boot over a pre-K7 log succeeds. |
+| K8 | **The double and the drift guard.** **The double** models: principals (read, write, compartment, members, `collab_all` and the CEO's hold filter); profiles enforced at dispatch; the grammar; the brief cap; `isError` codes in both wire forms; structured output; provenance stamping; the operator stamp with index `trust`; hand merges; the untrusted default; `lineage_within`; and `source_paths`. **Capture:** `capture:pmmcp` passes `--dotenv .env` and reads each kernel-held principal's token with `oneCredential`, as `scripts/eval.ts` does. It writes one fixture per principal (`test/fixtures/pmmcp-listtools.<principal>.json`), with `outputSchema` and the resource and prompt lists. `compareCapture` checks each fixture against its P3 profile. The deleted drift assertions (§4 rules) move to a capture the operator takes with pmmcp's own tooling. No script here reads the operator token. CLAUDE.md's, README's and `hygiene.test.ts`'s lists of `.env` readers add the capture script. **Structured content:** `callKernelOnly` returns `structuredContent`, and `McpHub.call` keeps it for K11. **Writer:** it first accepts both the P6 result and today's prose, for create and for update; a later commit removes the prose. | `mcp-pmmcp-double.test.ts`, `pmmcp-drift.test.ts`, `hygiene.test.ts`. |
+| K9 | **Collaboration efforts and copies** (§2.7). **Tools:** `kernel.open_effort`, `kernel.add_member` and `kernel.copy_to_collab` are CEO kernel tools; the first two carry `human: always`. **Prepare step:** `KernelToolHandler` gains an optional `prepare(args, ctx)`. `RunLoop.#handleToolCall` calls the pure `decide()` on the model's arguments first. If that denies, or the agent is not an orchestrator, or the model supplied a `sha256`, the call is denied and `prepare` never runs. Otherwise `prepare` resolves the source and refuses what §2.7 refuses. It then logs `kernel.proposed` with the full arguments, bytes and readers, and returns the arguments with `sha256` added. Those replace `context.args`, the gate input is built from them, and the runner re-checks the ticket against them. The same step logs `kernel.proposed` for every `human: always` kernel tool. **Coverage:** whether a copy needs a fresh approval is the `copyCovered` fact (§2.7, Coverage). **Write:** it uses `aos-collab` with the §2.7 provenance, and the kernel keeps only `{id, project_id}` from the reply. **Projection:** efforts (members, open set, expiry) are projected from the `effort.*` events, and their `effort:` labels are added to K2's scope. | `collab.test.ts`: without approval nothing is written; a copy whose escaped length is exactly `PAYLOAD_TEXT_BUDGET`, holding newlines and quotes and ending in a seeded phrase, is in `kernel.proposed` in full before approval and lands byte-identical; one escaped byte more is refused with nothing logged; a worker's or an unlisted caller's call resolves nothing and logs no `kernel.proposed`; a copy from a tainted run lands `untrusted`; a CEO copy whose lineage holds engineering is approved per copy, even with marketing in the open set; a tainted CEO run's otherwise covered copy parks; a member that recalled a copy has its `remember` into its own namespace denied; a non-member's recall returns nothing; a new member sees only later copies; after expiry the `effort:` label is gone and the copy no longer counts for hold. |
+| K10 | **Grants and overrides** (§2.9). `kernel.request_access` carries `human: always`. Its `kernel.proposed` row shows the lineage of what `what` names. The grantee is the requesting run, for that run. `kernel.read_grant` reads with `callKernelOnly` under the owning principal and renders hits without provenance. It adds `(owner, ∅)` and the delivered data's own lineage, all grant-marked. Grant-marked elements are held by the grantee run only, received by no child, covered by no open set and passed by no store rule. A file grant is refused until P9's `source_paths` ships; then the kernel fills `source_paths`. The D5 grant lives in config (`grants: [{compartment: security/code, reads: [aos/engineering/shared, aos/engineering/index/*]}]`), read at boot. In v1, overrides are approvals (§2.9). The v2 commands (§2.10) are ask-before, and ship after the operator approves the bump. | `grants.test.ts`: a grant read happens only after approval, only for the requesting run, and never after it ends; a grant on a marketing deliverable whose run held a released engineering element adds that element, marked, and the card shows it; that run's `remember` and `adopt_plan` are refused; its brief to any child parks; a clean CEO copy of its output into an effort with the owner in the open set parks; a file grant before P9 is refused; with P9, a grant on one indexed file returns no hit from another; comms-triage's run never reaches `aos-security-code`'s client. |
+| K11 | **Lineage** (§2.4). **Run state:** `RunScope` gains `lineage`, a set of `(c, R)` elements, grant marks included, that the kernel computes for every run. **Reading recall hits:** on the agent path, `McpHub.call` keeps `structuredContent`. For a pmmcp memory read, the hub renders the model's text from it as each hit's `id`, `project_id` and `content`, with no provenance, and `tool.result.text` logs the same bytes (D18). The hub returns the union of the hits' lineage, computed before any truncation, and logs it on `tool.result` as `lineageAdded`. A memory read with missing or invalid `structuredContent`, or with a hit lacking lineage, fails closed: it is an error to the model and passes no content. **Stamping:** every `remember` stamps the provenance (runId, agentId, taint, `origin` `untrusted` if tainted else `agent`, lineage, `observedAt`). The kernel logs each `remember`'s returned id with the lineage it stamped. On recall it unions into the hit's lineage what it logged for the hit's id and for each id in its `mergedFrom`. **The store rule** is the `memoryFits` deny fact, for every `remember`. **Labels:** the CEO's `own:<c>` and `own:all` labels fill `lineage_within`. | `lineage.test.ts`: a CEO run that read typed results only delegates to marketing with no human; one that read a marketing brief and a trading brief parks a brief to either with no effort, and passes one under an effort with both in its open set; a marketing run that recalled an engineering copy has its `remember` denied with a `tool.gate` row; a recall hit's `tool.result.text` holds no `provenance` key; a double that answers `remember` with an existing id still makes a later recall add the remembered lineage; a recall without `structuredContent` reaches the model as an error. |
 | K12 | **Migration.** Retire `aos/ceo`, `aos/shared`, `aos/agent/researcher`, `aos/agent/writer` and `aos/agent/aos-live-test` together with K1 and K6a, **before the first pmmcp write**. The first write can be any of these: the first `npm run eval`; any `AOS_LIVE_PMMCP_WRITES=1` run; or any pmmcp-connected orchestrator run. An orchestrator writes goals mid-run through `kernel.adopt_plan` (`risk: write`, so a clean run needs no human), and at `run.finished` when `goals.adoptFromRuns` is true. Both Phase 0 exit runs are such runs. If either comes before K1 and K12, the operator records in README's exit checklist whether its log holds a `plan.adopted` or `goal.created` row. If one does, the operator removes those goals with pmmcp's own CLI before K12's check. `LIVE_TEST_PROJECT` becomes `aos/<c>/agent/aos-live-test` for memory. README gives the check as `list_goals` on each retired id, plus pmmcp's own CLI for memories; the operator runs it outside the kernel. | Boot refuses a manifest with an old namespace; `runtime-bodies.ts` holds no namespace outside the §2.2 grammar; a boot with the live config writes no goal outside `aos/executive/live-test`. |
-| K13 | **Memory promotion** (§2.8), ask-before. A worker proposes only through typed `RunResult.proposals[]` entries. The kernel resolves the target (own `shared`; `aos/security/shared` for `security/code`; or `aos/fleet/shared`) and refuses any other. It applies §2.7's size, redaction and truncation rules, refuses a tainted source, and logs `promote.proposed` with the bytes. It then files a `kind: tool` approval of `kernel.promote`, a tool never offered to a model, with the sha256 hashed. Every promotion is approved per item. The write uses `aos-promote` with the §2.8 provenance. | `promote.test.ts`: nothing is written without approval; a marketing proposal targeting `aos/engineering/shared` is refused; a tainted source is refused; a `security/code` finding reaches `aos/security/shared` only after its own approval; the bytes written equal the bytes logged. |
+| K13 | **Memory promotion** (§2.8). `kernel.promote {source, target}` is a CEO kernel tool with `human: always`, filed per item. The kernel resolves `own`, `parent` or `fleet` relative to the source run's compartment, and refuses any other target. It applies §2.7's size, redaction and truncation rules, refuses a tainted source, and logs `kernel.proposed` with the bytes and every reader of the target, the CEO and standing-grant readers included. The write uses `aos-promote` with the §2.8 provenance. The kernel lists curator and eng-lead deliverables to the CEO as typed candidate refs. A run-independent approval kind is v2. | `promote.test.ts`: nothing is written without approval; `target: own` for a marketing source lands in `aos/marketing/shared`, and no target reaches another compartment's `shared`; a tainted source is refused; a `security/code` finding reaches `aos/security/shared` only after its own approval, with `security` and `ceo` in its `R`; a reader of a promoted record cannot store what it derived; the bytes written equal the bytes logged. |
 
 ## 5. End-to-end acceptance: the leak matrix
 
@@ -1506,7 +1755,7 @@ The release test for this contract.
   - it checks the positive reads of items 5 and 6 only as recalls that are not
     refused, never printing hits. That each read returns the seeded record is
     checked offline.
-- **Outside this repository.** The operator checks item 12, and clears the
+- **Outside this repository.** The operator checks item 11, and clears the
   live-test namespaces, with pmmcp's own CLI.
 - No file in this repository names the operator token.
 
@@ -1515,10 +1764,12 @@ The items:
 1. **Seed.**
    - One distinctive memory into each compartment's agent and shared
      namespaces.
-   - One into every brief except executive's.
+   - One into every brief except executive's, with the engineering and
+     `security/code` briefs carrying `ceo` in `R`.
    - One collaboration record per member pair, with and without coding
-     lineage.
-   - One record in `aos/engineering/index/x`.
+     lineage, and with and without `ceo` in `R`.
+   - One record each in `aos/engineering/index/x` (trusted) and
+     `aos/engineering/index/y` (untrusted).
 2. **Cross reads.** For every (principal, namespace) pair outside that
    principal's read list:
    - recall, search and list are refused;
@@ -1537,18 +1788,20 @@ The items:
    - `aos-security-code` reads engineering's shared and index namespaces, and
      writes neither.
    - `aos-security` reads nothing of `security/code` or `engineering`.
-6. **The CEO's reach** is exactly the `aos-ceo` read list in P1:
+6. **The CEO's reach** is exactly the `aos-ceo` read list in P1, under its hold
+   rule:
    - every brief;
    - the shared namespaces of compartments other than engineering and
      `security/code`;
-   - collaboration records without coding lineage, plus coding ones with
-     `ceo_release`;
+   - non-coding collaboration records, and coding ones only with `ceo` in
+     `R`;
    - fleet;
    - its own namespace.
 
    It never reaches any compartment's `agent` namespaces,
    `aos/engineering/shared`, `aos/security/code/shared` or any
-   `aos/engineering/index/*`.
+   `aos/engineering/index/*`. No record carrying a coding element without
+   `ceo` in `R` reaches it, in any namespace.
 7. **Goals.**
    - A goal can be read and moved only with `aos-goals` (or, for
      `aos/executive/live-test`, `aos-goals-live`).
@@ -1560,28 +1813,33 @@ The items:
      its rule, and `operator`.
    - A copy whose source lineage holds engineering is never written under an
      open set.
-9. **Untrusted text.** Untrusted hits never come back without
-   `include_untrusted`.
-10. **Lineage, grants and approvals.** Each of these seeded engineering
-    phrases never reaches a non-engineering run's input, memory or
-    `llm.request` without an operator approval of those bytes:
-    - one in an engineering child's summary;
-    - one in an engineering brief;
-    - one in a granted read;
-    - one in a collaboration copy.
-
-    Also:
-    - a seeded phrase in the brief of a parked CEO delegation never appears in
-      the `llm.request` of the assistant, warden or any run other than the
-      CEO's own and, after approval, the approved child's;
-    - a run that used a grant stores nothing.
-11. **Event log (D7).** warden's `events.search` with `text` set to a seeded
-    engineering phrase matches nothing over:
-    - a CEO run that read it through a summary or a grant;
-    - a `security/code` run that recalled it under D5.
-12. **Operator-only checks** (run outside this repository).
+   - A member stores nothing it read from a copy.
+9. **Untrusted text.** Untrusted hits, including index records from an
+   untrusted root, never come back without `include_untrusted`.
+10. **Lineage, results, grants and approvals.**
+    - **Seeded engineering phrases.** Each of these never reaches a
+      non-engineering run's input, memory or `llm.request` without an operator
+      approval of those bytes:
+      - one in an engineering child's summary, deliverable, failureHistory or
+        error text;
+      - one in an engineering brief;
+      - one in a granted read;
+      - one in a collaboration copy.
+    - **The CEO without a release.** A seeded engineering phrase that reaches
+      a marketing run through an approved copy never reaches the CEO without a
+      release to it.
+    - **Parked delegations.** A seeded phrase in the input of a parked CEO
+      delegation never appears in the `llm.request` of the assistant, warden
+      or any run other than the CEO's own and, after approval, the approved
+      child's.
+    - **Grants.** A run that used a grant stores nothing and adopts no plan.
+11. **Operator-only checks** (run outside this repository).
     - The operator token sees everything.
     - Requests without a token to 8765 and to Qdrant are refused.
+
+When warden's `events.search` is built, its acceptance carries the D7 check: a
+`text` search for a seeded engineering phrase matches nothing over a run whose
+lineage holds engineering.
 
 ## 6. Order of work
 
@@ -1591,7 +1849,7 @@ The items:
    1. The hub and writer part of K8: `callKernelOnly` returns
       `structuredContent`, and the writer accepts both the structured and the
       prose form, for create and for update.
-   2. pmmcp **P5 + P6**.
+   2. pmmcp **P5**, and **P6 for the goal tools** only.
    3. A kernel commit that removes the prose path and replaces falsify G13 and
       G15.
 
@@ -1599,13 +1857,16 @@ The items:
    order matters. pmmcp and the kernel live in separate repositories, so
    shipping them "together" does not set the order.
 3. **The compartment itself.**
-   1. Kernel **K1, K6a, K2, K4, K12**, landing together.
+   1. Kernel **K1, K6a, K12, K2, K4**, landing together.
       - Without K6a, once K1 ships every adopted plan writes its goals into
         `aos/executive/ceo`, which `aos-goals` cannot write once P2 ships.
       - K12 needs K1's grammar.
+      - K2 lands with its first labels; the effort and `own:*` labels come
+        later.
       - These must land before the first pmmcp write (K12's row), even if
         nothing else in this list has started.
-   2. Kernel **K3**, with the profile difference only recorded.
+   2. Kernel **K3**, with the event fields it needs from K7, and with profile
+      differences only recorded.
       - It declares each principal's `tokenEnv` in `kernel.yaml`, and adds one
         placeholder line per name to `.env.example`.
       - The loader refuses a `.env` line for a name `kernel.yaml` does not
@@ -1619,12 +1880,15 @@ The items:
       exact-profile check. Before P3, a wider listing is only recorded, so
       goals and delegation keep working.
 
-   **Gate:** leak-matrix items 1–7 and 12 pass before step 4.
-4. pmmcp **P4**, with kernel **K6b**.
-5. pmmcp **P7**. Then kernel **K11, K9a, K5, K7**. P7 ships before any recall
-   is exposed to an agent.
-6. Kernel **K9, K10, K13**. **Gate:** leak-matrix items 8–11.
-7. The protocol v2 commands (§2.10), after the operator approves the bump.
+   **Gate:** leak-matrix items 1–7 and 11 pass before step 4.
+4. **Goals under P4.** Kernel **K6b (1)**, then pmmcp **P4**, then kernel
+   **K6b (3)**.
+5. **Provenance and lineage.** pmmcp **P7**, with P6's memory models. Then
+   kernel **K11**, **K5** and the rest of **K7**. P7 ships before any recall is
+   exposed to an agent.
+6. **Efforts, grants and promotion.** Kernel **K9, K10, K13**. **Gate:**
+   leak-matrix items 8–10.
+7. **Protocol v2** (§2.10), after the operator approves the bump.
 
 After each pmmcp change: re-capture per principal, update the double, and let
 the drift test show exactly what moved.
@@ -1636,12 +1900,12 @@ the drift test show exactly what moved.
 | # | Question | Operator's answer | How this spec encodes it |
 |---|---|---|---|
 | D1 | Sector list | "marketing should have clipping as a sub-section" | Five sectors. `marketing/clipping` is an open sub-section of marketing (§2.1). `security/code` is a sealed one: the standing rule requires it once D5 lets those two agents read code. |
-| D2 | What the CEO sees | "as much visibility as the ceo needs to make the informed decisions" | Typed results always. Summaries on request. Every brief, the shared namespaces of compartments other than engineering and `security/code`, and every collaboration record except unreleased coding ones. Grants cover anything more (§2.3, §2.9). Lineage keeps it from passing any of this on without the operator, and efforts let cross-compartment objectives run without an approval each time (§2.4, §2.7). |
+| D2 | What the CEO sees | "as much visibility as the ceo needs to make the informed decisions" | **Always:** typed, kernel-derived results. **Directly:** every brief; the shared namespaces of compartments other than engineering and `security/code`; and every collaboration record its hold rule allows. **On request:** summaries and deliverables, through `kernel.read_result`. **Coding data:** only with `ceo` in `R`, given by the capped D6 channel or an operator release. **Anything more:** grants. Lineage keeps it from passing any of this on without the operator, and efforts let cross-compartment objectives run without an approval each time (§2.4, §2.7). |
 | D3 | Shared knowledge | "as big as it needs for agents to collaborate" | No cap on any shared or collaboration space. The one cap is one event's worth per copy (`PAYLOAD_TEXT_BUDGET`, about 62 KiB after JSON escaping), so the operator can read each copy whole. `aos/fleet/shared` holds whatever every compartment needs, by promotion (§2.7, §2.8). |
-| D4 | Data between sectors | "it shouldn't 'move', it should be copied to the collaboration space … when needed" | Copies into per-effort collaboration spaces. The original stays put, the copy carries provenance and lineage, and approvals follow §2.7. A copy is judged on what its source holds, not on where it ran. |
-| D5 | Security agents and code | "sounds about right, but we want to be able to override the security agents if necessary" | A read-only grant for `security/code` only, under its own principal. Its findings stay sealed and reach others only by promotion or copy. The operator can resolve every security block, can release a held output, and can cut the grant. The rest of the override set is protocol v2 (§2.9, §2.10). |
-| D6 | Engineering summaries to the CEO | "unless we override it and need the CEO to know the file contents" | Summaries and kernel-filed briefs may name files, functions and errors. Both are capped at 2,000 characters, and no artifact body is handed over. File contents reach the CEO only through an operator grant, or a copy the operator released to it (§2.5, §2.9). R8 names the residual. |
-| D7 | The event log | "Leave as is" | One log for the operator. Over every run whose compartment is `engineering` or `security/code`, or whose lineage holds either, warden's `events.search` returns metadata only. It takes no `text` filter there, because a substring match over payloads is a payload read. That covers the CEO's runs and grant-holding runs. A run whose lineage the kernel cannot establish counts as engineering. A payload read of any run needs a human: warden-forensics, on operator request (OS:189). |
+| D4 | Data between sectors | "it shouldn't 'move', it should be copied to the collaboration space … when needed" | Copies into per-effort collaboration spaces. The original stays put, and the copy carries provenance and lineage. Members use a copy in context and store none of it in their own namespaces. Foreign data is stored only where the operator approved its exact bytes, or under an open set the operator approved (§2.4, §2.7). |
+| D5 | Security agents and code | "sounds about right, but we want to be able to override the security agents if necessary" | A read-only grant for `security/code` only, under its own principal. Its findings stay sealed and reach others only by promotion or copy. In v1 the operator can resolve a security block as a card, release a held output, and cut or widen the grant by config. The rest of the override set is protocol v2 (§2.9, §2.10). |
+| D6 | Engineering summaries to the CEO | "unless we override it and need the CEO to know the file contents" | Summaries and kernel-filed briefs may name files, functions and errors. Both are capped at 2,000 code points, and no artifact body is handed over. File contents reach the CEO only through an operator grant, or through a copy or promotion the operator released to it (§2.5, §2.9). R8 names the residual. |
+| D7 | The event log | "Leave as is" | One log for the operator. When warden's `events.search` is built, the following holds over every run whose compartment is `engineering` or `security/code`, or whose lineage holds either: it returns metadata only, and takes no `text` filter there, because a substring match over payloads is a payload read. That covers the CEO's runs and grant-holding runs. A run whose lineage the kernel cannot establish counts as engineering. A payload read of any run needs a human: warden-forensics, on operator request (OS:189). |
 
 ### 7.2 Readings the operator may want to change
 
@@ -1659,12 +1923,13 @@ The rest of the spec is written on these readings. None blocks work.
   - cut the D5 grant;
   - widen a security run.
 
-  In v1, resolving a block, releasing output, and cutting or widening the
-  standing grant by a config edit all work. Overrides that record a reason,
-  halts, vetoes and per-run widening are v2.
+  In v1, a block resolves as a card, held output is released, and the
+  standing grant is cut or widened by a config edit. Overrides that record a
+  reason, halts, vetoes and per-run widening are v2.
 - **R4. The CEO's direct reads.** The CEO reads the shared namespaces of
   compartments other than engineering and `security/code` directly. It reads
-  those two only through capped briefs, summaries, grants and released copies.
+  those two only through capped briefs and summaries, grants, and released
+  copies and promotions.
 - **R5. The shipped researcher** is placed in marketing, and
   `ceo-objective-fanout` is rewritten to match. The other two eval cases are
   unchanged.
@@ -1677,17 +1942,18 @@ The rest of the spec is written on these readings. None blocks work.
     sectors separate" rule.
   - Closing it would make every agent's `events.search` compartment-scoped,
     with warden getting kernel-computed aggregates elsewhere.
-- **R7. Who curates engineering memory.** eng-lead, through promotion
-  proposals, or the operator. A `curator-engineering` agent exists only if the
-  operator adds its manifest.
+- **R7. Who curates engineering memory.** Promotions of eng-lead's
+  deliverables, filed by the CEO, or the operator. A `curator-engineering`
+  agent exists only if the operator adds its manifest.
 - **R8. What D6 still allows.** Summaries and briefs are model-written, so one
-  can quote up to 2,000 characters of code, and many together can quote more.
+  can quote up to 2,000 code points of code, and many together can quote more.
   The stricter alternatives are briefs the kernel renders from typed fields
-  only, or an operator approval per engineering brief.
+  only, or an operator approval per engineering brief and summary read.
 - **R9. Visibility costs unattended delegation.** Lineage is per run, and the
   CEO's memory and goals carry it into later runs.
   - A CEO run that reads several compartments' briefs, with no effort open,
-    parks every brief it writes to them. The planner is included.
+    parks every brief it writes to them. The planner and the assistant are
+    included.
   - Efforts with an open set, and the CEO's `own:*` recall labels, are the
     tools for keeping delegation unattended.
   - Tracking lineage per brief rather than per run is not an alternative,
@@ -1695,11 +1961,17 @@ The rest of the spec is written on these readings. None blocks work.
 - **R10. Who starts an override.** In v1 the operator can only approve what
   the CEO requests. To start a D6 override, the operator tells the CEO to ask.
   Grants the operator issues directly are v2.
-- **R11. The CEO's executive children** (planner, judge#exec,
-  worker-template) may hold non-coding data for the run they are delegated,
-  never coding data. They cannot store foreign data (§2.4, rule 2). The
-  alternative is to treat them like the assistant, which parks every brief
-  that carries another compartment's data.
+- **R11. Foreign data at rest.** An agent that read released data cannot store
+  anything in its own namespaces for the rest of that run. Neither can an
+  agent that holds open-set data from an effort, or a grantee run. What should
+  persist goes into a collaboration space or a promotion, both approved on
+  exact bytes. The alternative, letting released data be stored where its
+  release reaches, was revision 3's, and it let released data outlive its
+  effort.
+- **R12. Grants are per run.** A grant serves only the run that asked, and
+  nothing derived from it is stored or delegated without a per-item approval.
+  That run also cannot adopt a plan. The alternative is objective-scoped
+  grants, which need protocol v2 for revocation.
 
 ### 7.3 Design-doc conflicts these decisions resolve
 
@@ -1709,34 +1981,40 @@ Kept so the next design pass can amend the docs:
   - The flat `aos/shared` (AF:483, 489) becomes per-compartment `shared`
     plus `aos/fleet/shared`.
   - implementer#docs writing to `aos/shared` (EN:247).
+  - The kernel's per-run and handoff records into agent namespaces (EX:281)
+    are dropped. §2.3 admits only the agent's own gated `remember` there.
 - **The CEO's reads.**
-  - CEO recall over `aos/agent/*` (EX:410) becomes briefs, summaries,
-    grants and copies, under lineage.
+  - CEO recall over `aos/agent/*` (EX:410) becomes briefs, results, grants,
+    copies and promotions, under lineage.
 - **Curation and promotion.**
   - The curator reading every sector (EX:453) becomes standard curators per
     compartment, and none for engineering (R7).
   - Promotion as the curator's own `remember` into `shared` (EX:343, AF:175)
-    becomes a typed proposal and the kernel's write after approval (K13).
+    becomes a CEO-filed `kernel.promote`, approved per item (K13).
   - Pentest findings mirrored fleet-wide by the projection writer with no
     approval (OS:191, 225, 515) stay in `security/code`, and reach
     `security/shared` only by promotion.
-- **Templates and children.**
+- **Results and templates.**
+  - The self-reported `RunResult` fields (EX:139-152) are model text: they
+    reach the CEO only through `kernel.read_result`.
   - Shared templates recalling "the spawner's namespace" (EN:180, GR:239,
     TR:405) get their profile's compartment read set.
   - The delegation envelope that intersects `memory.projectId` (EX:130) is
     replaced: children get their compartment's read set.
   - scout and judge "spanning sectors" (AF:240, AF:542, TR:87) become profiles
     with one compartment each.
-- **Plans and delegation.**
-  - `inputRefs` injected into later children (EX:122, 166) are checked
-    against lineage, and refused unless released.
-  - A lead's `ProposedPlan` adopted into goals (EX:59, 243) carries the
-    lead's lineage.
+- **Plans and kernel-started runs.**
+  - `inputRefs` injected into later children (EX:122, 166) are inputs under
+    the receive rule.
+  - A lead's `ProposedPlan` adopted into goals (EX:59, 243) is model text:
+    it is read through `read_result`, which adds the lead's lineage.
+  - Kernel-started plan nodes (EX:45) and milestone judges (EX:497) follow
+    the receive rule and §2.5.
 - **Approvals.**
   - Tainted-write and promotion cards deferred into the assistant's digest,
     and the kernel bundle's pending approvals (EX:363, 510), become counts
     only.
-  - A declassification scoped by objective only (EX:205) is now released per
+  - A declassification scoped by objective only (EX:205) is now a release per
     compartment, through lineage.
 - **The event log.**
   - `events.search` with `text` over every payload (OS:74, 473) is governed by
@@ -1756,6 +2034,8 @@ Kept so the next design pass can amend the docs:
   the kernel. Invariant 2 keeps agents out of the kernel.
 - **Lineage is kernel-only.** pmmcp stores it, filters on it, and never sees a
   prompt.
+- **Non-pmmcp tools.** Their results enter a run as that run's own data. Web
+  pages and other untrusted inputs are handled by taint, not lineage.
 - **The kernel-only principals.**
   - What protects: they reach only their own namespaces, and `aos-promote`,
     `aos-collab` and `aos-brief` read nothing. So a kernel bug cannot read
@@ -1774,30 +2054,40 @@ Kept so the next design pass can amend the docs:
   recalls to estimate how much the others store. Closing that means one
   collection per principal, a change to pmmcp's storage. This revision
   accepts the channel.
-- **The operator's own tools.** The `operator` principal sees everything, by
-  design. A Claude Code session on an untrusted repository could be
-  prompt-injected into reading trading or CRM data through it. Recommended:
-  give the operator's MCP clients the `operator-clients` principal, limited to
-  the operator's own `project_id`s outside `aos/`, and keep `all` for pmmcp's
-  CLI.
+- **The operator's own tools.**
+  - The `operator` principal sees everything, by design. A Claude Code session
+    on an untrusted repository could be prompt-injected into reading trading
+    or CRM data through it.
+  - Recommended: give the operator's MCP clients the `operator-clients`
+    principal, limited to the operator's own `project_id`s outside `aos/`, and
+    keep `all` for pmmcp's CLI.
+  - `operator-clients` cannot reach global (null-project) records, or an
+    existing `project_id` outside its grammar (uppercase, `_` or `.`). Check
+    §9 before switching.
 
 ## 9. Needs validation before implementing
 
-- pmmcp's `mcp` version: v1 FastMCP or v2 MCPServer, and whether it is at
-  least 1.27.2.
-- Whether pmmcp's recall filters `project_id` inside the Qdrant query today,
-  and whether a project-scoped recall also returns global (null-project)
-  records.
-- Whether `remember` deduplicates, links or consolidates records, and how.
-- Whether Qdrant's payload filter can express P7's `lineage_within` (every
-  element of an array in a set) without a precomputed field.
-- The real name and arguments of `search`, if it exists, and the real
-  arguments of `index_project`.
-- Whether index records can carry `source_path` (P9).
-- Whether pmmcp registers resources, resource templates or prompts, and what
-  other routes it serves on 8766.
-- What the dashboard on 8765 shows.
-- Whether anything is already stored under `aos/` (K12), including goals from
-  any Phase 0 exit run.
-- Whether `get_secret` takes `project_id` live. After P3 this matters only to
-  the operator.
+- **pmmcp's SDK.** Its `mcp` version: v1 FastMCP or v2 MCPServer, and whether
+  it is at least 1.29.1 (P1).
+- **Search and storage.**
+  - Whether pmmcp's recall filters `project_id` inside the Qdrant query
+    today, and whether a project-scoped recall also returns global
+    (null-project) records.
+  - Whether `remember` deduplicates, links or consolidates records, and how.
+  - Whether Qdrant's payload filter can express P7's `lineage_within` (every
+    element of an array of objects in a set) and the CEO's hold rule without a
+    precomputed field.
+- **Tools.**
+  - The real name and arguments of `search`, if it exists.
+  - The real arguments of `index_project`.
+  - How `index_git_history` divides a commit into records.
+  - Whether pmmcp registers resources, resource templates or prompts, and
+    what other routes it serves on 8766.
+- **The operator's surfaces.**
+  - What the dashboard on 8765 shows.
+  - Which `project_id`s the operator's own clients use today, and how many
+    global records exist.
+- **Existing data.** Whether anything is already stored under `aos/` (K12),
+  including goals from any Phase 0 exit run.
+- **The vault.** Whether `get_secret` takes `project_id` live. After P3 this
+  matters only to the operator.

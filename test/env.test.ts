@@ -279,6 +279,9 @@ test('the test guard admits a mutated tree only for the falsify run that mutated
   mkdirSync(join(root, 'test', 'helpers'), { recursive: true })
   const guard = join(root, 'test', 'helpers', 'guard.ts')
   writeFileSync(guard, readFileSync(fileURLToPath(new URL('./helpers/guard.ts', import.meta.url))))
+  // The guard reads the lock through the same module the daemon uses.
+  mkdirSync(join(root, 'src'))
+  writeFileSync(join(root, 'src', 'falsify-hold.ts'), readFileSync(fileURLToPath(new URL('../src/falsify-hold.ts', import.meta.url))))
   mkdirSync(join(root, '.falsify'))
   const journal = (text: string): void => writeFileSync(join(root, '.falsify', 'journal.json'), text)
   const load = (run?: string): ReturnType<typeof spawnSync> =>

@@ -12,12 +12,13 @@
 // second signal is not polite — if a shutdown hangs, the operator gets their
 // terminal back.
 
-import { existsSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse as parseYaml } from 'yaml'
 
 import { ConfigError } from './errors.js'
+import { falsifyRefusal } from './falsify-hold.js'
 import { bootKernel } from './kernel.js'
 import { parseKernelConfig, type KernelConfig } from './config.js'
 import { parseProviders, type ProvidersFile } from './models/registry.js'
@@ -30,52 +31,11 @@ function readYaml(path: string): unknown {
   return parseYaml(readFileSync(path, 'utf8'))
 }
 
-/**
- * The journal `npm run falsify` keeps while a source file is mutated
- * (scripts/falsify/runner.ts JOURNAL_DIR/JOURNAL). While it exists, a file in
- * src/ may hold a deliberately planted bug — a disabled check, a credentials
- * path — so the daemon does not start, whether the run is live or died.
- */
-export const FALSIFY_JOURNAL = join('.falsify', 'journal.json')
-export const FALSIFY_LOCK = join('.falsify', 'lock.json')
-
-/**
- * The pid of a live falsify run holding this tree, or undefined. Between two
- * mutants (a baseline) there is no journal, but the next mutant is seconds
- * away. Live means the pid exists: a reused pid after a crash is a refusal
- * that `npm run falsify -- --recover` (which also checks the start time) clears.
- */
-function falsifyHolder(repoRoot: string): number | undefined {
-  let pid: unknown
-  try {
-    pid = (JSON.parse(readFileSync(join(repoRoot, FALSIFY_LOCK), 'utf8')) as { pid?: unknown }).pid
-  } catch {
-    return undefined
-  }
-  if (typeof pid !== 'number' || pid === process.pid) return undefined
-  try {
-    process.kill(pid, 0)
-    return pid
-  } catch (e) {
-    return (e as NodeJS.ErrnoException).code === 'EPERM' ? pid : undefined
-  }
-}
-
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
   const repoRoot = resolve(process.cwd())
-  if (existsSync(join(repoRoot, FALSIFY_JOURNAL))) {
-    throw new ConfigError(
-      `${join(repoRoot, FALSIFY_JOURNAL)} exists: a falsify run is in progress or was interrupted, and a source ` +
-        'file may still be mutated. Let it finish, or run: npm run falsify -- --recover',
-    )
-  }
-  const holder = falsifyHolder(repoRoot)
-  if (holder !== undefined) {
-    throw new ConfigError(
-      `a falsify run (pid ${String(holder)}) holds this tree and mutates its source files as it goes. Let it finish; ` +
-        'if none is going, run: npm run falsify -- --recover',
-    )
-  }
+  // A falsify run's tree may hold a planted bug in src/ (src/falsify-hold.ts).
+  const held = falsifyRefusal(repoRoot)
+  if (held !== undefined) throw new ConfigError(held)
   const configPath = configPathFrom(argv, repoRoot)
 
   const config = parseKernelConfig(readYaml(configPath), {

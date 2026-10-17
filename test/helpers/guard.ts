@@ -16,6 +16,8 @@ import net from 'node:net'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { lockHolder } from '../../src/falsify-hold.js'
+
 /**
  * Credentials never reach an offline test. Any name a provider key, the
  * control token or the pmmcp bearer would use is removed from this test
@@ -79,27 +81,15 @@ function interruptedMutation(root: string): string | undefined {
  * A falsify run that holds this tree right now, and is not the one that
  * started this process. It mutates file after file while it holds the lock,
  * baselines included, so a test admitted between two mutants would load the
- * next one. Live means its pid exists; the pid is all the guard checks, since
- * ps on every test file would cost every run, and a pid reused by an unrelated
- * process after a crash is a refusal that `--recover` (which checks the start
- * time) clears.
+ * next one. Liveness is src/falsify-hold.ts's: the pid alone, since ps on every
+ * test file would cost every run; a pid reused after a crash is a refusal that
+ * `--recover` (which checks the start time) clears.
  */
 function heldByAnotherRun(root: string): string | undefined {
-  let lock: { pid?: unknown; runId?: unknown }
-  try {
-    lock = JSON.parse(readFileSync(join(root, '.falsify', 'lock.json'), 'utf8')) as { pid?: unknown; runId?: unknown }
-  } catch {
-    return undefined
-  }
-  if (typeof lock.runId === 'string' && lock.runId !== '' && lock.runId === process.env['AOS_FALSIFY_RUN']) return undefined
-  if (typeof lock.pid !== 'number' || lock.pid === process.pid) return undefined
-  try {
-    process.kill(lock.pid, 0)
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== 'EPERM') return undefined
-  }
+  const holder = lockHolder(root)
+  if (holder === undefined || (holder.runId !== undefined && holder.runId === process.env['AOS_FALSIFY_RUN'])) return undefined
   return (
-    `a falsify run (pid ${String(lock.pid)}) holds this tree and mutates its files as it goes: let it finish before testing. ` +
+    `a falsify run (pid ${String(holder.pid)}) holds this tree and mutates its files as it goes: let it finish before testing. ` +
     'If no falsify run is going, run `npm run falsify -- --recover`, which drops a stale lock'
   )
 }

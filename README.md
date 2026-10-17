@@ -595,7 +595,8 @@ during cleanup, a second run during the first one's baseline, six runners
 racing for one stale lock, a reused pid, a missing `ps`, and the program's
 usage errors; it also refuses an unreadable journal in-process, and the
 `runner` suite proves those tests catch the bugs they name.
-`test/entrypoints.test.ts` proves the daemon's refusals and `test/env.test.ts`
+`test/falsify-hold.test.ts` proves the daemon's refusals in-process (and
+`test/entrypoints.test.ts` that the daemon applies them), `test/env.test.ts`
 the test guard's. On every `npm test`, `test/falsify.test.ts` also checks that
 every catalog anchor still matches exactly once — a refactor that moves one
 fails the suite instead of silently disabling its mutant — and that no

@@ -131,6 +131,14 @@ function loadConfig(io: CliIo, configPath: string | undefined): KernelConfig {
   })
 }
 
+/**
+ * How long `probe` waits for its reply. model.probe answers only after two
+ * provider calls in sequence, plus the router's retries, which the client's 5 s
+ * default does not cover. The daemon still records a probe whose caller gave
+ * up, so a short wait reports a failure that did not happen.
+ */
+export const PROBE_REPLY_TIMEOUT_MS = 180_000
+
 function dbPath(config: KernelConfig): string {
   return join(config.dataDir, EVENTS_DB_FILE)
 }
@@ -144,6 +152,7 @@ async function withClient<T>(
   config: KernelConfig,
   dotenv: string | undefined,
   fn: (client: ControlClient) => Promise<T>,
+  options: { readonly timeoutMs?: number } = {},
 ): Promise<T> {
   // Read ONLY here, so the read is on the path that needs it — the shell first,
   // then the --dotenv file, and only the token, never a provider key.
@@ -175,7 +184,11 @@ async function withClient<T>(
   assertTokenUsable(token)
 
   const connect = io.connect ?? connectControl
-  const client = await connect({ port: config.control.port, token })
+  const client = await connect({
+    port: config.control.port,
+    token,
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+  })
   try {
     return await fn(client)
   } finally {
@@ -268,11 +281,26 @@ async function dispatch(
     case 'probe': {
       const ref = positionals[0]
       if (ref === undefined) return usage(io, 'probe needs a model ref')
-      return withClient(io, config, dotenvOf(values), async (client) => {
-        const record = (await client.call('model.probe', { ref })) as { toolCalling: boolean; reason?: string }
-        io.out(`${ref}\ttoolCalling=${String(record.toolCalling)}${record.reason === undefined ? '' : `\t${record.reason}`}`)
-        return record.toolCalling ? 0 : 1
-      })
+      return withClient(
+        io,
+        config,
+        dotenvOf(values),
+        async (client) => {
+          let record: { toolCalling: boolean; reason?: string }
+          try {
+            record = (await client.call('model.probe', { ref })) as { toolCalling: boolean; reason?: string }
+          } catch (e) {
+            // A lost reply is not a lost probe: the daemon finishes and records it.
+            if (e instanceof Error && 'code' in e && e.code === 'transport') {
+              io.err(`the daemon may still record this probe; check: npm run cli -- search --type probe.recorded --limit 1`)
+            }
+            throw e
+          }
+          io.out(`${ref}\ttoolCalling=${String(record.toolCalling)}${record.reason === undefined ? '' : `\t${record.reason}`}`)
+          return record.toolCalling ? 0 : 1
+        },
+        { timeoutMs: PROBE_REPLY_TIMEOUT_MS },
+      )
     }
 
     case 'kill': {

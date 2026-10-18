@@ -35,6 +35,7 @@ import { EventStore } from '../src/events/store.js'
 import {
   CLI_COMMANDS,
   EVENTS_DB_FILE,
+  PROBE_REPLY_TIMEOUT_MS,
   runCli,
   SOCKET_COMMANDS,
   type CliIo,
@@ -68,7 +69,7 @@ interface Harness {
   readonly errs: string[]
   readonly calls: { cmd: string; params: Record<string, unknown> }[]
   readonly envReads: string[]
-  readonly connects: { port: number; token: string }[]
+  readonly connects: { port: number; token: string; timeoutMs?: number }[]
   readonly dataDir: string
   readonly configPath: string
   emit(event: EventNotice): void
@@ -148,7 +149,11 @@ function harness(
       ? {}
       : {
           connect: (opts) => {
-            connects.push({ port: opts.port, token: opts.token })
+            connects.push({
+              port: opts.port,
+              token: opts.token,
+              ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
+            })
             const client: ControlClient = {
               hello: { kernel: { version: '0.0.1' }, status: {} },
               onEvent: (listener) => listeners.push(listener),
@@ -510,6 +515,10 @@ test('approve/deny/approvals/kill/probe round-trip', async (t) => {
   const pf = harness(t)
   pf.reply('model.probe', { toolCalling: false, reason: 'made no tool call' })
   assert.equal(await runCli(['probe', 'x/y', '--config', pf.configPath], pf.io), 1)
+  // A real probe is two provider calls in sequence, so only it waits longer
+  // than the client's 5 s default.
+  assert.deepEqual(p.connects, [{ port: 7777, token: TOKEN, timeoutMs: PROBE_REPLY_TIMEOUT_MS }])
+  assert.deepEqual(k.connects, [{ port: 7777, token: TOKEN }])
 
   // An id that is neither shape, and one that is not pending.
   const nf = harness(t)
@@ -569,6 +578,22 @@ test('deny on a hold id is refused with usage', async (t) => {
   assert.match(h.errs.join('\n'), /cannot be denied/)
   assert.deepEqual(h.calls, [])
   assert.deepEqual(h.connects, [], 'a refused command must not open a socket')
+})
+
+test('a probe whose reply never comes says where the daemon records it', async (t) => {
+  // The daemon finishes a probe whose caller stopped waiting, so the operator
+  // is pointed at the record rather than told to probe (and pay) again.
+  const h = harness(t)
+  h.fail('model.probe', 'transport', 'no reply to model.probe')
+  assert.equal(await runCli(['probe', 'anthropic/claude-sonnet-5', '--config', h.configPath], h.io), 1)
+  assert.match(h.errs.join('\n'), /no reply to model\.probe/)
+  assert.match(h.errs.join('\n'), /npm run cli -- search --type probe\.recorded --limit 1/)
+
+  // Any other refusal carries no such hint: there is no probe to look for.
+  const r = harness(t)
+  r.fail('model.probe', 'not_found', 'no model anthropic/nope')
+  assert.equal(await runCli(['probe', 'anthropic/nope', '--config', r.configPath], r.io), 1)
+  assert.doesNotMatch(r.errs.join('\n'), /probe\.recorded/)
 })
 
 // ── the token ──────────────────────────────────────────────────────────────

@@ -13,7 +13,21 @@
 
 import './guard.js'
 
+import { FORCED_DISABLED, FORCED_KERNEL_ONLY } from '../../src/mcp/tool-views.js'
 import { PMMCP_TOOLS, PMMCP_TOOL_COUNT } from './mock-pmmcp.js'
+
+/**
+ * Tools invariant 7 forces closed that the live server does not register.
+ *
+ * Their pins stay in config/tool-views.yaml and their entries stay in the
+ * double, because the rule is about the day pmmcp adds them, not about today:
+ * the hub tests prove such a tool arrives kernel-only. The drift guard would
+ * otherwise read each one as a pin guarding nothing. Only a forced name may sit
+ * here (an operator's own pin for a missing tool IS a rule guarding nothing),
+ * and a name the live server registers again is a finding, so the list can
+ * neither grow past invariant 7 nor outlive the absence it records.
+ */
+export const ABSENT_BY_INVARIANT: readonly string[] = ['restore_backup']
 
 export interface CapturedTool {
   readonly name: string
@@ -33,6 +47,8 @@ export interface CompareInput {
   readonly keyArg: string
   /** The tool names config/tool-views.yaml pins. */
   readonly pinned: readonly string[]
+  /** Defaults to ABSENT_BY_INVARIANT; the tests pass a wrong one. */
+  readonly absentByInvariant?: readonly string[]
 }
 
 /** The property names a captured tool declares, or undefined if it declares none. */
@@ -54,8 +70,21 @@ export function compareCapture(input: CompareInput): string[] {
   }
   const live = new Map(tools.map((t) => [t.name, t]))
 
+  const forced = new Set([...FORCED_KERNEL_ONLY, ...FORCED_DISABLED])
+  const absent = new Set<string>()
+  for (const name of input.absentByInvariant ?? ABSENT_BY_INVARIANT) {
+    if (!forced.has(name)) {
+      findings.push(`${name} is excused as absent, but invariant 7 does not force it; only a forced pin may be absent`)
+    } else if (live.has(name)) {
+      findings.push(`the live server now registers ${name}; remove it from ABSENT_BY_INVARIANT so its schema is checked`)
+    } else {
+      absent.add(name)
+    }
+  }
+
   for (const spec of PMMCP_TOOLS) {
     const tool = live.get(spec.name)
+    if (tool === undefined && absent.has(spec.name)) continue
     if (tool === undefined) {
       // A modelled tool the server does not have is a guess that was wrong, and
       // anything in the kernel built on it needs revisiting.
@@ -94,7 +123,7 @@ export function compareCapture(input: CompareInput): string[] {
   // A pinned classification for a tool that does not exist is a rule guarding
   // nothing, and in an audit it reads exactly like a rule that works.
   for (const name of input.pinned) {
-    if (!live.has(name)) findings.push(`tool-views.yaml pins a tool the live server does not expose: ${name}`)
+    if (!live.has(name) && !absent.has(name)) findings.push(`tool-views.yaml pins a tool the live server does not expose: ${name}`)
   }
 
   // The count appears in CLAUDE.md, in config/tool-views.yaml's header and in
@@ -115,9 +144,10 @@ export function compareCapture(input: CompareInput): string[] {
  * A capture that agrees with this repo, for proving the comparison can pass.
  * Built from the same table it is compared against, so it says nothing about
  * pmmcp — only that `compareCapture` is not a function that always complains.
+ * Agreeing includes the belief that the excused tools are absent.
  */
 export function agreeingCapture(): PmmcpCapture {
-  const tools: CapturedTool[] = PMMCP_TOOLS.map((spec) => ({
+  const tools: CapturedTool[] = PMMCP_TOOLS.filter((spec) => !ABSENT_BY_INVARIANT.includes(spec.name)).map((spec) => ({
     name: spec.name,
     inputSchema: { properties: { ...spec.inputSchema.properties } },
   }))

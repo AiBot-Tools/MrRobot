@@ -32,6 +32,7 @@ import { parseToolViews } from '../src/mcp/tool-views.js'
 import { REPO_ROOT } from './helpers/kernel.js'
 import { PMMCP_TOOLS, PMMCP_TOOL_COUNT } from './helpers/mock-pmmcp.js'
 import {
+  ABSENT_BY_INVARIANT,
   agreeingCapture,
   compareCapture,
   type PmmcpCapture,
@@ -127,6 +128,49 @@ test('the comparison passes on a capture that agrees, so it is not merely always
   // And the agreeing capture is the real cardinality, so a passing comparison
   // is a comparison that saw as many tools as the live server has.
   assert.equal(agreeingCapture().toolCount, PMMCP_TOOL_COUNT)
+})
+
+test('only a tool invariant 7 forces may be missing from the live server, and only while it is', () => {
+  // The excuse that clears restore_backup must not become a way to excuse
+  // anything else, nor outlive the absence it records.
+  const agreeing = agreeingCapture()
+  assert.equal(
+    agreeing.tools?.some((t) => ABSENT_BY_INVARIANT.includes(t.name)),
+    false,
+    'the agreeing capture lacks the excused tools, as the live one does',
+  )
+  assert.deepEqual(compareCapture({ capture: agreeing, keyArg: 'label', pinned: pinned() }), [])
+
+  // An operator pin is not forced: a missing `forget` is a rule guarding nothing.
+  const operatorPin = compareCapture({
+    capture: { ...agreeing, tools: agreeing.tools?.filter((t) => t.name !== 'forget') ?? [] },
+    keyArg: 'label',
+    pinned: pinned(),
+    absentByInvariant: ['restore_backup', 'forget'],
+  })
+  assert.equal(operatorPin.some((f) => /forget is excused as absent, but invariant 7 does not force it/.test(f)), true)
+  assert.equal(operatorPin.some((f) => /pins a tool the live server does not expose: forget/.test(f)), true)
+
+  // pmmcp adds it back: the excuse is now stale and says so.
+  const returned = compareCapture({
+    capture: {
+      ...agreeing,
+      tools: [...(agreeing.tools ?? []), { name: 'restore_backup', inputSchema: { properties: { backup_id: {} } } }],
+    },
+    keyArg: 'label',
+    pinned: pinned(),
+  })
+  assert.equal(
+    returned.some((f) => /the live server now registers restore_backup; remove it from ABSENT_BY_INVARIANT/.test(f)),
+    true,
+  )
+
+  // Without the excuse, the absence is reported both ways, as before.
+  const unexcused = compareCapture({ capture: agreeing, keyArg: 'label', pinned: pinned(), absentByInvariant: [] })
+  assert.deepEqual(unexcused, [
+    'modelled tool absent from the live server: restore_backup',
+    'tool-views.yaml pins a tool the live server does not expose: restore_backup',
+  ])
 })
 
 test('a captured keyArg other than the configured one is the only thing that settles it', () => {

@@ -3016,6 +3016,29 @@ Kept so the next design pass can amend the docs:
 
 ## 9. Needs validation before implementing
 
+**Settled by the operator's capture** (`test/fixtures/pmmcp-listtools.json`,
+2026-10-18, 64 tools):
+
+- `remember` takes `key` and `value` (required), and `project_id`, `type` and
+  `extra` (optional). `recall` takes `query` (required), and `project_id`,
+  `limit`, `scope`, `max_tokens` and `explain`. In both, `project_id` is
+  optional today, so P2's refusal of an absent one is a real change.
+- There is no tool named `search`. Other tools read memory or indexed code:
+  `ask_memory`, `search_episodes`, `get_context_bundle`, `find_code`,
+  `graph_query`, `recall_commands` and more. `search_context` takes no
+  `project_id` at all. P2 must classify every one of the 64 as a read or a
+  write, and P3's agent profiles list none of these.
+- `index_project` takes `project_id` and `root_path` as arguments, with
+  `repo_url` and `full`. `index_git_history` takes `project_id`, `full` and
+  `max_commits`. P9's rule that roots come from `index_roots` and never from
+  an argument is therefore a change to `index_project`. `list_roots` lists
+  registered roots, which is where a boot check of `indexRepos` could read
+  them.
+- `get_secret` takes `label` and an optional `project_id`.
+- `restore_backup` does not exist on the live server.
+
+**Still open:**
+
 - **pmmcp's SDK.** Its `mcp` version: v1 FastMCP or v2 MCPServer, and whether
   it is at least 1.29.1 (P1).
 - **Search and storage.**
@@ -3028,8 +3051,6 @@ Kept so the next design pass can amend the docs:
     `lineage_within` (every element of an array of objects in a set) can be
     written without a precomputed field.
 - **Tools.**
-  - The real name and arguments of `search`, if it exists.
-  - The real arguments of `index_project`.
   - How `index_git_history` divides a commit into records.
   - Whether pmmcp registers resources, resource templates or prompts, and
     what other routes it serves on 8766.
@@ -3044,5 +3065,5 @@ Kept so the next design pass can amend the docs:
     global records exist.
 - **Existing data.** Whether anything is already stored under `aos/` (K12),
   including goals from any Phase 0 exit run.
-- **The vault.** Whether `get_secret` takes `project_id` live. After P3 this
-  matters only to the operator.
+- **Behaviour the capture cannot show:** what each tool does with an absent
+  `project_id`, and what `remember`'s `type` values change about storage.

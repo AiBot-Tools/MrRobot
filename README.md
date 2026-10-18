@@ -653,8 +653,13 @@ stand in for line 2.
 which wins.
 
 ```bash
-AOS_LIVE_TESTS=1 npm test
+AOS_LIVE_TESTS=1 node --import tsx --test test/live-anthropic.test.ts
 ```
+
+The passing test prints `costMicroUsd=<N>` as a test diagnostic (`ℹ` in the
+terminal's spec output, `#` in TAP); that is the number recorded below.
+`AOS_LIVE_TESTS=1 npm test` runs the same test plus every other live test, at
+roughly twice the cost.
 
 - Result: _not yet run_
 - Date: —
@@ -669,8 +674,14 @@ memory and goal store here, not the key store: its `get_secret` masks by design.
 The key comes from the same place.
 
 ```bash
-AOS_LIVE_TESTS=1 PMMCP_URL=http://127.0.0.1:8766/mcp npm test
+AOS_LIVE_TESTS=1 PMMCP_URL=http://127.0.0.1:8766/mcp node --import tsx --test --test-name-pattern="Phase 0 exit criterion" test/live-anthropic.test.ts
 ```
+
+`PMMCP_URL` is required (the test skips without it) and is read only by the
+test, which writes it into its own temporary `kernel.yaml`. The test runs the
+shipped CEO against the operator's real pmmcp: a reply that plans could write
+goals under `aos/ceo`, and pmmcp has no tool to delete them. It prints
+`costMicroUsd=<N>` the same way.
 
 - Result: _not yet run_
 - Date: —

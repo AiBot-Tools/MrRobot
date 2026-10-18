@@ -170,6 +170,9 @@ test(
     // the provider.
     assert.ok((finish['costMicroUsd'] as number) > 0, 'the run finished with zero cost')
     assert.ok((finish['llmCalls'] as number) > 0)
+    // README's checklist records this number; the log holding it is a temp
+    // dir that is gone once the test ends.
+    t.diagnostic(`costMicroUsd=${String(finish['costMicroUsd'])} llmCalls=${String(finish['llmCalls'])}`)
 
     await booted.kernel.shutdown()
     const all = rows(booted.fx.dbPath)
@@ -242,6 +245,7 @@ test(
     const finish = await probeThenRun(booted, ref, 'reply with the word pong')
     assert.equal(finish['status'], 'ok', String(finish['reason'] ?? ''))
     assert.ok((finish['costMicroUsd'] as number) > 0, 'the run finished with zero cost')
+    t.diagnostic(`costMicroUsd=${String(finish['costMicroUsd'])} llmCalls=${String(finish['llmCalls'])}`)
 
     await booted.kernel.shutdown()
     const all = rows(booted.fx.dbPath)

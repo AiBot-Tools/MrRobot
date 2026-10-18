@@ -177,6 +177,53 @@ test('an extra optional live argument is not drift: a server after P4 that only 
   assert.equal(goalToolsUnusable(hub, shippedConfig().goals), undefined)
 })
 
+test('a live branch the kernel cannot type is unknown, not narrower: a $ref status still serves', async (t) => {
+  // What pydantic emits for Optional[GoalStatus] with a str Enum.
+  const { hub } = await wired(t, {
+    schemas: edited('update_goal', (s) => ({
+      ...s,
+      properties: { ...s.properties, status: { anyOf: [{ $ref: '#/$defs/GoalStatus' }, { type: 'null' }], default: null } },
+    })),
+  })
+  assert.equal(goalToolsUnusable(hub, shippedConfig().goals), undefined)
+})
+
+test('a live enum that leaves out a value the kernel sends degrades goals by name; one that holds them serves', async (t) => {
+  const withStatus = (values: string[]): Record<string, JsonObjectSchema> =>
+    edited('update_goal', (s) => ({
+      ...s,
+      properties: { ...s.properties, status: { anyOf: [{ type: 'string', enum: values }, { type: 'null' }], default: null } },
+    }))
+  const { hub } = await wired(t, { schemas: withStatus(['pending', 'active', 'done', 'blocked']) })
+  assert.match(
+    String(goalToolsUnusable(hub, shippedConfig().goals)),
+    /pmmcp\.update_goal\.status accepts only pending, active, done, blocked, not in_progress/,
+  )
+  const { hub: holds } = await wired(t, { schemas: withStatus(['pending', 'in_progress', 'completed', 'abandoned', 'blocked']) })
+  assert.equal(goalToolsUnusable(holds, shippedConfig().goals), undefined)
+
+  const { hub: kinds } = await wired(t, {
+    schemas: edited('create_goal', (s) => ({
+      ...s,
+      properties: { ...s.properties, goal_type: { type: 'string', enum: ['objective', 'task'], default: 'objective' } },
+    })),
+  })
+  assert.match(String(goalToolsUnusable(kinds, shippedConfig().goals)), /create_goal\.goal_type accepts only objective, task, not milestone/)
+})
+
+test('two goals.args entries naming one wire key degrade goals, and a call built from them never leaves', async (t) => {
+  const { hub, mock } = await wired(t)
+  const goals = shippedConfig().goals
+  const clashing = { ...goals, args: { ...goals.args, kind: 'title' } }
+  assert.match(String(goalToolsUnusable(hub, clashing)), /goals\.args gives title to two arguments of pmmcp\.create_goal/)
+  const before = mock.calls.length
+  await assert.rejects(
+    () => createGoal({ hub, goals: clashing, serverId: 'pmmcp' }, { project_id: PROJECT, goal_type: 'task', title: 'T', parent_goal_id: 'g1' }, 'test'),
+    GoalWriteFailed,
+  )
+  assert.equal(mock.calls.length, before, 'a call with one value overwriting another reached the server')
+})
+
 test('a goals.statuses entry the kernel may not send degrades goals at boot, naming the line', async (t) => {
   const { hub } = await wired(t)
   const goals = shippedConfig().goals

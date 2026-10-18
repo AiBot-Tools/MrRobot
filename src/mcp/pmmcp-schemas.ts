@@ -136,9 +136,15 @@ export type GetSecretArgs = z.infer<typeof GetSecretSent>
 // ─── comparing a schema with the capture ───────────────────────────────────
 
 export interface PropertyShape {
-  /** Sorted; an array type is written `array<item types>`. */
+  /**
+   * Sorted; an array type is written `array<item types>`. Empty when a lenient
+   * read meets a branch it cannot type (a `$ref`, a `oneOf`): unknown, which is
+   * not the same as narrower.
+   */
   readonly types: readonly string[]
   readonly default?: unknown
+  /** Lenient reads only: the values every non-null branch is limited to, if all are. */
+  readonly enum?: readonly unknown[]
 }
 
 export interface InputShape {
@@ -152,6 +158,8 @@ const TOP_KEYS = new Set(['type', 'properties', 'required', 'title', 'descriptio
 const PROPERTY_KEYS = new Set(['type', 'anyOf', 'items', 'default', 'title', 'description', 'minimum', 'maximum'])
 const BRANCH_KEYS = new Set(['type', 'items', 'minimum', 'maximum'])
 const ITEM_KEYS = new Set(['type'])
+// Keywords that carry a type this file does not resolve.
+const OPAQUE = ['$ref', 'oneOf', 'allOf', 'not'] as const
 
 function record(value: unknown, where: string): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -207,19 +215,34 @@ export function inputShape(schema: unknown, options: { readonly strict?: boolean
     const node = record(value, where)
     onlyKnown(node, PROPERTY_KEYS, where, strict)
     const types = typesOf(node, where, strict)
+    // Lenient only: a part this file cannot type makes the whole property
+    // unknown, and an enum counts only if every non-null part has one.
+    let opaque = OPAQUE.some((key) => key in node)
+    let limited: unknown[] | undefined = []
+    const limit = (part: Record<string, unknown>, partTypes: readonly string[]): void => {
+      if (!partTypes.some((t) => t !== 'null')) return
+      if (Array.isArray(part['enum'])) limited?.push(...(part['enum'] as unknown[]))
+      else limited = undefined
+    }
+    limit(node, types)
     const branches = node['anyOf']
     if (branches !== undefined) {
       if (!Array.isArray(branches)) throw new Error(`${where}.anyOf is not an array`)
       branches.forEach((branch, i) => {
         const b = record(branch, `${where}.anyOf[${String(i)}]`)
         onlyKnown(b, BRANCH_KEYS, `${where}.anyOf[${String(i)}]`, strict)
-        types.push(...typesOf(b, `${where}.anyOf[${String(i)}]`, strict))
+        const branchTypes = typesOf(b, `${where}.anyOf[${String(i)}]`, strict)
+        if (branchTypes.length === 0 || OPAQUE.some((key) => key in b)) opaque = true
+        limit(b, branchTypes)
+        types.push(...branchTypes)
       })
     }
     if (types.length === 0 && strict) throw new Error(`${where} declares no type`)
+    const known = strict || !opaque
     shaped[name] = {
-      types: [...new Set(types)].sort(),
+      types: known ? [...new Set(types)].sort() : [],
       ...('default' in node ? { default: node['default'] } : {}),
+      ...(!strict && known && limited !== undefined && limited.length > 0 ? { enum: limited } : {}),
     }
   }
   const required = top['required']

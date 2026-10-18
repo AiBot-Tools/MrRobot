@@ -64,7 +64,9 @@ function onWire(goals: GoalsConfig, args: Record<string, unknown>): Record<strin
   const out: Record<string, unknown> = {}
   for (const [live, value] of Object.entries(args)) {
     // Only names WIRE_ARG holds can get here: the strict schemas refuse the rest.
-    out[goals.args[WIRE_ARG[live as keyof typeof WIRE_ARG]]] = value
+    const key = goals.args[WIRE_ARG[live as keyof typeof WIRE_ARG]]
+    if (key in out) throw new GoalWriteFailed(`kernel.yaml goals.args names ${key} for two arguments`, [])
+    out[key] = value
   }
   return out
 }

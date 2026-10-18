@@ -17,7 +17,7 @@
 // away from fixed.
 
 import type { McpHub } from '../mcp/hub.js'
-import { inputShape, SENDABLE_STATUSES } from '../mcp/pmmcp-schemas.js'
+import { GOAL_TYPES, inputShape, SENDABLE_STATUSES } from '../mcp/pmmcp-schemas.js'
 import type { KernelConfig } from '../config.js'
 
 export type GoalsConfig = KernelConfig['goals']
@@ -41,15 +41,24 @@ export interface SentArg {
   readonly type: 'string' | 'number'
   /** False for an argument some calls leave out (an objective's parent; progress outside review). */
   readonly always: boolean
+  /** The values it can carry, where the kernel sends from a closed set. */
+  readonly values?: readonly string[]
 }
 
 /** What src/goals/pmmcp.ts puts on the wire, per tool the kernel calls. */
 export function sentArgs(goals: GoalsConfig): { tool: string; args: SentArg[] }[] {
   const a = goals.args
   const s = (name: string, always = true): SentArg => ({ name, type: 'string', always })
+  const statuses = [...new Set(Object.values(goals.statuses))]
   return [
-    { tool: goals.tools.create, args: [s(a.projectId), s(a.kind), s(a.title), s(a.parentId, false)] },
-    { tool: goals.tools.updateStatus, args: [s(a.goalId), s(a.status), { name: a.progress, type: 'number', always: false }] },
+    {
+      tool: goals.tools.create,
+      args: [s(a.projectId), { ...s(a.kind), values: GOAL_TYPES }, s(a.title), s(a.parentId, false)],
+    },
+    {
+      tool: goals.tools.updateStatus,
+      args: [s(a.goalId), { ...s(a.status), values: statuses }, { name: a.progress, type: 'number', always: false }],
+    },
     { tool: goals.tools.get, args: [s(a.goalId)] },
   ]
 }
@@ -109,15 +118,26 @@ export function goalToolsUnusable(
       problems.push(`${serverId}.${tool} declares an inputSchema the kernel cannot read: ${e instanceof Error ? e.message : String(e)}`)
       continue
     }
+    // Two goals.args entries naming one key: the later value would silently
+    // replace the earlier on the wire.
+    const names = args.map((arg) => arg.name)
+    const doubled = [...new Set(names.filter((n, i) => names.indexOf(n) !== i))]
+    if (doubled.length > 0) {
+      problems.push(`kernel.yaml goals.args gives ${doubled.join(', ')} to two arguments of ${serverId}.${tool}`)
+    }
     const always = new Set(args.filter((arg) => arg.always).map((arg) => arg.name))
     for (const name of shape.required) {
       if (!always.has(name)) problems.push(`${serverId}.${tool} requires ${name}, which the kernel does not send on every call`)
     }
     for (const arg of args) {
-      const types = shape.properties[arg.name]?.types
-      if (types === undefined || types.length === 0) continue
-      const admitted = types.includes(arg.type) || (arg.type === 'number' && types.includes('integer'))
-      if (!admitted) problems.push(`${serverId}.${tool}.${arg.name} is ${types.join('|')}, but the kernel sends a ${arg.type}`)
+      const live = shape.properties[arg.name]
+      if (live === undefined || live.types.length === 0) continue
+      const admitted = live.types.includes(arg.type) || (arg.type === 'number' && live.types.includes('integer'))
+      if (!admitted) problems.push(`${serverId}.${tool}.${arg.name} is ${live.types.join('|')}, but the kernel sends a ${arg.type}`)
+      const outside = (arg.values ?? []).filter((v) => live.enum !== undefined && !live.enum.includes(v))
+      if (outside.length > 0) {
+        problems.push(`${serverId}.${tool}.${arg.name} accepts only ${(live.enum ?? []).map(String).join(', ')}, not ${outside.join(', ')}`)
+      }
     }
   }
 
@@ -126,10 +146,15 @@ export function goalToolsUnusable(
   // a stale goal per run.
   for (const [status, sent] of Object.entries(goals.statuses)) {
     if (!(SENDABLE_STATUSES as readonly string[]).includes(sent)) {
-      problems.push(`kernel.yaml goals.statuses.${status} is "${sent}"; the kernel sends only ${SENDABLE_STATUSES.join(', ')}`)
+      // An allowlist in code, on purpose: what the kernel may send is not config,
+      // so a pmmcp that renamed these would need SENDABLE_STATUSES changed.
+      problems.push(
+        `kernel.yaml goals.statuses.${status} is "${sent}"; the kernel sends only ${SENDABLE_STATUSES.join(', ')} ` +
+          '(src/mcp/pmmcp-schemas.ts SENDABLE_STATUSES)',
+      )
     }
   }
 
   if (problems.length === 0) return undefined
-  return `${problems.join('; ')}. Set goals.tools / goals.args / goals.statuses in kernel.yaml, or run \`npm run capture:pmmcp\` to read the live schemas.`
+  return `${problems.join('; ')}. Set goals.tools / goals.args in kernel.yaml, or run \`npm run capture:pmmcp\` to read the live schemas.`
 }

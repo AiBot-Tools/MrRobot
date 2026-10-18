@@ -178,6 +178,9 @@ const goals: Suite = {
     { id: 'G18', file: PMMCP_SCHEMAS, from: '    progress_pct: z.number().min(0).max(100).optional(),\n  })\n  .strict()', to: '    progress_pct: z.number().min(0).max(100).optional(),\n  })', why: 'update_goal silently drops a project_id instead of refusing it' },
     { id: 'G19', file: GOAL_TOOLS, from: '      if (!always.has(name)) problems.push(', to: '      if (false) problems.push(', why: 'a pmmcp that newly requires project_id on update_goal boots, and every update then fails as success text' },
     { id: 'G20', file: GOAL_TOOLS, from: '    if (!(SENDABLE_STATUSES as readonly string[]).includes(sent)) {', to: '    if (false) {', why: 'a goals.statuses line mapping review onto completed boots clean, and every review goes stale' },
+    { id: 'G21', file: GOAL_TOOLS, from: '      if (outside.length > 0) {', to: '      if (false) {', why: 'a pmmcp whose status enum drops in_progress boots clean, and every move is then refused per call' },
+    { id: 'G22', file: PMMCP_SCHEMAS, from: '    const known = strict || !opaque', to: '    const known = true', why: 'a $ref status reads as null-only, and a pmmcp that types its enum degrades goals for nothing' },
+    { id: 'G23', file: GOAL_TOOLS, from: '    if (doubled.length > 0) {', to: '    if (false) {', why: 'two goals.args entries naming one key boot clean, and every task is written as an objective' },
   ],
   control: {
     id: 'C',

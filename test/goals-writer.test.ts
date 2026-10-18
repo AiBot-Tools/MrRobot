@@ -22,6 +22,7 @@ import { parse as parseYaml } from 'yaml'
 import { PolicyDenied } from '../src/errors.js'
 import type { EventStore } from '../src/events/store.js'
 import { GoalsUnavailable, GoalWriteFailed, GoalWriter, goalIdOf } from '../src/goals/writer.js'
+import { createGoal, getGoalTree, updateGoal } from '../src/goals/pmmcp.js'
 import { parsePlan } from '../src/goals/plan.js'
 import { goalToolsUnusable, requiredArgs } from '../src/goals/tools.js'
 import { McpHub } from '../src/mcp/hub.js'
@@ -266,6 +267,64 @@ test('the kernel may set in_progress, blocked and review — and never done; rev
     ['in_progress:kernel', 'review:kernel'],
   )
   assert.equal(moves[0]?.['runId'], 'run_1')
+})
+
+test('every goal call goes through its typed wrapper: create carries project_id, update never does, and a status that is a decision never reaches pmmcp', async (t) => {
+  const { store, hub, mock, writer } = await wired(t)
+  const { task } = await written(writer)
+  const creates = mock.calls.filter((c) => c.tool === 'create_goal')
+  assert.equal(creates.length, 4)
+  for (const c of creates) {
+    assert.equal(c.args['project_id'], PROJECT)
+    for (const key of Object.keys(c.args)) {
+      assert.ok(['project_id', 'goal_type', 'title', 'parent_goal_id'].includes(key), `create_goal was sent ${key}`)
+    }
+  }
+  // An objective has no parent key at all: neither null nor ''.
+  assert.equal(creates.filter((c) => 'parent_goal_id' in c.args).length, 3)
+
+  // kernel.yaml maps review onto a decision. The wrapper refuses it before the
+  // wire; the writer before the wrappers sent `completed` to pmmcp.
+  const goals = shippedConfig().goals
+  const closing = new GoalWriter({ store, hub, goals: { ...goals, statuses: { ...goals.statuses, review: 'completed' } } })
+  const before = mock.calls.length
+  await assert.rejects(
+    () => closing.setStatus(task, 'review', { projectId: PROJECT }),
+    (e: unknown) => {
+      assert.ok(e instanceof GoalWriteFailed)
+      assert.match(e.message, /^pmmcp\.update_goal refused before the wire/)
+      return true
+    },
+  )
+  assert.equal(mock.calls.length, before, 'an unsendable status reached the server')
+  assert.notEqual(mock.state.goals.get(task)?.status, 'completed')
+  assert.equal(payloads(store, 'goal.status').length, 0)
+})
+
+test('the typed goal calls refuse what the kernel must never send, and put the configured names on the wire', async (t) => {
+  const { hub, mock } = await wired(t)
+  const goals = shippedConfig().goals
+  const c = { hub, goals, serverId: 'pmmcp' }
+  const before = mock.calls.length
+  for (const attempt of [
+    () => updateGoal(c, { goal_id: 'g', status: 'blocked', project_id: PROJECT } as never, 'test'),
+    () => createGoal(c, { goal_type: 'objective', title: 't' } as never, 'test'),
+    () => createGoal(c, { project_id: PROJECT, goal_type: 'objective', title: 't', parent_goal_id: null } as never, 'test'),
+    () => getGoalTree(c, { goal_id: '' }, 'test'),
+  ]) {
+    await assert.rejects(attempt, GoalWriteFailed)
+  }
+  assert.equal(mock.calls.length, before, 'a refused call reached the server')
+
+  const seeded = mock.seedTree(PROJECT)
+  const tree = await getGoalTree(c, { goal_id: seeded.objective }, 'test')
+  assert.equal(tree.ok, true)
+  assert.deepEqual(mock.calls.at(-1)?.args, { goal_id: seeded.objective })
+
+  // The schemas speak pmmcp's names; kernel.yaml still names the keys sent.
+  const renamed = { ...c, goals: { ...goals, args: { ...goals.args, goalId: 'id' } } }
+  await getGoalTree(renamed, { goal_id: seeded.objective }, 'test')
+  assert.deepEqual(mock.calls.at(-1)?.args, { id: seeded.objective })
 })
 
 test('a goal this kernel did not create, or created in another namespace, is never moved', async (t) => {

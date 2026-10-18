@@ -111,7 +111,7 @@ test('a server at the live tool count classifies closed: nothing exposed, ninete
   const kernelCall = await hub.callKernelOnly(
     'pmmcp',
     'create_goal',
-    { project_id: 'aos/ceo', kind: 'objective', title: 'reachable by the kernel' },
+    { project_id: 'aos/ceo', goal_type: 'objective', title: 'reachable by the kernel' },
     'test: an unclassified tool defaults to kernel-only, not disabled',
   )
   assert.equal(kernelCall.ok, true)

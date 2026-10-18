@@ -115,6 +115,8 @@ const replay: Suite = {
 const GATE = 'src/policy/gate.ts'
 const TRACKER = 'src/goals/tracker.ts'
 const WRITER = 'src/goals/writer.ts'
+const GOAL_CALLS = 'src/goals/pmmcp.ts'
+const PMMCP_SCHEMAS = 'src/mcp/pmmcp-schemas.ts'
 const STORE = 'src/events/store.ts'
 const CHECKS = 'src/eval/checks.ts'
 
@@ -152,6 +154,7 @@ const goals: Suite = {
     'test/goals-plan.test.ts',
     'test/delegation.test.ts',
     'test/delegation-restart.test.ts',
+    'test/pmmcp-schemas.test.ts',
   ],
   mutants: [
     { id: 'G1', file: WRITER, from: '    if (!(KERNEL_SETTABLE as readonly string[]).includes(to)) {', to: '    if (false) {', why: 'the kernel may mark a goal done' },
@@ -167,8 +170,11 @@ const goals: Suite = {
     { id: 'G11', file: WRITER, from: '    if (owner === undefined) {', to: '    if (false) {', why: 'a goal the kernel never created is moved (pmmcp moves any goal by id)' },
     { id: 'G12', file: WRITER, from: '    if (owner !== context.projectId) {', to: '    if (false) {', why: 'a goal created in one namespace is moved on behalf of another' },
     { id: 'G13', file: WRITER, from: '    if (confirmed?.[1] !== goalId) {', to: '    if (false) {', why: 'pmmcp’s refusal, sent as success text, is recorded as a move' },
-    { id: 'G14', file: WRITER, from: '        ...(to === \'review\' ? { [a.progress]: 100 } : {}),', to: '', why: 'review reaches pmmcp indistinguishable from a task still running' },
+    { id: 'G14', file: WRITER, from: "          ...(to === 'review' ? { progress_pct: 100 } : {}),", to: '', why: 'review reaches pmmcp indistinguishable from a task still running' },
     { id: 'G15', file: WRITER, from: '  if (created?.[1] !== undefined) return created[1]', to: '', why: 'pmmcp’s own create reply yields no id, so no tree is ever written' },
+    { id: 'G16', file: GOAL_CALLS, from: '  const checked = sendable(schema, `${c.serverId}.${tool}`, args)', to: '  const checked = args as Record<string, unknown>', why: 'a goal call reaches pmmcp unchecked: a decision sent as a status, an update carrying project_id' },
+    { id: 'G17', file: PMMCP_SCHEMAS, from: '    project_id: id,', to: '    project_id: id.optional(),', why: 'create_goal may go without project_id, which pmmcp reads as global scope' },
+    { id: 'G18', file: PMMCP_SCHEMAS, from: '    progress_pct: z.number().min(0).max(100).optional(),\n  })\n  .strict()', to: '    progress_pct: z.number().min(0).max(100).optional(),\n  })', why: 'update_goal silently drops a project_id instead of refusing it' },
   ],
   control: {
     id: 'C',

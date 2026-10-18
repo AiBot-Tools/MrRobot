@@ -40,8 +40,12 @@ import { PolicyDenied } from '../errors.js'
 import type { EventStore } from '../events/store.js'
 import type { McpHub } from '../mcp/hub.js'
 import { log } from '../log.js'
+import { GoalWriteFailed, GoalsUnavailable } from './errors.js'
+import { createGoal, updateGoal, type GoalCall, type GoalCallResult } from './pmmcp.js'
 import type { GoalsConfig } from './tools.js'
 import { tasksOf, type ProposedPlan } from './plan.js'
+
+export { GoalWriteFailed, GoalsUnavailable } from './errors.js'
 
 /**
  * The statuses the kernel may set, and the only ones it will.
@@ -67,26 +71,6 @@ export interface WrittenTree {
   readonly milestones: ReadonlyMap<string, string>
   /** Plan task id → server goal id. */
   readonly tasks: ReadonlyMap<string, string>
-}
-
-export class GoalsUnavailable extends Error {
-  readonly code = 'AOS_GOALS_UNAVAILABLE'
-  constructor(reason: string) {
-    super(`goals unavailable: ${reason}`)
-    this.name = 'GoalsUnavailable'
-  }
-}
-
-/** A create call whose result held no id. Never turned into a guess. */
-export class GoalWriteFailed extends Error {
-  readonly code = 'AOS_GOAL_WRITE_FAILED'
-  /** What had already been written when this failed. */
-  readonly written: readonly string[]
-  constructor(message: string, written: readonly string[]) {
-    super(message)
-    this.name = 'GoalWriteFailed'
-    this.written = written
-  }
 }
 
 /** Text of an MCP content array, which is all the hub hands back. */
@@ -138,10 +122,12 @@ export function goalIdOf(content: unknown): string | undefined {
 export class GoalWriter {
   readonly #o: GoalWriterOptions
   readonly #serverId: string
+  readonly #pmmcp: GoalCall
 
   constructor(options: GoalWriterOptions) {
     this.#o = options
     this.#serverId = options.serverId ?? 'pmmcp'
+    this.#pmmcp = { hub: options.hub, goals: options.goals, serverId: this.#serverId }
   }
 
   get available(): boolean {
@@ -157,8 +143,9 @@ export class GoalWriter {
     if (reason !== undefined) throw new GoalsUnavailable(reason)
   }
 
-  async #call(tool: string, args: Record<string, unknown>, purpose: string): Promise<unknown> {
-    const result = await this.#o.hub.callKernelOnly(this.#serverId, tool, args, purpose)
+  /** The content of a call the transport answered; a transport error is a failed write. */
+  async #answered(tool: string, call: Promise<GoalCallResult>): Promise<unknown> {
+    const result = await call
     if (!result.ok) {
       throw new GoalWriteFailed(`${this.#serverId}.${tool} failed: ${textOf(result.content)}`, [])
     }
@@ -178,17 +165,18 @@ export class GoalWriter {
     planTaskId?: string
     written: string[]
   }): Promise<string> {
-    const a = this.#o.goals.args
-    const args: Record<string, unknown> = {
-      [a.projectId]: input.projectId,
-      [a.kind]: input.kind,
-      [a.title]: input.title,
-      ...(input.parentId === undefined ? {} : { [a.parentId]: input.parentId }),
-    }
-    const content = await this.#call(
+    const content = await this.#answered(
       this.#o.goals.tools.create,
-      args,
-      `create ${input.kind} goal in ${input.projectId}`,
+      createGoal(
+        this.#pmmcp,
+        {
+          project_id: input.projectId,
+          goal_type: input.kind,
+          title: input.title,
+          ...(input.parentId === undefined ? {} : { parent_goal_id: input.parentId }),
+        },
+        `create ${input.kind} goal in ${input.projectId}`,
+      ),
     ).catch((e: unknown) => {
       if (e instanceof GoalWriteFailed) throw new GoalWriteFailed(e.message, input.written)
       throw e
@@ -318,18 +306,21 @@ export class GoalWriter {
       )
     }
 
-    const a = this.#o.goals.args
     const sent = this.#o.goals.statuses[to]
-    const content = await this.#call(
+    const content = await this.#answered(
       this.#o.goals.tools.updateStatus,
-      {
-        [a.goalId]: goalId,
-        [a.status]: sent,
-        // `review` is finished work awaiting the operator; 100 is how that shows
-        // in pmmcp, which has no review status of its own.
-        ...(to === 'review' ? { [a.progress]: 100 } : {}),
-      },
-      `move goal ${goalId} to ${to}`,
+      updateGoal(
+        this.#pmmcp,
+        {
+          goal_id: goalId,
+          // A string from kernel.yaml; updateGoal refuses one that is not sendable.
+          status: sent,
+          // `review` is finished work awaiting the operator; 100 is how that shows
+          // in pmmcp, which has no review status of its own.
+          ...(to === 'review' ? { progress_pct: 100 } : {}),
+        },
+        `move goal ${goalId} to ${to}`,
+      ),
     )
     const reply = textOf(content).trim()
     const confirmed = /^✅ Goal updated: (\S+)/u.exec(reply)

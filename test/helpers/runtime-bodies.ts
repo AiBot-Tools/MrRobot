@@ -41,6 +41,7 @@ import { claimsOf, readRunRows } from '../../src/eval/observe.js'
 import { CEO_SUITE } from '../../src/eval/suite.js'
 import type { CaseResult } from '../../src/eval/types.js'
 import { parsePlan, PlanInvalid } from '../../src/goals/plan.js'
+import { getGoalTree } from '../../src/goals/pmmcp.js'
 import { goalToolsUnusable, type GoalsConfig } from '../../src/goals/tools.js'
 import { GoalWriter } from '../../src/goals/writer.js'
 import type { McpHub } from '../../src/mcp/hub.js'
@@ -185,11 +186,9 @@ export async function goalTreeRoundTrip(ctx: GoalTreeContext): Promise<void> {
   assert.equal(tree.milestones.size, 1)
   assert.equal(tree.tasks.size, 2)
 
-  const a = ctx.goals.args
-  const shown = await ctx.hub.callKernelOnly(
-    'pmmcp',
-    ctx.goals.tools.get,
-    { [a.goalId]: tree.objectiveGoalId },
+  const shown = await getGoalTree(
+    { hub: ctx.hub, goals: ctx.goals, serverId: 'pmmcp' },
+    { goal_id: tree.objectiveGoalId },
     'runtime test: read back the tree just written',
   )
   assert.equal(shown.ok, true, `reading the tree back failed: ${JSON.stringify(shown.content)}`)

@@ -76,7 +76,7 @@ function payloads(store: EventStore, type: string): Record<string, unknown>[] {
     .map((r) => JSON.parse(r.payload) as Record<string, unknown>)
 }
 
-test('a 49-tool server classifies closed: nothing exposed, nineteen pinned, thirty defaulted', async (t) => {
+test('a server at the live tool count classifies closed: nothing exposed, nineteen pinned, the rest defaulted', async (t) => {
   // Invariant 7 at the cardinality the operator's machine actually has. The
   // shipped policy file classifies nineteen of 49, and the claim is that the
   // other thirty are unreachable by an agent because the DEFAULT is closed —
@@ -96,7 +96,7 @@ test('a 49-tool server classifies closed: nothing exposed, nineteen pinned, thir
 
   assert.equal(counts.exposed, 0, 'no pmmcp tool is exposed to agents')
   assert.equal(counts.disabled, 2, 'the two nested-LLM tools, and only those')
-  assert.equal(counts.unclassified.length, PMMCP_TOOL_COUNT - 19, 'thirty of 49 are unclassified')
+  assert.equal(counts.unclassified.length, PMMCP_TOOL_COUNT - 19, `${String(PMMCP_TOOL_COUNT - 19)} of ${String(PMMCP_TOOL_COUNT)} are unclassified`)
   assert.equal(
     counts.kernelOnly,
     PMMCP_TOOL_COUNT - 2,

@@ -166,10 +166,13 @@ const ARR = (description: string): { type: string; description: string } => ({
 })
 
 /**
- * The modelled tool surface. pmmcp exposes 49; this names the 15 the kernel has
- * a reason to know about — the nine pinned in config/tool-views.yaml, plus goals
- * and memory — and leaves the other 34 to `padTo`, which registers visibly fake
- * placeholders rather than inventing plausible names.
+ * The modelled tool surface. pmmcp exposes 64 (the live capture,
+ * test/fixtures/pmmcp-listtools.json, 2026-10-18); this names the 26 the kernel
+ * has a reason to know about — every tool config/tool-views.yaml pins, plus
+ * goals and memory — and leaves the rest to `padTo`, which registers visibly
+ * fake placeholders rather than inventing plausible names. Argument names that
+ * the capture corrected say so in `source`; `provenance` still records only
+ * what the drift test's no-capture branch may claim.
  */
 export const PMMCP_TOOLS: readonly PmmcpToolSpec[] = [
   {
@@ -177,11 +180,17 @@ export const PMMCP_TOOLS: readonly PmmcpToolSpec[] = [
     description: 'Store a memory in a project namespace',
     inputSchema: {
       type: 'object',
-      properties: { project_id: str('namespace'), content: str('text'), tags: { type: 'array' } },
-      required: ['project_id', 'content'],
+      properties: {
+        key: str('what the memory is about'),
+        value: str('text'),
+        project_id: str('namespace; absent means global scope on the live server'),
+        type: str('fact, preference, skill, decision, …'),
+        extra: str('optional extra text'),
+      },
+      required: ['key', 'value'],
     },
     provenance: 'modelled',
-    source: 'CLAUDE.md environment facts: namespacing is by project_id',
+    source: 'argument names from the live capture (test/fixtures/pmmcp-listtools.json, 2026-10-18); the double still refuses a call without project_id',
   },
   {
     name: 'recall',
@@ -289,9 +298,12 @@ export const PMMCP_TOOLS: readonly PmmcpToolSpec[] = [
   {
     name: 'audit_secrets',
     description: 'Read the vault access log',
-    inputSchema: { type: 'object', properties: { limit: num('max entries') } },
+    inputSchema: {
+      type: 'object',
+      properties: { hours: num('look-back window'), include_threat_scores: { type: 'boolean' } },
+    },
     provenance: 'modelled',
-    source: 'CLAUDE.md environment facts names audit_secrets; its args are a guess',
+    source: 'argument names from the live capture (test/fixtures/pmmcp-listtools.json, 2026-10-18)',
   },
   {
     name: 'admin',
@@ -394,9 +406,12 @@ export const PMMCP_TOOLS: readonly PmmcpToolSpec[] = [
   {
     name: 'coding_agent',
     description: 'Nested LLM call (the double refuses to model it)',
-    inputSchema: { type: 'object', properties: { prompt: str('task') } },
+    inputSchema: {
+      type: 'object',
+      properties: { task: str('task'), project_id: str('namespace'), file_hint: str('file') },
+    },
     provenance: 'modelled',
-    source: 'named in config/tool-views.yaml as forced disabled',
+    source: 'forced disabled in config/tool-views.yaml; argument names from the live capture (2026-10-18)',
   },
   {
     name: 'session_insight_agent',
@@ -407,8 +422,8 @@ export const PMMCP_TOOLS: readonly PmmcpToolSpec[] = [
   },
 ]
 
-/** pmmcp's real tool count, from CLAUDE.md's environment facts. */
-export const PMMCP_TOOL_COUNT = 49
+/** pmmcp's real tool count, from the live capture of 2026-10-18. */
+export const PMMCP_TOOL_COUNT = 64
 
 /**
  * The tools nobody may reach, kernel included, or may reach only through the
@@ -640,13 +655,13 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
 
   handlers.set('remember', (args) => {
     const projectId = need(args, 'project_id')
-    const content = need(args, 'content')
+    const key = need(args, 'key')
+    const content = need(args, 'value')
     if (projectId === undefined) return fail('project_id is required')
-    if (content === undefined) return fail('content is required')
-    const rawTags = args['tags']
-    const tags = Array.isArray(rawTags) ? rawTags.map((t) => String(t)) : []
+    if (key === undefined) return fail('key is required')
+    if (content === undefined) return fail('value is required')
     const id = nextId('mem')
-    state.memories.set(id, { id, projectId, content, tags })
+    state.memories.set(id, { id, projectId, content, tags: [] })
     return ok({ id })
   })
 
@@ -850,9 +865,9 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     return ok({ label })
   })
 
-  handlers.set('audit_secrets', (args) => {
-    const rawLimit = args['limit']
-    const limit = typeof rawLimit === 'number' && rawLimit > 0 ? Math.floor(rawLimit) : 50
+  handlers.set('audit_secrets', () => {
+    // The double keeps no clock, so `hours` selects nothing: the last 50 entries come back.
+    const limit = 50
     // Labels and outcomes. Never a value: the audit log of a vault is a place a
     // secret must not appear, in the double as much as in the real one.
     const entries = state.audit.slice(-limit).map((e) => ({ action: e.action, label: e.label, ok: e.ok }))

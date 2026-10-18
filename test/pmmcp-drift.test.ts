@@ -108,7 +108,11 @@ test('the comparison catches a capture that is wrong in every way it checks', ()
   assert.equal(says(/create_goal: the live tool declares no inputSchema.properties/), true, 'no schema')
   assert.equal(says(/secrets.keyArg is "label" but the live get_secret declares name/), true, 'the keyArg')
   assert.equal(says(/pins a tool the live server does not expose: admin/), true, 'a pinned tool absent')
-  assert.equal(says(/exposes 50 tools; this repo says 49/), true, 'the tool count')
+  assert.equal(
+    says(new RegExp(`exposes 50 tools; this repo says ${String(PMMCP_TOOL_COUNT)}`)),
+    true,
+    'the tool count',
+  )
 
   // An empty capture is its own finding: a file that parsed but holds nothing
   // must not read as "no disagreements".
@@ -121,7 +125,7 @@ test('the comparison passes on a capture that agrees, so it is not merely always
   const findings = compareCapture({ capture: agreeingCapture(), keyArg: 'label', pinned: pinned() })
   assert.deepEqual(findings, [], findings.join('\n'))
   // And the agreeing capture is the real cardinality, so a passing comparison
-  // is a comparison that saw 49 tools.
+  // is a comparison that saw as many tools as the live server has.
   assert.equal(agreeingCapture().toolCount, PMMCP_TOOL_COUNT)
 })
 

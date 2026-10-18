@@ -97,9 +97,9 @@ export function compareCapture(input: CompareInput): string[] {
     if (!live.has(name)) findings.push(`tool-views.yaml pins a tool the live server does not expose: ${name}`)
   }
 
-  // 49 appears in CLAUDE.md, in config/tool-views.yaml's header and in the
-  // double. If the server has gained tools, the number in three files is stale
-  // and so is "forty are unclassified".
+  // The count appears in CLAUDE.md, in config/tool-views.yaml's header and in
+  // the double. If the server has gained tools, the number in three files is
+  // stale and so is the count of unclassified tools.
   const count = input.capture.toolCount ?? tools.length
   if (count !== PMMCP_TOOL_COUNT) {
     findings.push(

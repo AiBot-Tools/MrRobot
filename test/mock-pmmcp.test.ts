@@ -177,7 +177,7 @@ test('update_goal and get_goal_tree take no project_id; listings carry titles an
   assert.equal(none.text, "No goals found for project 'aos/nobody'.")
   assert.equal((await call(client, 'get_goal_tree', { goal_id: 'goal_x' })).text, 'Goal goal_x not found.')
 
-  await json(client, 'remember', { project_id: 'aos/ceo', content: 'the operator prefers terse' })
+  await json(client, 'remember', { project_id: 'aos/ceo', key: 'style', value: 'the operator prefers terse' })
   const crossed = await json(client, 'recall', { project_id: 'aos/shared', query: 'operator' })
   assert.deepEqual(crossed['hits'], [], 'a memory never crosses a namespace')
 })

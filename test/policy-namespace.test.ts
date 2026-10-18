@@ -251,11 +251,11 @@ servers:
   const seedClient = await mock.connect()
   await seedClient.callTool({
     name: 'remember',
-    arguments: { project_id: 'aos/ceo', content: 'CEO-ONLY: the operator’s acquisition plan' },
+    arguments: { project_id: 'aos/ceo', key: 'plan', value: 'CEO-ONLY: the operator’s acquisition plan' },
   })
   await seedClient.callTool({
     name: 'remember',
-    arguments: { project_id: OWN, content: 'researcher note: the plan for sqlite comparisons' },
+    arguments: { project_id: OWN, key: 'note', value: 'researcher note: the plan for sqlite comparisons' },
   })
   const recallsBefore = mock.calls.filter((c) => c.tool === 'recall').length
 

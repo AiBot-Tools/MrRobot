@@ -1,0 +1,2424 @@
+{
+  "capturedAt": "2026-10-18T08:04:51.469Z",
+  "server": "pmmcp",
+  "url": "http://127.0.0.1:8766/mcp",
+  "toolCount": 64,
+  "tools": [
+    {
+      "name": "add_blocker",
+      "description": "Add a blocker to a goal and set status to blocked.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "goal_id": {
+            "description": "Goal ID",
+            "title": "Goal Id",
+            "type": "string"
+          },
+          "blocker": {
+            "description": "Description of what's blocking progress",
+            "title": "Blocker",
+            "type": "string"
+          }
+        },
+        "required": [
+          "goal_id",
+          "blocker"
+        ],
+        "title": "add_blockerArguments"
+      }
+    },
+    {
+      "name": "admin",
+      "description": "Unified admin/maintenance endpoint.\n\n        action options:\n        - 'repair': deep maintenance — reindex SQLite and verify Qdrant\n        - 'rebuild_summaries': force rebuild project-level summaries (needs project_id)\n        - 'reindex': reindex files of a language (needs project_id + language)\n        - 'reembed': migrate a Qdrant collection to a new model\n        - 'cancel_job': cancel a background job (needs job_id)\n        - 'list_languages': list indexed languages for a project (needs project_id)\n        - 'file_status': check indexing status of a file (needs file_path + project_id)\n        - 'export': export all memory for a project (needs project_id)\n        - 'checkpoint_wal': force immediate WAL flush across all SQLite databases\n        - 'aggregate_backfill': scan all projects and backfill matching\n          preferences into a knowledge aggregation target (needs project_id\n          as the target, e.g. 'global-frontend')\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Job Id"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Language"
+          },
+          "collection_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Collection Name"
+          },
+          "target_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Target Model"
+          },
+          "target_dim": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Target Dim"
+          },
+          "dry_run": {
+            "default": true,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "file_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "File Path"
+          },
+          "export_format": {
+            "default": "json",
+            "title": "Export Format",
+            "type": "string"
+          },
+          "mode": {
+            "default": "registry_only",
+            "title": "Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "adminArguments"
+      }
+    },
+    {
+      "name": "ask_memory",
+      "description": "Ask questions about the memory system in natural language.\n\n        Translates human-friendly queries into admin operations:\n        - \"How many memories do I have?\" → vector count\n        - \"Is everything healthy?\" → health check\n        - \"What did I learn today?\" → recent memories\n        - \"Any duplicates?\" → dedup status\n        - \"Show me projects\" → project list\n        - \"Find X\" → semantic search\n\n        Args:\n            question: Your question in natural language.\n            project_id: Optional project scope (e.g. 'AiBot-Tools/Persistent-Memory-MCP').\n\n        Returns:\n            Human-readable answer.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "description": "Natural language question about the memory system (e.g. 'how many memories?', 'what's stale?', 'show recent')",
+            "title": "Question",
+            "type": "string"
+          },
+          "project_id": {
+            "default": "",
+            "description": "Optional project ID to scope the query to.",
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "question"
+        ],
+        "title": "ask_memoryArguments"
+      }
+    },
+    {
+      "name": "audit_secrets",
+      "description": "Run a comprehensive secret security audit.\n\n        Returns anomalies (burst access, off-hours, breadth attacks, expired\n        access), per-secret threat scores, and secrets expiring within 30 days.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "hours": {
+            "default": 24,
+            "description": "Lookback window for anomaly detection",
+            "title": "Hours",
+            "type": "integer"
+          },
+          "include_threat_scores": {
+            "default": true,
+            "description": "Include per-secret threat scoring",
+            "title": "Include Threat Scores",
+            "type": "boolean"
+          }
+        },
+        "title": "audit_secretsArguments"
+      }
+    },
+    {
+      "name": "auto_diagnose_project",
+      "description": "Autonomous 7-step health scan for a project.\n\n        Streams progress through each diagnostic stage and returns a Markdown\n        health report with severity indicators (✅ / ⚠️ / ❌).\n\n        Steps: registry, Qdrant, integrity, embedding health, queue, watcher, staleness.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "title": "auto_diagnose_projectArguments"
+      }
+    },
+    {
+      "name": "coding_agent",
+      "description": "Claude-powered coding sub-agent with live codebase context.\n\n        Retrieves semantically relevant code chunks from the indexed project,\n        then calls the Claude API with that context to answer coding questions,\n        suggest implementations, explain code, or propose refactors.\n\n        **Setup required**: store your Anthropic API key first:\n            `set_secret(\"ANTHROPIC_API_KEY\", \"sk-ant-...\")`\n\n        Args:\n            task:        What you want Claude to do (question, task, or instruction).\n            project_id:  The project whose code to use as context.\n            file_hint:   Optional filename to prioritise in context retrieval.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task": {
+            "title": "Task",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "file_hint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "File Hint"
+          }
+        },
+        "required": [
+          "task",
+          "project_id"
+        ],
+        "title": "coding_agentArguments"
+      }
+    },
+    {
+      "name": "complete_goal",
+      "description": "Shorthand to mark a goal as completed (100% progress).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "goal_id": {
+            "description": "Goal to mark as completed",
+            "title": "Goal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "goal_id"
+        ],
+        "title": "complete_goalArguments"
+      }
+    },
+    {
+      "name": "create_goal",
+      "description": "Create a persistent goal that survives across sessions.\n\n        Goals form a hierarchy: objective → milestone → task.\n        auto_resume is OFF by default; confirmation is ALWAYS required.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "description": "Short goal title",
+            "title": "Title",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "Project this goal belongs to",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "description": "Detailed description",
+            "title": "Description",
+            "type": "string"
+          },
+          "goal_type": {
+            "default": "objective",
+            "description": "objective (high-level), milestone (mid), or task (concrete)",
+            "title": "Goal Type",
+            "type": "string"
+          },
+          "parent_goal_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Parent goal ID for hierarchy",
+            "title": "Parent Goal Id"
+          },
+          "priority": {
+            "default": 3,
+            "description": "1 (highest) to 5 (lowest)",
+            "title": "Priority",
+            "type": "integer"
+          },
+          "acceptance_criteria": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Measurable conditions for completion",
+            "title": "Acceptance Criteria"
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tags"
+          },
+          "related_files": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Files associated with this goal",
+            "title": "Related Files"
+          }
+        },
+        "required": [
+          "title",
+          "project_id"
+        ],
+        "title": "create_goalArguments"
+      }
+    },
+    {
+      "name": "cross_ide_activity",
+      "description": "Get detailed activity from a specific foreign IDE session.\n\n        Shows chat turns, memories created, and goals progressed\n        during that session. Use after cross_ide_discover to\n        drill into a specific session.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "description": "Session ID to inspect",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "Project the session belongs to",
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "project_id"
+        ],
+        "title": "cross_ide_activityArguments"
+      }
+    },
+    {
+      "name": "cross_ide_discover",
+      "description": "Discover what OTHER IDE sessions did for this project.\n\n        Shows recent sessions from IDEs other than the current one,\n        with summaries of what was accomplished. Read-only — no\n        writes to other sessions.\n\n        Use this when:\n        - Starting work and want to see what Cursor/VS Code did\n        - Looking for context from a different IDE's session\n        - Checking if another IDE made progress on a goal\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Project to discover activity for",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "current_ide": {
+            "default": "antigravity",
+            "description": "Your IDE name (antigravity, cursor, vscode, lm_studio, etc.)",
+            "title": "Current Ide",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "title": "cross_ide_discoverArguments"
+      }
+    },
+    {
+      "name": "cross_project_error_search",
+      "description": "Search error traces across ALL projects at once.\n\n        Unlike ``search_errors`` (which scopes to one project), this tool\n        searches globally — useful for finding whether a new error has occurred\n        in any other codebase, or for spotting systemic patterns that span\n        multiple projects (e.g. a shared dependency failure).\n\n        Returns:\n            Matching errors grouped by project with type, severity, and ID.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "description": "Natural language description of the error to find.",
+            "title": "Query",
+            "type": "string"
+          },
+          "limit": {
+            "default": 15,
+            "description": "Max results.",
+            "title": "Limit",
+            "type": "integer"
+          },
+          "open_only": {
+            "default": false,
+            "description": "If true, only return unresolved errors.",
+            "title": "Open Only",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "cross_project_error_searchArguments"
+      }
+    },
+    {
+      "name": "cross_project_recommend",
+      "description": "Proactively surface relevant knowledge from OTHER projects.\n\n        Searches fix patterns, preferences, and architectural decisions across\n        all projects EXCEPT the current one, ranked by relevance to the context.\n\n        Use this when starting work on a project to discover patterns,\n        conventions, and past solutions from similar codebases.\n\n        Args:\n            project_id: The project you're currently working on.\n            context: Brief description of the task for targeted recommendations.\n            limit: Maximum number of recommendations to return.\n\n        Returns:\n            Formatted recommendations grouped by type (fix patterns,\n            preferences, entities) with source project attribution.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Current project to get recommendations for",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "context": {
+            "default": "",
+            "description": "What you're working on (e.g. 'fixing auth flow', 'adding REST API')",
+            "title": "Context",
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "description": "Max recommendations",
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "title": "cross_project_recommendArguments"
+      }
+    },
+    {
+      "name": "decompose_goal",
+      "description": "Break a parent goal into sub-goals (milestones or tasks).\n\n        Automatically links sub-goals to the parent and transitions\n        the parent to in_progress if it was pending.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "parent_goal_id": {
+            "description": "Parent goal to decompose",
+            "title": "Parent Goal Id",
+            "type": "string"
+          },
+          "sub_goals": {
+            "description": "JSON array of sub-goal objects: [{\"title\": ..., \"goal_type\": \"task\"}]",
+            "title": "Sub Goals",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "Project ID",
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "parent_goal_id",
+          "sub_goals",
+          "project_id"
+        ],
+        "title": "decompose_goalArguments"
+      }
+    },
+    {
+      "name": "delete_context_source",
+      "description": "Delete a context source and all its chunks from both SQLite and Qdrant.\n\n        This is permanent. The source must be re-scraped to restore it.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "source_id": {
+            "description": "source_id to delete (e.g. ctx_a1b2c3d4)",
+            "title": "Source Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_id"
+        ],
+        "title": "delete_context_sourceArguments"
+      }
+    },
+    {
+      "name": "delete_secret",
+      "description": "Permanently and securely delete a stored secret.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "description": "Alias of secret to discard",
+            "title": "Label",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          }
+        },
+        "required": [
+          "label"
+        ],
+        "title": "delete_secretArguments"
+      }
+    },
+    {
+      "name": "error_trends",
+      "description": "Aggregate error frequency by type and severity.\n\n        Returns a breakdown of the most common error types across\n        one or all projects — useful for identifying systemic issues,\n        recurring failure modes, and prioritising fixes.\n\n        Returns:\n            Table of error types with count, severity distribution,\n            and affected projects.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Project to query, or omit for cross-project trends.",
+            "title": "Project Id"
+          },
+          "limit": {
+            "default": 50,
+            "description": "Max errors to analyse.",
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "error_trendsArguments"
+      }
+    },
+    {
+      "name": "find_code",
+      "description": "Unified code search — use 'mode' to control the search strategy.\n\n        - hybrid (default): dual-embedding (coderankembed + nomic) + BM25 lexical\n        - identifiers: SQLite FTS5 exact-match for variables, symbols, fragments\n        - signatures: search API signatures (function/class/method)\n\n        Multi-word queries are automatically decomposed into sub-queries;\n        chunks matched by more sub-queries rank highest.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "description": "Code search query — code pattern OR plain English description",
+            "title": "Query",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "Project ID search scope",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by language",
+            "title": "Language"
+          },
+          "show_scores": {
+            "default": false,
+            "description": "Include similarity scores",
+            "title": "Show Scores",
+            "type": "boolean"
+          },
+          "mode": {
+            "default": "hybrid",
+            "description": "Search mode. Options: 'hybrid' (default, dual-embedding + lexical), 'identifiers' (FTS5-only for exact variable/symbol matches), 'signatures' (API signature search)",
+            "title": "Mode",
+            "type": "string"
+          },
+          "explain": {
+            "default": false,
+            "description": "When True, each result includes a rationale explaining why it was returned (scoring breakdown).",
+            "title": "Explain",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "query",
+          "project_id"
+        ],
+        "title": "find_codeArguments"
+      }
+    },
+    {
+      "name": "find_fix_patterns",
+      "description": "Search for known fix patterns matching an error.\n\n        Uses error signature matching first, then falls back\n        to error type matching. Optionally filter by category.\n        When project_id is omitted, searches across ALL projects (global).\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "error_message": {
+            "description": "Error message to search fixes for",
+            "title": "Error Message",
+            "type": "string"
+          },
+          "error_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional error type filter",
+            "title": "Error Type"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Project scope",
+            "title": "Project Id"
+          },
+          "category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional category filter (e.g. 'async', 'testing', 'storage')",
+            "title": "Category"
+          },
+          "limit": {
+            "default": 5,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "error_message"
+        ],
+        "title": "find_fix_patternsArguments"
+      }
+    },
+    {
+      "name": "forget",
+      "description": "Remove a previously stored memory.\n\n        Unified delete endpoint — use 'type' to control what to remove:\n        - preference: find by key and delete\n        - chat/skill: delete by memory_id\n        - error: mark error trace as resolved\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "description": "Preference key or memory_id to remove",
+            "title": "Key",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Project scope",
+            "title": "Project Id"
+          },
+          "type": {
+            "default": "preference",
+            "description": "Type of memory to remove. Options: 'preference' (default, by key), 'chat' (by memory_id), 'skill' (by memory_id), 'error' (marks as resolved by memory_id)",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "title": "forgetArguments"
+      }
+    },
+    {
+      "name": "get_audit_logs",
+      "description": "Retrieve recent access and operation logs for secrets.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "limit": {
+            "default": 50,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "get_audit_logsArguments"
+      }
+    },
+    {
+      "name": "get_context_bundle",
+      "description": "Unified context assembly — use 'mode' to control what kind of context.\n\n        - full: wide diagnostic bundle (default)\n        - coding: pre-coding guidance with fix patterns, API signatures, conventions\n        - summary: compressed codebase structural summary\n        - file: summary for a specific file (pass file path in 'task')\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "task": {
+            "description": "Describe the problem to solve",
+            "title": "Task",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "Project scope",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "budget": {
+            "default": 8000,
+            "description": "Approximate token budget",
+            "title": "Budget",
+            "type": "integer"
+          },
+          "exclude": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Sections to omit",
+            "title": "Exclude"
+          },
+          "mode": {
+            "default": "full",
+            "description": "Context assembly mode. Options: 'full' (default, wide diagnostic bundle), 'coding' (pre-coding guidance with fix patterns and conventions), 'summary' (codebase structural summary only), 'file' (single file summary — requires task=relative_path)",
+            "title": "Mode",
+            "type": "string"
+          },
+          "file_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Target file for 'coding' or 'file' mode",
+            "title": "File Path"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Programming language for 'coding' mode",
+            "title": "Language"
+          }
+        },
+        "required": [
+          "task",
+          "project_id"
+        ],
+        "title": "get_context_bundleArguments"
+      }
+    },
+    {
+      "name": "get_coordination_status",
+      "description": "Get a summary of the session coordinator state.\n\n        Shows active sessions, write intents, and recent events.\n\n        Returns:\n            JSON summary of coordinator state.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "title": "get_coordination_statusArguments"
+      }
+    },
+    {
+      "name": "get_dependencies",
+      "description": "Unified dependency lookup.\n\n        direction options:\n        - 'imports' (default): what this file imports/depends on\n        - 'dependents': what files depend on/import this file\n        - 'transitive': full transitive impact chain (uses max_depth)\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "file_path": {
+            "title": "File Path",
+            "type": "string"
+          },
+          "direction": {
+            "default": "imports",
+            "title": "Direction",
+            "type": "string"
+          },
+          "max_depth": {
+            "default": 5,
+            "title": "Max Depth",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "file_path"
+        ],
+        "title": "get_dependenciesArguments"
+      }
+    },
+    {
+      "name": "get_git_history",
+      "description": "Unified git/change history.\n\n        - Default: project commit history\n        - file_path: history for a specific file\n        - since_hours: recent changes within a time window\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "file_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "File Path"
+          },
+          "since_hours": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Since Hours"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "title": "get_git_historyArguments"
+      }
+    },
+    {
+      "name": "get_goal_tree",
+      "description": "Display a goal and all its sub-goals as a tree.\n\n        Shows the full hierarchy with status icons, progress,\n        acceptance criteria, and blockers.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "goal_id": {
+            "description": "Root goal ID",
+            "title": "Goal Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "goal_id"
+        ],
+        "title": "get_goal_treeArguments"
+      }
+    },
+    {
+      "name": "get_recent_changes",
+      "description": "Get recent change events for a project.\n\n        Shows what writes, scans, and agent actions happened recently.\n        Useful for understanding what changed before debugging an issue.\n\n        Returns:\n            List of recent change events with timestamps.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Project to get change events for.",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "description": "Max events to return.",
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "title": "get_recent_changesArguments"
+      }
+    },
+    {
+      "name": "get_secret",
+      "description": "Fetch and decrypt an environmental secret.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "description": "Alias name",
+            "title": "Label",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Scope query exclusively to this project",
+            "title": "Project Id"
+          }
+        },
+        "required": [
+          "label"
+        ],
+        "title": "get_secretArguments"
+      }
+    },
+    {
+      "name": "get_secret_template",
+      "description": "Retrieve a secret template by name.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "get_secret_templateArguments"
+      }
+    },
+    {
+      "name": "get_test_trend",
+      "description": "Get the failure history of a specific test across runs.\n\n        Returns all recorded failures for the given test, ordered newest-first.\n        Useful for identifying flaky or consistently failing tests.\n\n        Returns:\n            Chronological failure history with run_id, status, and error message.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Project to query.",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "test_name": {
+            "description": "Fully qualified test name to get history for.",
+            "title": "Test Name",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "description": "Max history entries to return.",
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "test_name"
+        ],
+        "title": "get_test_trendArguments"
+      }
+    },
+    {
+      "name": "get_write_activity",
+      "description": "Show active write operations on a project.\n\n        Use before starting a write to check for potential conflicts.\n\n        Returns:\n            List of active write intents with operation type and owner.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Project to check write activity for.",
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "title": "get_write_activityArguments"
+      }
+    },
+    {
+      "name": "graph_query",
+      "description": "Query the symbol-level knowledge graph.\n\n        Natural language query:\n        - **query**: Ask a question in plain English. Pass the\n          question via 'symbol'. Uses IDF-weighted seed selection\n          + BFS traversal within a token budget.\n\n        Structural queries about code relationships:\n        - **callers**: Who calls this symbol?\n        - **callees**: What does this symbol call?\n        - **call_chain**: BFS call chain from a symbol\n        - **inheritance**: Class hierarchy (parents + children)\n        - **dead_code**: Symbols defined but never referenced\n        - **impact**: Impact analysis — what breaks if this changes?\n        - **blast_radius**: File-level blast radius (backward BFS with\n          file aggregation — \"which files break?\")\n        - **stats**: Graph statistics for the project\n        - **pagerank**: Rank symbols by importance (most depended-on)\n        - **communities**: Detect logical module clusters\n        - **betweenness**: Find bridge symbols connecting components\n        - **shortest_path**: Find shortest path between two symbols\n        - **hub_symbols**: Most-called symbols (highest in-degree)\n\n        Temporal (\"what happened\") queries over the activity graph:\n        - **file_history**: Episodes/commits that touched a file\n          (pass the file path via 'symbol'), chronological\n        - **session_activity**: What a session did (pass session_id\n          via 'symbol')\n        - **timeline**: Temporal neighbors of any node (file path,\n          'episode:...', 'commit:...', 'session:...')\n\n        Memory↔Code cross-referencing:\n        - **memory_code_xref**: Cross-reference between memories and\n          code symbols. Pass a symbol via 'symbol' to find memories\n          mentioning it, or pass a memory_id via 'target' to find\n          symbols it references.\n        - **memory_xref_stats**: Summary statistics for\n          cross-references.\n\n        Args:\n            project_id: Target project.\n            operation: One of the query types listed above.\n            symbol: The symbol to query (required for most operations).\n            target: Target symbol (for shortest_path).\n            depth: How deep to traverse (for call_chain, impact,\n                blast_radius, query).\n            top_n: Number of results for ranked queries (also max\n                seeds for query operation).\n            min_confidence_score: Minimum edge confidence score for traversal.\n            token_budget: Approximate token budget for 'query' responses.\n\n        Returns:\n            Formatted query results.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Project ID",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "operation": {
+            "description": "Query type: 'query' (natural language), 'callers', 'callees', 'call_chain', 'inheritance', 'dead_code', 'impact', 'blast_radius', 'stats', 'pagerank', 'communities', 'betweenness', 'shortest_path', 'hub_symbols', 'file_history', 'session_activity', 'timeline'",
+            "title": "Operation",
+            "type": "string"
+          },
+          "symbol": {
+            "default": "",
+            "description": "Symbol name (e.g. 'MyClass.process') or natural language question for 'query' operation",
+            "title": "Symbol",
+            "type": "string"
+          },
+          "target": {
+            "default": "",
+            "description": "Target symbol for shortest_path queries",
+            "title": "Target",
+            "type": "string"
+          },
+          "depth": {
+            "default": 3,
+            "description": "Traversal depth for chain/impact/blast_radius",
+            "title": "Depth",
+            "type": "integer"
+          },
+          "top_n": {
+            "default": 20,
+            "description": "Number of results for ranked queries",
+            "title": "Top N",
+            "type": "integer"
+          },
+          "min_confidence_score": {
+            "default": 0,
+            "description": "Minimum confidence score (0.0–1.0) to filter edges. Only edges with score >= this are traversed. EXTRACTED=1.0, INFERRED=0.5–0.95, AMBIGUOUS≤0.4.",
+            "title": "Min Confidence Score",
+            "type": "number"
+          },
+          "token_budget": {
+            "default": 2000,
+            "description": "Approximate token budget for 'query' operation responses. Higher = more detail, lower = more concise.",
+            "title": "Token Budget",
+            "type": "integer"
+          },
+          "relations": {
+            "default": "",
+            "description": "Comma-separated relationship types to filter for blast_radius traversal (e.g. 'calls,imports,inherits'). Empty = traverse all edge types.",
+            "title": "Relations",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "operation"
+        ],
+        "title": "graph_queryArguments"
+      }
+    },
+    {
+      "name": "health_check",
+      "description": "Returns the internal Qdrant connection status heartbeat.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "title": "health_checkArguments"
+      }
+    },
+    {
+      "name": "heartbeat",
+      "description": "Lightweight keepalive that resets the session idle timer.\n\n        Call periodically (~5 min) to prevent idle session expiry\n        without generating chat history noise.  Returns session info\n        and the remaining seconds before the session would auto-end.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "title": "heartbeatArguments"
+      }
+    },
+    {
+      "name": "index_git_history",
+      "description": "Index the git commit history for a registered project.\n\n        Stores commit messages, authors, timestamps, and changed file lists\n        in a searchable Qdrant collection so you can query WHY code changed.\n\n        Args:\n            project_id: The registered project ID to index\n                (e.g. 'AiBot-Tools/Persistent-Memory-MCP').\n\n            full: If True, wipes existing commits and re-indexes from scratch.\n            max_commits: Maximum number of commits to index (default 2000).\n\n        Returns:\n            Confirmation with job ID, or an error message.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "full": {
+            "default": false,
+            "title": "Full",
+            "type": "boolean"
+          },
+          "max_commits": {
+            "default": 2000,
+            "title": "Max Commits",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "title": "index_git_historyArguments"
+      }
+    },
+    {
+      "name": "index_project",
+      "description": "Register and asynchronously index a local codebase path.\n\n        The registration and job submission are wrapped in asyncio.shield() so\n        a client-side transport timeout or disconnect cannot cancel the operation\n        mid-flight — the job will always be durably persisted to the DB even if\n        the HTTP response is slow to arrive.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "root_path": {
+            "title": "Root Path",
+            "type": "string"
+          },
+          "repo_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Repo Url"
+          },
+          "full": {
+            "default": false,
+            "title": "Full",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "project_id",
+          "root_path"
+        ],
+        "title": "index_projectArguments"
+      }
+    },
+    {
+      "name": "list_active_agents",
+      "description": "List all active agent sessions connected to PMMCP.\n\n        Shows who's connected, what agent type they are, which project\n        they're working on, and their capabilities.\n\n        Returns:\n            Summary of all active sessions.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "default": "",
+            "description": "Filter by project. Leave empty for all sessions.",
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "title": "list_active_agentsArguments"
+      }
+    },
+    {
+      "name": "list_context_sources",
+      "description": "List all scraped context sources with their status, page/chunk counts, and dates.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "context_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by type: docs, api, snippets, tutorials, changelogs, research, qa, other",
+            "title": "Context Type"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by status: pending, running, done, error",
+            "title": "Status"
+          }
+        },
+        "title": "list_context_sourcesArguments"
+      }
+    },
+    {
+      "name": "list_goals",
+      "description": "List all goals for a project, optionally filtered.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Project to list goals for",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by status",
+            "title": "Status"
+          },
+          "goal_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by type",
+            "title": "Goal Type"
+          },
+          "root_only": {
+            "default": true,
+            "description": "Only show top-level goals (no children)",
+            "title": "Root Only",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "title": "list_goalsArguments"
+      }
+    },
+    {
+      "name": "list_recent_errors",
+      "description": "List most recent error traces, ordered newest-first.\n\n        Quick overview of recent errors without needing a semantic query.\n\n        Returns:\n            Recent error traces with type, severity, and timestamp.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "default": "global",
+            "description": "Project scope (or 'global').",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "description": "Max errors to return.",
+            "title": "Limit",
+            "type": "integer"
+          },
+          "open_only": {
+            "default": true,
+            "description": "If true, only return unresolved errors.",
+            "title": "Open Only",
+            "type": "boolean"
+          }
+        },
+        "title": "list_recent_errorsArguments"
+      }
+    },
+    {
+      "name": "list_roots",
+      "description": "List all registered project roots.\n\n        Rows marked ``(placeholder)`` were auto-created by session\n        registration for a project_id never indexed via index_project —\n        their root_path is not a real directory. Clean up with\n        ``admin(action=\"unregister_project\", ...)``.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "title": "list_rootsArguments"
+      }
+    },
+    {
+      "name": "list_secrets",
+      "description": "List metadata details of all stored secrets (Zero plaintext output).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          }
+        },
+        "title": "list_secretsArguments"
+      }
+    },
+    {
+      "name": "list_sessions",
+      "description": "List sessions or get details for a specific session.\n\n        - No session_id: list recent sessions\n        - With session_id: get session details and summary\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          },
+          "limit": {
+            "default": 20,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "title": "list_sessionsArguments"
+      }
+    },
+    {
+      "name": "mark_error_resolved",
+      "description": "Mark a recorded error trace as resolved.\n\n        Use this once a bug has been fixed or an error has been addressed so it\n        no longer appears in open-error queries.\n\n        Returns:\n            Confirmation message.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "memory_id": {
+            "description": "The memory_id of the error trace to resolve.",
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "resolution": {
+            "default": "",
+            "description": "Optional note on how the error was fixed.",
+            "title": "Resolution",
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "title": "mark_error_resolvedArguments"
+      }
+    },
+    {
+      "name": "ping",
+      "description": "Full server health check: status, uptime, version, subsystem map.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "title": "pingArguments"
+      }
+    },
+    {
+      "name": "recall",
+      "description": "Search across ALL stored memory.\n\n        Covers preferences, skills, decisions, chat, code,\n        commands, tests, errors, and more.\n\n        Use scope='all' (default) for broad recall, or narrow to a specific\n        collection when you know what type of memory you're looking for.\n        Specialized scopes (commands, tests, errors, signatures, docs, git_context)\n        delegate to dedicated internal searchers for best results.\n\n        Use max_tokens to cap the total output size. Results are packed by\n        relevance — highest-scored items first, lowest-scored dropped when\n        the budget is exceeded.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "description": "What to search for in memory",
+            "title": "Query",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Project scope, or global if None",
+            "title": "Project Id"
+          },
+          "limit": {
+            "default": 10,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "scope": {
+            "default": "all",
+            "description": "Which memory collections to search. 'all' (default) searches everything. Options: 'all', 'preferences', 'decisions', 'chat', 'code', 'skills', 'commands', 'tests', 'errors', 'signatures', 'docs', 'git_context'",
+            "title": "Scope",
+            "type": "string"
+          },
+          "max_tokens": {
+            "default": 0,
+            "description": "Maximum token budget for results. 0 = unlimited (default). When set, lowest-priority results are dropped to fit within budget.",
+            "title": "Max Tokens",
+            "type": "integer"
+          },
+          "explain": {
+            "default": false,
+            "description": "When True, each result includes a rationale explaining why it was returned (scoring breakdown).",
+            "title": "Explain",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "recallArguments"
+      }
+    },
+    {
+      "name": "recall_commands",
+      "description": "Recall terminal commands by semantic description.\n\n        Searches previously recorded commands by what they do rather than their\n        exact text — e.g. 'how do I run the test suite?' or 'build docker image'.\n\n        Returns:\n            Matching commands with description, project, and working directory.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "description": "Describe what you want to do (semantic search).",
+            "title": "Query",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by project.",
+            "title": "Project Id"
+          },
+          "limit": {
+            "default": 10,
+            "description": "Max commands to return.",
+            "title": "Limit",
+            "type": "integer"
+          },
+          "successful_only": {
+            "default": true,
+            "description": "Return only commands with exit_code=0.",
+            "title": "Successful Only",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "recall_commandsArguments"
+      }
+    },
+    {
+      "name": "record_command",
+      "description": "Record a terminal command for later semantic recall.\n\n        Use to capture useful build commands, run scripts, fix one-liners, and\n        other commands worth remembering.  Duplicate commands update the existing record.\n\n        Returns:\n            The stable memory_id (cmd_*) for this command.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "description": "The exact terminal command string.",
+            "title": "Command",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "description": "Human-readable summary of what this command does.",
+            "title": "Description",
+            "type": "string"
+          },
+          "output_snippet": {
+            "default": "",
+            "description": "First ~500 chars of output (optional).",
+            "title": "Output Snippet",
+            "type": "string"
+          },
+          "exit_code": {
+            "default": 0,
+            "description": "Exit code. 0 = success.",
+            "title": "Exit Code",
+            "type": "integer"
+          },
+          "project_id": {
+            "default": "global",
+            "description": "Project this command belongs to.",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "cwd": {
+            "default": "",
+            "description": "Working directory the command was run in.",
+            "title": "Cwd",
+            "type": "string"
+          },
+          "tags": {
+            "default": "",
+            "description": "Comma-separated tags (e.g. 'build,docker').",
+            "title": "Tags",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "title": "record_commandArguments"
+      }
+    },
+    {
+      "name": "record_error",
+      "description": "Record a runtime error or bug into the searchable error trace store.\n\n        Errors are deduplicated by (error_type + message) so identical errors update\n        an existing record rather than accumulating duplicates.\n\n        Returns:\n            The stable memory_id for this error trace.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "error_type": {
+            "description": "Short classifier for this error, e.g. 'QdrantError', 'EmbeddingTimeout', 'IndexFailure', 'AgentBug', 'ToolError'.",
+            "title": "Error Type",
+            "type": "string"
+          },
+          "error_message": {
+            "description": "Human-readable error description.",
+            "title": "Error Message",
+            "type": "string"
+          },
+          "project_id": {
+            "default": "global",
+            "description": "Project this error relates to.",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "severity": {
+            "default": "error",
+            "description": "One of: debug / info / warning / error / critical.",
+            "title": "Severity",
+            "type": "string"
+          },
+          "stack_trace": {
+            "default": "",
+            "description": "Optional traceback or stack trace.",
+            "title": "Stack Trace",
+            "type": "string"
+          },
+          "context": {
+            "default": "{}",
+            "description": "Optional JSON dict of extra context, e.g. {\"file\": \"foo.py\"}.",
+            "title": "Context",
+            "type": "string"
+          }
+        },
+        "required": [
+          "error_type",
+          "error_message"
+        ],
+        "title": "record_errorArguments"
+      }
+    },
+    {
+      "name": "record_test_failure",
+      "description": "Record a test failure for semantic search and trend analysis.\n\n        Stores test failures so you can answer 'have we seen this error before?' and\n        'what tests fail when the auth module changes?'.\n\n        Returns:\n            The stable memory_id (test_*) for this failure.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "description": "Project the test belongs to.",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "test_name": {
+            "description": "Fully qualified test name.",
+            "title": "Test Name",
+            "type": "string"
+          },
+          "error_message": {
+            "description": "The failure message or assertion error.",
+            "title": "Error Message",
+            "type": "string"
+          },
+          "test_file": {
+            "default": "",
+            "description": "Relative file path of the test.",
+            "title": "Test File",
+            "type": "string"
+          },
+          "test_suite": {
+            "default": "",
+            "description": "Suite or class containing the test.",
+            "title": "Test Suite",
+            "type": "string"
+          },
+          "error_type": {
+            "default": "",
+            "description": "Exception or assertion type.",
+            "title": "Error Type",
+            "type": "string"
+          },
+          "stack_trace": {
+            "default": "",
+            "description": "Full stack trace (optional).",
+            "title": "Stack Trace",
+            "type": "string"
+          },
+          "run_id": {
+            "default": "",
+            "description": "CI run or local session ID.",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "default": "failed",
+            "description": "failed / error / skipped.",
+            "title": "Status",
+            "type": "string"
+          },
+          "duration_ms": {
+            "default": 0,
+            "description": "Test duration in milliseconds.",
+            "title": "Duration Ms",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "test_name",
+          "error_message"
+        ],
+        "title": "record_test_failureArguments"
+      }
+    },
+    {
+      "name": "remember",
+      "description": "Store information in persistent memory.\n\n        Unified write endpoint — use 'type' to control what kind of memory:\n        - fact/preference: key-value pairs (default)\n        - skill: reusable workflow with tags\n        - decision: architectural decision record (ADR)\n        - fix_pattern: error→fix mapping for learning\n        - command: terminal command with output\n        - test_failure: test failure with stack trace\n        - error: error trace for tracking\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "description": "Short descriptive key or title",
+            "title": "Key",
+            "type": "string"
+          },
+          "value": {
+            "description": "The information to store",
+            "title": "Value",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Project scope, or global if None",
+            "title": "Project Id"
+          },
+          "type": {
+            "default": "fact",
+            "description": "What kind of memory to store. Options: 'fact' (default key=value), 'preference', 'skill', 'decision', 'fix_pattern', 'command', 'test_failure', 'error'",
+            "title": "Type",
+            "type": "string"
+          },
+          "extra": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Extra structured data (JSON string) for specialized types. E.g. for 'decision': {\"context\":\"...\",\"consequences\":\"...\"}, for 'command': {\"exit_code\":0,\"output\":\"...\"}, for 'skill': {\"tags\":[\"python\",\"async\"]}, for 'fix_pattern': {\"error_type\":\"TypeError\",\"language\":\"python\"}",
+            "title": "Extra"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "title": "rememberArguments"
+      }
+    },
+    {
+      "name": "remove_blocker",
+      "description": "Remove a blocker by index. If no blockers remain, sets status to in_progress.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "goal_id": {
+            "description": "Goal ID",
+            "title": "Goal Id",
+            "type": "string"
+          },
+          "blocker_index": {
+            "description": "Index of blocker to remove (0-based)",
+            "title": "Blocker Index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "goal_id",
+          "blocker_index"
+        ],
+        "title": "remove_blockerArguments"
+      }
+    },
+    {
+      "name": "repair_and_heal",
+      "description": "Interactive repair wizard — diagnoses issues and asks for confirmation before fixing.\n\n        Runs a full integrity check, presents findings, then uses MCP elicitation to ask\n        whether to proceed with repairs (index rebuild, optional VACUUM, optional reindex).\n        Falls back to a dry-run report if the client does not support elicitation.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          }
+        },
+        "title": "repair_and_healArguments"
+      }
+    },
+    {
+      "name": "retrieval_feedback",
+      "description": "Report whether retrieved memories were helpful.\n\n        This feedback improves future recall by adjusting importance:\n        - **led_to_fix**: Memory directly helped solve a problem → boost\n        - **used**: Memory was read and considered → mild boost\n        - **ignored**: Memory was irrelevant to the task → slight reduce\n\n        The system uses this signal to get better over time.\n\n        Args:\n            outcome: One of 'used', 'ignored', 'led_to_fix'.\n            memory_ids: Specific IDs, or None to mark most recent.\n\n        Returns:\n            Confirmation of feedback recorded.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "outcome": {
+            "description": "Outcome of recent retrieval: 'used', 'ignored', or 'led_to_fix'",
+            "title": "Outcome",
+            "type": "string"
+          },
+          "memory_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Specific memory IDs to mark (or None for most recent)",
+            "title": "Memory Ids"
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "title": "retrieval_feedbackArguments"
+      }
+    },
+    {
+      "name": "save_secret_template",
+      "description": "Save a secret template defining required fields.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Fields",
+            "type": "array"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "fields"
+        ],
+        "title": "save_secret_templateArguments"
+      }
+    },
+    {
+      "name": "scrape_context",
+      "description": "Scrape a documentation or reference website and store it in a context collection.\n\n        **Auto mode (default):** Set max_depth=-1 and max_pages=0 to crawl\n        every reachable page under the URL's domain/path scope.  The scraper\n        stops when it runs out of in-scope links or hits the 50 000-page\n        safety cap.\n\n        The job runs in the background worker; use list_context_sources() to check status.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "description": "Root URL to scrape (e.g. https://docs.python.org/3/)",
+            "title": "Url",
+            "type": "string"
+          },
+          "context_type": {
+            "description": "Type of context to store. One of: docs, api, snippets, tutorials, changelogs, research, qa, other",
+            "title": "Context Type",
+            "type": "string"
+          },
+          "max_depth": {
+            "default": -1,
+            "description": "BFS depth limit. -1 = auto (unlimited depth, crawl everything reachable). 1–10 = explicit depth cap.",
+            "title": "Max Depth",
+            "type": "integer"
+          },
+          "max_pages": {
+            "default": 0,
+            "description": "Maximum pages to scrape. 0 = auto (unlimited, safety cap at 50 000). 1–50000 = explicit page cap.",
+            "title": "Max Pages",
+            "type": "integer"
+          },
+          "delay_ms": {
+            "default": 250,
+            "description": "Delay between requests in milliseconds",
+            "title": "Delay Ms",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "url",
+          "context_type"
+        ],
+        "title": "scrape_contextArguments"
+      }
+    },
+    {
+      "name": "search_context",
+      "description": "Search across scraped context collections using semantic similarity.\n\n        If context_type is given, only that collection is searched.\n        Otherwise, all 8 context collections are searched and results are merged + ranked.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "description": "Semantic search query",
+            "title": "Query",
+            "type": "string"
+          },
+          "context_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Restrict search to one context type: docs, api, snippets, tutorials, changelogs, research, qa, other. Leave blank to search all types.",
+            "title": "Context Type"
+          },
+          "top_k": {
+            "default": 10,
+            "description": "Number of results to return (1–50)",
+            "title": "Top K",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "search_contextArguments"
+      }
+    },
+    {
+      "name": "search_episodes",
+      "description": "Search past problem-solving episodes (experience replay).\n\n        Returns narratives of how similar problems were solved before,\n        including what was tried, what failed, and what finally worked.\n\n        Use this when encountering a problem that might have been solved\n        before — the episodes capture the full debugging arc, not just\n        the final fix.\n\n        Args:\n            query: Description of the current problem or context.\n            project_id: Optional project scope.\n            outcome_type: Filter by outcome type.\n            limit: Max results.\n\n        Returns:\n            Formatted episode summaries with problem, attempts, and outcome.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "description": "Describe the problem or situation",
+            "title": "Query",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional project scope",
+            "title": "Project Id"
+          },
+          "outcome_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by outcome: 'success', 'failure', or 'partial'",
+            "title": "Outcome Type"
+          },
+          "limit": {
+            "default": 5,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "search_episodesArguments"
+      }
+    },
+    {
+      "name": "search_errors",
+      "description": "Search recorded error traces semantically.\n\n        Finds similar past errors, failures, and bugs.  Useful for understanding\n        recurring patterns before debugging a new issue.\n\n        Returns:\n            Matching error traces with type, severity, message, and ID.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "description": "Natural language description of the error to find.",
+            "title": "Query",
+            "type": "string"
+          },
+          "project_id": {
+            "default": "global",
+            "description": "Project scope (or 'global').",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "description": "Max results to return.",
+            "title": "Limit",
+            "type": "integer"
+          },
+          "open_only": {
+            "default": false,
+            "description": "If true, only return unresolved errors.",
+            "title": "Open Only",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "search_errorsArguments"
+      }
+    },
+    {
+      "name": "search_test_failures",
+      "description": "Search test failures semantically.\n\n        Finds failures similar to your query — useful for identifying recurring failures,\n        flaky tests, or errors you've seen before.\n\n        Returns:\n            Matching test failures with test name, suite, error type, and status.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "description": "Describe the failure or error you're looking for.",
+            "title": "Query",
+            "type": "string"
+          },
+          "project_id": {
+            "description": "Project to search test failures in.",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 10,
+            "description": "Max results to return.",
+            "title": "Limit",
+            "type": "integer"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by status (failed/error/skipped).",
+            "title": "Status"
+          }
+        },
+        "required": [
+          "query",
+          "project_id"
+        ],
+        "title": "search_test_failuresArguments"
+      }
+    },
+    {
+      "name": "session_insight_agent",
+      "description": "Generate an LLM-powered narrative insight about a past session.\n\n        Fetches conversation turns and relevant code context from the indexed\n        codebase, then asks a local Ollama model to produce a meaningful summary\n        of what was worked on, problems solved, and patterns observed.\n\n        Requires Ollama running with the configured model (default: llama3.2:3b).\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "project_id"
+        ],
+        "title": "session_insight_agentArguments"
+      }
+    },
+    {
+      "name": "set_secret",
+      "description": "Stores a sensitive value via AES-128 encryption. Value is NOT logged.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "description": "Unique alias for the secret",
+            "title": "Label",
+            "type": "string"
+          },
+          "value": {
+            "description": "Plaintext secret value to encrypt",
+            "title": "Value",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Scope isolated entirely to project if set",
+            "title": "Project Id"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Detailed purpose description",
+            "title": "Description"
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Metadata tags",
+            "title": "Tags"
+          }
+        },
+        "required": [
+          "label",
+          "value"
+        ],
+        "title": "set_secretArguments"
+      }
+    },
+    {
+      "name": "set_secret_expiry",
+      "description": "Set an expiry date for a secret (ISO 8601).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "expires_at": {
+            "description": "ISO 8601 timestamp",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          }
+        },
+        "required": [
+          "label",
+          "expires_at"
+        ],
+        "title": "set_secret_expiryArguments"
+      }
+    },
+    {
+      "name": "status",
+      "description": "Unified status/health endpoint.\n\n        scope options:\n        - 'all' (default): combined status overview\n        - 'queue': background indexing queue status\n        - 'project': disk vs index sync for a project\n        - 'stats': embedding and record telemetry\n        - 'embeddings': collection stats and embedding config\n        - 'watcher': file watcher status (action='pause'/'resume'/'start';\n          resume also restarts a dead watcher task)\n        - 'capture': active session and capture status\n        - 'schedule': project summarization schedule\n        - 'telemetry': tool usage call counts and latency\n        - 'tokens': token consumption (use project_id to filter)\n        - 'projects': health summary for all registered projects\n        - 'dedup': duplicate detection status and staleness\n        - 'retrieval_quality': retrieval success rate, latency, and knowledge gaps\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "default": "all",
+            "title": "Scope",
+            "type": "string"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "action": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Action"
+          }
+        },
+        "title": "statusArguments"
+      }
+    },
+    {
+      "name": "update_goal",
+      "description": "Update an existing goal's status, progress, or metadata.\n\n        Status transitions are validated:\n          pending → in_progress, abandoned, blocked\n          in_progress → completed, blocked, abandoned, pending\n          blocked → in_progress, abandoned, pending\n          completed → in_progress (re-open)\n          abandoned → pending (resurrect)\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "goal_id": {
+            "description": "Goal ID to update",
+            "title": "Goal Id",
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "pending, in_progress, completed, abandoned, blocked",
+            "title": "Status"
+          },
+          "progress_pct": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "0.0 to 100.0",
+            "title": "Progress Pct"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Title"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Description"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "1-5",
+            "title": "Priority"
+          },
+          "blockers": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Replace all blockers",
+            "title": "Blockers"
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tags"
+          },
+          "acceptance_criteria": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Acceptance Criteria"
+          },
+          "related_files": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Related Files"
+          }
+        },
+        "required": [
+          "goal_id"
+        ],
+        "title": "update_goalArguments"
+      }
+    }
+  ]
+}

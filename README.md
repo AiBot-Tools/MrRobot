@@ -462,10 +462,15 @@ as successful text (`Error: Cannot transition…`, `Goal x not found.`); the wri
 counts a move only on pmmcp's `✅ Goal updated: <id>`.
 
 Every pmmcp goal tool name and argument lives in `config/kernel.yaml` under
-`goals:`, read from pmmcp's source and not yet confirmed against its live schema. Boot compares them against what the
-server declares and, on a disagreement, appends `goals.degraded` naming the tool
-or argument and disables goal writing — so a wrong guess is one line of YAML
-rather than a patch. (It is an event and not a `status.get` subsystem key because
+`goals:`, confirmed by the operator's live capture of 2026-10-18, and every call
+goes through the typed wrappers in `src/goals/pmmcp.ts`. They parse each
+call against the strict schemas in `src/mcp/pmmcp-schemas.ts` and refuse a
+status that is a decision, a create without `project_id`, or an update
+carrying one, before anything reaches pmmcp. Boot compares the names, the
+arguments the server requires and the types it accepts against what the
+connected server declares and, on a disagreement, appends `goals.degraded` naming
+it and disables goal writing — so a pmmcp upgrade is one line of YAML rather
+than a patch. (It is an event and not a `status.get` subsystem key because
 `StatusResult.subsystems` is a strict object in the frozen protocol v1.)
 
 The kernel is tested against a **pmmcp double** (`test/helpers/mock-pmmcp.ts`):
@@ -473,10 +478,13 @@ an in-process MCP server with the goal hierarchy, the validated status
 transitions, `project_id` namespacing, the vault and an idle-expiring session
 all modelled — `get_secret` answering with pmmcp's real masked sentence unless a
 test opts into `revealSecrets` for the dormant vault path. It is what lets the credential paths, invariant 7 at pmmcp's
-real tool count, and a reconnect after a `-32001` be tested with no pmmcp anywhere. Its
-tool names and arguments are MODELLED, recorded as such in `PMMCP_TOOLS`, and
-nothing in the kernel may treat one as known-good until the capture confirms
-it.
+real tool count, and a reconnect after a `-32001` be tested with no pmmcp anywhere. The
+goal and vault tools are served verbatim from the capture
+(`test/fixtures/pmmcp-listtools.json`) and marked `confirmed` in `PMMCP_TOOLS`.
+The other tools' argument names are checked against the capture, but their types
+are not; `provenance` says which is which. Reply texts, the status vocabulary and
+the transition table are read from pmmcp's source: a capture shows arguments
+only.
 
 ---
 
@@ -490,7 +498,7 @@ and a live test cannot rot unexercised the way a gated-only one does.
 
 | Test | Needs | What only a live run settles |
 |---|---|---|
-| goal tools round-trip | pmmcp + both opt-ins | whether the MODELLED goal tool names and arguments in `kernel.yaml` match the real server — the first assertion is the boot check, and it names every disagreement |
+| goal tools round-trip | pmmcp + both opt-ins | whether the real server still matches the captured goal tool names, arguments and types in `kernel.yaml`, and whether its replies are the ones read from its source — the first assertion is the boot check, and it names every disagreement |
 | plan → tree | pmmcp, `ANTHROPIC_API_KEY`, both opt-ins | whether a real model's plan survives the `.strict()` parser; on failure the message carries the parser's own reason and the model's words |
 | eval harness gates | `ANTHROPIC_API_KEY` | whether the harness's own gates — one terminal row, paired LLM events, cost equal to the sum of logged calls — hold against a real provider's accounting |
 

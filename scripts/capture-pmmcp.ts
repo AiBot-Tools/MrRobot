@@ -1,11 +1,11 @@
 // Operator-only: capture pmmcp's live tool schemas.
 //
-// Everything this repo believes about pmmcp's tool surface — every goal tool
-// name, every argument name, the status vocabulary — is a GUESS made on a Linux
-// box, recorded as `provenance: 'modelled'` in test/helpers/mock-pmmcp.ts. This
-// script is how those guesses become facts: run it once on the Mac with pmmcp
-// up, and `test/pmmcp-drift.test.ts` starts checking the double against the real
-// server on every test run instead of skipping.
+// The capture is the reference for everything this repo believes about pmmcp's
+// tool surface: the double serves the goal and vault tools from it verbatim,
+// src/mcp/pmmcp-schemas.ts types them and is held to it, and
+// `test/pmmcp-drift.test.ts` checks the rest of the double's argument names
+// against it on every test run. Re-run this on the Mac with pmmcp up after a
+// pmmcp upgrade, and the tests name every disagreement.
 //
 //   npm run capture:pmmcp [-- OUT] [-- --config PATH]
 //

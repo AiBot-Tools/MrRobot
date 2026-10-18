@@ -77,25 +77,26 @@ sandbox:
     cpus: 2
     wallclockMs: 600000
 
-# pmmcp goal tools. EVERY NAME AND ARGUMENT HERE IS MODELLED, NOT CONFIRMED —
-# nobody has read pmmcp's live `listTools` on this machine, and CLAUDE.md's Phase
-# 1 says the typed wrappers come from those schemas.
+# pmmcp goal tools. Every name and argument here matches the operator's live
+# capture of 2026-10-18 (test/fixtures/pmmcp-listtools.json), and every call goes
+# through the typed wrappers in src/goals/pmmcp.ts. The reply texts are still
+# read from pmmcp's source: a listTools capture shows arguments only.
 #
-# They are config rather than constants for exactly that reason: a wrong guess is
-# one line of YAML instead of a patch. At boot the kernel asks the hub what the
-# server declares and compares; a disagreement appends `goals.degraded` naming the
-# tool or argument and disables goal writing, so nothing guesses at a call the
-# server would reject. `npm run capture:pmmcp` turns the guesses into facts.
+# Config rather than constants, so a pmmcp upgrade that renames something is one
+# line of YAML instead of a patch. At boot the kernel compares these names, the
+# arguments the server requires and the types it accepts against what the
+# connected server declares; a disagreement appends `goals.degraded` naming it
+# and disables goal writing, so nothing guesses at a call the server would
+# reject. `npm run capture:pmmcp` re-reads the live schemas.
 goals:
   # Write the tree from a plan found in a finished orchestrator run. Confined to
   # that agent's own memory namespace, and every write is logged as `plan.adopted`
   # plus one `goal.created` per goal. Set false to watch the CEO before it writes
   # anything durable.
   adoptFromRuns: true
-  # Read from pmmcp's source (src/tools/goals.py @55f3c1a); the boot check and
-  # `npm run capture:pmmcp` confirm them against the live server. update_goal
-  # and get_goal_tree take no project_id, so the kernel checks a goal's
-  # namespace against its own goal.created record before moving it.
+  # Confirmed by the live capture. update_goal and get_goal_tree take no
+  # project_id, so the kernel checks a goal's namespace against its own
+  # goal.created record before moving it.
   tools:
     create: create_goal
     updateStatus: update_goal

@@ -52,6 +52,7 @@ import { MIN_MASK_LENGTH, SecretMask } from '../events/redact.js'
 import type { EventStore } from '../events/store.js'
 import { runScope } from '../runtime/scope.js'
 import type { McpHub } from '../mcp/hub.js'
+import { GetSecretSent } from '../mcp/pmmcp-schemas.js'
 
 export const VAULT_TOOL = 'get_secret'
 
@@ -318,10 +319,15 @@ export class SecretsBroker {
       vaultError = this.#degraded ?? 'no MCP hub'
     } else {
       try {
+        // Typed (src/mcp/pmmcp-schemas.ts): the label and nothing else. No
+        // project_id, so the lookup stays global as it always was, and an empty
+        // label is refused here rather than asked of the vault.
+        const asked = GetSecretSent.safeParse({ label: id })
+        if (!asked.success) throw new Error(`"${id}" is not a label ${VAULT_TOOL} can be sent`)
         const result = await this.#hub.callKernelOnly(
           this.#serverId,
           VAULT_TOOL,
-          { [this.#keyArg]: id },
+          { [this.#keyArg]: asked.data.label },
           purpose,
         )
         const value = result.ok ? extractText(result.content) : undefined

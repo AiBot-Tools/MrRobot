@@ -153,7 +153,7 @@ test('the broker reads a credential out of the vault and the value never lands i
 })
 
 test('a vault that disagrees about its own argument name fails the broker closed', async (t) => {
-  // The stub table records: `keyArg` is unverified until a live pmmcp confirms
+  // The live capture confirms `label`, and a pmmcp upgrade could still rename
   // it. This is what "fails closed" has to mean — a server declaring `name`
   // while kernel.yaml says `label` is protocol drift, and the broker refuses
   // rather than sending a request the vault will answer with nothing.

@@ -128,15 +128,16 @@ const Secrets = z
 /**
  * The pmmcp goal tools, as CONFIG rather than constants.
  *
- * The defaults are READ FROM pmmcp's source (src/tools/goals.py and
- * src/storage/goal_store.py at 55f3c1a), not yet from its live `listTools`.
- * They replace guesses that were wrong on every name but `create_goal`:
- * pmmcp has `update_goal` (goal_id, status, progress_pct — and NO project_id),
+ * The defaults match the operator's live capture of 2026-10-18, which the
+ * typed wrappers in src/goals/pmmcp.ts and src/mcp/pmmcp-schemas.ts are held
+ * to: `update_goal` (goal_id, status, progress_pct — and NO project_id),
  * `get_goal_tree` (goal_id only), `parent_goal_id` and `goal_type`.
  *
  * Still config, and still checked against the connected server at boot, which
  * DEGRADES the goals subsystem with a reason naming any tool or argument that
- * disagrees: a pmmcp upgrade is one line of YAML, not a patch.
+ * disagrees, any argument it requires that the kernel does not send, and any
+ * type that no longer admits what it sends: a pmmcp upgrade is one line of
+ * YAML, not a patch.
  */
 const GoalTools = z
   .object({

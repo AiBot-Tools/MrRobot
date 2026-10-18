@@ -207,6 +207,25 @@ test('keyArg absent from the live schema fails closed', async (t) => {
   assertSecretSchema({ properties: { label: { type: 'string' } } }, 'label', 'pmmcp.get_secret')
 })
 
+test('the vault call is the typed get_secret: the label only, never project_id, and an empty label never reaches the vault', async (t) => {
+  const { broker, mock } = await wire(t)
+  await broker.ref('anthropic', 'test: the typed vault call')
+  const asked = (): Record<string, unknown>[] => mock.calls.filter((c) => c.tool === 'get_secret').map((c) => c.args)
+  // Global, as it always was: the live get_secret takes an optional project_id
+  // and the kernel never sends one.
+  assert.deepEqual(asked(), [{ label: 'anthropic' }])
+
+  await assert.rejects(
+    () => broker.ref('', 'test: an empty label'),
+    (e: unknown) => {
+      assert.ok(e instanceof PolicyDenied)
+      assert.match(e.message, /is not a label get_secret can be sent/)
+      return true
+    },
+  )
+  assert.equal(asked().length, 1, 'an empty label was asked of the vault')
+})
+
 test('broker is degraded without a hub and ref() throws with why', async (t) => {
   const { broker, store } = await wire(t, { noHub: true })
 

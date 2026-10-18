@@ -93,7 +93,9 @@ test('exactly one declared tool is confirmed, and it is get_secret taking label'
     confirmed.map((s) => s.name),
     ['get_secret'],
   )
-  assert.deepEqual(Object.keys(confirmed[0]?.inputSchema.properties ?? {}), ['label'])
+  // The capture shows the optional project_id beside it; `label` is still the
+  // argument the broker sends.
+  assert.deepEqual(Object.keys(confirmed[0]?.inputSchema.properties ?? {}), ['label', 'project_id'])
   // And the rest say so, each with where the guess came from.
   for (const spec of PMMCP_TOOLS) {
     if (spec.provenance === 'modelled') {

@@ -98,6 +98,15 @@ test('the comparison catches a capture that is wrong in every way it checks', ()
       { name: 'recall', inputSchema: { properties: { project_id: {} } } },
       // A tool with no schema at all.
       { name: 'create_goal' },
+      // A typed tool whose live argument changed type.
+      {
+        name: 'update_goal',
+        inputSchema: {
+          type: 'object',
+          properties: { goal_id: { type: 'string' }, progress_pct: { type: 'string' } },
+          required: ['goal_id', 'progress_pct'],
+        },
+      },
       // A pinned tool is absent: `admin` is classified but not served.
     ],
   }
@@ -107,6 +116,10 @@ test('the comparison catches a capture that is wrong in every way it checks', ()
   assert.equal(says(/modelled tool absent from the live server: remember/), true, 'missing tools')
   assert.equal(says(/recall: models limit, query; live declares project_id/), true, 'an argument the server does not accept')
   assert.equal(says(/create_goal: the live tool declares no inputSchema.properties/), true, 'no schema')
+  assert.equal(says(/update_goal\.progress_pct: typed null\|number; live declares string/), true, 'a type the transcript disagrees with')
+  assert.equal(says(/update_goal\.progress_pct: typed default null; live no default/), true, 'a default')
+  assert.equal(says(/update_goal\.status: src\/mcp\/pmmcp-schemas\.ts declares it; live does not/), true, 'a property')
+  assert.equal(says(/update_goal: typed required \[goal_id\]; live requires \[goal_id, progress_pct\]/), true, 'required')
   assert.equal(says(/secrets.keyArg is "label" but the live get_secret declares name/), true, 'the keyArg')
   assert.equal(says(/pins a tool the live server does not expose: admin/), true, 'a pinned tool absent')
   assert.equal(

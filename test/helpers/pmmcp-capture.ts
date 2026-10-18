@@ -13,6 +13,14 @@
 
 import './guard.js'
 
+import {
+  inputShape,
+  liveJsonSchema,
+  PMMCP_LIVE,
+  type InputShape,
+  type PmmcpLiveTool,
+  type PropertyShape,
+} from '../../src/mcp/pmmcp-schemas.js'
 import { FORCED_DISABLED, FORCED_KERNEL_ONLY } from '../../src/mcp/tool-views.js'
 import { PMMCP_TOOLS, PMMCP_TOOL_COUNT } from './mock-pmmcp.js'
 
@@ -32,7 +40,9 @@ export const ABSENT_BY_INVARIANT: readonly string[] = ['restore_backup']
 export interface CapturedTool {
   readonly name: string
   readonly description?: string
-  readonly inputSchema?: { readonly properties?: Record<string, unknown> } | undefined
+  readonly inputSchema?:
+    | { readonly type?: unknown; readonly properties?: Record<string, unknown>; readonly required?: readonly string[] }
+    | undefined
 }
 
 export interface PmmcpCapture {
@@ -49,6 +59,39 @@ export interface CompareInput {
   readonly pinned: readonly string[]
   /** Defaults to ABSENT_BY_INVARIANT; the tests pass a wrong one. */
   readonly absentByInvariant?: readonly string[]
+}
+
+function defaultOf(p: PropertyShape): string {
+  return 'default' in p ? `default ${JSON.stringify(p.default)}` : 'no default'
+}
+
+/**
+ * Where the kernel's typed transcript (src/mcp/pmmcp-schemas.ts) and the live
+ * tool part ways: a property either side lacks, its types, its default, and
+ * the required set. Exact, not a subset: the transcript claims to BE the live
+ * schema, so a property it lacks is a property nothing has typed.
+ */
+function shapeFindings(tool: string, typed: InputShape, live: InputShape): string[] {
+  const out: string[] = []
+  const names = [...new Set([...Object.keys(typed.properties), ...Object.keys(live.properties)])].sort()
+  for (const name of names) {
+    const t = typed.properties[name]
+    const l = live.properties[name]
+    if (t === undefined) {
+      out.push(`${tool}.${name}: live declares it; src/mcp/pmmcp-schemas.ts does not`)
+    } else if (l === undefined) {
+      out.push(`${tool}.${name}: src/mcp/pmmcp-schemas.ts declares it; live does not`)
+    } else {
+      if (t.types.join('|') !== l.types.join('|')) {
+        out.push(`${tool}.${name}: typed ${t.types.join('|')}; live declares ${l.types.join('|')}`)
+      }
+      if (defaultOf(t) !== defaultOf(l)) out.push(`${tool}.${name}: typed ${defaultOf(t)}; live ${defaultOf(l)}`)
+    }
+  }
+  if (typed.required.join(',') !== live.required.join(',')) {
+    out.push(`${tool}: typed required [${typed.required.join(', ')}]; live requires [${live.required.join(', ')}]`)
+  }
+  return out
 }
 
 /** The property names a captured tool declares, or undefined if it declares none. */
@@ -107,6 +150,19 @@ export function compareCapture(input: CompareInput): string[] {
     }
   }
 
+  // The kernel's typed transcript, held to the capture by type, nullability,
+  // item type, default and requiredness. A tool missing from the capture, or
+  // with no properties, is already a finding above.
+  for (const name of Object.keys(PMMCP_LIVE) as PmmcpLiveTool[]) {
+    const tool = live.get(name)
+    if (tool?.inputSchema?.properties === undefined) continue
+    try {
+      findings.push(...shapeFindings(name, inputShape(liveJsonSchema(name)), inputShape(tool.inputSchema)))
+    } catch (e) {
+      findings.push(`${name}: the live schema cannot be compared: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
+
   // The stub that fails closed until this passes. kernel.yaml names the argument
   // the broker sends; a server wanting a different one makes every credential
   // fetch fail, and this names it before boot ever tries.
@@ -149,7 +205,11 @@ export function compareCapture(input: CompareInput): string[] {
 export function agreeingCapture(): PmmcpCapture {
   const tools: CapturedTool[] = PMMCP_TOOLS.filter((spec) => !ABSENT_BY_INVARIANT.includes(spec.name)).map((spec) => ({
     name: spec.name,
-    inputSchema: { properties: { ...spec.inputSchema.properties } },
+    inputSchema: {
+      type: 'object',
+      properties: { ...spec.inputSchema.properties },
+      ...(spec.inputSchema.required === undefined ? {} : { required: [...spec.inputSchema.required] }),
+    },
   }))
   for (let i = tools.length; i < PMMCP_TOOL_COUNT; i += 1) {
     tools.push({ name: `live_tool_${String(i)}`, inputSchema: { properties: {} } })

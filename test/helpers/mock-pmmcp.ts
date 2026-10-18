@@ -38,6 +38,8 @@
 
 import './guard.js'
 
+import { readFileSync } from 'node:fs'
+
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -134,8 +136,42 @@ export interface PmmcpState {
 
 export interface JsonObjectSchema {
   readonly type: 'object'
-  readonly properties: Readonly<Record<string, { type: string; description?: string }>>
+  /** Modelled tools declare `{type, description}`; captured ones carry pydantic's full form. */
+  readonly properties: Readonly<Record<string, Readonly<Record<string, unknown>>>>
   readonly required?: readonly string[]
+}
+
+interface CapturedTool {
+  readonly name: string
+  readonly description?: string
+  readonly inputSchema?: { readonly properties?: Record<string, unknown>; readonly required?: readonly string[] }
+}
+
+const CAPTURED: readonly CapturedTool[] = (
+  JSON.parse(readFileSync(new URL('../fixtures/pmmcp-listtools.json', import.meta.url), 'utf8')) as {
+    tools: CapturedTool[]
+  }
+).tools
+
+/**
+ * A tool exactly as the operator's live capture declares it, minus pydantic's
+ * schema `title`. Served verbatim so the double's arguments ARE the live ones,
+ * in the live form, and stay independent of the kernel's own transcript in
+ * src/mcp/pmmcp-schemas.ts, which is what the drift guard holds to this file.
+ */
+function captured(name: string): { description: string; inputSchema: JsonObjectSchema } {
+  const tool = CAPTURED.find((t) => t.name === name)
+  if (tool?.inputSchema?.properties === undefined) {
+    throw new Error(`test/fixtures/pmmcp-listtools.json has no ${name} with properties`)
+  }
+  return {
+    description: tool.description ?? name,
+    inputSchema: {
+      type: 'object',
+      properties: tool.inputSchema.properties as JsonObjectSchema['properties'],
+      ...(tool.inputSchema.required === undefined ? {} : { required: [...tool.inputSchema.required] }),
+    },
+  }
 }
 
 export interface PmmcpToolSpec {
@@ -205,67 +241,25 @@ export const PMMCP_TOOLS: readonly PmmcpToolSpec[] = [
   },
   {
     name: 'create_goal',
-    description: 'Create a new goal (objective, milestone, or task) for a project',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        title: str('Short goal title'),
-        project_id: str('Project this goal belongs to'),
-        description: str('Detailed description'),
-        goal_type: str('objective (high-level), milestone (mid), or task (concrete)'),
-        parent_goal_id: str('Parent goal ID for hierarchy'),
-        priority: num('1 (highest) to 5 (lowest)'),
-        acceptance_criteria: ARR('Measurable conditions for completion'),
-        tags: ARR('tags'),
-        related_files: ARR('related files'),
-      },
-      required: ['title', 'project_id'],
-    },
+    ...captured('create_goal'),
     provenance: 'source',
     source: 'pmmcp src/tools/goals.py create_goal @55f3c1a',
   },
   {
     name: 'update_goal',
-    description: "Update an existing goal's status, progress, or metadata",
-    inputSchema: {
-      type: 'object',
-      properties: {
-        goal_id: str('Goal ID to update'),
-        status: str('pending, in_progress, completed, abandoned, blocked'),
-        progress_pct: num('0.0 to 100.0'),
-        title: str('title'),
-        description: str('description'),
-        priority: num('1-5'),
-        blockers: ARR('blockers'),
-        tags: ARR('tags'),
-        acceptance_criteria: ARR('acceptance criteria'),
-        related_files: ARR('related files'),
-      },
-      required: ['goal_id'],
-    },
+    ...captured('update_goal'),
     provenance: 'source',
     source: 'pmmcp src/tools/goals.py update_goal @55f3c1a: no project_id',
   },
   {
     name: 'list_goals',
-    description: 'List all goals for a project, optionally filtered',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        project_id: str('Project to list goals for'),
-        status: str('Filter by status'),
-        goal_type: str('Filter by type'),
-        root_only: { type: 'boolean', description: 'Only show top-level goals (no children)' },
-      },
-      required: ['project_id'],
-    },
+    ...captured('list_goals'),
     provenance: 'source',
     source: 'pmmcp src/tools/goals.py list_goals @55f3c1a',
   },
   {
     name: 'get_goal_tree',
-    description: 'Display a goal and all its sub-goals as a tree',
-    inputSchema: { type: 'object', properties: { goal_id: str('Root goal ID') }, required: ['goal_id'] },
+    ...captured('get_goal_tree'),
     provenance: 'source',
     source: 'pmmcp src/tools/goals.py get_goal_tree @55f3c1a: no project_id',
   },
@@ -278,20 +272,13 @@ export const PMMCP_TOOLS: readonly PmmcpToolSpec[] = [
   },
   {
     name: 'get_secret',
-    description: 'Read a vault entry',
-    // The one confirmed argument name in this file.
-    inputSchema: { type: 'object', properties: { label: str('vault label') }, required: ['label'] },
+    ...captured('get_secret'),
     provenance: 'confirmed',
     source: 'DECISIONS Q24: arg is `label`, read off the live listTools',
   },
   {
     name: 'set_secret',
-    description: 'Write a vault entry',
-    inputSchema: {
-      type: 'object',
-      properties: { label: str('vault label'), value: str('secret') },
-      required: ['label', 'value'],
-    },
+    ...captured('set_secret'),
     provenance: 'modelled',
     source: 'paired with get_secret; only `label` is confirmed',
   },

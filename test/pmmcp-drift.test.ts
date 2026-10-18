@@ -1,23 +1,22 @@
-// Drift guard: the pmmcp double against the real server's schemas.
+// Drift guard: what this repository believes about pmmcp against the live
+// server's schemas.
 //
-// test/helpers/mock-pmmcp.ts models pmmcp from docs and CLAUDE.md's environment
-// notes. Exactly one thing in it is confirmed — `get_secret` takes `label`
-// (DECISIONS Q24) — and every other name and argument is a guess, recorded as
-// `provenance: 'modelled'`. This file is how those guesses stop being guesses.
+// The operator's capture (test/fixtures/pmmcp-listtools.json, 2026-10-18)
+// is the reference. Against it this file checks: the double's argument names
+// for every tool it declares; the kernel's typed transcript of the goal and
+// vault tools (src/mcp/pmmcp-schemas.ts) by type, nullability, default and
+// requiredness; the keyArg the broker sends; every pin in tool-views.yaml;
+// and the tool count three files repeat. The capture is re-taken on the
+// operator's machine (pmmcp needs no token):
 //
-// The capture can only be taken on the operator's machine:
+//   npm run capture:pmmcp
 //
-//   PMMCP_TOKEN=... npm run capture:pmmcp
-//
-// NOTHING HERE SKIPS. A gated skip would mean the comparison sits unexercised
-// until the day it matters most, and a hygiene rule in this suite forbids new
-// skips outside the live tests for exactly that reason. So the comparison is a
-// pure function (helpers/pmmcp-capture.ts) and this file exercises it three
-// ways: against the real capture when there is one, against a synthetic capture
-// that is wrong in every way the guard is supposed to notice, and against one
-// that agrees. With no capture on disk, the first of those instead asserts the
-// thing that must still be true in its absence — that the repository has not
-// started claiming these facts are settled.
+// NOTHING HERE SKIPS, and the capture must exist: the `confirmed` provenance
+// in the double is earned against it, so a repository without it would be
+// claiming facts it cannot show. The comparison is a pure function
+// (helpers/pmmcp-capture.ts) exercised three ways: against the real capture,
+// against a synthetic one that is wrong in every way the guard is supposed to
+// notice, and against one that agrees.
 
 import './helpers/guard.js'
 
@@ -30,7 +29,7 @@ import { parse as parseYaml } from 'yaml'
 import { parseKernelConfig } from '../src/config.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
 import { REPO_ROOT } from './helpers/kernel.js'
-import { PMMCP_TOOLS, PMMCP_TOOL_COUNT } from './helpers/mock-pmmcp.js'
+import { PMMCP_TOOL_COUNT } from './helpers/mock-pmmcp.js'
 import {
   ABSENT_BY_INVARIANT,
   agreeingCapture,
@@ -55,34 +54,21 @@ function pinned(): string[] {
   return Object.keys(views.servers['pmmcp']?.tools ?? {})
 }
 
-test('the live capture agrees with the double, or its absence is still recorded', () => {
-  if (existsSync(CAPTURE)) {
-    const capture = JSON.parse(readFileSync(CAPTURE, 'utf8')) as PmmcpCapture
-    const findings = compareCapture({ capture, keyArg: keyArg(), pinned: pinned() })
-    assert.deepEqual(
-      findings,
-      [],
-      `the live pmmcp disagrees with this repo:\n  ${findings.join('\n  ')}\n` +
-        'Each line is an assumption Phase 1 may have been built on.',
-    )
-    return
-  }
-
-  // No capture. What must still hold is that nothing here has quietly started
-  // treating the guesses as settled — the claim, not the check, is what goes
-  // stale first.
-  const confirmed = PMMCP_TOOLS.filter((s) => s.provenance === 'confirmed').map((s) => s.name)
-  assert.deepEqual(
-    confirmed,
-    ['get_secret'],
-    'a tool claims confirmation from a live listTools, but no capture exists to have read it off',
+test('the live capture agrees with the double and with the kernel\'s typed schemas', () => {
+  // Approved by the operator on 2026-10-18 in place of the no-capture branch,
+  // which could no longer run and asserted a README line that was gone.
+  assert.ok(
+    existsSync(CAPTURE),
+    'test/fixtures/pmmcp-listtools.json is gone, but the double\'s `confirmed` tools are earned against it; ' +
+      're-run `npm run capture:pmmcp` on the operator\'s machine',
   )
-  const readme = readFileSync(join(REPO_ROOT, 'README.md'), 'utf8')
-  const table = readme.slice(readme.indexOf('## Still needs validation'))
-  assert.match(
-    table,
-    /the 49 tool names/,
-    'README stopped listing pmmcp\'s tool names as needing validation while no capture exists',
+  const capture = JSON.parse(readFileSync(CAPTURE, 'utf8')) as PmmcpCapture
+  const findings = compareCapture({ capture, keyArg: keyArg(), pinned: pinned() })
+  assert.deepEqual(
+    findings,
+    [],
+    `the live pmmcp disagrees with this repo:\n  ${findings.join('\n  ')}\n` +
+      'Each line is an assumption Phase 1 may have been built on.',
   )
 })
 

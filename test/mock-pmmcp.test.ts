@@ -24,6 +24,7 @@ import {
   pmmcpMock,
   type PmmcpMock,
 } from './helpers/mock-pmmcp.js'
+import { inputShape, liveJsonSchema, PMMCP_LIVE, type PmmcpLiveTool } from '../src/mcp/pmmcp-schemas.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
 import { REPO_ROOT } from './helpers/kernel.js'
 
@@ -84,18 +85,23 @@ test('every tool config/tool-views.yaml pins is declared by the double', () => {
   }
 })
 
-test('exactly one declared tool is confirmed, and it is get_secret taking label', () => {
-  // The honesty invariant. Q24 confirmed one argument name off a live listTools
-  // and nothing else; a second `confirmed` here would be a guess wearing the
-  // word, and every later decision built on it would look grounded.
+test('confirmed is exactly the tools the kernel types from the live capture, each served as typed', () => {
+  // The honesty invariant. `confirmed` is earned by a transcript the capture
+  // holds (src/mcp/pmmcp-schemas.ts, test/pmmcp-schemas.test.ts), not by
+  // having read a name once; one more here would be a guess wearing the word.
   const confirmed = PMMCP_TOOLS.filter((s) => s.provenance === 'confirmed')
-  assert.deepEqual(
-    confirmed.map((s) => s.name),
-    ['get_secret'],
-  )
-  // The capture shows the optional project_id beside it; `label` is still the
-  // argument the broker sends.
-  assert.deepEqual(Object.keys(confirmed[0]?.inputSchema.properties ?? {}), ['label', 'project_id'])
+  assert.deepEqual(confirmed.map((s) => s.name).sort(), Object.keys(PMMCP_LIVE).sort())
+  for (const spec of confirmed) {
+    assert.deepEqual(
+      inputShape(spec.inputSchema),
+      inputShape(liveJsonSchema(spec.name as PmmcpLiveTool)),
+      `${spec.name} is served differently from how the kernel types it`,
+    )
+  }
+  // `label` is still the argument the broker sends; project_id is optional.
+  const secret = confirmed.find((s) => s.name === 'get_secret')
+  assert.deepEqual(Object.keys(secret?.inputSchema.properties ?? {}), ['label', 'project_id'])
+  assert.deepEqual(secret?.inputSchema.required, ['label'])
   // And the rest say so, each with where the guess came from.
   for (const spec of PMMCP_TOOLS) {
     if (spec.provenance === 'modelled') {

@@ -9,15 +9,15 @@
 //
 // WHAT IS CONFIRMED AND WHAT IS MODELLED
 //
-// Exactly one thing here is confirmed against the live server: `get_secret`
-// takes `label` (DECISIONS Q24). Everything else — every goal tool name, every
-// argument name, the status vocabulary, the transition table — is MODELLED from
-// docs/design and CLAUDE.md's environment notes, and is recorded as such in
-// `PMMCP_TOOLS[].provenance`. That table is the single place the guesses live,
-// and `test/pmmcp-drift.test.ts` turns every one of them into a checked fact
-// the moment the operator drops a real `listTools` capture into
-// test/fixtures/pmmcp-listtools.json. Until then, nothing in the kernel may
-// treat a `modelled` name as known-good.
+// Confirmed means served exactly as the operator's live capture declares it
+// (test/fixtures/pmmcp-listtools.json, 2026-10-18), AND typed by the kernel in
+// src/mcp/pmmcp-schemas.ts, which test/pmmcp-schemas.test.ts holds to that
+// capture: the goal tools and get_secret/set_secret. The reply texts, the
+// status vocabulary and the transition table are still read from pmmcp's
+// source, because a listTools capture shows arguments and nothing else. Every
+// other tool's argument NAMES are checked against the capture by
+// test/pmmcp-drift.test.ts; their types are not, and `PMMCP_TOOLS[].provenance`
+// says which is which.
 //
 // Two deliberate design choices, because a double can fail in both directions:
 //
@@ -179,10 +179,10 @@ export interface PmmcpToolSpec {
   readonly description: string
   readonly inputSchema: JsonObjectSchema
   /**
-   * `confirmed` means the operator read this off a live `listTools`. Exactly one
-   * entry may carry it until the capture exists. `source` means read from
-   * pmmcp's Python source (55f3c1a): far better than a guess, still not the
-   * schema FastMCP actually serves.
+   * `confirmed`: served verbatim from the live capture and typed in
+   * src/mcp/pmmcp-schemas.ts, which is held to it; exactly the tools there.
+   * `source`: read from pmmcp's Python source (55f3c1a), names checked against
+   * the capture. `modelled`: a guess, names checked against the capture.
    */
   readonly provenance: 'confirmed' | 'source' | 'modelled'
   readonly source: string
@@ -242,26 +242,26 @@ export const PMMCP_TOOLS: readonly PmmcpToolSpec[] = [
   {
     name: 'create_goal',
     ...captured('create_goal'),
-    provenance: 'source',
-    source: 'pmmcp src/tools/goals.py create_goal @55f3c1a',
+    provenance: 'confirmed',
+    source: 'live capture 2026-10-18; replies from pmmcp src/tools/goals.py @55f3c1a',
   },
   {
     name: 'update_goal',
     ...captured('update_goal'),
-    provenance: 'source',
-    source: 'pmmcp src/tools/goals.py update_goal @55f3c1a: no project_id',
+    provenance: 'confirmed',
+    source: 'live capture 2026-10-18: no project_id; replies from pmmcp src/tools/goals.py @55f3c1a',
   },
   {
     name: 'list_goals',
     ...captured('list_goals'),
-    provenance: 'source',
-    source: 'pmmcp src/tools/goals.py list_goals @55f3c1a',
+    provenance: 'confirmed',
+    source: 'live capture 2026-10-18; replies from pmmcp src/tools/goals.py @55f3c1a',
   },
   {
     name: 'get_goal_tree',
     ...captured('get_goal_tree'),
-    provenance: 'source',
-    source: 'pmmcp src/tools/goals.py get_goal_tree @55f3c1a: no project_id',
+    provenance: 'confirmed',
+    source: 'live capture 2026-10-18: no project_id; replies from pmmcp src/tools/goals.py @55f3c1a',
   },
   {
     name: 'complete_goal',
@@ -274,13 +274,13 @@ export const PMMCP_TOOLS: readonly PmmcpToolSpec[] = [
     name: 'get_secret',
     ...captured('get_secret'),
     provenance: 'confirmed',
-    source: 'DECISIONS Q24: arg is `label`, read off the live listTools',
+    source: 'live capture 2026-10-18 (label first confirmed in DECISIONS Q24); replies from pmmcp src/tools/security.py',
   },
   {
     name: 'set_secret',
     ...captured('set_secret'),
-    provenance: 'modelled',
-    source: 'paired with get_secret; only `label` is confirmed',
+    provenance: 'confirmed',
+    source: 'live capture 2026-10-18; the kernel never calls it',
   },
   {
     name: 'audit_secrets',
@@ -571,7 +571,7 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
             properties: { [secretArg]: str('vault label') },
             required: [secretArg],
           },
-          // Overriding the one confirmed name makes it a guess again.
+          // Overriding the captured argument name makes it a guess again.
           provenance: 'modelled',
           source: `secretArg override: ${secretArg}`,
         }

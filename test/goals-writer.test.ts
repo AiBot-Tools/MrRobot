@@ -29,7 +29,7 @@ import { McpHub } from '../src/mcp/hub.js'
 import { parseToolViews, type ToolViewsFile } from '../src/mcp/tool-views.js'
 import { parseKernelConfig, type KernelConfig } from '../src/config.js'
 import { REPO_ROOT } from './helpers/kernel.js'
-import { pmmcpMock, type PmmcpMock } from './helpers/mock-pmmcp.js'
+import { PMMCP_TOOLS, pmmcpMock, type JsonObjectSchema, type PmmcpMock } from './helpers/mock-pmmcp.js'
 import { withStore } from './helpers/store.js'
 
 const PROJECT = 'aos/ceo'
@@ -125,6 +125,63 @@ test('a renamed tool or argument degrades the writer with a reason that names it
   })
   assert.match(String(both), /create_goal/)
   assert.match(String(both), /update_goal\b/)
+})
+
+/** A captured goal tool's schema, edited: the server after a pmmcp upgrade. */
+function edited(tool: string, edit: (schema: JsonObjectSchema) => JsonObjectSchema): Record<string, JsonObjectSchema> {
+  const spec = PMMCP_TOOLS.find((s) => s.name === tool)
+  assert.ok(spec !== undefined)
+  return { [tool]: edit(spec.inputSchema) }
+}
+
+test('a live goal tool that newly requires an argument the kernel does not send degrades goals by name', async (t) => {
+  // pmmcp's P4 makes project_id required on update_goal. The names check alone
+  // passes that server (project_id is just one more property), and every
+  // update would then fail as success text.
+  const { hub } = await wired(t, {
+    schemas: edited('update_goal', (s) => ({
+      ...s,
+      properties: { ...s.properties, project_id: { type: 'string' } },
+      required: ['goal_id', 'project_id'],
+    })),
+  })
+  assert.match(
+    String(goalToolsUnusable(hub, shippedConfig().goals)),
+    /pmmcp\.update_goal requires project_id, which the kernel does not send on every call/,
+  )
+
+  // An argument the kernel sends only sometimes is not enough either.
+  const { hub: parentRequired } = await wired(t, {
+    schemas: edited('create_goal', (s) => ({ ...s, required: ['title', 'project_id', 'parent_goal_id'] })),
+  })
+  assert.match(String(goalToolsUnusable(parentRequired, shippedConfig().goals)), /requires parent_goal_id/)
+})
+
+test('a live argument whose type no longer admits what the kernel sends degrades goals by name', async (t) => {
+  const { hub } = await wired(t, {
+    schemas: edited('create_goal', (s) => ({ ...s, properties: { ...s.properties, goal_type: { type: 'integer' } } })),
+  })
+  assert.match(
+    String(goalToolsUnusable(hub, shippedConfig().goals)),
+    /pmmcp\.create_goal\.goal_type is integer, but the kernel sends a string/,
+  )
+})
+
+test('an extra optional live argument is not drift: a server after P4 that only adds project_id still serves', async (t) => {
+  const { hub } = await wired(t, {
+    schemas: edited('update_goal', (s) => ({
+      ...s,
+      properties: { ...s.properties, project_id: { anyOf: [{ type: 'string' }, { type: 'null' }], default: null } },
+    })),
+  })
+  assert.equal(goalToolsUnusable(hub, shippedConfig().goals), undefined)
+})
+
+test('a goals.statuses entry the kernel may not send degrades goals at boot, naming the line', async (t) => {
+  const { hub } = await wired(t)
+  const goals = shippedConfig().goals
+  const reason = goalToolsUnusable(hub, { ...goals, statuses: { ...goals.statuses, review: 'completed' } })
+  assert.match(String(reason), /kernel\.yaml goals\.statuses\.review is "completed"; the kernel sends only in_progress, blocked/)
 })
 
 test('a validated plan becomes objective → milestone → task with the SERVER’s ids', async (t) => {

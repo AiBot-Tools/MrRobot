@@ -469,6 +469,12 @@ export interface PmmcpMockOptions {
   /** Register placeholders until tools/list reports this many. */
   readonly padTo?: number
   /**
+   * Declare a different inputSchema for the named tools: a server whose
+   * arguments changed after the capture, for the kernel's boot check to meet.
+   * Handlers are unchanged.
+   */
+  readonly schemas?: Readonly<Record<string, JsonObjectSchema>>
+  /**
    * Idle window. A call or ping arriving more than this after the session's last
    * activity expires it, the way pmmcp's sessions idle-expire. Needs `now`.
    */
@@ -562,21 +568,23 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     return `goal_${seq.toString(16).padStart(12, '0')}`
   }
 
-  const specs: PmmcpToolSpec[] = PMMCP_TOOLS.map((spec) =>
-    spec.name === 'get_secret' && secretArg !== 'label'
-      ? {
-          ...spec,
-          inputSchema: {
-            type: 'object',
-            properties: { [secretArg]: str('vault label') },
-            required: [secretArg],
-          },
-          // Overriding the captured argument name makes it a guess again.
-          provenance: 'modelled',
-          source: `secretArg override: ${secretArg}`,
-        }
-      : spec,
-  )
+  const specs: PmmcpToolSpec[] = PMMCP_TOOLS.map((spec): PmmcpToolSpec => {
+    if (spec.name === 'get_secret' && secretArg !== 'label') {
+      return {
+        ...spec,
+        inputSchema: {
+          type: 'object',
+          properties: { [secretArg]: str('vault label') },
+          required: [secretArg],
+        },
+        // Overriding the captured argument name makes it a guess again.
+        provenance: 'modelled',
+        source: `secretArg override: ${secretArg}`,
+      }
+    }
+    const replaced = options.schemas?.[spec.name]
+    return replaced === undefined ? spec : { ...spec, inputSchema: replaced, provenance: 'modelled', source: 'schemas override' }
+  })
 
   const tools: Tool[] = specs.map((spec) => ({
     name: spec.name,

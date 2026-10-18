@@ -116,6 +116,7 @@ const GATE = 'src/policy/gate.ts'
 const TRACKER = 'src/goals/tracker.ts'
 const WRITER = 'src/goals/writer.ts'
 const GOAL_CALLS = 'src/goals/pmmcp.ts'
+const GOAL_TOOLS = 'src/goals/tools.ts'
 const PMMCP_SCHEMAS = 'src/mcp/pmmcp-schemas.ts'
 const STORE = 'src/events/store.ts'
 const CHECKS = 'src/eval/checks.ts'
@@ -175,6 +176,8 @@ const goals: Suite = {
     { id: 'G16', file: GOAL_CALLS, from: '  const checked = sendable(schema, `${c.serverId}.${tool}`, args)', to: '  const checked = args as Record<string, unknown>', why: 'a goal call reaches pmmcp unchecked: a decision sent as a status, an update carrying project_id' },
     { id: 'G17', file: PMMCP_SCHEMAS, from: '    project_id: id,', to: '    project_id: id.optional(),', why: 'create_goal may go without project_id, which pmmcp reads as global scope' },
     { id: 'G18', file: PMMCP_SCHEMAS, from: '    progress_pct: z.number().min(0).max(100).optional(),\n  })\n  .strict()', to: '    progress_pct: z.number().min(0).max(100).optional(),\n  })', why: 'update_goal silently drops a project_id instead of refusing it' },
+    { id: 'G19', file: GOAL_TOOLS, from: '      if (!always.has(name)) problems.push(', to: '      if (false) problems.push(', why: 'a pmmcp that newly requires project_id on update_goal boots, and every update then fails as success text' },
+    { id: 'G20', file: GOAL_TOOLS, from: '    if (!(SENDABLE_STATUSES as readonly string[]).includes(sent)) {', to: '    if (false) {', why: 'a goals.statuses line mapping review onto completed boots clean, and every review goes stale' },
   ],
   control: {
     id: 'C',

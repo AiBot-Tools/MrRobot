@@ -160,7 +160,8 @@ function record(value: unknown, where: string): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
-function onlyKnown(node: Record<string, unknown>, known: ReadonlySet<string>, where: string): void {
+function onlyKnown(node: Record<string, unknown>, known: ReadonlySet<string>, where: string, strict: boolean): void {
+  if (!strict) return
   for (const key of Object.keys(node)) {
     if (!known.has(key)) throw new Error(`${where} uses JSON Schema keyword "${key}", which inputShape does not compare`)
   }
@@ -171,14 +172,15 @@ function onlyKnown(node: Record<string, unknown>, known: ReadonlySet<string>, wh
   }
 }
 
-function typesOf(node: Record<string, unknown>, where: string): string[] {
+function typesOf(node: Record<string, unknown>, where: string, strict: boolean): string[] {
   const raw = node['type']
   const names = typeof raw === 'string' ? [raw] : Array.isArray(raw) ? raw.map(String) : []
   return names.map((name) => {
     if (name !== 'array') return name
+    if (node['items'] === undefined && !strict) return 'array<>'
     const items = record(node['items'], `${where}.items`)
-    onlyKnown(items, ITEM_KEYS, `${where}.items`)
-    return `array<${typesOf(items, `${where}.items`).join('|')}>`
+    onlyKnown(items, ITEM_KEYS, `${where}.items`, strict)
+    return `array<${typesOf(items, `${where}.items`, strict).join('|')}>`
   })
 }
 
@@ -188,30 +190,33 @@ function typesOf(node: Record<string, unknown>, where: string): string[] {
  * `type: ['string', 'null']` and pydantic's `anyOf: [{type: string}, {type:
  * null}]` read the same.
  *
- * Throws on any keyword it does not compare, so a schema narrower than the
- * server's (an enum, a pattern, a length) cannot pass as equal by being ignored.
+ * Strict (the default) throws on any keyword it does not compare, so a schema
+ * narrower than the server's (an enum, a pattern, a length) cannot pass as
+ * equal by being ignored. `strict: false` reads a connected server's schema at
+ * boot, where a keyword this file does not know is not a reason to stop.
  */
-export function inputShape(schema: unknown): InputShape {
+export function inputShape(schema: unknown, options: { readonly strict?: boolean } = {}): InputShape {
+  const strict = options.strict ?? true
   const top = record(schema, 'schema')
-  onlyKnown(top, TOP_KEYS, 'schema')
+  onlyKnown(top, TOP_KEYS, 'schema', strict)
   if (top['type'] !== 'object') throw new Error('schema is not type: object')
   const properties = record(top['properties'] ?? {}, 'schema.properties')
   const shaped: Record<string, PropertyShape> = {}
   for (const [name, value] of Object.entries(properties)) {
     const where = `properties.${name}`
     const node = record(value, where)
-    onlyKnown(node, PROPERTY_KEYS, where)
-    const types = typesOf(node, where)
+    onlyKnown(node, PROPERTY_KEYS, where, strict)
+    const types = typesOf(node, where, strict)
     const branches = node['anyOf']
     if (branches !== undefined) {
       if (!Array.isArray(branches)) throw new Error(`${where}.anyOf is not an array`)
       branches.forEach((branch, i) => {
         const b = record(branch, `${where}.anyOf[${String(i)}]`)
-        onlyKnown(b, BRANCH_KEYS, `${where}.anyOf[${String(i)}]`)
-        types.push(...typesOf(b, `${where}.anyOf[${String(i)}]`))
+        onlyKnown(b, BRANCH_KEYS, `${where}.anyOf[${String(i)}]`, strict)
+        types.push(...typesOf(b, `${where}.anyOf[${String(i)}]`, strict))
       })
     }
-    if (types.length === 0) throw new Error(`${where} declares no type`)
+    if (types.length === 0 && strict) throw new Error(`${where} declares no type`)
     shaped[name] = {
       types: [...new Set(types)].sort(),
       ...('default' in node ? { default: node['default'] } : {}),

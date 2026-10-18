@@ -1,8 +1,10 @@
 // Checking the configured pmmcp goal tools against the connected server.
 //
-// The goal tool names and arguments in config/kernel.yaml are read from pmmcp's
-// source, not yet from its live `listTools`. The kernel therefore does not
-// assume: at boot it asks the hub what the server declares and compares.
+// The goal tool names and arguments in config/kernel.yaml match the operator's
+// live capture of 2026-10-18, and src/goals/pmmcp.ts types every call. A
+// capture is still a past fact, so the kernel does not assume: at boot it asks
+// the hub what the connected server declares and compares the names, the
+// arguments the server requires, and the type of every value the kernel sends.
 //
 // The result is a DEGRADATION, not a refusal. A kernel that will not start
 // because one tool is named differently takes away the control plane the operator
@@ -15,6 +17,7 @@
 // away from fixed.
 
 import type { McpHub } from '../mcp/hub.js'
+import { inputShape, SENDABLE_STATUSES } from '../mcp/pmmcp-schemas.js'
 import type { KernelConfig } from '../config.js'
 
 export type GoalsConfig = KernelConfig['goals']
@@ -29,6 +32,25 @@ export function requiredArgs(goals: GoalsConfig): { tool: string; args: string[]
     { tool: goals.tools.updateStatus, args: [a.goalId, a.status, a.progress] },
     { tool: goals.tools.get, args: [a.goalId] },
     { tool: goals.tools.list, args: [a.projectId] },
+  ]
+}
+
+export interface SentArg {
+  /** As kernel.yaml goals.args names it on the wire. */
+  readonly name: string
+  readonly type: 'string' | 'number'
+  /** False for an argument some calls leave out (an objective's parent; progress outside review). */
+  readonly always: boolean
+}
+
+/** What src/goals/pmmcp.ts puts on the wire, per tool the kernel calls. */
+export function sentArgs(goals: GoalsConfig): { tool: string; args: SentArg[] }[] {
+  const a = goals.args
+  const s = (name: string, always = true): SentArg => ({ name, type: 'string', always })
+  return [
+    { tool: goals.tools.create, args: [s(a.projectId), s(a.kind), s(a.title), s(a.parentId, false)] },
+    { tool: goals.tools.updateStatus, args: [s(a.goalId), s(a.status), { name: a.progress, type: 'number', always: false }] },
+    { tool: goals.tools.get, args: [s(a.goalId)] },
   ]
 }
 
@@ -75,6 +97,39 @@ export function goalToolsUnusable(
     }
   }
 
+  // Past the names: what the server requires and what it accepts. A tool or
+  // argument that is missing is already a problem above.
+  for (const { tool, args } of sentArgs(goals)) {
+    const described = hub.describe(serverId, tool)
+    if (described === undefined) continue
+    let shape
+    try {
+      shape = inputShape(described.inputSchema, { strict: false })
+    } catch (e) {
+      problems.push(`${serverId}.${tool} declares an inputSchema the kernel cannot read: ${e instanceof Error ? e.message : String(e)}`)
+      continue
+    }
+    const always = new Set(args.filter((arg) => arg.always).map((arg) => arg.name))
+    for (const name of shape.required) {
+      if (!always.has(name)) problems.push(`${serverId}.${tool} requires ${name}, which the kernel does not send on every call`)
+    }
+    for (const arg of args) {
+      const types = shape.properties[arg.name]?.types
+      if (types === undefined || types.length === 0) continue
+      const admitted = types.includes(arg.type) || (arg.type === 'number' && types.includes('integer'))
+      if (!admitted) problems.push(`${serverId}.${tool}.${arg.name} is ${types.join('|')}, but the kernel sends a ${arg.type}`)
+    }
+  }
+
+  // Not the server's to judge: a status the kernel may never send. The typed
+  // update refuses it per call; here it is named once, at boot, instead of as
+  // a stale goal per run.
+  for (const [status, sent] of Object.entries(goals.statuses)) {
+    if (!(SENDABLE_STATUSES as readonly string[]).includes(sent)) {
+      problems.push(`kernel.yaml goals.statuses.${status} is "${sent}"; the kernel sends only ${SENDABLE_STATUSES.join(', ')}`)
+    }
+  }
+
   if (problems.length === 0) return undefined
-  return `${problems.join('; ')}. Set goals.tools / goals.args in kernel.yaml, or run \`npm run capture:pmmcp\` to read the live schemas.`
+  return `${problems.join('; ')}. Set goals.tools / goals.args / goals.statuses in kernel.yaml, or run \`npm run capture:pmmcp\` to read the live schemas.`
 }

@@ -482,9 +482,10 @@ real tool count, and a reconnect after a `-32001` be tested with no pmmcp anywhe
 goal and vault tools are served verbatim from the capture
 (`test/fixtures/pmmcp-listtools.json`) and marked `confirmed` in `PMMCP_TOOLS`.
 The other tools' argument names are checked against the capture, but their types
-are not; `provenance` says which is which. Reply texts, the status vocabulary and
-the transition table are read from pmmcp's source: a capture shows arguments
-only.
+are not; `provenance` says which is which. Reply texts are read from pmmcp's
+source, because a capture shows arguments and descriptions but never replies; the
+status vocabulary and the transition table, which the captured `update_goal`
+states in prose, are held to it by `test/pmmcp-drift.test.ts`.
 
 ---
 

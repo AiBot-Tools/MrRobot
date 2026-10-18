@@ -29,7 +29,7 @@ import { parse as parseYaml } from 'yaml'
 import { parseKernelConfig } from '../src/config.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
 import { REPO_ROOT } from './helpers/kernel.js'
-import { PMMCP_TOOL_COUNT } from './helpers/mock-pmmcp.js'
+import { GOAL_STATUSES, GOAL_TRANSITIONS, PMMCP_TOOL_COUNT } from './helpers/mock-pmmcp.js'
 import {
   ABSENT_BY_INVARIANT,
   agreeingCapture,
@@ -69,6 +69,33 @@ test('the live capture agrees with the double and with the kernel\'s typed schem
     [],
     `the live pmmcp disagrees with this repo:\n  ${findings.join('\n  ')}\n` +
       'Each line is an assumption Phase 1 may have been built on.',
+  )
+})
+
+test("the double's status vocabulary and transition table are the ones the live update_goal describes", () => {
+  // pmmcp states both in prose (its tool description and the status
+  // argument's), not in the schema; the double enforces them hard, so a pmmcp
+  // that changed them would leave the kernel tested against rules it no
+  // longer has.
+  const capture = JSON.parse(readFileSync(CAPTURE, 'utf8')) as PmmcpCapture
+  const tool = capture.tools?.find((t) => t.name === 'update_goal')
+  const prose = tool?.description ?? ''
+  const described: Record<string, string[]> = {}
+  for (const m of prose.matchAll(/^\s*(\w+) → (.+)$/gmu)) {
+    const from = m[1]
+    const to = m[2]
+    if (from === undefined || to === undefined) continue
+    described[from] = to
+      .replace(/\s*\([^)]*\)\s*$/u, '')
+      .split(',')
+      .map((s) => s.trim())
+  }
+  assert.deepEqual(described, GOAL_TRANSITIONS, `update_goal describes: ${prose}`)
+
+  const status = tool?.inputSchema?.properties?.['status'] as { description?: string } | undefined
+  assert.deepEqual(
+    (status?.description ?? '').split(',').map((s) => s.trim()).sort(),
+    [...GOAL_STATUSES].sort(),
   )
 })
 

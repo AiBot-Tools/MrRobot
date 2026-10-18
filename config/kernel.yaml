@@ -80,7 +80,8 @@ sandbox:
 # pmmcp goal tools. Every name and argument here matches the operator's live
 # capture of 2026-10-18 (test/fixtures/pmmcp-listtools.json), and every call goes
 # through the typed wrappers in src/goals/pmmcp.ts. The reply texts are still
-# read from pmmcp's source: a listTools capture shows arguments only.
+# read from pmmcp's source: a listTools capture shows arguments and
+# descriptions, never replies.
 #
 # Config rather than constants, so a pmmcp upgrade that renames something is one
 # line of YAML instead of a patch. At boot the kernel compares these names, the

@@ -12,12 +12,12 @@
 // Confirmed means served exactly as the operator's live capture declares it
 // (test/fixtures/pmmcp-listtools.json, 2026-10-18), AND typed by the kernel in
 // src/mcp/pmmcp-schemas.ts, which test/pmmcp-schemas.test.ts holds to that
-// capture: the goal tools and get_secret/set_secret. The reply texts, the
-// status vocabulary and the transition table are still read from pmmcp's
-// source, because a listTools capture shows arguments and nothing else. Every
-// other tool's argument NAMES are checked against the capture by
-// test/pmmcp-drift.test.ts; their types are not, and `PMMCP_TOOLS[].provenance`
-// says which is which.
+// capture: the goal tools and get_secret/set_secret. The reply texts are still
+// read from pmmcp's source, because a listTools capture shows arguments and
+// descriptions, never replies; the status vocabulary and transition table are
+// held to the captured update_goal's own prose by test/pmmcp-drift.test.ts.
+// Every other tool's argument NAMES are checked against the capture there too;
+// their types are not, and `PMMCP_TOOLS[].provenance` says which is which.
 //
 // Two deliberate design choices, because a double can fail in both directions:
 //

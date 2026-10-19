@@ -17,8 +17,10 @@
 // tools/list only — no tool is invoked, so nothing in the operator's memory or
 // vault is read or written.
 //
-// The capture is a schema record and is safe to commit: tool names, descriptions
-// and input schemas. It contains no memory contents and no secret. Check it
+// The capture is a schema record and is safe to commit: tool names, descriptions,
+// input schemas and output schemas (kept since contract §6 step 2.1.3, so the
+// next capture shows whether pmmcp's goal tools publish a typed P6 result,
+// FastMCP's `{result: string}`, or nothing; see src/mcp/capture.ts). It contains no memory contents and no secret. Check it
 // anyway before committing — a description written by whoever authored the
 // server is text this repo has never seen.
 
@@ -30,20 +32,13 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { parse as parseYaml } from 'yaml'
 
 import { parseKernelConfig } from '../src/config.js'
-import { listAllTools, streamableHttpTransport } from '../src/mcp/hub.js'
+import { captureOf } from '../src/mcp/capture.js'
+import { listToolPages, streamableHttpTransport } from '../src/mcp/hub.js'
 import { redactString } from '../src/events/redact.js'
 import { bearerRefusal } from '../src/secrets/broker.js'
 import { VERSION } from '../src/version.js'
 
 export const CAPTURE_PATH = 'test/fixtures/pmmcp-listtools.json'
-
-interface Capture {
-  readonly capturedAt: string
-  readonly server: string
-  readonly url: string
-  readonly toolCount: number
-  readonly tools: readonly { name: string; description?: string; inputSchema: unknown }[]
-}
 
 async function main(argv: readonly string[]): Promise<number> {
   const repoRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
@@ -89,20 +84,8 @@ async function main(argv: readonly string[]): Promise<number> {
   try {
     // Paginated: a server that pages its tool list would otherwise be captured
     // one page deep, and a short capture reads exactly like a shrunken server.
-    const tools = await listAllTools(client)
-    const capture: Capture = {
-      capturedAt: new Date().toISOString(),
-      server: 'pmmcp',
-      url: server.url,
-      toolCount: tools.length,
-      tools: tools
-        .map((t) => ({
-          name: t.name,
-          ...(t.description === undefined ? {} : { description: t.description }),
-          inputSchema: t.inputSchema,
-        }))
-        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
-    }
+    const { tools, pages } = await listToolPages(client)
+    const capture = captureOf(tools, { capturedAt: new Date().toISOString(), server: 'pmmcp', url: server.url, pages })
     const out = args[0] ?? join(repoRoot, CAPTURE_PATH)
     writeFileSync(out, `${JSON.stringify(capture, null, 2)}\n`)
     process.stdout.write(`captured ${String(tools.length)} tools to ${out}\n`)

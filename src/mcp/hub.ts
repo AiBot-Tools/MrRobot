@@ -177,6 +177,11 @@ export interface ListedTool {
 }
 
 export async function listAllTools(client: Client): Promise<ListedTool[]> {
+  return (await listToolPages(client)).tools
+}
+
+/** The same walk, also counting the pages it took. */
+export async function listToolPages(client: Client): Promise<{ tools: ListedTool[]; pages: number }> {
   const all: ListedTool[] = []
   let cursor: string | undefined
   // A server that returned the same cursor forever would hang the kernel at
@@ -185,7 +190,7 @@ export async function listAllTools(client: Client): Promise<ListedTool[]> {
     const result = cursor === undefined ? await client.listTools() : await client.listTools({ cursor })
     all.push(...result.tools)
     cursor = result.nextCursor
-    if (cursor === undefined) return all
+    if (cursor === undefined) return { tools: all, pages: page + 1 }
   }
   throw new Error('tools/list did not terminate after 100 pages')
 }

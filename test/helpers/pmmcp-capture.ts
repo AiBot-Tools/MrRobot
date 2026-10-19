@@ -43,9 +43,12 @@ export interface CapturedTool {
   readonly inputSchema?:
     | { readonly type?: unknown; readonly properties?: Record<string, unknown>; readonly required?: readonly string[] }
     | undefined
+  readonly outputSchema?: unknown
 }
 
 export interface PmmcpCapture {
+  /** Set by captures taken since step 2.1.3; absent means outputs are unknown, not absent. */
+  readonly recordsOutputSchema?: boolean
   readonly capturedAt?: string
   readonly toolCount?: number
   readonly tools?: readonly CapturedTool[]

@@ -21,7 +21,7 @@ import { CREDENTIAL_NAME } from './helpers/guard.js'
 
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
@@ -402,6 +402,10 @@ test('runners started together on a stale lock: exactly one takes it, the rest r
   // check-then-delete let a late breaker delete the lock an earlier one had
   // just taken, so both ran. The drivers wait at a common gate so they reach
   // the lock within a millisecond of each other.
+  //
+  // The gate is set only once every driver has loaded and said so. A gate fixed
+  // at spawn time (it was spawn + 8 s) is missed on a loaded machine, where six
+  // tsx start-ups take longer, and the test then failed without running the race.
   const { root } = fixture(t)
   const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'])
   t.after(() => other.kill('SIGKILL'))
@@ -410,8 +414,13 @@ test('runners started together on a stale lock: exactly one takes it, the rest r
   const driver = join(root, 'race.ts')
   writeFileSync(
     driver,
-    `import { runSuites } from ${JSON.stringify(join(REPO_ROOT, 'scripts/falsify/runner.ts'))}
-const gate = Number(process.argv[2])
+    `import { existsSync, readFileSync } from 'node:fs'
+import { runSuites } from ${JSON.stringify(join(REPO_ROOT, 'scripts/falsify/runner.ts'))}
+const go = process.argv[2]
+process.stdout.write('ready\\n')
+// Wait cheaply for the gate, then spin on the clock so all six leave together.
+while (!existsSync(go)) await new Promise((r) => setTimeout(r, 5))
+const gate = Number(readFileSync(go, 'utf8'))
 if (Date.now() > gate) process.stdout.write('late\\n')
 while (Date.now() < gate) {}
 try {
@@ -430,14 +439,26 @@ try {
 `,
   )
   t.after(() => spawnSync('pkill', ['-KILL', '-f', driver]))
-  const gate = Date.now() + 8_000
+  const go = join(root, 'go')
   const runs = Array.from({ length: 6 }, () => {
-    const child = spawn(process.execPath, ['--import', 'tsx', driver, String(gate)], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'] })
+    const child = spawn(process.execPath, ['--import', 'tsx', driver, go], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'] })
     let out = ''
     child.stdout.on('data', (c: Buffer) => (out += c.toString('utf8')))
-    return new Promise<string>((resolve) => child.on('close', () => resolve(out)))
+    return {
+      // A driver that dies before it is ready settles too, and fails below.
+      ready: new Promise<void>((resolve) => {
+        child.stdout.on('data', () => out.includes('ready') && resolve())
+        child.on('close', () => resolve())
+      }),
+      closed: new Promise<string>((resolve) => child.on('close', () => resolve(out))),
+    }
   })
-  const outs = await Promise.all(runs)
+  await Promise.all(runs.map((r) => r.ready))
+  // Renamed into place, so no driver can read a half-written gate.
+  writeFileSync(`${go}.tmp`, String(Date.now() + 1_000))
+  renameSync(`${go}.tmp`, go)
+  const outs = await Promise.all(runs.map((r) => r.closed))
+  assert.equal(outs.filter((o) => o.includes('ready')).length, 6, outs.join('---'))
   assert.equal(outs.filter((o) => o.includes('late')).length, 0, 'a driver missed the gate, so the race was not run')
   assert.equal(outs.filter((o) => o.includes('holding')).length, 1, outs.join('---'))
   for (const o of outs.filter((x) => !x.includes('holding'))) {

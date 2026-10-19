@@ -103,8 +103,13 @@ function outputProblems(where: string, schema: unknown, statuses: readonly strin
     return [`${where} returns ${names.join(', ') || 'nothing'}, which the kernel's P6 result does not read`]
   }
   const problems: string[] = []
-  const extra = names.filter((n) => RESULT_TYPES[n] === undefined)
+  // Own keys only: `constructor` is not a field the kernel reads.
+  const extra = names.filter((n) => !Object.hasOwn(RESULT_TYPES, n))
   if (extra.length > 0) problems.push(`${where} returns ${extra.join(', ')}, which the kernel's P6 result does not read`)
+  // The SDK's validator demands every required name, declared or not; one the
+  // kernel does not read is refused by the strict parse whenever it is sent.
+  const demanded = shape.required.filter((n) => !Object.hasOwn(RESULT_TYPES, n) && !names.includes(n))
+  if (demanded.length > 0) problems.push(`${where} requires ${demanded.join(', ')}, which the kernel's P6 result does not read`)
   for (const [name, type] of Object.entries(RESULT_TYPES)) {
     const live = shape.properties[name]
     if (live === undefined) {

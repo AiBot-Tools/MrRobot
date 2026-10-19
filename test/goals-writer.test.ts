@@ -502,6 +502,12 @@ test("a live goal tool whose outputSchema the writer cannot read degrades goals 
     ['a field pmmcp may leave out', { update_goal: withProps({}, ['goal_id', 'project_id', 'status']) }, /pmmcp\.update_goal may leave out progress_pct/],
     ['a status enum without what the kernel sends', { update_goal: withProps({ status: { type: 'string', enum: ['pending', 'active', 'blocked'] } }) }, /leaves out in_progress/],
     ['a shape that is not a goal result', { create_goal: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] } }, /pmmcp\.create_goal returns ok, which the kernel's P6 result does not read/],
+    // The SDK demands a required name whether or not it is declared.
+    ['a required field it does not declare', { create_goal: withProps({}, ['goal_id', 'progress_pct', 'project_id', 'status', 'created_at']) }, /pmmcp\.create_goal requires created_at, which the kernel's P6 result does not read/],
+    // pydantic's Literal is a const: an enum of one.
+    ['a status Literal without what the kernel sends', { update_goal: withProps({ status: { type: 'string', const: 'pending' } }) }, /pmmcp\.update_goal returns status from pending, which leaves out in_progress/],
+    // Not a member of the kernel's field table, whatever Object.prototype says.
+    ['a field named like a prototype member', { create_goal: withProps({ constructor: { type: 'string' } }) }, /pmmcp\.create_goal returns constructor, which the kernel's P6 result does not read/],
   ]
   for (const [why, outputSchemas, reason] of cases) {
     const { hub } = await wired(t, { outputSchemas })

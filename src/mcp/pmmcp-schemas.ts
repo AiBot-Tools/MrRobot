@@ -250,6 +250,8 @@ export function inputShape(schema: unknown, options: { readonly strict?: boolean
     const limit = (part: Record<string, unknown>, partTypes: readonly string[]): void => {
       if (!partTypes.some((t) => t !== 'null')) return
       if (Array.isArray(part['enum'])) limited?.push(...(part['enum'] as unknown[]))
+      // pydantic writes a Literal as `const`; it narrows exactly as an enum of one.
+      else if ('const' in part) limited?.push(part['const'])
       else limited = undefined
     }
     limit(node, types)
@@ -267,11 +269,18 @@ export function inputShape(schema: unknown, options: { readonly strict?: boolean
     }
     if (types.length === 0 && strict) throw new Error(`${where} declares no type`)
     const known = strict || !opaque
-    shaped[name] = {
-      types: known ? [...new Set(types)].sort() : [],
-      ...('default' in node ? { default: node['default'] } : {}),
-      ...(!strict && known && limited !== undefined && limited.length > 0 ? { enum: limited } : {}),
-    }
+    // Defined, not assigned: a property named `__proto__` would otherwise set
+    // the prototype and vanish from the shape every check reads.
+    Object.defineProperty(shaped, name, {
+      value: {
+        types: known ? [...new Set(types)].sort() : [],
+        ...('default' in node ? { default: node['default'] } : {}),
+        ...(!strict && known && limited !== undefined && limited.length > 0 ? { enum: limited } : {}),
+      },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    })
   }
   const required = top['required']
   return {

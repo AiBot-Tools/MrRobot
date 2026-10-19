@@ -151,3 +151,16 @@ test("the P6 goal result is strict: an unknown key, a missing key, a status outs
     assert.deepEqual(kernel[name]?.types, declared[name]?.types, name)
   }
 })
+
+test('the lenient reader keeps a const as an enum of one, and a property named __proto__ as a property', () => {
+  const literal = { type: 'object', properties: { status: { type: 'string', const: 'pending' } } }
+  assert.deepEqual(inputShape(literal, { strict: false }).properties['status']?.enum, ['pending'])
+  // Strict still refuses it: a const is a narrowing the field-for-field comparison does not read.
+  assert.throws(() => inputShape(literal), /keyword "const"/)
+  // JSON.parse makes __proto__ an own key; assigned, it would set a prototype and vanish.
+  const proto = JSON.parse('{"type":"object","properties":{"__proto__":{"type":"string"}},"required":["__proto__"]}') as unknown
+  const shape = inputShape(proto, { strict: false })
+  assert.deepEqual(Object.keys(shape.properties), ['__proto__'])
+  assert.deepEqual(Object.getPrototypeOf(shape.properties), Object.prototype)
+  assert.deepEqual(shape.required, ['__proto__'])
+})

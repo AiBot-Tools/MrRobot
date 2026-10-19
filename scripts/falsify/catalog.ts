@@ -205,6 +205,9 @@ const goals: Suite = {
     { id: 'G43', file: GOAL_TOOLS, from: "${recordable(problems.join('; '), GOALS_REASON_BYTES)}", to: "${problems.join('; ')}", why: 'a drift reason quoting the server unbounded is too big or ill-formed to record, and goes unrecorded' },
     { id: 'G44', file: GOAL_TOOLS, from: '        const err = e instanceof Error ? e.message : String(e)\n', to: '        throw e\n', why: 'a re-check that throws after a reconnect ends the daemon' },
     { id: 'G45', file: GOAL_TOOLS, from: "        options.writer.degrade(reason)\n        options.store.append({ type: 'goals.degraded', payload: { schemaVersion: 1, reason } })\n", to: "        options.store.append({ type: 'goals.degraded', payload: { schemaVersion: 1, reason } })\n        options.writer.degrade(reason)\n", why: 'a drift the log will not take degrades the writer for the lost row, not for the drift' },
+    { id: 'G46', file: GOAL_TOOLS, from: '  if (demanded.length > 0) problems.push(', to: '  if (false) problems.push(', why: 'a result schema requiring a field it does not declare passes the boot check, and the SDK or the strict parse refuses every call' },
+    { id: 'G47', file: GOAL_TOOLS, from: '  const extra = names.filter((n) => !Object.hasOwn(RESULT_TYPES, n))', to: '  const extra = names.filter((n) => RESULT_TYPES[n] === undefined)', why: 'a result field named constructor passes the boot check through the prototype' },
+    { id: 'G48', file: PMMCP_SCHEMAS, from: "      else if ('const' in part) limited?.push(part['const'])\n", to: '', why: "a status Literal (pydantic's const) passes the boot check, and the SDK refuses every other status" },
   ],
   control: {
     id: 'C',

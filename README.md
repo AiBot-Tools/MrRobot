@@ -463,7 +463,9 @@ as successful text (`Error: Cannot transition…`, `Goal x not found.`); the wri
 counts a move only on pmmcp's own confirmation: `✅ Goal updated: <id>` today, or,
 from contract P6, a typed result naming the same goal, status and project (100 %
 for a review). A typed success it will not confirm is refused AND recorded as
-`goal.unconfirmed`, because pmmcp may have acted on it.
+`goal.unconfirmed`, because pmmcp may have acted on it; so is a created goal,
+typed or prose, whose id the kernel cannot record verbatim (masked, ill-formed,
+or past 128 bytes).
 
 Every pmmcp goal tool name and argument lives in `config/kernel.yaml` under
 `goals:`, confirmed by the operator's live capture of 2026-10-18, and every call

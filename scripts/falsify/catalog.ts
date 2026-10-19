@@ -217,9 +217,12 @@ const goals: Suite = {
     { id: 'G55', file: GOAL_TOOLS, from: '      if (!options.writer.available) return\n', to: '', why: 'every later drift is recorded again under a writer already off' },
     { id: 'G56', file: KERNEL, from: '    const unwatchGoals = watchGoalTools({ store, hub, goals: config.goals, writer: goalWriter })', to: '    const unwatchGoals = (): void => {}', why: 'the daemon never re-checks a pmmcp redeployed under it' },
     { id: 'G57', file: WRITER, from: ' P6 goal result (${ids}): ${z.prettifyError', to: ' P6 goal result: ${z.prettifyError', why: 'a refused result names none of the ids pmmcp gave, and a move loses the other goal it named' },
-    { id: 'G58', file: WRITER, from: '    if (recordable(goalId, 128) !== goalId) {', to: '    if (false) {', why: 'a goal id no record holds verbatim becomes a goal.created that names another goal, or throws and leaves no record' },
+    { id: 'G58', file: WRITER, from: '    if (recordable(goalId, 128) !== goalId) {', to: '    if (false) {', why: 'a masked, ill-formed or over-long goal id becomes a goal.created no later record can name, or throws and leaves no record' },
     { id: 'G59', file: GOAL_TOOLS, from: '    return unsent.length === 0 ? [] :', to: '    return true ? [] :', why: "a {result} wrapper schema that requires more passes the boot check, and the SDK refuses every call" },
     { id: 'G60', file: WRITER, from: "      if (v.project_id !== context.projectId) off.push(`project_id ${quoted(v.project_id)}`)", to: "      if (v.project_id !== context.projectId) off.push(`project_id ${v.project_id}`)", why: 'a long project in a refused move pushes the rest of the reason past the record' },
+    { id: 'G61', file: WRITER, from: '    if (recordable(goalId, 128) !== goalId) {', to: "    if (reply.kind === 'typed' && recordable(goalId, 128) !== goalId) {", why: "today's prose path writes a goal.created under a masked, ill-formed or over-long id" },
+    { id: 'G62', file: WRITER, from: 'verbatim (${quoted(goalId)}); ${reason}', to: 'verbatim; ${reason}', why: 'an orphan whose id cannot be recorded leaves no trace of that id when the reason does not quote it' },
+    { id: 'G63', file: WRITER, from: "throw disagreement(tool, goalIdOf([{ type: 'text', text }]), goalIdOf([{ type: 'text', text: wrapped }]))", to: 'throw disagreement(tool, goalNamedIn(text.trim()), goalNamedIn(wrapped.trim()))', why: 'a {result} disagreement in bare-id or JSON prose says neither form names a goal' },
   ],
   control: {
     id: 'C',

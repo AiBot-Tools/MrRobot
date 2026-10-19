@@ -235,9 +235,11 @@ export const GoalStatusPayload = z
   .strict()
 
 /**
- * pmmcp answered a goal call with a typed (contract P6) success the kernel
- * would not confirm: another project, two forms that disagree, a result it
- * does not read, or one the SDK refused against the tool's own schema. pmmcp
+ * pmmcp answered a goal call with a success the kernel would not confirm: a
+ * typed (contract P6) one in another project, with two forms that disagree, of
+ * a shape it does not read, or refused by the SDK against the tool's own
+ * schema; or a create, typed or prose, whose goal id the kernel cannot record
+ * verbatim (masked, ill-formed, or past 128 bytes). pmmcp
  * may have written it, so the goal may exist with no `goal.created` or
  * `goal.status` claiming it; this row is that orphan's record (operator
  * decision, 2026-10-19). `goalId` is the goal the row is about: for a create,

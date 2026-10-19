@@ -346,7 +346,7 @@ test('a typed create the kernel will not confirm is refused, records the orphan,
   // [why, double, refusal, the orphan row's goalId]
   const cases: [string, Parameters<typeof pmmcpMock>[0], RegExp, string | undefined][] = [
     // Both forms agree, on another project: only the project check can refuse it.
-    ['another project', { ...P6, skew: { create_goal: { fields: { project_id: 'aos/elsewhere' } } } }, /pmmcp reports it in aos\/elsewhere, not aos\/ceo/, ONE],
+    ['another project', { ...P6, skew: { create_goal: { fields: { project_id: 'aos/elsewhere' } } } }, /pmmcp reports goal_000000000001 in aos\/elsewhere, not aos\/ceo/, ONE],
     // Only structuredContent names another goal: only the agreement check can,
     // and with two ids for one write the row claims neither and names both.
     ['forms that disagree on the goal', { ...P6, skew: { create_goal: { fields: { goal_id: 'goal_ffffffffffff' }, where: 'structured' } } }, /disagree: the text names goal_000000000001, structuredContent goal_ffffffffffff/, undefined],
@@ -426,9 +426,10 @@ test('a refused move names the goal the kernel asked to move, and any other id p
 test('what pmmcp says in a refused create reaches goal.unconfirmed redacted, whole and well-formed, and the refusal stays a GoalWriteFailed', async (t) => {
   // Fabricated, as everywhere in the tests.
   const pem = `-----BEGIN RSA PRIVATE KEY-----\n${'Q'.repeat(1_000)}\n-----END RSA PRIVATE KEY-----`
-  // The reason is "pmmcp reports it in <project_id>, not aos/ceo": 20 units of
-  // preamble put this emoji's high surrogate at unit 499, where a 500 cut halves it.
-  const split = `${'x'.repeat(479)}\u{1F600}tail`
+  // The project is quoted bounded (128 bytes) before the reason is cut at 500:
+  // these hold that bound to the same rules. Text that reaches the 500 cut
+  // whole has its own test below.
+  const split = `${'x'.repeat(122)}\u{1F600}tail`
   const cases: [string, string][] = [
     ['a credential across the cut', pem],
     ['an astral character across the cut', split],
@@ -449,7 +450,7 @@ test('what pmmcp says in a refused create reaches goal.unconfirmed redacted, who
     assert.equal(orphans.length, 1, `${why}: the orphan went unrecorded`)
     const reason = String(orphans[0]?.['reason'])
     assert.ok(!reason.includes('QQQQ'), `${why}: the key body is in the log`)
-    assert.match(reason, /^pmmcp reports it in /, why)
+    assert.match(reason, /^pmmcp reports goal_000000000001 in /, why)
     assert.ok(Buffer.byteLength(reason, 'utf8') <= 500, why)
     assert.equal(orphans[0]?.['goalId'], 'goal_000000000001', why)
     assert.equal(store.verifyChain().ok, true, why)
@@ -463,21 +464,31 @@ test('a goal.unconfirmed the store will not take still leaves the refusal a Goal
     () => writer.materialise(plan(), PROJECT, 'run_1'),
     (e: unknown) => {
       assert.ok(e instanceof GoalWriteFailed, `escaped as ${String(e)}`)
-      assert.match(e.message, /pmmcp reports it in aos\/elsewhere/)
+      assert.match(e.message, /pmmcp reports goal_000000000001 in aos\/elsewhere/)
       return true
     },
   )
 })
 
-test('a goal id pmmcp gave that no record holds verbatim is an orphan with a record, never a goal.created', async (t) => {
+test('a goal id pmmcp gave that is masked, ill-formed or past 128 bytes is an orphan with a record, never a goal.created, typed or prose', async (t) => {
   // Fabricated, as everywhere in the tests: shaped like a key, so the log masks it.
-  const cases: [string, string][] = [
-    ['a lone surrogate', 'goal_\ud800'],
-    ['an id shaped like a credential', 'sk-ant-abcdefgh1234'],
-    ['an id past 128 bytes in fewer than 128 units', `goal_${'é'.repeat(100)}`],
+  const ids: [string, string, RegExp][] = [
+    ['a lone surrogate', 'goal_\ud800', /goal_\ufffd/],
+    ['an id shaped like a credential', 'sk-ant-abcdefgh1234', /\[REDACTED\]/],
+    ['an id past 128 bytes in fewer than 128 units', `goal_${'é'.repeat(100)}`, /goal_é+…/],
   ]
-  for (const [why, id] of cases) {
-    const { store, mock, writer } = await wired(t, { ...P6, skew: { create_goal: { fields: { goal_id: id } } } })
+  const cases: [string, Parameters<typeof pmmcpMock>[0], RegExp][] = []
+  for (const [what, id, quote] of ids) {
+    cases.push([`typed: ${what}`, { ...P6, skew: { create_goal: { fields: { goal_id: id } } } }, quote])
+    // Typed, in another project too: refused for the project, and the id still quoted.
+    cases.push([`typed, another project: ${what}`, { ...P6, skew: { create_goal: { fields: { goal_id: id, project_id: 'aos/other' } } } }, quote])
+    // Today's pmmcp: prose, in each shape the prose reader reads.
+    for (const goalIdShape of ['pmmcp', 'bare', 'json'] as const) {
+      cases.push([`prose (${goalIdShape}): ${what}`, { goalIdShape, firstGoalId: id }, quote])
+    }
+  }
+  for (const [why, options, quote] of cases) {
+    const { store, mock, writer } = await wired(t, options)
     await assert.rejects(
       () => writer.materialise(plan(), PROJECT, 'run_1'),
       (e: unknown) => {
@@ -490,7 +501,37 @@ test('a goal id pmmcp gave that no record holds verbatim is an orphan with a rec
     const orphans = payloads(store, 'goal.unconfirmed')
     assert.equal(orphans.length, 1, why)
     assert.equal(orphans[0]?.['goalId'], undefined, why)
-    assert.match(String(orphans[0]?.['reason']), /goal id is not recordable verbatim/, why)
+    const reason = String(orphans[0]?.['reason'])
+    assert.match(reason, /goal id is not recordable verbatim/, why)
+    assert.match(reason, quote, `${why}: the record does not quote the id`)
+  }
+})
+
+test('pmmcp text that reaches the record whole is redacted before the 500-byte cut, and cut on a code point', async (t) => {
+  // A refused result's unread key names are pmmcp's, and reach the reason
+  // unbounded through the parser's message.
+  const pem = `-----BEGIN RSA PRIVATE KEY-----${'Q'.repeat(1_000)}-----END RSA PRIVATE KEY-----`
+  const keys: [string, string][] = [['a credential across the cut', pem], ['a lone surrogate', 'k\ud800']]
+  // One padding per unit, so one of them puts the emoji across the cut whatever the preamble.
+  for (let pad = 360; pad < 400; pad++) keys.push([`an astral character after ${String(pad)}`, `${'x'.repeat(pad)}\u{1F600}${'y'.repeat(200)}`])
+  for (const [why, key] of keys) {
+    const { store, mock, writer } = await wired(t, { ...P6, skew: { create_goal: { fields: { [key]: 'x' } } } })
+    await assert.rejects(
+      () => writer.materialise(plan(), PROJECT, 'run_1'),
+      (e: unknown) => {
+        assert.ok(e instanceof GoalWriteFailed, `${why}: escaped as ${String(e)}`)
+        assert.ok(!e.message.includes('QQQQ'), `${why}: the refusal carries the key`)
+        return true
+      },
+    )
+    assert.equal(mock.state.goals.size, 1, why)
+    const orphans = payloads(store, 'goal.unconfirmed')
+    assert.equal(orphans.length, 1, `${why}: the orphan went unrecorded`)
+    const reason = String(orphans[0]?.['reason'])
+    assert.match(reason, /^create_goal returned structuredContent that is not a P6 goal result \(it names goal_000000000001\)/, why)
+    assert.ok(!reason.includes('QQQQ'), `${why}: the key body is in the log`)
+    assert.ok(Buffer.byteLength(reason, 'utf8') <= 500, why)
+    assert.equal(orphans[0]?.['goalId'], 'goal_000000000001', why)
   }
 })
 
@@ -502,7 +543,7 @@ test('a typed goal id longer than any record holds is refused, and the orphan is
   const orphans = payloads(store, 'goal.unconfirmed')
   assert.equal(orphans.length, 1)
   assert.equal(orphans[0]?.['goalId'], undefined, 'a cut id names some other goal')
-  assert.match(String(orphans[0]?.['reason']), /^pmmcp's goal id is not recordable verbatim; .*not a P6 goal result/s)
+  assert.match(String(orphans[0]?.['reason']), /^pmmcp's goal id is not recordable verbatim \(goal_f+…\); .*not a P6 goal result/s)
 })
 
 test("a move is confirmed from structuredContent: P6's JSON-only reply is a move, and a reply naming another status, goal or project, or a review below 100 %, is not recorded", async (t) => {
@@ -575,9 +616,9 @@ test("a live goal tool whose outputSchema the writer cannot read degrades goals 
     ['a required field it does not declare', { create_goal: withProps({}, ['goal_id', 'progress_pct', 'project_id', 'status', 'created_at']) }, /pmmcp\.create_goal requires created_at, which the kernel's P6 result does not read/],
     // pydantic's Literal is a const: an enum of one.
     ['a status Literal without what the kernel sends', { update_goal: withProps({ status: { type: 'string', const: 'pending' } }) }, /pmmcp\.update_goal returns status from pending, which leaves out in_progress/],
-    // Not a member of the kernel's field table, whatever Object.prototype says.
     // FastMCP's wrapper sends {result} and nothing else.
     ['a {result} wrapper that requires more', { create_goal: { type: 'object', properties: { result: { type: 'string' } }, required: ['result', 'created_at'] } }, /pmmcp\.create_goal requires created_at beside FastMCP's \{result\}/],
+    // Not a member of the kernel's field table, whatever Object.prototype says.
     ['a field named like a prototype member', { create_goal: withProps({ constructor: { type: 'string' } }) }, /pmmcp\.create_goal returns constructor, which the kernel's P6 result does not read/],
   ]
   for (const [why, outputSchemas, reason] of cases) {
@@ -710,6 +751,15 @@ test('a FastMCP {result} that says something its text does not is refused and re
   assert.equal(orphans.length, 1)
   assert.equal(orphans[0]?.['goalId'], undefined)
   assert.match(String(orphans[0]?.['reason']), /disagree: the text names goal_000000000001, structuredContent goal_ffffffffffff/)
+
+  // Prose in the other shapes the prose reader reads: a bare id names a goal too.
+  const bare = await wired(t, {
+    goalIdShape: 'bare',
+    outputs: { create_goal: 'wrapped', update_goal: 'wrapped' },
+    skew: { create_goal: { fields: { result: 'goal_ffffffffffff' }, where: 'structured' } },
+  })
+  await assert.rejects(() => bare.writer.materialise(plan(), PROJECT, 'run_1'), GoalWriteFailed)
+  assert.match(String(payloads(bare.store, 'goal.unconfirmed')[0]?.['reason']), /disagree: the text names goal_000000000001, structuredContent goal_ffffffffffff/)
 
   // A {result} that names the same goal and differs elsewhere: that goal is the orphan.
   const same = await wired(t, {

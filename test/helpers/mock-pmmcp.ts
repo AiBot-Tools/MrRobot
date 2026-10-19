@@ -521,6 +521,8 @@ export interface PmmcpMockOptions {
    * writer must refuse rather than guess at.
    */
   readonly goalIdShape?: 'pmmcp' | 'json' | 'bare' | 'prose'
+  /** Mint this id for the first create instead of pmmcp's `goal_<hex>`, in whatever shape the reply takes. */
+  readonly firstGoalId?: string
   /**
    * Fault injection: calls to a tool BEYOND this count return an isError result.
    *
@@ -682,6 +684,7 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
   // pmmcp's shape: `goal_` + 12 hex (uuid4().hex[:12]); deterministic here.
   const nextGoalId = (): string => {
     seq += 1
+    if (seq === 1 && options.firstGoalId !== undefined) return options.firstGoalId
     return `goal_${seq.toString(16).padStart(12, '0')}`
   }
 

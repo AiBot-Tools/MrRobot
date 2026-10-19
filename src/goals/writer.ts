@@ -35,7 +35,8 @@
 //   It reads contract P6's typed result when pmmcp sends one, and today's prose
 //   when it does not (§6 step 2). A typed success it will not confirm (another
 //   project, a text that says something else, a shape it does not read) may
-//   still have been written, so it is refused AND recorded as `goal.unconfirmed`.
+//   still have been written, so it is refused AND recorded as `goal.unconfirmed`;
+//   so is a created goal, typed or prose, whose id it cannot record verbatim.
 //
 //   It stops at the FIRST failure and reports what it had written. A partial tree
 //   is a fact on the server; pretending the whole write failed would leave goals
@@ -198,8 +199,9 @@ function replyOf(tool: string, result: GoalCallResult): Reply {
   const keys = Object.keys(structured)
   const wrapped = structured['result']
   if (keys.length === 1 && keys[0] === 'result' && typeof wrapped === 'string') {
+    // Both forms are prose, so each is read the way prose is (goalIdOf).
     if (wrapped !== text) {
-      throw disagreement(tool, goalNamedIn(trimmed), goalNamedIn(wrapped.trim()))
+      throw disagreement(tool, goalIdOf([{ type: 'text', text }]), goalIdOf([{ type: 'text', text: wrapped }]))
     }
     return { kind: 'prose' }
   }
@@ -289,7 +291,7 @@ export class GoalWriter {
    */
   #recordUnconfirmed(tool: string, projectId: string, goalId: string | undefined, reason: string): void {
     const id = goalId !== undefined && recordable(goalId, 128) === goalId ? goalId : undefined
-    const why = goalId !== undefined && id === undefined ? `pmmcp's goal id is not recordable verbatim; ${reason}` : reason
+    const why = goalId !== undefined && id === undefined ? `pmmcp's goal id is not recordable verbatim (${quoted(goalId)}); ${reason}` : reason
     try {
       this.#o.store.append({
         type: 'goal.unconfirmed',
@@ -317,7 +319,9 @@ export class GoalWriter {
   /**
    * Create one goal and return the id the SERVER gave it.
    *
-   * @throws {GoalWriteFailed} when the result holds no readable id.
+   * @throws {GoalWriteFailed} when the result holds no readable id, or one the
+   *   kernel will not confirm or cannot record verbatim (then also recorded as
+   *   goal.unconfirmed).
    */
   async #create(input: {
     projectId: string
@@ -357,7 +361,7 @@ export class GoalWriter {
       throw e
     }
     if (reply.kind === 'typed' && reply.value.project_id !== input.projectId) {
-      const where = `pmmcp reports it in ${quoted(reply.value.project_id)}, not ${input.projectId}`
+      const where = `pmmcp reports ${quoted(reply.value.goal_id)} in ${quoted(reply.value.project_id)}, not ${input.projectId}`
       throw this.#unconfirmed(tool, input.projectId, reply.value.goal_id, where, input.written)
     }
 
@@ -372,9 +376,11 @@ export class GoalWriter {
         input.written,
       )
     }
-    // pmmcp wrote it, so an id no record holds verbatim (too long, ill-formed,
-    // or shaped like a credential and so masked) is an orphan with a record:
-    // as goal.created it would name some other goal, or fail to append at all.
+    // Every later record of this goal (goal.status, a refused move's
+    // goal.unconfirmed) must name it by the id goal.created holds. A masked id
+    // (shaped like a credential) names no goal, an ill-formed one cannot be
+    // appended, and one past 128 bytes no refused move could name. pmmcp wrote
+    // it, so on either path such an id is an orphan with a record instead.
     if (recordable(goalId, 128) !== goalId) {
       throw this.#unconfirmed(tool, input.projectId, undefined, `pmmcp's goal id is not recordable verbatim: ${quoted(goalId)}`, input.written)
     }

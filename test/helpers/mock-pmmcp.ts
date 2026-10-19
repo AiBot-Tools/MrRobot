@@ -10,7 +10,9 @@
 // WHAT IS CONFIRMED AND WHAT IS MODELLED
 //
 // Confirmed means served exactly as the operator's live capture declares it
-// (test/fixtures/pmmcp-listtools.json, 2026-10-18), AND typed by the kernel in
+// (test/fixtures/pmmcp-listtools.json, 2026-10-18; re-taken 2026-10-19, which
+// also records every tool's output: FastMCP's {result}, DEFAULT_OUTPUT here,
+// held to the capture by test/pmmcp-drift.test.ts), AND typed by the kernel in
 // src/mcp/pmmcp-schemas.ts, which test/pmmcp-schemas.test.ts holds to that
 // capture: the goal tools and get_secret/set_secret. The reply texts are still
 // read from pmmcp's source, because a listTools capture shows arguments and
@@ -409,7 +411,7 @@ export const PMMCP_TOOLS: readonly PmmcpToolSpec[] = [
   },
 ]
 
-/** pmmcp's real tool count, from the live capture of 2026-10-18. */
+/** pmmcp's real tool count, from the live capture (2026-10-18; unchanged 2026-10-19). */
 export const PMMCP_TOOL_COUNT = 64
 
 /**
@@ -484,12 +486,14 @@ export interface PmmcpMockOptions {
   /** P5's two wire forms: raised in a tool body, or at dispatch. Default `body`. */
   readonly p5Form?: 'body' | 'dispatch'
   /**
-   * Per tool, what a success carries besides text. `prose` (the default) is
-   * today's capture: no outputSchema. `wrapped` is FastMCP's automatic output for
-   * a `-> str` tool, `{result: <the text>}`. `structured` is contract P6's typed
-   * result, for create_goal, update_goal and get_goal_tree only, and needs
+   * Per tool, what a success carries besides text. `wrapped` (the default,
+   * DEFAULT_OUTPUT) is what the live capture of 2026-10-19 records for every
+   * tool: FastMCP's automatic output for a `-> str` tool, `{result: <the
+   * text>}`. `prose` is a server with no outputSchema (pmmcp before its SDK
+   * wrapped). `structured` is contract P6's typed result, for create_goal,
+   * update_goal and get_goal_tree only, MODELLED from the contract, and needs
    * `refusals: 'p5'`: once a tool declares an outputSchema, the client refuses a
-   * success without structuredContent. Both modes are MODELLED, never confirmed.
+   * success without structuredContent.
    */
   readonly outputs?: Readonly<Record<string, OutputMode>>
   /** The text block beside a `structured` result: its JSON (P6, the default), today's prose, or none. */
@@ -578,6 +582,13 @@ function fail(message: string): CallToolResult {
 
 export type OutputMode = 'prose' | 'wrapped' | 'structured'
 
+/**
+ * The output every tool has when a test names none: the live server's, as the
+ * operator's capture of 2026-10-19 records it (test/fixtures/pmmcp-listtools.json,
+ * all 64 tools). test/pmmcp-drift.test.ts holds the two together.
+ */
+export const DEFAULT_OUTPUT: OutputMode = 'wrapped'
+
 export interface SkewSpec {
   readonly fields: Readonly<Record<string, unknown>>
   readonly where?: 'both' | 'structured'
@@ -641,6 +652,13 @@ export function wrappedOutput(tool: string): Readonly<Record<string, unknown>> {
   }
 }
 
+/** The outputSchema a tool declares in a given mode, or undefined for none. */
+export function outputSchemaFor(tool: string, mode: OutputMode): Readonly<Record<string, unknown>> | undefined {
+  if (mode === 'wrapped') return wrappedOutput(tool)
+  if (mode === 'structured') return tool === 'get_goal_tree' ? GOAL_TREE_OUTPUT : GOAL_RESULT_OUTPUT
+  return undefined
+}
+
 export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
   const secretArg = options.secretArg ?? 'label'
   const now = options.now ?? ((): number => Date.now())
@@ -659,7 +677,7 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     }
   }
   for (const [tool, spec] of Object.entries(options.skew ?? {})) {
-    const mode = outputs[tool] ?? 'prose'
+    const mode = outputs[tool] ?? DEFAULT_OUTPUT
     if (mode === 'prose') throw new Error(`skew.${tool} bends structuredContent, which a prose output does not have`)
     const textBent = mode === 'structured' && options.structuredText !== 'prose'
     if ((spec.where ?? 'both') === 'both' && !textBent) {
@@ -709,10 +727,7 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
   const outputSchemaOf = (tool: string): Readonly<Record<string, unknown>> | undefined => {
     const declared = options.outputSchemas?.[tool]
     if (declared !== undefined) return declared
-    const mode = outputs[tool] ?? 'prose'
-    if (mode === 'wrapped') return wrappedOutput(tool)
-    if (mode === 'structured') return tool === 'get_goal_tree' ? GOAL_TREE_OUTPUT : GOAL_RESULT_OUTPUT
-    return undefined
+    return outputSchemaFor(tool, outputs[tool] ?? DEFAULT_OUTPUT)
   }
 
   const tools: Tool[] = specs.map((spec) => {
@@ -784,7 +799,7 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
   // What a success looks like on the wire, per tool's output mode. A refusal
   // (isError) goes out as it is: the client validates only successes.
   const shaped = (tool: string, result: CallToolResult): CallToolResult => {
-    const mode = outputs[tool] ?? 'prose'
+    const mode = outputs[tool] ?? DEFAULT_OUTPUT
     if (mode === 'prose' || result.isError === true) return result
     const text = (result.content as { text?: unknown }[]).map((b) => (typeof b.text === 'string' ? b.text : '')).join('')
     const skew = options.skew?.[tool]

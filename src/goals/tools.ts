@@ -87,7 +87,7 @@ const RESULT_TYPES: Readonly<Record<string, 'string' | 'number'>> = {
  * call AFTER pmmcp had written the goal, one orphan per run; named here, it is
  * one degradation and no write.
  */
-function outputProblems(where: string, schema: unknown, statuses: readonly string[]): string[] {
+export function outputProblems(where: string, schema: unknown, statuses: readonly string[]): string[] {
   if (schema === undefined) return []
   let shape
   try {

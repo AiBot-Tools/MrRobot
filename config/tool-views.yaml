@@ -5,7 +5,7 @@
 # classified is unreachable by agents rather than quietly available — which is
 # what matters on a server that gains tools between releases.
 #
-# pmmcp registers 64 tools (the operator's capture, 2026-10-18). This file
+# pmmcp registers 64 tools (the operator's capture, re-taken 2026-10-19). This file
 # classifies NINETEEN of them, and every one is pinned CLOSED. Nothing is
 # exposed to agents. The rest are not invented here: they resolve to
 # kernel-only by the literal default, and the hub emits `hub.tools.classified`

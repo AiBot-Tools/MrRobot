@@ -3037,6 +3037,18 @@ Kept so the next design pass can amend the docs:
 - `get_secret` takes `label` and an optional `project_id`.
 - `restore_backup` does not exist on the live server.
 
+**Settled by the re-capture with output schemas** (2026-10-19, 64 tools):
+
+- Every tool declares the output schema `{result: string}` (required), titled
+  `<tool>Output`: FastMCP's automatic output for a tool returning `str`. So
+  pmmcp sends each reply's text twice, as content and as `structuredContent`.
+  That it is v1 FastMCP is read from that shape (I); the exact `mcp` version
+  is still open below.
+- `recall`'s `project_id` now also takes `'*'`, which searches every project.
+  That is a second road to cross-project reads beside an absent `project_id`,
+  so P2's refusal must cover it too. The kernel's gate already sets an
+  agent's `project_id` and refuses any other value, `'*'` included.
+
 **Still open:**
 
 - **pmmcp's SDK.** Its `mcp` version: v1 FastMCP or v2 MCPServer, and whether

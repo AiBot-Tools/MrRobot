@@ -11,7 +11,7 @@ import { listToolPages } from '../src/mcp/hub.js'
 import { GOAL_RESULT_OUTPUT, pmmcpMock } from './helpers/mock-pmmcp.js'
 
 test('a capture keeps every tool\'s outputSchema verbatim and says that it records them', async (t) => {
-  const mock = pmmcpMock({ refusals: 'p5', outputs: { create_goal: 'structured', get_secret: 'wrapped' } })
+  const mock = pmmcpMock({ refusals: 'p5', outputs: { create_goal: 'structured', get_secret: 'wrapped', remember: 'prose' } })
   t.after(async () => {
     await mock.close()
   })

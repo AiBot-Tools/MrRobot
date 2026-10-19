@@ -22,6 +22,7 @@ import {
   PMMCP_TOOLS,
   PMMCP_TOOL_COUNT,
   pmmcpMock,
+  wrappedOutput,
   type PmmcpMock,
 } from './helpers/mock-pmmcp.js'
 import { inputShape, liveJsonSchema, PMMCP_LIVE, type PmmcpLiveTool } from '../src/mcp/pmmcp-schemas.js'
@@ -350,11 +351,11 @@ test('padTo reaches pmmcp\'s real cardinality with visibly fake placeholders', a
 
 // ── contract P5 and P6, opt-in ───────────────────────────────────────────────
 //
-// The live server is today's prose server, so that stays the default. These
-// modes are MODELLED from contract §3 P5/P6 and FastMCP's own wrapping of a
-// `-> str` tool; the SDK client below validates them as it would the real thing.
+// The default is the live server as the capture of 2026-10-19 records it:
+// FastMCP wraps every tool's text as `{result}`. P5 and P6 are MODELLED from
+// contract §3; the SDK client below validates every mode as it would the real thing.
 
-test('structured goal tools declare object-rooted output schemas and answer with structuredContent and the same JSON as text; by default they declare none', async (t) => {
+test("structured goal tools declare object-rooted output schemas and answer with structuredContent and the same JSON as text; by default they declare the live capture's {result} wrapper", async (t) => {
   const { mock, client } = await open(t, {
     refusals: 'p5',
     outputs: { create_goal: 'structured', update_goal: 'structured', get_goal_tree: 'structured' },
@@ -364,7 +365,7 @@ test('structured goal tools declare object-rooted output schemas and answer with
     listed.tools.find((x) => x.name === name)?.outputSchema as Record<string, unknown> | undefined
   assert.equal(schemaOf('create_goal')?.['type'], 'object')
   assert.ok((schemaOf('get_goal_tree')?.['$defs'] as Record<string, unknown> | undefined)?.['GoalNode'])
-  assert.equal(schemaOf('list_goals'), undefined, 'list_goals stays prose: P6 gives it no shape')
+  assert.deepEqual(schemaOf('list_goals'), wrappedOutput('list_goals'), "list_goals keeps the live wrapper: P6 gives it no shape")
 
   const created = await client.callTool({
     name: 'create_goal',
@@ -382,11 +383,23 @@ test('structured goal tools declare object-rooted output schemas and answer with
   const tree = await client.callTool({ name: 'get_goal_tree', arguments: { goal_id: goalId } })
   assert.equal((tree.structuredContent as Record<string, unknown>)['goal_type'], 'objective')
 
-  const plain = await open(t)
+  // Today's pmmcp: every tool declares FastMCP's wrapper and sends its text twice.
+  const live = await open(t)
+  const liveList = await live.client.listTools()
+  for (const name of ['create_goal', 'update_goal', 'get_goal_tree', 'list_goals', 'recall']) {
+    assert.deepEqual(liveList.tools.find((x) => x.name === name)?.outputSchema, wrappedOutput(name), name)
+  }
+  const wrapped = await live.client.callTool({ name: 'create_goal', arguments: { project_id: 'aos/ceo', goal_type: 'objective', title: 'x' } })
+  const wrappedText = (wrapped.content as { text: string }[])[0]?.text ?? ''
+  assert.match(wrappedText, /^✅ Goal created: /u)
+  assert.deepEqual(wrapped.structuredContent, { result: wrappedText })
+
+  // A server with no outputSchema (pmmcp before its SDK wrapped) is asked for by name.
+  const plain = await open(t, { outputs: { create_goal: 'prose' } })
   const plainList = await plain.client.listTools()
   assert.equal(plainList.tools.find((x) => x.name === 'create_goal')?.outputSchema, undefined)
-  const prose = await call(plain.client, 'create_goal', { project_id: 'aos/ceo', goal_type: 'objective', title: 'x' })
-  assert.match(prose.text, /^✅ Goal created: /u)
+  const prose = await plain.client.callTool({ name: 'create_goal', arguments: { project_id: 'aos/ceo', goal_type: 'objective', title: 'x' } })
+  assert.equal(prose.structuredContent, undefined)
 })
 
 test('P5 refusals are isError with a code, in both wire forms, and a not-found message never quotes what it was sent', async (t) => {
@@ -475,7 +488,7 @@ test("FastMCP's wrapper and the skew option: the forms the kernel must tell apar
     () => pmmcpMock({ refusals: 'p5', outputs, structuredText: 'prose', skew: { create_goal: { fields: { goal_id: 'goal_ffffffffffff' } } } }),
     /say where: 'structured'/,
   )
-  assert.throws(() => pmmcpMock({ skew: { create_goal: { fields: { goal_id: 'x' } } } }), /a prose output does not have/)
+  assert.throws(() => pmmcpMock({ outputs: { create_goal: 'prose' }, skew: { create_goal: { fields: { goal_id: 'x' } } } }), /a prose output does not have/)
 
   assert.throws(() => pmmcpMock({ outputs: { create_goal: 'structured' } }), /needs refusals: 'p5'/)
   assert.throws(() => pmmcpMock({ refusals: 'p5', outputs: { list_goals: 'structured' } }), /no structured result for list_goals/)

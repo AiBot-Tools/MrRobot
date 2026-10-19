@@ -1,12 +1,14 @@
 // Drift guard: what this repository believes about pmmcp against the live
 // server's schemas.
 //
-// The operator's capture (test/fixtures/pmmcp-listtools.json, 2026-10-18)
-// is the reference. Against it this file checks: the double's argument names
-// for every tool it declares; the kernel's typed transcript of the goal and
-// vault tools (src/mcp/pmmcp-schemas.ts) by type, nullability, default and
-// requiredness; the keyArg the broker sends; every pin in tool-views.yaml;
-// and the tool count three files repeat. The capture is re-taken on the
+// The operator's capture (test/fixtures/pmmcp-listtools.json, first taken
+// 2026-10-18, re-taken with output schemas 2026-10-19) is the reference.
+// Against it this file checks: the double's argument names for every tool it
+// declares; the kernel's typed transcript of the goal and vault tools
+// (src/mcp/pmmcp-schemas.ts) by type, nullability, default and requiredness;
+// the double's default output for every tool, and the live create and update
+// outputs against what the boot check accepts; the keyArg the broker sends;
+// every pin in tool-views.yaml; and the tool count three files repeat. The capture is re-taken on the
 // operator's machine (pmmcp needs no token):
 //
 //   npm run capture:pmmcp
@@ -26,10 +28,10 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { parse as parseYaml } from 'yaml'
 
-import { parseKernelConfig } from '../src/config.js'
+import { parseKernelConfig, type KernelConfig } from '../src/config.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
 import { REPO_ROOT } from './helpers/kernel.js'
-import { GOAL_STATUSES, GOAL_TRANSITIONS, PMMCP_TOOL_COUNT } from './helpers/mock-pmmcp.js'
+import { GOAL_RESULT_OUTPUT, GOAL_STATUSES, GOAL_TRANSITIONS, PMMCP_TOOL_COUNT } from './helpers/mock-pmmcp.js'
 import {
   ABSENT_BY_INVARIANT,
   agreeingCapture,
@@ -39,13 +41,15 @@ import {
 
 const CAPTURE = join(REPO_ROOT, 'test/fixtures/pmmcp-listtools.json')
 
-function keyArg(): string {
-  const config = parseKernelConfig(
-    parseYaml(readFileSync(join(REPO_ROOT, 'config/kernel.yaml'), 'utf8')),
-    { repoRoot: REPO_ROOT },
-  )
-  return config.secrets.keyArg
+function kernelConfig(): KernelConfig {
+  return parseKernelConfig(parseYaml(readFileSync(join(REPO_ROOT, 'config/kernel.yaml'), 'utf8')), { repoRoot: REPO_ROOT })
 }
+
+function keyArg(): string {
+  return kernelConfig().secrets.keyArg
+}
+
+const goals = (): KernelConfig['goals'] => kernelConfig().goals
 
 function pinned(): string[] {
   const views = parseToolViews(
@@ -63,7 +67,7 @@ test('the live capture agrees with the double and with the kernel\'s typed schem
       're-run `npm run capture:pmmcp` on the operator\'s machine',
   )
   const capture = JSON.parse(readFileSync(CAPTURE, 'utf8')) as PmmcpCapture
-  const findings = compareCapture({ capture, keyArg: keyArg(), pinned: pinned() })
+  const findings = compareCapture({ capture, keyArg: keyArg(), pinned: pinned(), goals: goals() })
   assert.deepEqual(
     findings,
     [],
@@ -123,7 +127,7 @@ test('the comparison catches a capture that is wrong in every way it checks', ()
       // A pinned tool is absent: `admin` is classified but not served.
     ],
   }
-  const findings = compareCapture({ capture: wrong, keyArg: 'label', pinned: pinned() })
+  const findings = compareCapture({ capture: wrong, keyArg: 'label', pinned: pinned(), goals: goals() })
 
   const says = (pattern: RegExp): boolean => findings.some((f) => pattern.test(f))
   assert.equal(says(/modelled tool absent from the live server: remember/), true, 'missing tools')
@@ -135,6 +139,7 @@ test('the comparison catches a capture that is wrong in every way it checks', ()
   assert.equal(says(/update_goal: typed required \[goal_id\]; live requires \[goal_id, progress_pct\]/), true, 'required')
   assert.equal(says(/secrets.keyArg is "label" but the live get_secret declares name/), true, 'the keyArg')
   assert.equal(says(/pins a tool the live server does not expose: admin/), true, 'a pinned tool absent')
+  assert.equal(says(/the capture does not record output schemas/), true, 'a capture from before step 2.1.3')
   assert.equal(
     says(new RegExp(`exposes 50 tools; this repo says ${String(PMMCP_TOOL_COUNT)}`)),
     true,
@@ -143,13 +148,13 @@ test('the comparison catches a capture that is wrong in every way it checks', ()
 
   // An empty capture is its own finding: a file that parsed but holds nothing
   // must not read as "no disagreements".
-  assert.deepEqual(compareCapture({ capture: { tools: [] }, keyArg: 'label', pinned: [] }), [
+  assert.deepEqual(compareCapture({ capture: { tools: [] }, keyArg: 'label', pinned: [], goals: goals() }), [
     'the capture holds no tools; re-run `npm run capture:pmmcp`',
   ])
 })
 
 test('the comparison passes on a capture that agrees, so it is not merely always red', () => {
-  const findings = compareCapture({ capture: agreeingCapture(), keyArg: 'label', pinned: pinned() })
+  const findings = compareCapture({ capture: agreeingCapture(), keyArg: 'label', pinned: pinned(), goals: goals() })
   assert.deepEqual(findings, [], findings.join('\n'))
   // And the agreeing capture is the real cardinality, so a passing comparison
   // is a comparison that saw as many tools as the live server has.
@@ -165,13 +170,13 @@ test('only a tool invariant 7 forces may be missing from the live server, and on
     false,
     'the agreeing capture lacks the excused tools, as the live one does',
   )
-  assert.deepEqual(compareCapture({ capture: agreeing, keyArg: 'label', pinned: pinned() }), [])
+  assert.deepEqual(compareCapture({ capture: agreeing, keyArg: 'label', pinned: pinned(), goals: goals() }), [])
 
   // An operator pin is not forced: a missing `forget` is a rule guarding nothing.
   const operatorPin = compareCapture({
     capture: { ...agreeing, tools: agreeing.tools?.filter((t) => t.name !== 'forget') ?? [] },
     keyArg: 'label',
-    pinned: pinned(),
+    pinned: pinned(), goals: goals(),
     absentByInvariant: ['restore_backup', 'forget'],
   })
   assert.equal(operatorPin.some((f) => /forget is excused as absent, but invariant 7 does not force it/.test(f)), true)
@@ -184,7 +189,7 @@ test('only a tool invariant 7 forces may be missing from the live server, and on
       tools: [...(agreeing.tools ?? []), { name: 'restore_backup', inputSchema: { properties: { backup_id: {} } } }],
     },
     keyArg: 'label',
-    pinned: pinned(),
+    pinned: pinned(), goals: goals(),
   })
   assert.equal(
     returned.some((f) => /the live server now registers restore_backup; remove it from ABSENT_BY_INVARIANT/.test(f)),
@@ -192,7 +197,7 @@ test('only a tool invariant 7 forces may be missing from the live server, and on
   )
 
   // Without the excuse, the absence is reported both ways, as before.
-  const unexcused = compareCapture({ capture: agreeing, keyArg: 'label', pinned: pinned(), absentByInvariant: [] })
+  const unexcused = compareCapture({ capture: agreeing, keyArg: 'label', pinned: pinned(), goals: goals(), absentByInvariant: [] })
   assert.deepEqual(unexcused, [
     'modelled tool absent from the live server: restore_backup',
     'tool-views.yaml pins a tool the live server does not expose: restore_backup',
@@ -207,14 +212,58 @@ test('a captured keyArg other than the configured one is the only thing that set
   const findings = compareCapture({
     capture: agreeingCapture(),
     keyArg: configured,
-    pinned: pinned(),
+    pinned: pinned(), goals: goals(),
   })
   assert.deepEqual(findings, [], `config/kernel.yaml secrets.keyArg is "${configured}"`)
   const mismatch = compareCapture({
     capture: agreeingCapture(),
     keyArg: 'something-else',
-    pinned: pinned(),
+    pinned: pinned(), goals: goals(),
   })
   assert.equal(mismatch.length, 1)
   assert.match(mismatch[0] ?? '', /something-else/)
+})
+
+test('output schemas are compared only in a capture that records them, and then a P6 result that disagrees with the kernel\'s, or a double that does not serve the live form, is named', () => {
+  const agreeing = agreeingCapture()
+  const P = GOAL_RESULT_OUTPUT['properties'] as Record<string, unknown>
+  const withOutputs = (outputs: Record<string, unknown>, records = true): PmmcpCapture => ({
+    ...agreeing,
+    recordsOutputSchema: records,
+    tools: (agreeing.tools ?? []).map((t) => {
+      if (!(t.name in outputs)) return t
+      const { outputSchema: _dropped, ...rest } = t
+      const next = outputs[t.name]
+      return next === undefined ? rest : { ...rest, outputSchema: next }
+    }),
+  })
+  const compare = (capture: PmmcpCapture): string[] => compareCapture({ capture, keyArg: 'label', pinned: pinned(), goals: goals() })
+
+  // An older capture: its outputs are unknown, so nothing about them is judged,
+  // and the one finding is that it should be re-taken.
+  assert.deepEqual(compare(withOutputs({ recall: { type: 'object', properties: { items: { type: 'array' } } } }, false)), [
+    'the capture does not record output schemas; re-run `npm run capture:pmmcp` (step 2.1.3 or later)',
+  ])
+
+  // The double must serve the live form: another shape, or none at all, is named.
+  const recall = compare(withOutputs({ recall: { type: 'object', properties: { items: { type: 'array' } } }, forget: undefined }))
+  assert.deepEqual([...recall].sort(), [
+    'forget: the double serves {result: string} by default; live declares no output schema',
+    'recall: the double serves {result: string} by default; live declares {items?: array<>}',
+  ])
+
+  // P6 as the kernel reads it: the double is behind (named), the boot check serves.
+  const p6 = compare(withOutputs({ create_goal: GOAL_RESULT_OUTPUT, update_goal: GOAL_RESULT_OUTPUT }))
+  assert.deepEqual([...p6].sort(), [
+    'create_goal: the double serves {result: string} by default; live declares {goal_id: string, progress_pct: number, project_id: string, status: string}',
+    'update_goal: the double serves {result: string} by default; live declares {goal_id: string, progress_pct: number, project_id: string, status: string}',
+  ])
+
+  // A P6 result the kernel would not read: the boot check would degrade goals, and says why.
+  const short = { ...GOAL_RESULT_OUTPUT, properties: { goal_id: P['goal_id'], project_id: P['project_id'], status: P['status'] }, required: ['goal_id', 'project_id', 'status'] }
+  const degraded = compare(withOutputs({ update_goal: short }))
+  assert.ok(degraded.includes('the boot check would degrade goals on this capture: pmmcp.update_goal does not return progress_pct'), degraded.join('\n'))
+
+  // And the agreeing capture, which records them, has nothing to say.
+  assert.deepEqual(compare(agreeing), [])
 })

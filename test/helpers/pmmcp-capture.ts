@@ -13,6 +13,7 @@
 
 import './guard.js'
 
+import { outputProblems, type GoalsConfig } from '../../src/goals/tools.js'
 import {
   inputShape,
   liveJsonSchema,
@@ -22,7 +23,7 @@ import {
   type PropertyShape,
 } from '../../src/mcp/pmmcp-schemas.js'
 import { FORCED_DISABLED, FORCED_KERNEL_ONLY } from '../../src/mcp/tool-views.js'
-import { PMMCP_TOOLS, PMMCP_TOOL_COUNT } from './mock-pmmcp.js'
+import { DEFAULT_OUTPUT, outputSchemaFor, PMMCP_TOOLS, PMMCP_TOOL_COUNT } from './mock-pmmcp.js'
 
 /**
  * Tools invariant 7 forces closed that the live server does not register.
@@ -62,6 +63,62 @@ export interface CompareInput {
   readonly pinned: readonly string[]
   /** Defaults to ABSENT_BY_INVARIANT; the tests pass a wrong one. */
   readonly absentByInvariant?: readonly string[]
+  /** config/kernel.yaml goals: which tools the writer reads, and the statuses it sends. */
+  readonly goals: GoalsConfig
+}
+
+/**
+ * An output schema as the boot check reads it (src/goals/tools.ts): property
+ * names, their types, and which are required; nothing narrower. Undefined is
+ * a tool that declares none.
+ */
+function outputShape(schema: unknown): string {
+  if (schema === undefined) return 'no output schema'
+  const shape = inputShape(schema, { strict: false })
+  const fields = Object.keys(shape.properties)
+    .sort()
+    .map((name) => `${name}${shape.required.includes(name) ? '' : '?'}: ${shape.properties[name]?.types.join('|') || 'unknown'}`)
+  const loose = shape.required.filter((name) => shape.properties[name] === undefined)
+  return `{${fields.join(', ')}}${loose.length > 0 ? ` requiring ${loose.join(', ')}` : ''}`
+}
+
+/**
+ * Where the live tools' outputs part ways with this repo. Read only from a
+ * capture that records outputs: in an older one an absent outputSchema means
+ * unknown, not none.
+ *
+ * Two beliefs rest on them. The double serves DEFAULT_OUTPUT to every test
+ * that names no other, so its outputs must be the live ones. And the writer
+ * reads the live create and update results, so they must be what the boot
+ * check accepts: a capture the boot check would degrade on is a pmmcp the
+ * kernel cannot write goals to.
+ */
+function outputFindings(live: ReadonlyMap<string, CapturedTool>, absent: ReadonlySet<string>, goals: GoalsConfig): string[] {
+  const out: string[] = []
+  for (const spec of PMMCP_TOOLS) {
+    const tool = live.get(spec.name)
+    if (tool === undefined || absent.has(spec.name)) continue
+    let served: string
+    let declared: string
+    try {
+      served = outputShape(outputSchemaFor(spec.name, DEFAULT_OUTPUT))
+      declared = outputShape(tool.outputSchema)
+    } catch (e) {
+      out.push(`${spec.name}: the live output schema cannot be read: ${e instanceof Error ? e.message : String(e)}`)
+      continue
+    }
+    if (served !== declared) out.push(`${spec.name}: the double serves ${served} by default; live declares ${declared}`)
+  }
+  const sent = Object.values(goals.statuses)
+  for (const [tool, statuses] of [
+    [goals.tools.create, ['pending']],
+    [goals.tools.updateStatus, sent],
+  ] as const) {
+    for (const problem of outputProblems(`pmmcp.${tool}`, live.get(tool)?.outputSchema, statuses)) {
+      out.push(`the boot check would degrade goals on this capture: ${problem}`)
+    }
+  }
+  return out
 }
 
 function defaultOf(p: PropertyShape): string {
@@ -166,6 +223,14 @@ export function compareCapture(input: CompareInput): string[] {
     }
   }
 
+  // Outputs, since step 2.1.5: a capture that does not record them cannot
+  // vouch for the double's default or for what the writer will read.
+  if (input.capture.recordsOutputSchema === true) {
+    findings.push(...outputFindings(live, absent, input.goals))
+  } else {
+    findings.push('the capture does not record output schemas; re-run `npm run capture:pmmcp` (step 2.1.3 or later)')
+  }
+
   // The stub that fails closed until this passes. kernel.yaml names the argument
   // the broker sends; a server wanting a different one makes every credential
   // fetch fail, and this names it before boot ever tries.
@@ -206,16 +271,20 @@ export function compareCapture(input: CompareInput): string[] {
  * Agreeing includes the belief that the excused tools are absent.
  */
 export function agreeingCapture(): PmmcpCapture {
-  const tools: CapturedTool[] = PMMCP_TOOLS.filter((spec) => !ABSENT_BY_INVARIANT.includes(spec.name)).map((spec) => ({
-    name: spec.name,
-    inputSchema: {
-      type: 'object',
-      properties: { ...spec.inputSchema.properties },
-      ...(spec.inputSchema.required === undefined ? {} : { required: [...spec.inputSchema.required] }),
-    },
-  }))
+  const tools: CapturedTool[] = PMMCP_TOOLS.filter((spec) => !ABSENT_BY_INVARIANT.includes(spec.name)).map((spec) => {
+    const outputSchema = outputSchemaFor(spec.name, DEFAULT_OUTPUT)
+    return {
+      name: spec.name,
+      inputSchema: {
+        type: 'object',
+        properties: { ...spec.inputSchema.properties },
+        ...(spec.inputSchema.required === undefined ? {} : { required: [...spec.inputSchema.required] }),
+      },
+      ...(outputSchema === undefined ? {} : { outputSchema }),
+    }
+  })
   for (let i = tools.length; i < PMMCP_TOOL_COUNT; i += 1) {
     tools.push({ name: `live_tool_${String(i)}`, inputSchema: { properties: {} } })
   }
-  return { toolCount: PMMCP_TOOL_COUNT, tools }
+  return { recordsOutputSchema: true, toolCount: PMMCP_TOOL_COUNT, tools }
 }

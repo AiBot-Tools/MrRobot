@@ -598,7 +598,8 @@ test('with P5 refusals a refused move is isError, a failure with no orphan, and 
 
 test("a live goal tool whose outputSchema the writer cannot read degrades goals at boot, by name; no schema, FastMCP's {result} and the P6 schema all serve", async (t) => {
   const goals = shippedConfig().goals
-  for (const options of [{}, { outputs: { create_goal: 'wrapped', update_goal: 'wrapped' } }, P6] as const) {
+  const none = { outputs: { create_goal: 'prose', update_goal: 'prose', get_goal_tree: 'prose', list_goals: 'prose' } } as const
+  for (const options of [none, { outputs: { create_goal: 'wrapped', update_goal: 'wrapped' } }, P6] as const) {
     const { hub } = await wired(t, options)
     assert.equal(goalToolsUnusable(hub, goals), undefined, JSON.stringify(options))
   }

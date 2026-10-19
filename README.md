@@ -468,7 +468,7 @@ typed or prose, whose id the kernel cannot record verbatim (masked, ill-formed,
 or past 128 bytes).
 
 Every pmmcp goal tool name and argument lives in `config/kernel.yaml` under
-`goals:`, confirmed by the operator's live capture of 2026-10-18, and every call
+`goals:`, confirmed by the operator's live capture (2026-10-18, re-taken with output schemas 2026-10-19), and every call
 goes through the typed wrappers in `src/goals/pmmcp.ts`. They parse each
 call against the strict schemas in `src/mcp/pmmcp-schemas.ts` and refuse a
 status that is a decision, a create without `project_id`, or an update
@@ -774,7 +774,7 @@ not `key`).
 | Fact | How it gets settled |
 |---|---|
 | `node:sqlite` on darwin-arm64: `DatabaseSync` `timeout` runtime behaviour, `errcode 1811` stability, `t.mock.timers` | `npm test` on the Mac; `test/env.test.ts` fails first, with a named reason |
-| pmmcp: Streamable HTTP interop with SDK 1.32.1 (same-origin redirects only, from 1.32.0), idle timeout vs the 240 s heartbeat (the 64 tool names and their schemas are captured in `test/fixtures/pmmcp-listtools.json`, 2026-10-18) | boot with pmmcp up: `hub.connected` and `hub.tools.classified` list what is really there; checklist line 2 |
+| pmmcp: Streamable HTTP interop with SDK 1.32.1 (same-origin redirects only, from 1.32.0), idle timeout vs the 240 s heartbeat (the 64 tool names, their input schemas and their output schemas, every one FastMCP's `{result: string}`, are captured in `test/fixtures/pmmcp-listtools.json`, re-taken 2026-10-19) | boot with pmmcp up: `hub.connected` and `hub.tools.classified` list what is really there; checklist line 2 |
 | An Anthropic API key accepted as `Authorization: Bearer` (D20's alternative) | one `npm run cli -- probe anthropic/claude-sonnet-5` with `auth.header: Authorization` |
 | Docker on Colima: `--cap-drop=ALL` → empty `CapEff`; `--read-only` plus a `/workspace` writable by `65534` through virtiofs; `~/.colima/<profile>/docker.sock` paths; FSEvents through virtiofs | `scripts/colima-up.sh` (itself marked NEEDS VALIDATION on line 2) then the security check commands; Phase 2 live tests |
 | Whether the docker CLI works with a spawn env of only `PATH`, `DOCKER_HOST` and `DOCKER_CONFIG` (the kernel's own `.aos/docker`) | `env -i PATH="$PATH" DOCKER_CONFIG="$PWD/.aos/docker" DOCKER_HOST=unix://$HOME/.colima/trusted/docker.sock docker version`. If it needs `HOME`, the driver adds `HOME` **only** — never the full environment |

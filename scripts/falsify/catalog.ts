@@ -158,6 +158,7 @@ const goals: Suite = {
     'test/delegation.test.ts',
     'test/delegation-restart.test.ts',
     'test/pmmcp-schemas.test.ts',
+    'test/pmmcp-drift.test.ts',
   ],
   mutants: [
     { id: 'G1', file: WRITER, from: '    if (!(KERNEL_SETTABLE as readonly string[]).includes(to)) {', to: '    if (false) {', why: 'the kernel may mark a goal done' },
@@ -224,6 +225,11 @@ const goals: Suite = {
     { id: 'G62', file: WRITER, from: 'verbatim (${quoted(goalId)}); ${reason}', to: 'verbatim; ${reason}', why: 'an orphan whose id cannot be recorded leaves no trace of that id when the reason does not quote it' },
     { id: 'G63', file: WRITER, from: "  return reads === 'create' ? goalIdOf([{ type: 'text', text }]) :", to: "  return reads === 'create' ? goalNamedIn(text.trim()) :", why: 'a create {result} disagreement in bare-id or JSON prose says neither form names a goal' },
     { id: 'G64', file: WRITER, from: ": /^✅ Goal updated: (\\S+)/u.exec(text.trim())?.[1]", to: ": goalIdOf([{ type: 'text', text }])", why: "a move's {result} disagreement reads pmmcp's '✅ Goal updated' prose as naming no goal" },
+    { id: 'G65', file: 'test/helpers/mock-pmmcp.ts', from: "export const DEFAULT_OUTPUT: OutputMode = 'wrapped'", to: "export const DEFAULT_OUTPUT: OutputMode = 'prose'", why: 'the double serves a form the live server does not, and every test that names none is tested against it' },
+    { id: 'G66', file: 'test/helpers/pmmcp-capture.ts', from: '  if (input.capture.recordsOutputSchema === true) {', to: '  if (true) {', why: "a capture from before outputs were recorded is read as one whose tools declare none" },
+    { id: 'G67', file: 'test/helpers/pmmcp-capture.ts', from: '    if (served !== declared) out.push(', to: '    if (false) out.push(', why: "a double whose default output is not the live one passes the drift guard" },
+    { id: 'G68', file: 'test/helpers/pmmcp-capture.ts', from: '      out.push(`the boot check would degrade goals on this capture: ${problem}`)', to: '      void problem', why: 'a live capture the boot check would degrade goals on passes the drift guard' },
+    { id: 'G69', file: 'test/helpers/pmmcp-capture.ts', from: "  } else {\n    findings.push('the capture does not record output schemas", to: "  } else if (false) {\n    findings.push('the capture does not record output schemas", why: 'a capture that cannot vouch for any output passes the drift guard' },
   ],
   control: {
     id: 'C',

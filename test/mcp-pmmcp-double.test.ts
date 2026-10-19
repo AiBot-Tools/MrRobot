@@ -387,8 +387,21 @@ test('callKernelOnly hands back structuredContent and still appends nothing, and
   assert.equal(store.query().length, before, 'a kernel-only call appended to the log')
   assert.equal(hub.describe('pmmcp', 'create_goal')?.outputSchema?.['type'], 'object')
 
-  // Today's pmmcp: no structured result, no output schema, and the key is absent.
-  const plain = vaultMock(t)
+  // Today's pmmcp (the capture of 2026-10-19): FastMCP's {result}, the text again.
+  const live = vaultMock(t)
+  const third = hubOn(t)
+  await third.hub.connect('pmmcp', live.connect)
+  const wrapped = await third.hub.callKernelOnly(
+    'pmmcp',
+    'create_goal',
+    { project_id: 'aos/ceo', goal_type: 'objective', title: 'wrapped' },
+    'test: the live form reaches the kernel',
+  )
+  assert.deepEqual(Object.keys(wrapped.structuredContent ?? {}), ['result'])
+  assert.deepEqual(third.hub.describe('pmmcp', 'create_goal')?.outputSchema?.['required'], ['result'])
+
+  // A server with no output schema: no structured result, and the key is absent.
+  const plain = vaultMock(t, { outputs: { create_goal: 'prose' } })
   const second = hubOn(t)
   await second.hub.connect('pmmcp', plain.connect)
   const prose = await second.hub.callKernelOnly(

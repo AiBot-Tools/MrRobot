@@ -493,3 +493,13 @@ test("FastMCP's wrapper and the skew option: the forms the kernel must tell apar
   assert.throws(() => pmmcpMock({ outputs: { create_goal: 'structured' } }), /needs refusals: 'p5'/)
   assert.throws(() => pmmcpMock({ refusals: 'p5', outputs: { list_goals: 'structured' } }), /no structured result for list_goals/)
 })
+
+test("recall's project_id '*' searches every project, as the live recall does since the capture of 2026-10-19", async (t) => {
+  const { client } = await open(t)
+  await client.callTool({ name: 'remember', arguments: { project_id: 'aos/ceo', key: 'a', value: 'needle in the ceo' } })
+  await client.callTool({ name: 'remember', arguments: { project_id: 'aos/agent/researcher', key: 'b', value: 'needle in the researcher' } })
+  const one = await call(client, 'recall', { project_id: 'aos/agent/researcher', query: 'needle' })
+  assert.equal(one.text.includes('ceo'), false)
+  const every = await call(client, 'recall', { project_id: '*', query: 'needle' })
+  assert.equal(every.text.includes('needle in the ceo') && every.text.includes('needle in the researcher'), true, every.text)
+})

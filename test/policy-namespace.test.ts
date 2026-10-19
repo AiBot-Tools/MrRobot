@@ -91,6 +91,14 @@ test('the gate denies an absent namespace argument rather than letting the serve
   assert.equal(gate({ project_id: ['aos/agent/researcher'] }).decision, 'deny')
 })
 
+test("the gate denies pmmcp's '*' (every project) like any namespace that is not the agent's own", () => {
+  // The live recall takes project_id '*' to search every project (capture of
+  // 2026-10-19): a second road to the CEO's memory beside an absent argument.
+  const verdict = gate({ project_id: '*', query: 'x' })
+  assert.equal(verdict.decision, 'deny')
+  assert.match(verdict.reason, /may only address aos\/agent\/researcher, not \*/)
+})
+
 test('an agent with no memory namespace may not call a namespaced tool at all', () => {
   const verdict = gate(
     { project_id: OWN },
@@ -223,7 +231,7 @@ function recall(projectId: string, id: string): ScriptedResponse {
   })
 }
 
-test('through the loop: the researcher asking for aos/ceo never reaches pmmcp; its own namespace does', async (t) => {
+test("through the loop: the researcher asking for aos/ceo, or for pmmcp's '*' (every project), never reaches pmmcp; its own namespace does", async (t) => {
   // The researcher is exactly the agent whose manifest names `recall` as its
   // first entry. The CEO's namespace holds something it must never read.
   const mock = pmmcpMock()
@@ -260,6 +268,7 @@ servers:
   const recallsBefore = mock.calls.filter((c) => c.tool === 'recall').length
 
   const provider = fakeProvider([
+    recall('*', 'call_0'),
     recall('aos/ceo', 'call_1'),
     recall(OWN, 'call_2'),
     turn({ role: 'assistant', content: 'done' }, 'stop'),
@@ -311,8 +320,10 @@ servers:
     .query({ type: 'tool.gate' })
     .map((r) => JSON.parse(r.payload) as { decision: string; reason: string })
   assert.equal(gates[0]?.decision, 'deny')
-  assert.match(gates[0]?.reason ?? '', /may only address aos\/agent\/researcher, not aos\/ceo/)
-  assert.equal(gates[1]?.decision, 'allow')
+  assert.match(gates[0]?.reason ?? '', /may only address aos\/agent\/researcher, not \*/)
+  assert.equal(gates[1]?.decision, 'deny')
+  assert.match(gates[1]?.reason ?? '', /may only address aos\/agent\/researcher, not aos\/ceo/)
+  assert.equal(gates[2]?.decision, 'allow')
 
   // And the CEO's memory never entered the run: not in a tool result, not in a
   // prompt sent to the model.

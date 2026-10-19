@@ -838,8 +838,10 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     const limit = typeof rawLimit === 'number' && rawLimit > 0 ? Math.floor(rawLimit) : 10
     // Namespaced: a project never sees another project's memories. This is the
     // property the kernel's aos/ceo · aos/agent/<id> · aos/shared split rests on.
+    // Except '*', which the live recall takes as every project (capture of
+    // 2026-10-19): modelled, so a gate that let it through is caught leaking.
     const hits = [...state.memories.values()]
-      .filter((m) => m.projectId === projectId && m.content.includes(query))
+      .filter((m) => (projectId === '*' || m.projectId === projectId) && m.content.includes(query))
       .slice(0, limit)
       .map((m) => ({ id: m.id, content: m.content, tags: m.tags }))
     return ok({ hits })

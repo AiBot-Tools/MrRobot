@@ -139,6 +139,7 @@ const namespace: Suite = {
     { id: 'N5', file: 'src/runtime/loop.ts', from: '        ...(view.namespaceArg === undefined ? {} : { namespaceArg: view.namespaceArg }),', to: '', why: 'the loop never tells the gate which argument to pin' },
     { id: 'N6', file: KERNEL, from: '      projectId: m.memory.projectId,', to: "      projectId: 'aos/ceo',", why: 'the kernel gives every agent the CEO’s namespace' },
     { id: 'N7', file: TRACKER, from: '  #projectFor(goalId: string): string | undefined {\n    return this.#namespaceOf.get(goalId)', to: "  #projectFor(goalId: string): string | undefined {\n    return this.#namespaceOf.has(goalId) ? 'aos/agent/researcher' : undefined", why: 'a child’s goal is moved in the child’s namespace, not where it was written' },
+    { id: 'N8', file: GATE, from: '    if (asked !== scope.projectId) {', to: "    if (asked !== scope.projectId && asked !== '*') {", why: "an agent's recall of pmmcp's '*' reads every project's memory, the CEO's included" },
   ],
   control: {
     id: 'C',

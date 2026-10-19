@@ -187,6 +187,10 @@ const goals: Suite = {
     { id: 'G27', file: WRITER, from: '  if (!parsed.success) {\n    throw new UnconfirmedReply(named,', to: "  if (!parsed.success) return { kind: 'prose' }\n  if (false) {\n    throw new UnconfirmedReply(named,", why: 'a structured result the kernel does not read falls back to guessing an id from its text' },
     { id: 'G28', file: WRITER, from: '      if (e instanceof GoalWriteFailed || e instanceof GoalsUnavailable || e instanceof PolicyDenied) throw e', to: '      throw e', why: 'an SDK refusal mid-tree escapes as a bare error, losing what was written' },
     { id: 'G29', file: WRITER, from: '    this.#recordUnconfirmed(tool, projectId, goalId, reason)\n    return new GoalWriteFailed', to: '    return new GoalWriteFailed', why: 'a goal pmmcp wrote and the kernel refused leaves no record in the chain' },
+    { id: 'G30', file: WRITER, from: '      if (v.goal_id !== goalId) off.push(', to: '      if (false) off.push(', why: 'a typed reply naming another goal is recorded as this move' },
+    { id: 'G31', file: WRITER, from: '      if (v.status !== sent) off.push(', to: '      if (false) off.push(', why: 'a typed reply naming another status is recorded as the move asked for' },
+    { id: 'G32', file: WRITER, from: '      if (v.project_id !== context.projectId) off.push(', to: '      if (false) off.push(', why: 'a typed reply placing the goal in another project is recorded as a move in this one' },
+    { id: 'G33', file: WRITER, from: "      if (to === 'review' && v.progress_pct !== 100) off.push(", to: '      if (false) off.push(', why: 'a review pmmcp records below 100 % is logged as review' },
   ],
   control: {
     id: 'C',

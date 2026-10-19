@@ -422,8 +422,9 @@ export class GoalWriter {
     }
 
     const sent = this.#o.goals.statuses[to]
-    const { content } = await this.#answered(
-      this.#o.goals.tools.updateStatus,
+    const tool = this.#o.goals.tools.updateStatus
+    const result = await this.#answered(
+      tool,
       updateGoal(
         this.#pmmcp,
         {
@@ -439,14 +440,36 @@ export class GoalWriter {
       context.projectId,
       [],
     )
-    const reply = textOf(content).trim()
-    const confirmed = /^✅ Goal updated: (\S+)/u.exec(reply)
-    if (confirmed?.[1] !== goalId) {
-      throw new GoalWriteFailed(
-        `${this.#serverId}.${this.#o.goals.tools.updateStatus} did not confirm ${goalId} → ${sent}: ` +
-          reply.slice(0, 300),
-        [],
-      )
+
+    let answer: Reply
+    try {
+      answer = replyOf(tool, result)
+    } catch (e) {
+      if (e instanceof UnconfirmedReply) throw this.#unconfirmed(tool, context.projectId, goalId, e.message, [])
+      throw e
+    }
+    if (answer.kind === 'typed') {
+      // P6 says where the goal now is; every part of it must be the move asked
+      // for, and the project the kernel's own goal.created names.
+      const v = answer.value
+      const off: string[] = []
+      if (v.goal_id !== goalId) off.push(`goal_id ${v.goal_id}`)
+      if (v.status !== sent) off.push(`status ${v.status}`)
+      if (v.project_id !== context.projectId) off.push(`project_id ${v.project_id}`)
+      if (to === 'review' && v.progress_pct !== 100) off.push(`progress_pct ${String(v.progress_pct)}`)
+      if (off.length > 0) {
+        throw this.#unconfirmed(tool, context.projectId, goalId, `did not confirm ${goalId} → ${sent}: pmmcp reports ${off.join(', ')}`, [])
+      }
+    } else {
+      const reply = textOf(result.content).trim()
+      const confirmed = /^✅ Goal updated: (\S+)/u.exec(reply)
+      if (confirmed?.[1] !== goalId) {
+        throw new GoalWriteFailed(
+          `${this.#serverId}.${this.#o.goals.tools.updateStatus} did not confirm ${goalId} → ${sent}: ` +
+            reply.slice(0, 300),
+          [],
+        )
+      }
     }
     this.#o.store.append({
       type: 'goal.status',

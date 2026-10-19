@@ -361,6 +361,51 @@ test('a result the SDK refuses mid-tree is a GoalWriteFailed naming what was wri
   assert.equal(payloads(store, 'goal.unconfirmed').length, 1)
 })
 
+test("a move is confirmed from structuredContent: P6's JSON-only reply is a move, and a reply naming another status, goal or project, or a review below 100 %, is not recorded", async (t) => {
+  const { store, writer } = await wired(t, P6)
+  const { task } = await written(writer)
+  await writer.setStatus(task, 'in_progress', { projectId: PROJECT })
+  await writer.setStatus(task, 'review', { projectId: PROJECT })
+  assert.deepEqual(payloads(store, 'goal.status').map((p) => p['to']), ['in_progress', 'review'])
+  assert.equal(payloads(store, 'goal.unconfirmed').length, 0)
+
+  // Each skew bends both forms alike, so only the field check under test can refuse.
+  const cases: [string, Record<string, unknown>, number, 'in_progress' | 'review', RegExp][] = [
+    ['another status', { status: 'blocked' }, 1, 'in_progress', /pmmcp reports status blocked/],
+    ['another goal', { goal_id: 'goal_ffffffffffff' }, 1, 'in_progress', /pmmcp reports goal_id goal_ffffffffffff/],
+    ['another project', { project_id: 'aos/elsewhere' }, 1, 'in_progress', /pmmcp reports project_id aos\/elsewhere/],
+    ['a review below 100 %', { progress_pct: 50 }, 2, 'review', /pmmcp reports progress_pct 50/],
+  ]
+  for (const [why, fields, fromCall, to, reason] of cases) {
+    const w = await wired(t, { ...P6, skew: { update_goal: { fields, fromCall } } })
+    const target = (await written(w.writer)).task
+    if (to === 'review') await w.writer.setStatus(target, 'in_progress', { projectId: PROJECT })
+    const before = payloads(w.store, 'goal.status').length
+    await assert.rejects(
+      () => w.writer.setStatus(target, to, { projectId: PROJECT }),
+      (e: unknown) => {
+        assert.ok(e instanceof GoalWriteFailed, why)
+        assert.match(e.message, reason, why)
+        return true
+      },
+    )
+    assert.equal(payloads(w.store, 'goal.status').length, before, `${why}: the move was recorded`)
+    assert.equal(payloads(w.store, 'goal.unconfirmed').length, 1, why)
+  }
+})
+
+test('with P5 refusals a refused move is isError, a failure with no orphan, and trySetStatus keeps the run alive', async (t) => {
+  const { store, mock, writer } = await wired(t, P6)
+  const { task } = await written(writer)
+  const goal = mock.state.goals.get(task)
+  assert.ok(goal)
+  goal.status = 'abandoned'
+  await assert.rejects(() => writer.setStatus(task, 'in_progress', { projectId: PROJECT }), /invalid_transition/)
+  assert.equal(await writer.trySetStatus(task, 'in_progress', { projectId: PROJECT }), false)
+  assert.equal(payloads(store, 'goal.status').length, 0)
+  assert.equal(payloads(store, 'goal.unconfirmed').length, 0, 'pmmcp refused, so nothing was written to orphan')
+})
+
 test("FastMCP's {result} wrapper reads as the prose it wraps", async (t) => {
   const { store, writer } = await wired(t, { outputs: { create_goal: 'wrapped', update_goal: 'wrapped' } })
   const tree = await writer.materialise(plan(), PROJECT, 'run_1')

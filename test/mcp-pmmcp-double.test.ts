@@ -363,3 +363,40 @@ test('the hub describes every declared tool with the schema the double declares'
     )
   }
 })
+
+test('callKernelOnly hands back structuredContent and still appends nothing, and describe() carries the live outputSchema', async (t) => {
+  // Contract §6 step 2.1.2. The goal writer reads P6's typed result; the hub
+  // used to drop it, along with the schema that says what it is.
+  const mock = vaultMock(t, {
+    refusals: 'p5',
+    outputs: { create_goal: 'structured', update_goal: 'structured' },
+  })
+  const { store, hub } = hubOn(t)
+  await hub.connect('pmmcp', mock.connect)
+  const before = store.query().length
+  const result = await hub.callKernelOnly(
+    'pmmcp',
+    'create_goal',
+    { project_id: 'aos/ceo', goal_type: 'objective', title: 'typed' },
+    'test: structured results reach the kernel',
+  )
+  assert.equal(result.ok, true)
+  const goalId = result.structuredContent?.['goal_id']
+  assert.equal(typeof goalId, 'string')
+  assert.ok(mock.state.goals.has(String(goalId)))
+  assert.equal(store.query().length, before, 'a kernel-only call appended to the log')
+  assert.equal(hub.describe('pmmcp', 'create_goal')?.outputSchema?.['type'], 'object')
+
+  // Today's pmmcp: no structured result, no output schema, and the key is absent.
+  const plain = vaultMock(t)
+  const second = hubOn(t)
+  await second.hub.connect('pmmcp', plain.connect)
+  const prose = await second.hub.callKernelOnly(
+    'pmmcp',
+    'create_goal',
+    { project_id: 'aos/ceo', goal_type: 'objective', title: 'prose' },
+    'test: prose results stay as they were',
+  )
+  assert.equal('structuredContent' in prose, false)
+  assert.equal(second.hub.describe('pmmcp', 'create_goal')?.outputSchema, undefined)
+})

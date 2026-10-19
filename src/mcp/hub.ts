@@ -100,6 +100,19 @@ export interface HubOptions {
 export interface ToolDescription {
   readonly description: string
   readonly inputSchema: Record<string, unknown>
+  /** Absent when the tool declares none, which is today's pmmcp (contract P6 adds them). */
+  readonly outputSchema?: Record<string, unknown>
+}
+
+/**
+ * What a kernel-only call hands back. `structuredContent` is present only when
+ * the server sent one: the typed result of contract P6, which the goal writer
+ * reads. Like `content`, it is never logged here.
+ */
+export interface KernelOnlyResult {
+  readonly ok: boolean
+  readonly content: unknown
+  readonly structuredContent?: Readonly<Record<string, unknown>>
 }
 
 interface ServerState {
@@ -160,6 +173,7 @@ export interface ListedTool {
   // optional fields are not assignable to a bare `?:`.
   readonly description?: string | undefined
   readonly inputSchema?: unknown
+  readonly outputSchema?: unknown
 }
 
 export async function listAllTools(client: Client): Promise<ListedTool[]> {
@@ -253,12 +267,14 @@ export class McpHub {
 
     const described = new Map<string, ToolDescription>()
     for (const tool of listed) {
+      const output = tool.outputSchema
       described.set(tool.name, {
         description: tool.description ?? '',
         inputSchema:
           typeof tool.inputSchema === 'object' && tool.inputSchema !== null
             ? (tool.inputSchema as Record<string, unknown>)
             : { type: 'object' },
+        ...(typeof output === 'object' && output !== null ? { outputSchema: Object.fromEntries(Object.entries(output)) } : {}),
       })
     }
 
@@ -477,7 +493,7 @@ export class McpHub {
     tool: string,
     args: Record<string, unknown>,
     purpose: string,
-  ): Promise<{ ok: boolean; content: unknown }> {
+  ): Promise<KernelOnlyResult> {
     if (purpose.trim() === '') {
       throw new PolicyDenied(`${serverId}.${tool}`, 'a kernel-only call must state its purpose')
     }
@@ -494,7 +510,15 @@ export class McpHub {
     }
 
     const result = await state.client.callTool({ name: tool, arguments: args })
-    return { ok: result.isError !== true, content: result.content }
+    const structured = result.structuredContent
+    return {
+      ok: result.isError !== true,
+      content: result.content,
+      // Copied into a plain record rather than cast: the SDK types it as `object`.
+      ...(typeof structured === 'object' && structured !== null && !Array.isArray(structured)
+        ? { structuredContent: Object.fromEntries(Object.entries(structured)) }
+        : {}),
+    }
   }
 
   /** Stop every heartbeat and close every client. */

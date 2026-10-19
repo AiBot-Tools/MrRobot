@@ -15,7 +15,7 @@
 
 import { z } from 'zod'
 
-import type { McpHub } from '../mcp/hub.js'
+import type { KernelOnlyResult, McpHub } from '../mcp/hub.js'
 import {
   CreateGoalSent,
   GetGoalTreeSent,
@@ -44,10 +44,8 @@ export interface GoalCall {
   readonly serverId: string
 }
 
-export interface GoalCallResult {
-  readonly ok: boolean
-  readonly content: unknown
-}
+/** The hub's own result type, so the two cannot drift apart. */
+export type GoalCallResult = KernelOnlyResult
 
 /** The status arrives from kernel.yaml goals.statuses as any string; the schema decides. */
 export type UpdateGoalRequest = Omit<UpdateGoalArgs, 'status'> & { readonly status: string }

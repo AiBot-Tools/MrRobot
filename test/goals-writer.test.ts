@@ -519,6 +519,8 @@ test("a move is confirmed from structuredContent: P6's JSON-only reply is a move
     ['another goal', { goal_id: 'goal_ffffffffffff' }, 1, 'in_progress', /pmmcp reports goal_id goal_ffffffffffff/],
     ['another project', { project_id: 'aos/elsewhere' }, 1, 'in_progress', /pmmcp reports project_id aos\/elsewhere/],
     ['a review below 100 %', { progress_pct: 50 }, 2, 'review', /pmmcp reports progress_pct 50/],
+    // A long project is quoted bounded, so what follows it still reaches the record.
+    ['a review below 100 % in a long project', { project_id: 'x'.repeat(600), progress_pct: 50 }, 2, 'review', /project_id x+…, progress_pct 50$/],
   ]
   for (const [why, fields, fromCall, to, reason] of cases) {
     const w = await wired(t, { ...P6, skew: { update_goal: { fields, fromCall } } })
@@ -537,6 +539,7 @@ test("a move is confirmed from structuredContent: P6's JSON-only reply is a move
     const orphans = payloads(w.store, 'goal.unconfirmed')
     assert.equal(orphans.length, 1, why)
     assert.equal(orphans[0]?.['goalId'], target, why)
+    assert.match(String(orphans[0]?.['reason']), reason, `${why}: the record lost what the refusal said`)
   }
 })
 

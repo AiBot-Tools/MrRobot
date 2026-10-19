@@ -21,14 +21,18 @@ import {
   GetGoalTreeSent,
   GetSecretLive,
   GetSecretSent,
+  GoalResult,
   inputShape,
   liveJsonSchema,
   PMMCP_LIVE,
+  PMMCP_STATUSES,
+  SENDABLE_STATUSES,
   UpdateGoalLive,
   UpdateGoalSent,
   type PmmcpLiveTool,
 } from '../src/mcp/pmmcp-schemas.js'
 import { REPO_ROOT } from './helpers/kernel.js'
+import { GOAL_RESULT_OUTPUT, GOAL_STATUSES } from './helpers/mock-pmmcp.js'
 
 interface Captured {
   readonly name: string
@@ -116,4 +120,34 @@ test('update_goal and get_goal_tree are sent no project_id, and create_goal is n
   }
   assert.equal(CreateGoalSent.safeParse({ project_id: 'p', goal_type: 'epic', title: 't' }).success, false)
   assert.equal(GetSecretSent.safeParse({ label: 'k', project_id: 'aos/ceo' }).success, false)
+})
+
+test("the P6 goal result is strict: an unknown key, a missing key, a status outside pmmcp's five, or progress outside 0-100 is refused", () => {
+  const good = { goal_id: 'goal_000000000001', project_id: 'aos/ceo', status: 'in_progress', progress_pct: 100 }
+  assert.deepEqual(GoalResult.parse(good), good)
+  for (const [why, bad] of [
+    ['an unknown key (a timestamp, say)', { ...good, created_at: '2026-10-19T00:00:00Z' }],
+    ['a missing key', { goal_id: good.goal_id, project_id: good.project_id, status: good.status }],
+    ['a status pmmcp does not have', { ...good, status: 'review' }],
+    ['progress above 100', { ...good, progress_pct: 101 }],
+    ['progress below 0', { ...good, progress_pct: -1 }],
+    ['an empty id', { ...good, goal_id: '' }],
+    ['a null project', { ...good, project_id: null }],
+  ] as const) {
+    assert.equal(GoalResult.safeParse(bad).success, false, why)
+  }
+  // The kernel's vocabulary sits inside pmmcp's, and the double's is pmmcp's.
+  for (const s of SENDABLE_STATUSES) assert.ok((PMMCP_STATUSES as readonly string[]).includes(s))
+  assert.deepEqual([...GOAL_STATUSES], [...PMMCP_STATUSES])
+  // And it is the shape the double declares as P6, by names, types and required.
+  assert.deepEqual(
+    inputShape(z.toJSONSchema(GoalResult), { strict: false }).required,
+    inputShape(GOAL_RESULT_OUTPUT, { strict: false }).required,
+  )
+  const kernel = inputShape(z.toJSONSchema(GoalResult), { strict: false }).properties
+  const declared = inputShape(GOAL_RESULT_OUTPUT, { strict: false }).properties
+  assert.deepEqual(Object.keys(kernel).sort(), Object.keys(declared).sort())
+  for (const name of Object.keys(declared)) {
+    assert.deepEqual(kernel[name]?.types, declared[name]?.types, name)
+  }
 })

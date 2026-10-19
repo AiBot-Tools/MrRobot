@@ -133,6 +133,32 @@ export type UpdateGoalArgs = z.infer<typeof UpdateGoalSent>
 export type GetGoalTreeArgs = z.infer<typeof GetGoalTreeSent>
 export type GetSecretArgs = z.infer<typeof GetSecretSent>
 
+// ─── what the kernel reads back (contract P6) ──────────────────────────────
+
+/** pmmcp's status vocabulary (goal_store.py `_VALID_STATUSES`); the double's copy is held to the capture. */
+export const PMMCP_STATUSES = ['pending', 'in_progress', 'completed', 'abandoned', 'blocked'] as const
+
+/**
+ * Contract P6's create_goal and update_goal result. Strict: pydantic publishes
+ * no additionalProperties, so the SDK's validator admits a field the kernel has
+ * never read; here it is refused (operator decision, 2026-10-19), and the boot
+ * check names such a field before any write meets it. The spec states the four
+ * names; the types and bounds are the kernel's reading of pmmcp's model.
+ */
+export const GoalResult = z
+  .object({
+    goal_id: z.string().min(1),
+    project_id: z.string().min(1),
+    status: z.enum(PMMCP_STATUSES),
+    progress_pct: z.number().min(0).max(100),
+  })
+  .strict()
+
+export type GoalResultValue = z.infer<typeof GoalResult>
+
+/** The tools whose structured result the kernel reads. list_goals has no P6 shape and is not read. */
+export const PMMCP_RESULTS = { create_goal: GoalResult, update_goal: GoalResult } as const
+
 // ─── comparing a schema with the capture ───────────────────────────────────
 
 export interface PropertyShape {

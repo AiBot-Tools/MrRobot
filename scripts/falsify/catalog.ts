@@ -181,6 +181,7 @@ const goals: Suite = {
     { id: 'G21', file: GOAL_TOOLS, from: '      if (outside.length > 0) {', to: '      if (false) {', why: 'a pmmcp whose status enum drops in_progress boots clean, and every move is then refused per call' },
     { id: 'G22', file: PMMCP_SCHEMAS, from: '    const known = strict || !opaque', to: '    const known = true', why: 'a $ref status reads as null-only, and a pmmcp that types its enum degrades goals for nothing' },
     { id: 'G23', file: GOAL_TOOLS, from: '    if (doubled.length > 0) {', to: '    if (false) {', why: 'two goals.args entries naming one key boot clean, and every task is written as an objective' },
+    { id: 'G24', file: PMMCP_SCHEMAS, from: '    progress_pct: z.number().min(0).max(100),\n  })\n  .strict()', to: '    progress_pct: z.number().min(0).max(100),\n  })', why: 'a P6 goal result carrying a field the kernel never read is accepted' },
   ],
   control: {
     id: 'C',

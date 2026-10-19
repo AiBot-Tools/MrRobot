@@ -31,7 +31,7 @@ import { parseToolViews, type ToolViewsFile } from '../src/mcp/tool-views.js'
 import { parseKernelConfig, type KernelConfig } from '../src/config.js'
 import { REPO_ROOT } from './helpers/kernel.js'
 import { GOAL_RESULT_OUTPUT, PMMCP_TOOLS, pmmcpMock, type JsonObjectSchema, type PmmcpMock } from './helpers/mock-pmmcp.js'
-import { withStore } from './helpers/store.js'
+import { closeVerified, withStore } from './helpers/store.js'
 
 const PROJECT = 'aos/ceo'
 
@@ -103,8 +103,9 @@ class RefusingStore extends EventStore {
 
 function refusing(t: TestContext, type: string): RefusingStore {
   const store = new RefusingStore(type)
+  // What it took is chained like any store's: verified at the end.
   t.after(() => {
-    store.close()
+    closeVerified(store)
   })
   return store
 }
@@ -352,9 +353,11 @@ test('a typed create the kernel will not confirm is refused, records the orphan,
     // The same, with pmmcp's prose as the text: it names the goal it wrote.
     ['prose that names another goal', { ...P6, structuredText: 'prose', skew: { create_goal: { fields: { goal_id: 'goal_ffffffffffff' }, where: 'structured' } } }, /disagree: the text names goal_000000000001, structuredContent goal_ffffffffffff/, undefined],
     // Both forms name one goal and differ elsewhere: that goal is the orphan.
-    ['forms that disagree on another field', { ...P6, skew: { create_goal: { fields: { project_id: 'aos/elsewhere' }, where: 'structured' } } }, /disagree on a field other than goal_id/, ONE],
+    ['forms that disagree on another field', { ...P6, skew: { create_goal: { fields: { project_id: 'aos/elsewhere' }, where: 'structured' } } }, /both name goal_000000000001 and disagree on a field other than goal_id/, ONE],
     // A field the kernel never read, which the SDK's validator admits.
-    ['a result it does not read', { ...P6, skew: { create_goal: { fields: { created_at: '2026-10-19T00:00:00Z' } } } }, /not a P6 goal result/, ONE],
+    ['a result it does not read', { ...P6, skew: { create_goal: { fields: { created_at: '2026-10-19T00:00:00Z' } } } }, /not a P6 goal result \(it names goal_000000000001\)/, ONE],
+    // The same, its structured id unconfirmed by the text: claim neither, name both.
+    ['a result it does not read, naming another goal', { ...P6, skew: { create_goal: { fields: { goal_id: 'goal_ffffffffffff', created_at: 'x' }, where: 'structured' } } }, /not a P6 goal result \(the text names goal_000000000001, structuredContent goal_ffffffffffff\)/, undefined],
   ]
   for (const [why, options, reason, orphan] of cases) {
     const { store, mock, writer } = await wired(t, options)
@@ -400,7 +403,13 @@ test('a refused move names the goal the kernel asked to move, and any other id p
   // parse refusing a reply that also names another goal.
   const cases: [string, Record<string, unknown>, RegExp][] = [
     ['the SDK refuses the reply', { progress_pct: 'x' }, /output schema/],
-    ['a result it does not read', { goal_id: 'goal_ffffffffffff', created_at: 'x' }, /not a P6 goal result.*; pmmcp names goal_ffffffffffff$/s],
+    ['a result it does not read', { goal_id: 'goal_ffffffffffff', created_at: 'x' }, /not a P6 goal result \(it names goal_ffffffffffff\)/],
+    // A parser message past the record's bound: the ids lead, so the cut takes only its tail.
+    [
+      'a refusal longer than the record',
+      { goal_id: 'goal_ffffffffffff', ...Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`unread_field_${String(i).padStart(2, '0')}`, 'x'])) },
+      /^update_goal returned structuredContent that is not a P6 goal result \(it names goal_ffffffffffff\): .*…$/s,
+    ],
   ]
   for (const [why, fields, reason] of cases) {
     const { store, writer } = await wired(t, { ...P6, skew: { update_goal: { fields } } })
@@ -458,6 +467,31 @@ test('a goal.unconfirmed the store will not take still leaves the refusal a Goal
       return true
     },
   )
+})
+
+test('a goal id pmmcp gave that no record holds verbatim is an orphan with a record, never a goal.created', async (t) => {
+  // Fabricated, as everywhere in the tests: shaped like a key, so the log masks it.
+  const cases: [string, string][] = [
+    ['a lone surrogate', 'goal_\ud800'],
+    ['an id shaped like a credential', 'sk-ant-abcdefgh1234'],
+    ['an id past 128 bytes in fewer than 128 units', `goal_${'é'.repeat(100)}`],
+  ]
+  for (const [why, id] of cases) {
+    const { store, mock, writer } = await wired(t, { ...P6, skew: { create_goal: { fields: { goal_id: id } } } })
+    await assert.rejects(
+      () => writer.materialise(plan(), PROJECT, 'run_1'),
+      (e: unknown) => {
+        assert.ok(e instanceof GoalWriteFailed, `${why}: escaped as ${String(e)}`)
+        return true
+      },
+    )
+    assert.equal(mock.state.goals.size, 1, why)
+    assert.equal(payloads(store, 'goal.created').length, 0, `${why}: a goal.created names a goal that is not pmmcp's`)
+    const orphans = payloads(store, 'goal.unconfirmed')
+    assert.equal(orphans.length, 1, why)
+    assert.equal(orphans[0]?.['goalId'], undefined, why)
+    assert.match(String(orphans[0]?.['reason']), /goal id is not recordable verbatim/, why)
+  }
 })
 
 test('a typed goal id longer than any record holds is refused, and the orphan is recorded without a cut id', async (t) => {
@@ -539,6 +573,8 @@ test("a live goal tool whose outputSchema the writer cannot read degrades goals 
     // pydantic's Literal is a const: an enum of one.
     ['a status Literal without what the kernel sends', { update_goal: withProps({ status: { type: 'string', const: 'pending' } }) }, /pmmcp\.update_goal returns status from pending, which leaves out in_progress/],
     // Not a member of the kernel's field table, whatever Object.prototype says.
+    // FastMCP's wrapper sends {result} and nothing else.
+    ['a {result} wrapper that requires more', { create_goal: { type: 'object', properties: { result: { type: 'string' } }, required: ['result', 'created_at'] } }, /pmmcp\.create_goal requires created_at beside FastMCP's \{result\}/],
     ['a field named like a prototype member', { create_goal: withProps({ constructor: { type: 'string' } }) }, /pmmcp\.create_goal returns constructor, which the kernel's P6 result does not read/],
   ]
   for (const [why, outputSchemas, reason] of cases) {
@@ -670,6 +706,17 @@ test('a FastMCP {result} that says something its text does not is refused and re
   const orphans = payloads(store, 'goal.unconfirmed')
   assert.equal(orphans.length, 1)
   assert.equal(orphans[0]?.['goalId'], undefined)
+  assert.match(String(orphans[0]?.['reason']), /disagree: the text names goal_000000000001, structuredContent goal_ffffffffffff/)
+
+  // A {result} that names the same goal and differs elsewhere: that goal is the orphan.
+  const same = await wired(t, {
+    outputs: { create_goal: 'wrapped', update_goal: 'wrapped' },
+    skew: { create_goal: { fields: { result: '✅ Goal created: goal_000000000001' }, where: 'structured' } },
+  })
+  await assert.rejects(() => same.writer.materialise(plan(), PROJECT, 'run_1'), GoalWriteFailed)
+  const named = payloads(same.store, 'goal.unconfirmed')
+  assert.equal(named.length, 1)
+  assert.equal(named[0]?.['goalId'], 'goal_000000000001')
 })
 
 test('a failure partway through reports the ids already written', async (t) => {

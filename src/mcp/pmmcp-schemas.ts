@@ -147,8 +147,10 @@ export const PMMCP_STATUSES = ['pending', 'in_progress', 'completed', 'abandoned
  */
 export const GoalResult = z
   .object({
-    // No longer than any record the kernel keeps of a goal (goal.unconfirmed's
-    // goalId): an id past it could be neither recorded nor named as an orphan.
+    // A first bound, in UTF-16 units as zod counts them. The record's own test
+    // is stricter (128 UTF-8 bytes, unchanged by redaction, well-formed: writer.ts
+    // #create), so an id that passes here and fails there is still an orphan
+    // with a record, never a goal.created.
     goal_id: z.string().min(1).max(128),
     project_id: z.string().min(1),
     status: z.enum(PMMCP_STATUSES),

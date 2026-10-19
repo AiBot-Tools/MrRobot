@@ -97,7 +97,9 @@ function outputProblems(where: string, schema: unknown, statuses: readonly strin
   }
   const names = Object.keys(shape.properties)
   if (names.length === 1 && names[0] === 'result' && (shape.properties['result']?.types ?? []).includes('string')) {
-    return []
+    // The SDK demands a required name the wrapper never sends.
+    const unsent = shape.required.filter((n) => n !== 'result')
+    return unsent.length === 0 ? [] : [`${where} requires ${unsent.join(', ')} beside FastMCP's {result}, which never sends them`]
   }
   if (!names.includes('goal_id')) {
     return [`${where} returns ${names.join(', ') || 'nothing'}, which the kernel's P6 result does not read`]

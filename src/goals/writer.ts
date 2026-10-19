@@ -164,9 +164,29 @@ function goalNamedIn(text: string): string | undefined {
 }
 
 /**
+ * Something pmmcp chose (an id, a project), as a reason quotes it: bounded, so
+ * the ids a reason leads with survive the record's cut.
+ */
+function quoted(value: string | undefined): string {
+  return value === undefined ? 'no goal' : recordable(value, 128)
+}
+
+/** Two forms of one reply that disagree. The record claims an id only when both name it. */
+function disagreement(tool: string, text: string | undefined, structured: string | undefined): UnconfirmedReply {
+  if (text !== undefined && text === structured) {
+    return new UnconfirmedReply(text, `the text and structuredContent of ${tool} both name ${quoted(text)} and disagree on a field other than goal_id`)
+  }
+  // Either form may be the goal pmmcp holds; the kernel cannot tell which, so
+  // the reason names both and the record claims neither.
+  return new UnconfirmedReply(undefined, `the text and structuredContent of ${tool} disagree: the text names ${quoted(text)}, structuredContent ${quoted(structured)}`)
+}
+
+/**
  * Read a success. No structuredContent, or FastMCP's `{result: <the text>}`
  * wrapping of a `-> str` tool, is prose. Anything else must be a P6 goal result,
  * parsed strictly, whose text block (if any) says the same thing.
+ *
+ * Every refusal's reason names the ids pmmcp gave, first.
  *
  * @throws {UnconfirmedReply} for a typed success the kernel will not read.
  */
@@ -174,24 +194,25 @@ function replyOf(tool: string, result: GoalCallResult): Reply {
   const structured = result.structuredContent
   if (structured === undefined) return { kind: 'prose' }
   const text = textOf(result.content)
+  const trimmed = text.trim()
   const keys = Object.keys(structured)
-  if (keys.length === 1 && keys[0] === 'result' && typeof structured['result'] === 'string') {
-    if (structured['result'] !== text) throw new UnconfirmedReply(undefined, `the text and structuredContent of ${tool} disagree`)
+  const wrapped = structured['result']
+  if (keys.length === 1 && keys[0] === 'result' && typeof wrapped === 'string') {
+    if (wrapped !== text) {
+      throw disagreement(tool, goalNamedIn(trimmed), goalNamedIn(wrapped.trim()))
+    }
     return { kind: 'prose' }
   }
   const named = typeof structured['goal_id'] === 'string' ? structured['goal_id'] : undefined
   const parsed = GoalResult.safeParse(structured)
   if (!parsed.success) {
-    throw new UnconfirmedReply(named, `${tool} returned structuredContent that is not a P6 goal result: ${z.prettifyError(parsed.error)}`)
+    // The structured id is the orphan only if the text, when there is one, names it too.
+    const said = trimmed === '' ? named : goalNamedIn(trimmed)
+    const ids = said === named ? `it names ${quoted(named)}` : `the text names ${quoted(said)}, structuredContent ${quoted(named)}`
+    throw new UnconfirmedReply(said === named ? named : undefined, `${tool} returned structuredContent that is not a P6 goal result (${ids}): ${z.prettifyError(parsed.error)}`)
   }
-  const trimmed = text.trim()
   if (trimmed !== '' && !agrees(trimmed, structured, parsed.data.goal_id)) {
-    const id = parsed.data.goal_id
-    const said = goalNamedIn(trimmed)
-    if (said === id) throw new UnconfirmedReply(id, `the text and structuredContent of ${tool} disagree on a field other than goal_id`)
-    // Either form may be the goal pmmcp holds; the kernel cannot tell which, so
-    // the reason names both and the record claims neither.
-    throw new UnconfirmedReply(undefined, `the text and structuredContent of ${tool} disagree: the text names ${said ?? 'no goal'}, structuredContent ${id}`)
+    throw disagreement(tool, goalNamedIn(trimmed), parsed.data.goal_id)
   }
   return { kind: 'typed', value: parsed.data }
 }
@@ -336,7 +357,7 @@ export class GoalWriter {
       throw e
     }
     if (reply.kind === 'typed' && reply.value.project_id !== input.projectId) {
-      const where = `pmmcp reports it in ${reply.value.project_id}, not ${input.projectId}`
+      const where = `pmmcp reports it in ${quoted(reply.value.project_id)}, not ${input.projectId}`
       throw this.#unconfirmed(tool, input.projectId, reply.value.goal_id, where, input.written)
     }
 
@@ -350,6 +371,12 @@ export class GoalWriter {
           `${input.kind} "${input.title}": ${textOf(content).slice(0, 300)}`,
         input.written,
       )
+    }
+    // pmmcp wrote it, so an id no record holds verbatim (too long, ill-formed,
+    // or shaped like a credential and so masked) is an orphan with a record:
+    // as goal.created it would name some other goal, or fail to append at all.
+    if (recordable(goalId, 128) !== goalId) {
+      throw this.#unconfirmed(tool, input.projectId, undefined, `pmmcp's goal id is not recordable verbatim: ${quoted(goalId)}`, input.written)
     }
 
     this.#o.store.append({
@@ -489,12 +516,9 @@ export class GoalWriter {
     try {
       answer = replyOf(tool, result)
     } catch (e) {
-      if (e instanceof UnconfirmedReply) {
-        // The row names the goal the kernel asked to move; another id pmmcp
-        // named goes in the reason.
-        const named = e.goalId !== undefined && e.goalId !== goalId ? `; pmmcp names ${e.goalId}` : ''
-        throw this.#unconfirmed(tool, context.projectId, goalId, `${e.message}${named}`, [])
-      }
+      // The row names the goal the kernel asked to move; the ids pmmcp named
+      // lead the reason.
+      if (e instanceof UnconfirmedReply) throw this.#unconfirmed(tool, context.projectId, goalId, e.message, [])
       throw e
     }
     if (answer.kind === 'typed') {
@@ -502,9 +526,9 @@ export class GoalWriter {
       // for, and the project the kernel's own goal.created names.
       const v = answer.value
       const off: string[] = []
-      if (v.goal_id !== goalId) off.push(`goal_id ${v.goal_id}`)
+      if (v.goal_id !== goalId) off.push(`goal_id ${quoted(v.goal_id)}`)
       if (v.status !== sent) off.push(`status ${v.status}`)
-      if (v.project_id !== context.projectId) off.push(`project_id ${v.project_id}`)
+      if (v.project_id !== context.projectId) off.push(`project_id ${quoted(v.project_id)}`)
       if (to === 'review' && v.progress_pct !== 100) off.push(`progress_pct ${String(v.progress_pct)}`)
       if (off.length > 0) {
         throw this.#unconfirmed(tool, context.projectId, goalId, `did not confirm ${goalId} → ${sent}: pmmcp reports ${off.join(', ')}`, [])

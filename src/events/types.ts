@@ -240,7 +240,10 @@ export const GoalStatusPayload = z
  * does not read, or one the SDK refused against the tool's own schema. pmmcp
  * may have written it, so the goal may exist with no `goal.created` or
  * `goal.status` claiming it; this row is that orphan's record (operator
- * decision, 2026-10-19). `goalId` is the server's, when it could be read.
+ * decision, 2026-10-19). `goalId` is the goal the row is about: for a create,
+ * the id pmmcp reported, when it reported one unambiguously and it fits
+ * verbatim; for a move, the goal the kernel asked to move. Any other id pmmcp
+ * named is in `reason`.
  */
 export const GoalUnconfirmedPayload = z
   .object({

@@ -340,15 +340,20 @@ test('a create is read from structuredContent when there is one, with or without
 })
 
 test('a typed create the kernel will not confirm is refused, records the orphan, and writes no goal.created', async (t) => {
-  const cases: [string, Parameters<typeof pmmcpMock>[0], RegExp][] = [
+  const ONE = 'goal_000000000001'
+  // [why, double, refusal, the orphan row's goalId]
+  const cases: [string, Parameters<typeof pmmcpMock>[0], RegExp, string | undefined][] = [
     // Both forms agree, on another project: only the project check can refuse it.
-    ['another project', { ...P6, skew: { create_goal: { fields: { project_id: 'aos/elsewhere' } } } }, /pmmcp reports it in aos\/elsewhere, not aos\/ceo/],
-    // Only structuredContent names another goal: only the agreement check can.
-    ['forms that disagree', { ...P6, skew: { create_goal: { fields: { goal_id: 'goal_ffffffffffff' }, where: 'structured' } } }, /disagree/],
+    ['another project', { ...P6, skew: { create_goal: { fields: { project_id: 'aos/elsewhere' } } } }, /pmmcp reports it in aos\/elsewhere, not aos\/ceo/, ONE],
+    // Only structuredContent names another goal: only the agreement check can,
+    // and with two ids for one write the row claims neither and names both.
+    ['forms that disagree on the goal', { ...P6, skew: { create_goal: { fields: { goal_id: 'goal_ffffffffffff' }, where: 'structured' } } }, /disagree: the text names goal_000000000001, structuredContent goal_ffffffffffff/, undefined],
+    // Both forms name one goal and differ elsewhere: that goal is the orphan.
+    ['forms that disagree on another field', { ...P6, skew: { create_goal: { fields: { project_id: 'aos/elsewhere' }, where: 'structured' } } }, /disagree on a field other than goal_id/, ONE],
     // A field the kernel never read, which the SDK's validator admits.
-    ['a result it does not read', { ...P6, skew: { create_goal: { fields: { created_at: '2026-10-19T00:00:00Z' } } } }, /not a P6 goal result/],
+    ['a result it does not read', { ...P6, skew: { create_goal: { fields: { created_at: '2026-10-19T00:00:00Z' } } } }, /not a P6 goal result/, ONE],
   ]
-  for (const [why, options, reason] of cases) {
+  for (const [why, options, reason, orphan] of cases) {
     const { store, mock, writer } = await wired(t, options)
     await assert.rejects(
       () => writer.materialise(plan(), PROJECT, 'run_1'),
@@ -363,8 +368,11 @@ test('a typed create the kernel will not confirm is refused, records the orphan,
     assert.equal(orphans.length, 1, why)
     assert.equal(orphans[0]?.['projectId'], PROJECT)
     assert.equal(orphans[0]?.['tool'], 'create_goal')
-    // pmmcp did write it: the record names the goal that now has no owner.
+    assert.match(String(orphans[0]?.['reason']), reason, why)
+    // pmmcp did write it; the row names it wherever one id is certain.
     assert.equal(mock.state.goals.size, 1, why)
+    assert.ok(mock.state.goals.has(ONE), why)
+    assert.equal(orphans[0]?.['goalId'], orphan, why)
   }
 })
 
@@ -382,6 +390,25 @@ test('a result the SDK refuses mid-tree is a GoalWriteFailed naming what was wri
   assert.equal(mock.state.goals.size, 3, 'pmmcp wrote the third goal before the client refused its reply')
   assert.equal(payloads(store, 'goal.created').length, 2)
   assert.equal(payloads(store, 'goal.unconfirmed').length, 1)
+})
+
+test('a refused move names the goal the kernel asked to move, and any other id pmmcp named is in the reason', async (t) => {
+  // [why, update_goal skew, refusal]: the SDK refusing the reply, and the strict
+  // parse refusing a reply that also names another goal.
+  const cases: [string, Record<string, unknown>, RegExp][] = [
+    ['the SDK refuses the reply', { progress_pct: 'x' }, /output schema/],
+    ['a result it does not read', { goal_id: 'goal_ffffffffffff', created_at: 'x' }, /not a P6 goal result.*; pmmcp names goal_ffffffffffff$/s],
+  ]
+  for (const [why, fields, reason] of cases) {
+    const { store, writer } = await wired(t, { ...P6, skew: { update_goal: { fields } } })
+    const { task } = await written(writer)
+    await assert.rejects(() => writer.setStatus(task, 'in_progress', { projectId: PROJECT }), GoalWriteFailed, why)
+    const orphans = payloads(store, 'goal.unconfirmed')
+    assert.equal(orphans.length, 1, why)
+    assert.equal(orphans[0]?.['tool'], 'update_goal', why)
+    assert.equal(orphans[0]?.['goalId'], task, `${why}: the row does not name the goal that may have moved`)
+    assert.match(String(orphans[0]?.['reason']), reason, why)
+  }
 })
 
 test('what pmmcp says in a refused create reaches goal.unconfirmed redacted, whole and well-formed, and the refusal stays a GoalWriteFailed', async (t) => {
@@ -470,7 +497,9 @@ test("a move is confirmed from structuredContent: P6's JSON-only reply is a move
       },
     )
     assert.equal(payloads(w.store, 'goal.status').length, before, `${why}: the move was recorded`)
-    assert.equal(payloads(w.store, 'goal.unconfirmed').length, 1, why)
+    const orphans = payloads(w.store, 'goal.unconfirmed')
+    assert.equal(orphans.length, 1, why)
+    assert.equal(orphans[0]?.['goalId'], target, why)
   }
 })
 

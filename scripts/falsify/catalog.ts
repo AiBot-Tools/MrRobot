@@ -208,6 +208,10 @@ const goals: Suite = {
     { id: 'G46', file: GOAL_TOOLS, from: '  if (demanded.length > 0) problems.push(', to: '  if (false) problems.push(', why: 'a result schema requiring a field it does not declare passes the boot check, and the SDK or the strict parse refuses every call' },
     { id: 'G47', file: GOAL_TOOLS, from: '  const extra = names.filter((n) => !Object.hasOwn(RESULT_TYPES, n))', to: '  const extra = names.filter((n) => RESULT_TYPES[n] === undefined)', why: 'a result field named constructor passes the boot check through the prototype' },
     { id: 'G48', file: PMMCP_SCHEMAS, from: "      else if ('const' in part) limited?.push(part['const'])\n", to: '', why: "a status Literal (pydantic's const) passes the boot check, and the SDK refuses every other status" },
+    { id: 'G49', file: WRITER, from: 'this.#recordUnconfirmed(tool, projectId, goalId, message)', to: 'this.#recordUnconfirmed(tool, projectId, undefined, message)', why: 'a move whose reply the SDK refused is recorded without the goal that may have moved' },
+    { id: 'G50', file: WRITER, from: '    throw new UnconfirmedReply(undefined, `the text and structuredContent of ${tool} disagree: the text names', to: '    throw new UnconfirmedReply(id, `the text and structuredContent of ${tool} disagree: the text names', why: 'a create whose two forms name two goals is recorded under one of them, maybe a goal that does not exist' },
+    { id: 'G51', file: WRITER, from: "        const named = e.goalId !== undefined && e.goalId !== goalId ? `; pmmcp names ${e.goalId}` : ''", to: "        const named = ''", why: 'a refused move drops the other goal pmmcp named from the record' },
+    { id: 'G52', file: WRITER, from: '    if (said === id) throw new UnconfirmedReply(id, ', to: '    if (false) throw new UnconfirmedReply(id, ', why: 'a create whose two forms name one goal and differ elsewhere is recorded with no goal id' },
   ],
   control: {
     id: 'C',

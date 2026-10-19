@@ -152,6 +152,17 @@ function agrees(text: string, structured: Readonly<Record<string, unknown>>, goa
   return /^✅ Goal (?:created|updated): (\S+)/u.exec(text)?.[1] === goalId
 }
 
+/** The goal a reply's text names, as P6's JSON or pmmcp's prose, or undefined. */
+function goalNamedIn(text: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(text)
+    const id = typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>)['goal_id'] : undefined
+    return typeof id === 'string' ? id : undefined
+  } catch {
+    return /^✅ Goal (?:created|updated): (\S+)/u.exec(text)?.[1]
+  }
+}
+
 /**
  * Read a success. No structuredContent, or FastMCP's `{result: <the text>}`
  * wrapping of a `-> str` tool, is prose. Anything else must be a P6 goal result,
@@ -175,7 +186,12 @@ function replyOf(tool: string, result: GoalCallResult): Reply {
   }
   const trimmed = text.trim()
   if (trimmed !== '' && !agrees(trimmed, structured, parsed.data.goal_id)) {
-    throw new UnconfirmedReply(parsed.data.goal_id, `the text and structuredContent of ${tool} disagree`)
+    const id = parsed.data.goal_id
+    const said = goalNamedIn(trimmed)
+    if (said === id) throw new UnconfirmedReply(id, `the text and structuredContent of ${tool} disagree on a field other than goal_id`)
+    // Either form may be the goal pmmcp holds; the kernel cannot tell which, so
+    // the reason names both and the record claims neither.
+    throw new UnconfirmedReply(undefined, `the text and structuredContent of ${tool} disagree: the text names ${said ?? 'no goal'}, structuredContent ${id}`)
   }
   return { kind: 'typed', value: parsed.data }
 }
@@ -217,13 +233,15 @@ export class GoalWriter {
    * Any error but the kernel's own refusals becomes GoalWriteFailed, so
    * kernel.adopt_plan refuses with a record instead of throwing. The SDK refuses
    * a success that breaks the tool's own outputSchema, or that has none: pmmcp
-   * has answered, so it may have written, and that is recorded.
+   * has answered, so it may have written, and that is recorded, naming `goalId`
+   * when the call itself named one (a move).
    */
   async #answered(
     tool: string,
     call: Promise<GoalCallResult>,
     projectId: string,
     written: readonly string[],
+    goalId: string | undefined,
   ): Promise<GoalCallResult> {
     let result: GoalCallResult
     try {
@@ -231,7 +249,7 @@ export class GoalWriter {
     } catch (e) {
       if (e instanceof GoalWriteFailed || e instanceof GoalsUnavailable || e instanceof PolicyDenied) throw e
       const message = e instanceof Error ? e.message : String(e)
-      if (/output schema|structured content/i.test(message)) this.#recordUnconfirmed(tool, projectId, undefined, message)
+      if (/output schema|structured content/i.test(message)) this.#recordUnconfirmed(tool, projectId, goalId, message)
       throw new GoalWriteFailed(`${this.#serverId}.${tool} failed: ${message}`, written)
     }
     if (!result.ok) {
@@ -306,6 +324,7 @@ export class GoalWriter {
       }),
       input.projectId,
       input.written,
+      undefined,
     )
     const content = result.content
 
@@ -463,13 +482,19 @@ export class GoalWriter {
       ),
       context.projectId,
       [],
+      goalId,
     )
 
     let answer: Reply
     try {
       answer = replyOf(tool, result)
     } catch (e) {
-      if (e instanceof UnconfirmedReply) throw this.#unconfirmed(tool, context.projectId, goalId, e.message, [])
+      if (e instanceof UnconfirmedReply) {
+        // The row names the goal the kernel asked to move; another id pmmcp
+        // named goes in the reason.
+        const named = e.goalId !== undefined && e.goalId !== goalId ? `; pmmcp names ${e.goalId}` : ''
+        throw this.#unconfirmed(tool, context.projectId, goalId, `${e.message}${named}`, [])
+      }
       throw e
     }
     if (answer.kind === 'typed') {

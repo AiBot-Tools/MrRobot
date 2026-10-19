@@ -347,3 +347,116 @@ test('padTo reaches pmmcp\'s real cardinality with visibly fake placeholders', a
     /no tool unmodelled_placeholder_1/,
   )
 })
+
+// ── contract P5 and P6, opt-in ───────────────────────────────────────────────
+//
+// The live server is today's prose server, so that stays the default. These
+// modes are MODELLED from contract §3 P5/P6 and FastMCP's own wrapping of a
+// `-> str` tool; the SDK client below validates them as it would the real thing.
+
+test('structured goal tools declare object-rooted output schemas and answer with structuredContent and the same JSON as text; by default they declare none', async (t) => {
+  const { mock, client } = await open(t, {
+    refusals: 'p5',
+    outputs: { create_goal: 'structured', update_goal: 'structured', get_goal_tree: 'structured' },
+  })
+  const listed = await client.listTools()
+  const schemaOf = (name: string): Record<string, unknown> | undefined =>
+    listed.tools.find((x) => x.name === name)?.outputSchema as Record<string, unknown> | undefined
+  assert.equal(schemaOf('create_goal')?.['type'], 'object')
+  assert.ok((schemaOf('get_goal_tree')?.['$defs'] as Record<string, unknown> | undefined)?.['GoalNode'])
+  assert.equal(schemaOf('list_goals'), undefined, 'list_goals stays prose: P6 gives it no shape')
+
+  const created = await client.callTool({
+    name: 'create_goal',
+    arguments: { project_id: 'aos/ceo', goal_type: 'objective', title: 'ship step 2' },
+  })
+  const structured = created.structuredContent as Record<string, unknown>
+  const goalId = structured['goal_id'] as string
+  assert.deepEqual(structured, { goal_id: goalId, project_id: 'aos/ceo', status: 'pending', progress_pct: 0 })
+  assert.ok(mock.state.goals.has(goalId))
+  const text = (created.content as { text: string }[])[0]?.text ?? ''
+  assert.deepEqual(JSON.parse(text), structured, 'P6: the serialized JSON is also returned as a text block')
+
+  const moved = await client.callTool({ name: 'update_goal', arguments: { goal_id: goalId, status: 'in_progress' } })
+  assert.deepEqual(moved.structuredContent, { goal_id: goalId, project_id: 'aos/ceo', status: 'in_progress', progress_pct: 0 })
+  const tree = await client.callTool({ name: 'get_goal_tree', arguments: { goal_id: goalId } })
+  assert.equal((tree.structuredContent as Record<string, unknown>)['goal_type'], 'objective')
+
+  const plain = await open(t)
+  const plainList = await plain.client.listTools()
+  assert.equal(plainList.tools.find((x) => x.name === 'create_goal')?.outputSchema, undefined)
+  const prose = await call(plain.client, 'create_goal', { project_id: 'aos/ceo', goal_type: 'objective', title: 'x' })
+  assert.match(prose.text, /^✅ Goal created: /u)
+})
+
+test('P5 refusals are isError with a code, in both wire forms, and a not-found message never quotes what it was sent', async (t) => {
+  const { mock, client } = await open(t, { refusals: 'p5' })
+  const ceo = mock.seedTree('aos/ceo')
+  const illegal = await call(client, 'update_goal', { goal_id: ceo.task, status: 'completed' })
+  // pending → completed is not a legal transition.
+  assert.equal(illegal.isError, true)
+  assert.match(illegal.text, /^Error executing tool update_goal: invalid_transition: /)
+  const missing = await call(client, 'update_goal', { goal_id: 'goal_000000000fff', status: 'blocked' })
+  assert.match(missing.text, /^Error executing tool update_goal: goal_not_found: /)
+  assert.equal(missing.text.includes('goal_000000000fff'), false)
+  const parent = await call(client, 'create_goal', {
+    project_id: 'aos/ceo',
+    goal_type: 'milestone',
+    title: 'x',
+    parent_goal_id: 'goal_000000000eee',
+  })
+  assert.match(parent.text, /^Error executing tool create_goal: parent_not_found: /)
+  assert.equal(parent.text.includes('goal_000000000eee'), false)
+  const secret = await call(client, 'get_secret', { label: 'no-such-label' })
+  assert.match(secret.text, /not_found: /)
+  assert.equal(secret.text.includes('no-such-label'), false)
+
+  const dispatch = await open(t, { refusals: 'p5', p5Form: 'dispatch' })
+  const bad = await call(dispatch.client, 'create_goal', { project_id: 'aos/ceo', goal_type: 'epic', title: 'x' })
+  assert.equal(bad.isError, true)
+  assert.match(bad.text, /^invalid_goal_type: /)
+
+  // The default is today's pmmcp: a refusal is SUCCESS text.
+  const today = await open(t)
+  const textual = await call(today.client, 'create_goal', { project_id: 'aos/ceo', goal_type: 'epic', title: 'x' })
+  assert.equal(textual.isError, false)
+  assert.match(textual.text, /^Error: Invalid goal_type: epic/)
+})
+
+test("FastMCP's wrapper and the skew option: the forms the kernel must tell apart", async (t) => {
+  const wrapped = await open(t, { outputs: { create_goal: 'wrapped' } })
+  await wrapped.client.listTools()
+  const w = await wrapped.client.callTool({
+    name: 'create_goal',
+    arguments: { project_id: 'aos/ceo', goal_type: 'objective', title: 'x' },
+  })
+  const text = (w.content as { text: string }[])[0]?.text ?? ''
+  assert.deepEqual(w.structuredContent, { result: text })
+
+  const outputs = { create_goal: 'structured' } as const
+  const both = await open(t, { refusals: 'p5', outputs, skew: { create_goal: { fields: { project_id: 'aos/elsewhere' } } } })
+  await both.client.listTools()
+  const b = await both.client.callTool({ name: 'create_goal', arguments: { project_id: 'aos/ceo', goal_type: 'objective', title: 'x' } })
+  assert.equal((b.structuredContent as Record<string, unknown>)['project_id'], 'aos/elsewhere')
+  assert.equal(JSON.parse((b.content as { text: string }[])[0]?.text ?? '')['project_id'], 'aos/elsewhere', 'both forms bent alike')
+
+  const one = await open(t, {
+    refusals: 'p5',
+    outputs,
+    skew: { create_goal: { fields: { goal_id: 'goal_ffffffffffff' }, where: 'structured' } },
+  })
+  await one.client.listTools()
+  const o = await one.client.callTool({ name: 'create_goal', arguments: { project_id: 'aos/ceo', goal_type: 'objective', title: 'x' } })
+  assert.equal((o.structuredContent as Record<string, unknown>)['goal_id'], 'goal_ffffffffffff')
+  assert.notEqual(JSON.parse((o.content as { text: string }[])[0]?.text ?? '')['goal_id'], 'goal_ffffffffffff', 'only structuredContent bent')
+
+  // A value that breaks the declared schema is refused by the SDK client itself.
+  const broken = await open(t, { refusals: 'p5', outputs, skew: { create_goal: { fields: { progress_pct: 'x' } } } })
+  await broken.client.listTools()
+  await assert.rejects(() =>
+    broken.client.callTool({ name: 'create_goal', arguments: { project_id: 'aos/ceo', goal_type: 'objective', title: 'x' } }),
+  )
+
+  assert.throws(() => pmmcpMock({ outputs: { create_goal: 'structured' } }), /needs refusals: 'p5'/)
+  assert.throws(() => pmmcpMock({ refusals: 'p5', outputs: { list_goals: 'structured' } }), /no structured result for list_goals/)
+})

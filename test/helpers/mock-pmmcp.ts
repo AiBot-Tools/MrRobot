@@ -475,6 +475,33 @@ export interface PmmcpMockOptions {
    */
   readonly schemas?: Readonly<Record<string, JsonObjectSchema>>
   /**
+   * How a refusal arrives. `text` (the default) is today's pmmcp: SUCCESS text,
+   * "Error: …" or "Goal x not found.". `p5` is contract P5, MODELLED from the
+   * contract: `isError` with `<code>: <message>`, and a not-found message never
+   * quotes the id or label it was sent.
+   */
+  readonly refusals?: 'text' | 'p5'
+  /** P5's two wire forms: raised in a tool body, or at dispatch. Default `body`. */
+  readonly p5Form?: 'body' | 'dispatch'
+  /**
+   * Per tool, what a success carries besides text. `prose` (the default) is
+   * today's capture: no outputSchema. `wrapped` is FastMCP's automatic output for
+   * a `-> str` tool, `{result: <the text>}`. `structured` is contract P6's typed
+   * result, for create_goal, update_goal and get_goal_tree only, and needs
+   * `refusals: 'p5'`: once a tool declares an outputSchema, the client refuses a
+   * success without structuredContent. Both modes are MODELLED, never confirmed.
+   */
+  readonly outputs?: Readonly<Record<string, OutputMode>>
+  /** The text block beside a `structured` result: its JSON (P6, the default), today's prose, or none. */
+  readonly structuredText?: 'json' | 'prose' | 'none'
+  /**
+   * Bend a tool's structured result, from its `fromCall`-th call on (1-based,
+   * default 1). `both` (the default) bends it before the JSON text is made, so
+   * the two forms agree on the bent value; `structured` bends only
+   * structuredContent, so they disagree.
+   */
+  readonly skew?: Readonly<Record<string, SkewSpec>>
+  /**
    * Idle window. A call or ping arriving more than this after the session's last
    * activity expires it, the way pmmcp's sessions idle-expire. Needs `now`.
    */
@@ -542,11 +569,88 @@ function fail(message: string): CallToolResult {
   return { content: [{ type: 'text', text: message }], isError: true }
 }
 
+export type OutputMode = 'prose' | 'wrapped' | 'structured'
+
+export interface SkewSpec {
+  readonly fields: Readonly<Record<string, unknown>>
+  readonly where?: 'both' | 'structured'
+  readonly fromCall?: number
+}
+
+/** The tools contract P6 gives a typed result that the double models. */
+export const STRUCTURED_TOOLS: readonly string[] = ['create_goal', 'update_goal', 'get_goal_tree']
+
+/** P5's codes for the refusals the double makes; `invalid_arguments` marks its own stricter-than-pmmcp checks. */
+export type P5Code =
+  | 'goal_not_found'
+  | 'not_found'
+  | 'invalid_transition'
+  | 'invalid_status'
+  | 'parent_not_found'
+  | 'invalid_goal_type'
+  | 'progress_out_of_range'
+  | 'invalid_arguments'
+
+// Contract P6's create/update result, in the form pydantic publishes: an
+// object root, titles, every field required, and no additionalProperties.
+export const GOAL_RESULT_OUTPUT: Readonly<Record<string, unknown>> = {
+  type: 'object',
+  title: 'GoalResult',
+  properties: {
+    goal_id: { type: 'string', title: 'Goal Id' },
+    project_id: { type: 'string', title: 'Project Id' },
+    status: { type: 'string', title: 'Status' },
+    progress_pct: { type: 'number', title: 'Progress Pct' },
+  },
+  required: ['goal_id', 'project_id', 'status', 'progress_pct'],
+}
+
+// P6's tree: a non-recursive root whose children are a self-referential node,
+// because a root that is only a $ref is a schema the SDK's tools/list refuses.
+const NODE_PROPERTIES = {
+  goal_id: { type: 'string', title: 'Goal Id' },
+  title: { type: 'string', title: 'Title' },
+  goal_type: { type: 'string', title: 'Goal Type' },
+  status: { type: 'string', title: 'Status' },
+  progress_pct: { type: 'number', title: 'Progress Pct' },
+  children: { type: 'array', items: { $ref: '#/$defs/GoalNode' }, title: 'Children' },
+}
+const NODE_REQUIRED = ['goal_id', 'title', 'goal_type', 'status', 'progress_pct', 'children']
+export const GOAL_TREE_OUTPUT: Readonly<Record<string, unknown>> = {
+  type: 'object',
+  title: 'GoalTree',
+  properties: NODE_PROPERTIES,
+  required: NODE_REQUIRED,
+  $defs: { GoalNode: { type: 'object', title: 'GoalNode', properties: NODE_PROPERTIES, required: NODE_REQUIRED } },
+}
+
+/** FastMCP's automatic output schema for a tool annotated `-> str`. */
+export function wrappedOutput(tool: string): Readonly<Record<string, unknown>> {
+  return {
+    type: 'object',
+    title: `${tool}Output`,
+    properties: { result: { type: 'string', title: 'Result' } },
+    required: ['result'],
+  }
+}
+
 export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
   const secretArg = options.secretArg ?? 'label'
   const now = options.now ?? ((): number => Date.now())
   const strictRollup = options.strictRollup ?? false
   const revealSecrets = options.revealSecrets ?? false
+  const refusals = options.refusals ?? 'text'
+  const outputs = options.outputs ?? {}
+  for (const [tool, mode] of Object.entries(outputs)) {
+    if (mode === 'structured' && !STRUCTURED_TOOLS.includes(tool)) {
+      throw new Error(`the double models no structured result for ${tool}`)
+    }
+    if (mode === 'structured' && refusals !== 'p5') {
+      // A refusal as success text carries no structuredContent, which the SDK
+      // client refuses for a tool with an outputSchema; P6 ships with P5.
+      throw new Error(`outputs.${tool} is structured, which needs refusals: 'p5'`)
+    }
+  }
 
   const state: PmmcpState = {
     goals: new Map(),
@@ -586,15 +690,26 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     return replaced === undefined ? spec : { ...spec, inputSchema: replaced, provenance: 'modelled', source: 'schemas override' }
   })
 
-  const tools: Tool[] = specs.map((spec) => ({
-    name: spec.name,
-    description: spec.description,
-    inputSchema: {
-      type: 'object' as const,
-      properties: { ...spec.inputSchema.properties },
-      ...(spec.inputSchema.required === undefined ? {} : { required: [...spec.inputSchema.required] }),
-    },
-  }))
+  const outputSchemaOf = (tool: string): Readonly<Record<string, unknown>> | undefined => {
+    const mode = outputs[tool] ?? 'prose'
+    if (mode === 'wrapped') return wrappedOutput(tool)
+    if (mode === 'structured') return tool === 'get_goal_tree' ? GOAL_TREE_OUTPUT : GOAL_RESULT_OUTPUT
+    return undefined
+  }
+
+  const tools: Tool[] = specs.map((spec) => {
+    const outputSchema = outputSchemaOf(spec.name)
+    return {
+      name: spec.name,
+      description: spec.description,
+      inputSchema: {
+        type: 'object' as const,
+        properties: { ...spec.inputSchema.properties },
+        ...(spec.inputSchema.required === undefined ? {} : { required: [...spec.inputSchema.required] }),
+      },
+      ...(outputSchema === undefined ? {} : { outputSchema: { ...outputSchema, type: 'object' as const } }),
+    }
+  })
 
   const padTo = options.padTo
   if (padTo !== undefined) {
@@ -648,6 +763,25 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
 
   const handlers = new Map<string, Handler>()
 
+  // What a success looks like on the wire, per tool's output mode. A refusal
+  // (isError) goes out as it is: the client validates only successes.
+  const shaped = (tool: string, result: CallToolResult): CallToolResult => {
+    const mode = outputs[tool] ?? 'prose'
+    if (mode === 'prose' || result.isError === true) return result
+    const text = (result.content as { text?: unknown }[]).map((b) => (typeof b.text === 'string' ? b.text : '')).join('')
+    if (mode === 'wrapped') return { ...result, structuredContent: { result: text } }
+    const value = typed.get(result)
+    if (value === undefined) throw new Error(`${tool} produced no typed result to structure`)
+    const skew = options.skew?.[tool]
+    const nth = calls.filter((c) => c.tool === tool).length
+    const bent = skew !== undefined && nth >= (skew.fromCall ?? 1) ? { ...value, ...skew.fields } : value
+    const textual = skew?.where === 'structured' ? value : bent
+    const how = options.structuredText ?? 'json'
+    const content =
+      how === 'none' ? [] : [{ type: 'text' as const, text: how === 'prose' ? text : JSON.stringify(textual, null, 2) }]
+    return { content, structuredContent: bent }
+  }
+
   handlers.set('remember', (args) => {
     const projectId = need(args, 'project_id')
     const key = need(args, 'key')
@@ -681,6 +815,28 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
   // error, because FastMCP rejects it before the tool body runs.
   const said = (text: string): CallToolResult => ok(text)
 
+  // A refusal: today's success text, or P5's isError with a code. The P5 message
+  // is written for the operator and never carries the id or label the call sent.
+  const refuse = (tool: string, code: P5Code, legacy: string, message: string): CallToolResult => {
+    if (refusals === 'text') return said(legacy)
+    const body = `${code}: ${message}`
+    return fail(options.p5Form === 'dispatch' ? body : `Error executing tool ${tool}: ${body}`)
+  }
+
+  // The typed value a handler's success stands for. The dispatcher decides,
+  // per tool, whether it goes out as structuredContent.
+  const typed = new WeakMap<CallToolResult, Record<string, unknown>>()
+  const withTyped = (result: CallToolResult, value: Record<string, unknown>): CallToolResult => {
+    typed.set(result, value)
+    return result
+  }
+  const goalResult = (g: MockGoal): Record<string, unknown> => ({
+    goal_id: g.id,
+    project_id: g.projectId,
+    status: g.status,
+    progress_pct: g.progressPct,
+  })
+
   handlers.set('create_goal', (args) => {
     const projectId = need(args, 'project_id')
     const title = need(args, 'title')
@@ -688,25 +844,35 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     if (title === undefined) return fail('title is required')
     const kindRaw = need(args, 'goal_type') ?? 'objective'
     if (!(GOAL_KINDS as readonly string[]).includes(kindRaw)) {
-      return said(`Error: Invalid goal_type: ${kindRaw}. Must be one of {'objective', 'milestone', 'task'}`)
+      return refuse(
+        'create_goal',
+        'invalid_goal_type',
+        `Error: Invalid goal_type: ${kindRaw}. Must be one of {'objective', 'milestone', 'task'}`,
+        'goal_type must be one of objective, milestone, task',
+      )
     }
     const kind = kindRaw as GoalKind
     const parentId = need(args, 'parent_goal_id')
     if (parentId !== undefined && !state.goals.has(parentId)) {
-      return said(`Error: Parent goal not found: ${parentId}`)
+      return refuse('create_goal', 'parent_not_found', `Error: Parent goal not found: ${parentId}`, 'the parent goal does not exist')
     }
     // STRICTER than pmmcp, which checks only that the parent exists: the kernel
     // always writes objective → milestone → task in one project, so holding it
     // to that costs nothing and catches a writer that ever stops doing so.
     const wantParent = PARENT_KIND[kind]
     if (wantParent === undefined && parentId !== undefined) {
-      return said('Error: an objective is a root and takes no parent_goal_id (stricter than pmmcp)')
+      const why = 'an objective is a root and takes no parent_goal_id (stricter than pmmcp)'
+      return refuse('create_goal', 'invalid_arguments', `Error: ${why}`, why)
     }
     if (wantParent !== undefined) {
       const parent = parentId === undefined ? undefined : state.goals.get(parentId)
-      if (parent === undefined) return said(`Error: a ${kind} requires a parent_goal_id (stricter than pmmcp)`)
+      if (parent === undefined) {
+        const why = `a ${kind} requires a parent_goal_id (stricter than pmmcp)`
+        return refuse('create_goal', 'invalid_arguments', `Error: ${why}`, why)
+      }
       if (parent.projectId !== projectId || parent.kind !== wantParent) {
-        return said(`Error: a ${kind} hangs from a ${wantParent} in ${projectId} (stricter than pmmcp)`)
+        const why = `a ${kind} hangs from a ${wantParent} in ${projectId} (stricter than pmmcp)`
+        return refuse('create_goal', 'invalid_arguments', `Error: ${why}`, why)
       }
     }
     const priority = typeof args['priority'] === 'number' ? Math.max(1, Math.min(5, args['priority'])) : 3
@@ -724,16 +890,21 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
       createdAt: at,
       updatedAt: at,
     })
+    const created = state.goals.get(id)
+    const value = created === undefined ? {} : goalResult(created)
     const shape = options.goalIdShape ?? 'pmmcp'
-    if (shape === 'bare') return ok(id)
-    if (shape === 'prose') return ok(`I have created the ${kind} for you.`)
-    if (shape === 'json') return ok({ id, kind, status: 'pending' })
-    return said(
-      `✅ Goal created: ${id}\n` +
-        `   Title: ${title}\n` +
-        `   Type: ${kind} | Priority: ${String(priority)}\n` +
-        '   Status: pending | auto_resume: false\n' +
-        '   Confirmation required: always',
+    if (shape === 'bare') return withTyped(ok(id), value)
+    if (shape === 'prose') return withTyped(ok(`I have created the ${kind} for you.`), value)
+    if (shape === 'json') return withTyped(ok({ id, kind, status: 'pending' }), value)
+    return withTyped(
+      said(
+        `✅ Goal created: ${id}\n` +
+          `   Title: ${title}\n` +
+          `   Type: ${kind} | Priority: ${String(priority)}\n` +
+          '   Status: pending | auto_resume: false\n' +
+          '   Confirmation required: always',
+      ),
+      value,
     )
   })
 
@@ -753,13 +924,21 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     [...state.goals.values()].filter((g) => g.parentId === id).sort((x, y) => x.createdAt - y.createdAt)
   const tree = (g: MockGoal, indent: number): string =>
     [display(g, indent), ...childrenOf(g.id).map((c) => tree(c, indent + 1))].join('\n')
+  const node = (g: MockGoal): Record<string, unknown> => ({
+    goal_id: g.id,
+    title: g.title,
+    goal_type: g.kind,
+    status: g.status,
+    progress_pct: g.progressPct,
+    children: childrenOf(g.id).map(node),
+  })
 
   handlers.set('get_goal_tree', (args) => {
     const goalId = need(args, 'goal_id')
     if (goalId === undefined) return fail('goal_id is required')
     const goal = options.forgetsGoals === true ? undefined : state.goals.get(goalId)
-    if (goal === undefined) return said(`Goal ${goalId} not found.`)
-    return said(tree(goal, 0))
+    if (goal === undefined) return refuse('get_goal_tree', 'goal_not_found', `Goal ${goalId} not found.`, 'the goal does not exist')
+    return withTyped(said(tree(goal, 0)), node(goal))
   })
 
   handlers.set('list_goals', (args) => {
@@ -810,28 +989,36 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     const goalId = need(args, 'goal_id')
     if (goalId === undefined) return fail('goal_id is required')
     const goal = state.goals.get(goalId)
-    if (goal === undefined) return said(`Goal ${goalId} not found.`)
+    if (goal === undefined) return refuse('update_goal', 'goal_not_found', `Goal ${goalId} not found.`, 'the goal does not exist')
     const status = need(args, 'status')
     if (status !== undefined) {
-      if (!(GOAL_STATUSES as readonly string[]).includes(status)) return said(`Error: Invalid status: ${status}`)
+      if (!(GOAL_STATUSES as readonly string[]).includes(status)) {
+        return refuse('update_goal', 'invalid_status', `Error: Invalid status: ${status}`, `status must be one of ${GOAL_STATUSES.join(', ')}`)
+      }
+      const from = goal.status
       const refused = move(goal, status as GoalStatus)
-      if (refused !== undefined) return said(refused)
+      if (refused !== undefined) {
+        return refuse('update_goal', 'invalid_transition', refused, `cannot move from ${from} to ${status}`)
+      }
     }
     const pct = args['progress_pct']
     if (typeof pct === 'number') {
-      if (pct < 0 || pct > 100) return said('Error: progress_pct must be between 0.0 and 100.0')
+      if (pct < 0 || pct > 100) {
+        return refuse('update_goal', 'progress_out_of_range', 'Error: progress_pct must be between 0.0 and 100.0', 'progress_pct must be between 0 and 100')
+      }
       goal.progressPct = pct
     }
-    return said(`✅ Goal updated: ${goalId}\n   ${display(goal)}`)
+    return withTyped(said(`✅ Goal updated: ${goalId}\n   ${display(goal)}`), goalResult(goal))
   })
 
   handlers.set('complete_goal', (args) => {
     const goalId = need(args, 'goal_id')
     if (goalId === undefined) return fail('goal_id is required')
     const goal = state.goals.get(goalId)
-    if (goal === undefined) return said(`Goal ${goalId} not found.`)
+    if (goal === undefined) return refuse('complete_goal', 'goal_not_found', `Goal ${goalId} not found.`, 'the goal does not exist')
+    const from = goal.status
     const refused = move(goal, 'completed')
-    if (refused !== undefined) return said(refused)
+    if (refused !== undefined) return refuse('complete_goal', 'invalid_transition', refused, `cannot move from ${from} to completed`)
     return said(`✅ Completed: ${goal.title}`)
   })
 
@@ -842,7 +1029,7 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     state.audit.push({ action: 'get_secret', label, ok: value !== undefined, at: now() })
     if (!revealSecrets) {
       // pmmcp's own replies, verbatim in shape: success text either way.
-      if (value === undefined) return ok(`Secret '${label}' not found.`)
+      if (value === undefined) return refuse('get_secret', 'not_found', `Secret '${label}' not found.`, 'no such secret')
       const masked = value.length > 4 ? '*'.repeat(value.length - 4) + value.slice(-4) : '****'
       return ok(`Secret '${label}' exists (masked): ${masked}`)
     }
@@ -939,7 +1126,7 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
         throw new McpError(ErrorCode.MethodNotFound, `mock pmmcp has no tool ${name}`)
       }
       const before = new Map([...state.goals].map(([id, g]) => [id, g.status]))
-      const result = handler(args)
+      const result = shaped(name, handler(args))
       // auto_resume is OFF: the only thing that moves a status is an explicit
       // update. Anything else is recorded, and a test asserts it stays empty.
       for (const [id, status] of before) {

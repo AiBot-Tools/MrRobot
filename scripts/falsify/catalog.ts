@@ -182,6 +182,11 @@ const goals: Suite = {
     { id: 'G22', file: PMMCP_SCHEMAS, from: '    const known = strict || !opaque', to: '    const known = true', why: 'a $ref status reads as null-only, and a pmmcp that types its enum degrades goals for nothing' },
     { id: 'G23', file: GOAL_TOOLS, from: '    if (doubled.length > 0) {', to: '    if (false) {', why: 'two goals.args entries naming one key boot clean, and every task is written as an objective' },
     { id: 'G24', file: PMMCP_SCHEMAS, from: '    progress_pct: z.number().min(0).max(100),\n  })\n  .strict()', to: '    progress_pct: z.number().min(0).max(100),\n  })', why: 'a P6 goal result carrying a field the kernel never read is accepted' },
+    { id: 'G25', file: WRITER, from: "    if (reply.kind === 'typed' && reply.value.project_id !== input.projectId) {", to: '    if (false) {', why: 'a typed create pmmcp reports in another project is recorded as this one' },
+    { id: 'G26', file: WRITER, from: "  if (trimmed !== '' && !agrees(trimmed, structured, parsed.data.goal_id)) {", to: '  if (false) {', why: 'a typed result whose text names another goal is believed' },
+    { id: 'G27', file: WRITER, from: '  if (!parsed.success) {\n    throw new UnconfirmedReply(named,', to: "  if (!parsed.success) return { kind: 'prose' }\n  if (false) {\n    throw new UnconfirmedReply(named,", why: 'a structured result the kernel does not read falls back to guessing an id from its text' },
+    { id: 'G28', file: WRITER, from: '      if (e instanceof GoalWriteFailed || e instanceof GoalsUnavailable || e instanceof PolicyDenied) throw e', to: '      throw e', why: 'an SDK refusal mid-tree escapes as a bare error, losing what was written' },
+    { id: 'G29', file: WRITER, from: '    this.#recordUnconfirmed(tool, projectId, goalId, reason)\n    return new GoalWriteFailed', to: '    return new GoalWriteFailed', why: 'a goal pmmcp wrote and the kernel refused leaves no record in the chain' },
   ],
   control: {
     id: 'C',

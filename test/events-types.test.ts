@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import { EVENT_TYPES, PAYLOAD_SCHEMAS, type EventType } from '../src/events/types.js'
 import { withStore } from './helpers/store.js'
 
-const FROZEN_45: readonly string[] = [
+const FROZEN_46: readonly string[] = [
   'kernel.booted',
   'kernel.shutdown',
   'subsystem.state',
@@ -56,6 +56,7 @@ const FROZEN_45: readonly string[] = [
   'plan.adopted',
   'goal.created',
   'goal.status',
+  'goal.unconfirmed',
   'delegation.admitted',
   'delegation.result',
   'delegation.refused',
@@ -195,9 +196,16 @@ const SAMPLES: Record<EventType, Record<string, unknown>> = {
     by: 'kernel',
     runId: 'run_2',
   },
+  'goal.unconfirmed': {
+    schemaVersion: 1,
+    projectId: 'aos/ceo',
+    tool: 'create_goal',
+    goalId: 'goal_000000000002',
+    reason: 'the text and structuredContent of create_goal disagree',
+  },
 }
 
-test('EVENT_TYPES equals the 45 frozen names by literal array equality', () => {
+test('EVENT_TYPES equals the 46 frozen names by literal array equality', () => {
   // The list is frozen by literal equality precisely so that growing it is a
   // deliberate act with a reason. The reasons, in order of arrival:
   //
@@ -213,11 +221,14 @@ test('EVENT_TYPES equals the 45 frozen names by literal array equality', () => {
   //     and every one of those writes has to be in the record;
   //   `delegation.admitted`, `.result`, `.refused` — a child run's spend and taint
   //     must be traceable to the parent that caused it, and a refusal to the reason
-  //     the model was given.
-  assert.equal(EVENT_TYPES.length, 45)
-  assert.deepEqual([...EVENT_TYPES], FROZEN_45)
+  //     the model was given;
+  //   `goal.unconfirmed` — pmmcp can write a goal the kernel then refuses to
+  //     confirm (contract P6), and that orphan belongs in the record, not only in
+  //     a refusal reason (operator decision, 2026-10-19).
+  assert.equal(EVENT_TYPES.length, 46)
+  assert.deepEqual([...EVENT_TYPES], FROZEN_46)
   // No duplicates, and every name is dotted and lowercase.
-  assert.equal(new Set(EVENT_TYPES).size, 45)
+  assert.equal(new Set(EVENT_TYPES).size, 46)
   for (const t of EVENT_TYPES) assert.match(t, /^[a-z]+(\.[a-z]+)+$/)
 })
 
@@ -259,7 +270,7 @@ test('store.append rejects a type outside EVENT_TYPES', (t) => {
     const row = store.append({ type, payload: SAMPLES[type] })
     assert.equal(row.type, type)
   }
-  assert.equal(store.query().length, 45)
+  assert.equal(store.query().length, 46)
   assert.equal(store.verifyChain().ok, true)
 })
 

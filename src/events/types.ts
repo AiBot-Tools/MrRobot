@@ -234,6 +234,24 @@ export const GoalStatusPayload = z
   })
   .strict()
 
+/**
+ * pmmcp answered a goal call with a typed (contract P6) success the kernel
+ * would not confirm: another project, two forms that disagree, a result it
+ * does not read, or one the SDK refused against the tool's own schema. pmmcp
+ * may have written it, so the goal may exist with no `goal.created` or
+ * `goal.status` claiming it; this row is that orphan's record (operator
+ * decision, 2026-10-19). `goalId` is the server's, when it could be read.
+ */
+export const GoalUnconfirmedPayload = z
+  .object({
+    ...V,
+    projectId: z.string(),
+    tool: z.string().max(128),
+    goalId: z.string().max(128).optional(),
+    reason: z.string().max(500),
+  })
+  .strict()
+
 // ── agents ─────────────────────────────────────────────────────────────────
 
 export const AgentRegisteredPayload = z
@@ -534,6 +552,7 @@ export const EVENT_TYPES = [
   'plan.adopted',
   'goal.created',
   'goal.status',
+  'goal.unconfirmed',
   'delegation.admitted',
   'delegation.result',
   'delegation.refused',
@@ -584,6 +603,7 @@ export const PAYLOAD_SCHEMAS: Readonly<Record<EventType, z.ZodType>> = {
   'plan.adopted': PlanAdoptedPayload,
   'goal.created': GoalCreatedPayload,
   'goal.status': GoalStatusPayload,
+  'goal.unconfirmed': GoalUnconfirmedPayload,
   'delegation.admitted': DelegationAdmittedPayload,
   'delegation.result': DelegationResultPayload,
   'delegation.refused': DelegationRefusedPayload,

@@ -32,13 +32,23 @@
 //   answers errors as SUCCESSFUL text ("Error: Cannot transition…", "Goal x not
 //   found."), so `ok` from the transport proves nothing on its own.
 //
+//   It reads contract P6's typed result when pmmcp sends one, and today's prose
+//   when it does not (§6 step 2). A typed success it will not confirm (another
+//   project, a text that says something else, a shape it does not read) may
+//   still have been written, so it is refused AND recorded as `goal.unconfirmed`.
+//
 //   It stops at the FIRST failure and reports what it had written. A partial tree
 //   is a fact on the server; pretending the whole write failed would leave goals
 //   nothing knows about.
 
+import { isDeepStrictEqual } from 'node:util'
+
+import { z } from 'zod'
+
 import { PolicyDenied } from '../errors.js'
 import type { EventStore } from '../events/store.js'
 import type { McpHub } from '../mcp/hub.js'
+import { GoalResult, type GoalResultValue } from '../mcp/pmmcp-schemas.js'
 import { log } from '../log.js'
 import { GoalWriteFailed, GoalsUnavailable } from './errors.js'
 import { createGoal, updateGoal, type GoalCall, type GoalCallResult } from './pmmcp.js'
@@ -119,6 +129,56 @@ export function goalIdOf(content: unknown): string | undefined {
   }
 }
 
+/** What a goal call's success said: the typed P6 result, or prose to read the old way. */
+type Reply = { readonly kind: 'prose' } | { readonly kind: 'typed'; readonly value: GoalResultValue }
+
+/** A typed success the kernel will not confirm; pmmcp may already have acted on it. */
+class UnconfirmedReply extends Error {
+  readonly goalId: string | undefined
+  constructor(goalId: string | undefined, reason: string) {
+    super(reason)
+    this.goalId = goalId
+  }
+}
+
+/** The JSON text P6 sends beside its result, or pmmcp's prose naming the same goal. */
+function agrees(text: string, structured: Readonly<Record<string, unknown>>, goalId: string): boolean {
+  try {
+    return isDeepStrictEqual(JSON.parse(text), structured)
+  } catch {
+    // Not JSON: prose may still name the goal.
+  }
+  return /^✅ Goal (?:created|updated): (\S+)/u.exec(text)?.[1] === goalId
+}
+
+/**
+ * Read a success. No structuredContent, or FastMCP's `{result: <the text>}`
+ * wrapping of a `-> str` tool, is prose. Anything else must be a P6 goal result,
+ * parsed strictly, whose text block (if any) says the same thing.
+ *
+ * @throws {UnconfirmedReply} for a typed success the kernel will not read.
+ */
+function replyOf(tool: string, result: GoalCallResult): Reply {
+  const structured = result.structuredContent
+  if (structured === undefined) return { kind: 'prose' }
+  const text = textOf(result.content)
+  const keys = Object.keys(structured)
+  if (keys.length === 1 && keys[0] === 'result' && typeof structured['result'] === 'string') {
+    if (structured['result'] !== text) throw new UnconfirmedReply(undefined, `the text and structuredContent of ${tool} disagree`)
+    return { kind: 'prose' }
+  }
+  const named = typeof structured['goal_id'] === 'string' ? structured['goal_id'] : undefined
+  const parsed = GoalResult.safeParse(structured)
+  if (!parsed.success) {
+    throw new UnconfirmedReply(named, `${tool} returned structuredContent that is not a P6 goal result: ${z.prettifyError(parsed.error)}`)
+  }
+  const trimmed = text.trim()
+  if (trimmed !== '' && !agrees(trimmed, structured, parsed.data.goal_id)) {
+    throw new UnconfirmedReply(parsed.data.goal_id, `the text and structuredContent of ${tool} disagree`)
+  }
+  return { kind: 'typed', value: parsed.data }
+}
+
 export class GoalWriter {
   readonly #o: GoalWriterOptions
   readonly #serverId: string
@@ -143,13 +203,52 @@ export class GoalWriter {
     if (reason !== undefined) throw new GoalsUnavailable(reason)
   }
 
-  /** The content of a call the transport answered; a transport error is a failed write. */
-  async #answered(tool: string, call: Promise<GoalCallResult>): Promise<unknown> {
-    const result = await call
-    if (!result.ok) {
-      throw new GoalWriteFailed(`${this.#serverId}.${tool} failed: ${textOf(result.content)}`, [])
+  /**
+   * A call the transport answered, or a failed write carrying what was written.
+   *
+   * Any error but the kernel's own refusals becomes GoalWriteFailed, so
+   * kernel.adopt_plan refuses with a record instead of throwing. The SDK refuses
+   * a success that breaks the tool's own outputSchema, or that has none: pmmcp
+   * has answered, so it may have written, and that is recorded.
+   */
+  async #answered(
+    tool: string,
+    call: Promise<GoalCallResult>,
+    projectId: string,
+    written: readonly string[],
+  ): Promise<GoalCallResult> {
+    let result: GoalCallResult
+    try {
+      result = await call
+    } catch (e) {
+      if (e instanceof GoalWriteFailed || e instanceof GoalsUnavailable || e instanceof PolicyDenied) throw e
+      const message = e instanceof Error ? e.message : String(e)
+      if (/output schema|structured content/i.test(message)) this.#recordUnconfirmed(tool, projectId, undefined, message)
+      throw new GoalWriteFailed(`${this.#serverId}.${tool} failed: ${message}`, written)
     }
-    return result.content
+    if (!result.ok) {
+      throw new GoalWriteFailed(`${this.#serverId}.${tool} failed: ${textOf(result.content)}`, written)
+    }
+    return result
+  }
+
+  #recordUnconfirmed(tool: string, projectId: string, goalId: string | undefined, reason: string): void {
+    this.#o.store.append({
+      type: 'goal.unconfirmed',
+      payload: {
+        schemaVersion: 1,
+        projectId,
+        tool,
+        ...(goalId === undefined ? {} : { goalId: goalId.slice(0, 128) }),
+        reason: reason.slice(0, 500),
+      },
+    })
+  }
+
+  /** Record the orphan, then the refusal to throw. */
+  #unconfirmed(tool: string, projectId: string, goalId: string | undefined, reason: string, written: readonly string[]): GoalWriteFailed {
+    this.#recordUnconfirmed(tool, projectId, goalId, reason)
+    return new GoalWriteFailed(`${this.#serverId}.${tool} answered with a result the kernel will not confirm: ${reason}`, written)
   }
 
   /**
@@ -165,8 +264,9 @@ export class GoalWriter {
     planTaskId?: string
     written: string[]
   }): Promise<string> {
-    const content = await this.#answered(
-      this.#o.goals.tools.create,
+    const tool = this.#o.goals.tools.create
+    const result = await this.#answered(
+      tool,
       createGoal(
         this.#pmmcp,
         {
@@ -176,13 +276,28 @@ export class GoalWriter {
           ...(input.parentId === undefined ? {} : { parent_goal_id: input.parentId }),
         },
         `create ${input.kind} goal in ${input.projectId}`,
-      ),
-    ).catch((e: unknown) => {
-      if (e instanceof GoalWriteFailed) throw new GoalWriteFailed(e.message, input.written)
-      throw e
-    })
+      ).catch((e: unknown) => {
+        if (e instanceof GoalWriteFailed) throw new GoalWriteFailed(e.message, input.written)
+        throw e
+      }),
+      input.projectId,
+      input.written,
+    )
+    const content = result.content
 
-    const goalId = goalIdOf(content)
+    let reply: Reply
+    try {
+      reply = replyOf(tool, result)
+    } catch (e) {
+      if (e instanceof UnconfirmedReply) throw this.#unconfirmed(tool, input.projectId, e.goalId, e.message, input.written)
+      throw e
+    }
+    if (reply.kind === 'typed' && reply.value.project_id !== input.projectId) {
+      const where = `pmmcp reports it in ${reply.value.project_id}, not ${input.projectId}`
+      throw this.#unconfirmed(tool, input.projectId, reply.value.goal_id, where, input.written)
+    }
+
+    const goalId = reply.kind === 'typed' ? reply.value.goal_id : goalIdOf(content)
     if (goalId === undefined) {
       // Never a guess: a fabricated id is a goal nothing can ever update, and it
       // would be indistinguishable from a real one in the log. The server's own
@@ -307,7 +422,7 @@ export class GoalWriter {
     }
 
     const sent = this.#o.goals.statuses[to]
-    const content = await this.#answered(
+    const { content } = await this.#answered(
       this.#o.goals.tools.updateStatus,
       updateGoal(
         this.#pmmcp,
@@ -321,6 +436,8 @@ export class GoalWriter {
         },
         `move goal ${goalId} to ${to}`,
       ),
+      context.projectId,
+      [],
     )
     const reply = textOf(content).trim()
     const confirmed = /^✅ Goal updated: (\S+)/u.exec(reply)

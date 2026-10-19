@@ -301,6 +301,75 @@ test('a bare-string id is accepted; a prose result fails the write and names wha
   assert.equal(payloads(prose.store, 'plan.adopted').length, 0)
 })
 
+// ── contract P6: typed results (§6 step 2.1.6) ───────────────────────────────
+
+const P6 = { refusals: 'p5', outputs: { create_goal: 'structured', update_goal: 'structured' } } as const
+const plan = (): ReturnType<typeof parsePlan> => parsePlan(PLAN, { knownTemplates: ['researcher'] })
+
+test('a create is read from structuredContent when there is one, with or without a text block beside it', async (t) => {
+  for (const structuredText of ['json', 'none'] as const) {
+    const { store, mock, writer } = await wired(t, { ...P6, structuredText })
+    const tree = await writer.materialise(plan(), PROJECT, 'run_1')
+    assert.ok(mock.state.goals.has(tree.objectiveGoalId), structuredText)
+    assert.equal(payloads(store, 'goal.created').length, 4)
+    assert.equal(payloads(store, 'goal.unconfirmed').length, 0)
+  }
+})
+
+test('a typed create the kernel will not confirm is refused, records the orphan, and writes no goal.created', async (t) => {
+  const cases: [string, Parameters<typeof pmmcpMock>[0], RegExp][] = [
+    // Both forms agree, on another project: only the project check can refuse it.
+    ['another project', { ...P6, skew: { create_goal: { fields: { project_id: 'aos/elsewhere' } } } }, /pmmcp reports it in aos\/elsewhere, not aos\/ceo/],
+    // Only structuredContent names another goal: only the agreement check can.
+    ['forms that disagree', { ...P6, skew: { create_goal: { fields: { goal_id: 'goal_ffffffffffff' }, where: 'structured' } } }, /disagree/],
+    // A field the kernel never read, which the SDK's validator admits.
+    ['a result it does not read', { ...P6, skew: { create_goal: { fields: { created_at: '2026-10-19T00:00:00Z' } } } }, /not a P6 goal result/],
+  ]
+  for (const [why, options, reason] of cases) {
+    const { store, mock, writer } = await wired(t, options)
+    await assert.rejects(
+      () => writer.materialise(plan(), PROJECT, 'run_1'),
+      (e: unknown) => {
+        assert.ok(e instanceof GoalWriteFailed, why)
+        assert.match(e.message, reason, why)
+        return true
+      },
+    )
+    assert.equal(payloads(store, 'goal.created').length, 0, `${why}: a goal.created was written`)
+    const orphans = payloads(store, 'goal.unconfirmed')
+    assert.equal(orphans.length, 1, why)
+    assert.equal(orphans[0]?.['projectId'], PROJECT)
+    assert.equal(orphans[0]?.['tool'], 'create_goal')
+    // pmmcp did write it: the record names the goal that now has no owner.
+    assert.equal(mock.state.goals.size, 1, why)
+  }
+})
+
+test('a result the SDK refuses mid-tree is a GoalWriteFailed naming what was written, and the orphan is recorded', async (t) => {
+  // The third create breaks its own outputSchema; the SDK client throws.
+  const { store, mock, writer } = await wired(t, { ...P6, skew: { create_goal: { fields: { progress_pct: 'x' }, fromCall: 3 } } })
+  await assert.rejects(
+    () => writer.materialise(plan(), PROJECT, 'run_1'),
+    (e: unknown) => {
+      assert.ok(e instanceof GoalWriteFailed, `escaped as ${String(e)}`)
+      assert.equal(e.written.length, 2)
+      return true
+    },
+  )
+  assert.equal(mock.state.goals.size, 3, 'pmmcp wrote the third goal before the client refused its reply')
+  assert.equal(payloads(store, 'goal.created').length, 2)
+  assert.equal(payloads(store, 'goal.unconfirmed').length, 1)
+})
+
+test("FastMCP's {result} wrapper reads as the prose it wraps", async (t) => {
+  const { store, writer } = await wired(t, { outputs: { create_goal: 'wrapped', update_goal: 'wrapped' } })
+  const tree = await writer.materialise(plan(), PROJECT, 'run_1')
+  await writer.setStatus(String(tree.tasks.get('t1')), 'in_progress', { projectId: PROJECT })
+  assert.equal(payloads(store, 'goal.created').length, 4)
+  assert.equal(payloads(store, 'goal.status').length, 1)
+  assert.equal(payloads(store, 'goal.unconfirmed').length, 0)
+})
+
 test('a failure partway through reports the ids already written', async (t) => {
   // Partial failure is the case this gets wrong quietly. A caller that believed
   // "the whole write failed" would leave an objective and a milestone on the

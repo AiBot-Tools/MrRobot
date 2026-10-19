@@ -8,9 +8,10 @@
 //
 // A signal shuts the kernel down rather than killing the process: shutdown
 // writes `kernel.shutdown` and the anchor, and an exit that skipped both would
-// leave the next boot looking at a log ahead of its anchor for no reason. The
-// second signal is not polite — if a shutdown hangs, the operator gets their
-// terminal back.
+// leave the next boot looking at a log ahead of its anchor for no reason. A
+// repeat within a second is the same Ctrl-C delivered twice (the terminal and
+// npm both send it) and is ignored; a later one is not polite — if a shutdown
+// hangs, the operator gets their terminal back. See shutdown-signals.ts.
 
 import { readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
@@ -25,6 +26,7 @@ import { parseProviders, type ProvidersFile } from './models/registry.js'
 import { credentialEnv, credentialNames, dotenvPathFrom, loadDotenv, type DotenvResult } from './secrets/dotenv.js'
 import { parseToolViews } from './mcp/tool-views.js'
 import { log } from './log.js'
+import { onShutdownSignals } from './shutdown-signals.js'
 import { VERSION } from './version.js'
 
 function readYaml(path: string): unknown {
@@ -76,25 +78,10 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     log.warn({ degraded: kernel.degraded }, 'booted degraded — run `aos agents` or status.get for reasons')
   }
 
-  await new Promise<void>((resolveExit) => {
-    let shuttingDown = false
-    const stop = (signal: string): void => {
-      if (shuttingDown) {
-        // A hung shutdown must not trap the operator.
-        log.error({ signal }, 'second signal during shutdown; exiting immediately')
-        process.exit(1)
-      }
-      shuttingDown = true
-      log.info({ signal }, 'shutting down')
-      void kernel
-        .shutdown('signal', signal)
-        .catch((e: unknown) => {
-          log.error({ err: e instanceof Error ? e.message : String(e) }, 'shutdown failed')
-        })
-        .finally(resolveExit)
-    }
-    process.once('SIGINT', () => stop('SIGINT'))
-    process.once('SIGTERM', () => stop('SIGTERM'))
+  await onShutdownSignals(process, {
+    shutdown: (signal) => kernel.shutdown('signal', signal),
+    exit: (code) => process.exit(code),
+    log,
   })
 
   return 0

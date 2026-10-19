@@ -501,6 +501,8 @@ export interface PmmcpMockOptions {
    * structuredContent, so they disagree.
    */
   readonly skew?: Readonly<Record<string, SkewSpec>>
+  /** Declare a different outputSchema for the named tools, for the boot check to meet. Handlers are unchanged. */
+  readonly outputSchemas?: Readonly<Record<string, Readonly<Record<string, unknown>>>>
   /**
    * Idle window. A call or ping arriving more than this after the session's last
    * activity expires it, the way pmmcp's sessions idle-expire. Needs `now`.
@@ -691,6 +693,8 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
   })
 
   const outputSchemaOf = (tool: string): Readonly<Record<string, unknown>> | undefined => {
+    const declared = options.outputSchemas?.[tool]
+    if (declared !== undefined) return declared
     const mode = outputs[tool] ?? 'prose'
     if (mode === 'wrapped') return wrappedOutput(tool)
     if (mode === 'structured') return tool === 'get_goal_tree' ? GOAL_TREE_OUTPUT : GOAL_RESULT_OUTPUT

@@ -45,7 +45,7 @@ import { GoalTracker } from './goals/tracker.js'
 import { Delegation } from './runtime/delegate.js'
 import { KernelTools } from './runtime/kernel-tools.js'
 import { GoalWriter } from './goals/writer.js'
-import { goalToolsUnusable } from './goals/tools.js'
+import { goalToolsUnusable, watchGoalTools } from './goals/tools.js'
 
 import { AgentRegistry, type AgentRecord } from './agents/registry.js'
 import { loadSoul, type SoulBudgetTracker } from './agents/souls.js'
@@ -466,6 +466,8 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       goals: config.goals,
       ...(goalsReason === undefined ? {} : { degradedReason: goalsReason }),
     })
+    // A pmmcp redeployed under a running kernel is re-checked on reconnect.
+    const unwatchGoals = watchGoalTools({ store, hub, goals: config.goals, writer: goalWriter })
     const goalTracker = new GoalTracker({
       store,
       writer: goalWriter,
@@ -756,6 +758,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
         if (stopped) return
         stopped = true
         unsubscribe()
+        unwatchGoals()
         detachGoals()
         scheduler.stop()
         for (const live of runs.values()) live.controller.abort()

@@ -16,9 +16,12 @@
 // useless; "pmmcp declares no tool `create_goal` (it has: …)" is one line of YAML
 // away from fixed.
 
+import type { EventStore } from '../events/store.js'
+import { log } from '../log.js'
 import type { McpHub } from '../mcp/hub.js'
 import { GOAL_TYPES, inputShape, SENDABLE_STATUSES } from '../mcp/pmmcp-schemas.js'
 import type { KernelConfig } from '../config.js'
+import type { GoalWriter } from './writer.js'
 
 export type GoalsConfig = KernelConfig['goals']
 
@@ -61,6 +64,59 @@ export function sentArgs(goals: GoalsConfig): { tool: string; args: SentArg[] }[
     },
     { tool: goals.tools.get, args: [s(a.goalId)] },
   ]
+}
+
+/** The JSON type the kernel's P6 result (GoalResult) reads for each field. */
+const RESULT_TYPES: Readonly<Record<string, 'string' | 'number'>> = {
+  goal_id: 'string',
+  project_id: 'string',
+  status: 'string',
+  progress_pct: 'number',
+}
+
+/**
+ * Why a create or update result the server declares is one the writer cannot
+ * read. No schema (today's pmmcp) and FastMCP's `{result: string}` wrapper are
+ * prose and serve. A P6 result must be GoalResult's four fields, all required,
+ * of types that admit what the writer reads, with a status enum (if any) that
+ * holds every status the kernel will see. Anything else would be refused per
+ * call AFTER pmmcp had written the goal, one orphan per run; named here, it is
+ * one degradation and no write.
+ */
+function outputProblems(where: string, schema: unknown, statuses: readonly string[]): string[] {
+  if (schema === undefined) return []
+  let shape
+  try {
+    shape = inputShape(schema, { strict: false })
+  } catch (e) {
+    return [`${where} declares an outputSchema the kernel cannot read: ${e instanceof Error ? e.message : String(e)}`]
+  }
+  const names = Object.keys(shape.properties)
+  if (names.length === 1 && names[0] === 'result' && (shape.properties['result']?.types ?? []).includes('string')) {
+    return []
+  }
+  if (!names.includes('goal_id')) {
+    return [`${where} returns ${names.join(', ') || 'nothing'}, which the kernel's P6 result does not read`]
+  }
+  const problems: string[] = []
+  const extra = names.filter((n) => RESULT_TYPES[n] === undefined)
+  if (extra.length > 0) problems.push(`${where} returns ${extra.join(', ')}, which the kernel's P6 result does not read`)
+  for (const [name, type] of Object.entries(RESULT_TYPES)) {
+    const live = shape.properties[name]
+    if (live === undefined) {
+      problems.push(`${where} does not return ${name}`)
+      continue
+    }
+    if (!shape.required.includes(name)) problems.push(`${where} may leave out ${name}, which the kernel requires`)
+    const admitted = live.types.length === 0 || live.types.includes(type) || (type === 'number' && live.types.includes('integer'))
+    if (!admitted) problems.push(`${where} returns ${name} as ${live.types.join('|')}, not ${type}`)
+  }
+  const allowed = shape.properties['status']?.enum
+  if (allowed !== undefined) {
+    const missing = [...new Set(statuses)].filter((s) => !allowed.includes(s))
+    if (missing.length > 0) problems.push(`${where} returns status from ${allowed.map(String).join(', ')}, which leaves out ${missing.join(', ')}`)
+  }
+  return problems
 }
 
 /** The property names a described tool declares, or undefined when it declares none. */
@@ -141,6 +197,15 @@ export function goalToolsUnusable(
     }
   }
 
+  // What comes back: a create is `pending`, a move is whatever was sent.
+  const sentStatuses = Object.values(goals.statuses)
+  for (const [tool, statuses] of [
+    [goals.tools.create, ['pending']],
+    [goals.tools.updateStatus, sentStatuses],
+  ] as const) {
+    problems.push(...outputProblems(`${serverId}.${tool}`, hub.describe(serverId, tool)?.outputSchema, statuses))
+  }
+
   // Not the server's to judge: a status the kernel may never send. The typed
   // update refuses it per call; here it is named once, at boot, instead of as
   // a stale goal per run.
@@ -157,4 +222,38 @@ export function goalToolsUnusable(
 
   if (problems.length === 0) return undefined
   return `${problems.join('; ')}. Set goals.tools / goals.args in kernel.yaml, or run \`npm run capture:pmmcp\` to read the live schemas.`
+}
+
+/**
+ * Re-run the check each time the hub re-lists the server's tools.
+ *
+ * Boot checks once, but pmmcp can be redeployed under a running kernel, and the
+ * hub's heartbeat then reconnects and re-lists it. A drift found then degrades
+ * the writer and is recorded, like a boot drift. It never restores the writer:
+ * there is no event that says goals came back, so a restart is what does that.
+ *
+ * Deferred a microtask: the hub records the listing before it installs the new
+ * tool descriptions, in the same synchronous run.
+ */
+export function watchGoalTools(options: {
+  readonly store: EventStore
+  readonly hub: McpHub
+  readonly goals: GoalsConfig
+  readonly writer: GoalWriter
+  readonly serverId?: string
+}): () => void {
+  const serverId = options.serverId ?? 'pmmcp'
+  return options.store.subscribe((row) => {
+    if (row.type !== 'hub.tools.classified') return
+    const payload = JSON.parse(row.payload) as { server?: unknown }
+    if (payload.server !== serverId) return
+    queueMicrotask(() => {
+      if (!options.writer.available) return
+      const reason = goalToolsUnusable(options.hub, options.goals, serverId)
+      if (reason === undefined) return
+      options.writer.degrade(reason)
+      options.store.append({ type: 'goals.degraded', payload: { schemaVersion: 1, reason } })
+      log.warn({ reason }, 'the reconnected pmmcp no longer serves the goal tools; no goal tree can be written or read')
+    })
+  })
 }

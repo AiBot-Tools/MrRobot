@@ -24,12 +24,12 @@ import type { EventStore } from '../src/events/store.js'
 import { GoalsUnavailable, GoalWriteFailed, GoalWriter, goalIdOf } from '../src/goals/writer.js'
 import { createGoal, getGoalTree, updateGoal } from '../src/goals/pmmcp.js'
 import { parsePlan } from '../src/goals/plan.js'
-import { goalToolsUnusable, requiredArgs } from '../src/goals/tools.js'
+import { goalToolsUnusable, requiredArgs, watchGoalTools } from '../src/goals/tools.js'
 import { McpHub } from '../src/mcp/hub.js'
 import { parseToolViews, type ToolViewsFile } from '../src/mcp/tool-views.js'
 import { parseKernelConfig, type KernelConfig } from '../src/config.js'
 import { REPO_ROOT } from './helpers/kernel.js'
-import { PMMCP_TOOLS, pmmcpMock, type JsonObjectSchema, type PmmcpMock } from './helpers/mock-pmmcp.js'
+import { GOAL_RESULT_OUTPUT, PMMCP_TOOLS, pmmcpMock, type JsonObjectSchema, type PmmcpMock } from './helpers/mock-pmmcp.js'
 import { withStore } from './helpers/store.js'
 
 const PROJECT = 'aos/ceo'
@@ -404,6 +404,63 @@ test('with P5 refusals a refused move is isError, a failure with no orphan, and 
   assert.equal(await writer.trySetStatus(task, 'in_progress', { projectId: PROJECT }), false)
   assert.equal(payloads(store, 'goal.status').length, 0)
   assert.equal(payloads(store, 'goal.unconfirmed').length, 0, 'pmmcp refused, so nothing was written to orphan')
+})
+
+test("a live goal tool whose outputSchema the writer cannot read degrades goals at boot, by name; no schema, FastMCP's {result} and the P6 schema all serve", async (t) => {
+  const goals = shippedConfig().goals
+  for (const options of [{}, { outputs: { create_goal: 'wrapped', update_goal: 'wrapped' } }, P6] as const) {
+    const { hub } = await wired(t, options)
+    assert.equal(goalToolsUnusable(hub, goals), undefined, JSON.stringify(options))
+  }
+  const withProps = (extra: Record<string, unknown>, required?: string[]): Record<string, unknown> => ({
+    ...GOAL_RESULT_OUTPUT,
+    properties: { ...(GOAL_RESULT_OUTPUT['properties'] as Record<string, unknown>), ...extra },
+    ...(required === undefined ? {} : { required }),
+  })
+  const cases: [string, Record<string, Record<string, unknown>>, RegExp][] = [
+    ['a field it does not read', { create_goal: withProps({ created_at: { type: 'string' } }) }, /pmmcp\.create_goal returns created_at, which the kernel's P6 result does not read/],
+    ['a field pmmcp may leave out', { update_goal: withProps({}, ['goal_id', 'project_id', 'status']) }, /pmmcp\.update_goal may leave out progress_pct/],
+    ['a status enum without what the kernel sends', { update_goal: withProps({ status: { type: 'string', enum: ['pending', 'active', 'blocked'] } }) }, /leaves out in_progress/],
+    ['a shape that is not a goal result', { create_goal: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] } }, /pmmcp\.create_goal returns ok, which the kernel's P6 result does not read/],
+  ]
+  for (const [why, outputSchemas, reason] of cases) {
+    const { hub } = await wired(t, { outputSchemas })
+    assert.match(String(goalToolsUnusable(hub, goals)), reason, why)
+  }
+})
+
+test('a pmmcp redeployed under a running kernel is re-checked when the hub re-lists it, and the writer only ever degrades', async (t) => {
+  const { store, hub, writer } = await wired(t)
+  const unwatch = watchGoalTools({ store, hub, goals: shippedConfig().goals, writer })
+  t.after(unwatch)
+  assert.equal(writer.available, true)
+
+  // The redeployed server returns a field the writer does not read.
+  const redeployed = pmmcpMock({
+    outputSchemas: {
+      create_goal: { ...GOAL_RESULT_OUTPUT, properties: { ...(GOAL_RESULT_OUTPUT['properties'] as Record<string, unknown>), created_at: { type: 'string' } } },
+    },
+  })
+  t.after(async () => {
+    await redeployed.close()
+  })
+  await hub.connect('pmmcp', redeployed.connect)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(writer.available, false)
+  assert.match(String(writer.degradedReason), /returns created_at/)
+  const degraded = payloads(store, 'goals.degraded')
+  assert.equal(degraded.length, 1)
+  await assert.rejects(() => writer.materialise(plan(), PROJECT, 'run_1'), GoalsUnavailable)
+
+  // A good server again does not restore it: no event says goals came back.
+  const good = pmmcpMock()
+  t.after(async () => {
+    await good.close()
+  })
+  await hub.connect('pmmcp', good.connect)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(writer.available, false)
+  assert.equal(payloads(store, 'goals.degraded').length, 1, 'a second degradation was recorded for one drift')
 })
 
 test("FastMCP's {result} wrapper reads as the prose it wraps", async (t) => {

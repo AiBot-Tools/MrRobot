@@ -191,6 +191,11 @@ const goals: Suite = {
     { id: 'G31', file: WRITER, from: '      if (v.status !== sent) off.push(', to: '      if (false) off.push(', why: 'a typed reply naming another status is recorded as the move asked for' },
     { id: 'G32', file: WRITER, from: '      if (v.project_id !== context.projectId) off.push(', to: '      if (false) off.push(', why: 'a typed reply placing the goal in another project is recorded as a move in this one' },
     { id: 'G33', file: WRITER, from: "      if (to === 'review' && v.progress_pct !== 100) off.push(", to: '      if (false) off.push(', why: 'a review pmmcp records below 100 % is logged as review' },
+    { id: 'G34', file: GOAL_TOOLS, from: '    problems.push(...outputProblems(`${serverId}.${tool}`, hub.describe(serverId, tool)?.outputSchema, statuses))', to: '', why: 'a pmmcp whose results the writer cannot read boots clean, and every write leaves an orphan' },
+    { id: 'G35', file: GOAL_TOOLS, from: '      options.writer.degrade(reason)', to: '', why: 'a pmmcp redeployed under a running kernel keeps being written to after it drifted' },
+    { id: 'G36', file: GOAL_TOOLS, from: '  if (extra.length > 0) problems.push(', to: '  if (false) problems.push(', why: 'a result field the kernel never read passes the boot check, then every strict parse refuses' },
+    { id: 'G37', file: GOAL_TOOLS, from: '    if (!shape.required.includes(name)) problems.push(', to: '    if (false) problems.push(', why: 'a result pmmcp may leave a field out of passes the boot check' },
+    { id: 'G38', file: GOAL_TOOLS, from: '    if (missing.length > 0) problems.push(`${where} returns status from', to: '    if (false) problems.push(`${where} returns status from', why: 'a result status enum without the statuses the kernel sends passes the boot check' },
   ],
   control: {
     id: 'C',

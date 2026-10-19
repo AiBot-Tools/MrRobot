@@ -183,23 +183,30 @@ export class GoalWriter {
   readonly #o: GoalWriterOptions
   readonly #serverId: string
   readonly #pmmcp: GoalCall
+  #degradedReason: string | undefined
 
   constructor(options: GoalWriterOptions) {
     this.#o = options
     this.#serverId = options.serverId ?? 'pmmcp'
     this.#pmmcp = { hub: options.hub, goals: options.goals, serverId: this.#serverId }
+    this.#degradedReason = options.degradedReason
   }
 
   get available(): boolean {
-    return this.#o.degradedReason === undefined
+    return this.#degradedReason === undefined
   }
 
   get degradedReason(): string | undefined {
-    return this.#o.degradedReason
+    return this.#degradedReason
+  }
+
+  /** Stop writing, from a re-check after boot (tools.ts watchGoalTools). One way only. */
+  degrade(reason: string): void {
+    this.#degradedReason ??= reason
   }
 
   #assertAvailable(): void {
-    const reason = this.#o.degradedReason
+    const reason = this.#degradedReason
     if (reason !== undefined) throw new GoalsUnavailable(reason)
   }
 

@@ -172,6 +172,11 @@ function quoted(value: string | undefined): string {
   return value === undefined ? 'no goal' : recordable(value, 128)
 }
 
+/** The goal pmmcp's prose names, read as the writer reads that tool's prose: a create by goalIdOf, a move by its ✅ line. */
+function proseNames(text: string, reads: 'create' | 'update'): string | undefined {
+  return reads === 'create' ? goalIdOf([{ type: 'text', text }]) : /^✅ Goal updated: (\S+)/u.exec(text.trim())?.[1]
+}
+
 /** Two forms of one reply that disagree. The record claims an id only when both name it. */
 function disagreement(tool: string, text: string | undefined, structured: string | undefined): UnconfirmedReply {
   if (text !== undefined && text === structured) {
@@ -191,7 +196,7 @@ function disagreement(tool: string, text: string | undefined, structured: string
  *
  * @throws {UnconfirmedReply} for a typed success the kernel will not read.
  */
-function replyOf(tool: string, result: GoalCallResult): Reply {
+function replyOf(tool: string, result: GoalCallResult, reads: 'create' | 'update'): Reply {
   const structured = result.structuredContent
   if (structured === undefined) return { kind: 'prose' }
   const text = textOf(result.content)
@@ -199,9 +204,9 @@ function replyOf(tool: string, result: GoalCallResult): Reply {
   const keys = Object.keys(structured)
   const wrapped = structured['result']
   if (keys.length === 1 && keys[0] === 'result' && typeof wrapped === 'string') {
-    // Both forms are prose, so each is read the way prose is (goalIdOf).
+    // Both forms are prose, so each is read the way this tool's prose is.
     if (wrapped !== text) {
-      throw disagreement(tool, goalIdOf([{ type: 'text', text }]), goalIdOf([{ type: 'text', text: wrapped }]))
+      throw disagreement(tool, proseNames(text, reads), proseNames(wrapped, reads))
     }
     return { kind: 'prose' }
   }
@@ -355,7 +360,7 @@ export class GoalWriter {
 
     let reply: Reply
     try {
-      reply = replyOf(tool, result)
+      reply = replyOf(tool, result, 'create')
     } catch (e) {
       if (e instanceof UnconfirmedReply) throw this.#unconfirmed(tool, input.projectId, e.goalId, e.message, input.written)
       throw e
@@ -520,7 +525,7 @@ export class GoalWriter {
 
     let answer: Reply
     try {
-      answer = replyOf(tool, result)
+      answer = replyOf(tool, result, 'update')
     } catch (e) {
       // The row names the goal the kernel asked to move; the ids pmmcp named
       // lead the reason.

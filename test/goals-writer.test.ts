@@ -772,6 +772,28 @@ test('a FastMCP {result} that says something its text does not is refused and re
   assert.equal(named[0]?.['goalId'], 'goal_000000000001')
 })
 
+test("a move's FastMCP {result} that disagrees with its text names the goals pmmcp's update prose names", async (t) => {
+  // [the {result} pmmcp sends, the reason, the row's goalId]: the row names the
+  // goal the kernel asked to move; the reason, every goal either form names.
+  const cases: [string, RegExp][] = [
+    ['✅ Goal updated: goal_ffffffffffff', /disagree: the text names goal_000000000003, structuredContent goal_ffffffffffff/],
+    ['✅ Goal updated: goal_000000000003', /both name goal_000000000003 and disagree on a field other than goal_id/],
+  ]
+  for (const [wrapped, reason] of cases) {
+    const { store, writer } = await wired(t, {
+      outputs: { create_goal: 'wrapped', update_goal: 'wrapped' },
+      skew: { update_goal: { fields: { result: wrapped }, where: 'structured' } },
+    })
+    const { task } = await written(writer)
+    assert.equal(task, 'goal_000000000003')
+    await assert.rejects(() => writer.setStatus(task, 'in_progress', { projectId: PROJECT }), GoalWriteFailed, wrapped)
+    const orphans = payloads(store, 'goal.unconfirmed')
+    assert.equal(orphans.length, 1, wrapped)
+    assert.equal(orphans[0]?.['goalId'], task, wrapped)
+    assert.match(String(orphans[0]?.['reason']), reason, wrapped)
+  }
+})
+
 test('a failure partway through reports the ids already written', async (t) => {
   // Partial failure is the case this gets wrong quietly. A caller that believed
   // "the whole write failed" would leave an objective and a milestone on the

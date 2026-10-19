@@ -489,8 +489,9 @@ export interface PmmcpMockOptions {
    * Per tool, what a success carries besides text. `wrapped` (the default,
    * DEFAULT_OUTPUT) is what the live capture of 2026-10-19 records for every
    * tool: FastMCP's automatic output for a `-> str` tool, `{result: <the
-   * text>}`. `prose` is a server with no outputSchema (pmmcp before its SDK
-   * wrapped). `structured` is contract P6's typed result, for create_goal,
+   * text>}`. `prose` is a server that declares no outputSchema (the capture
+   * of 2026-10-18 did not record outputs, so nothing shows pmmcp ever was
+   * one). `structured` is contract P6's typed result, for create_goal,
    * update_goal and get_goal_tree only, MODELLED from the contract, and needs
    * `refusals: 'p5'`: once a tool declares an outputSchema, the client refuses a
    * success without structuredContent.
@@ -746,14 +747,19 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
 
   const padTo = options.padTo
   if (padTo !== undefined) {
-    // Visibly fake. The 34 unmodelled pmmcp tools have real names nobody on this
-    // machine has read, and inventing plausible ones would be fiction that later
-    // looks like knowledge.
+    // Visibly fake. The tools the double does not model have real names (the
+    // capture lists them), but serving those names with nothing behind them
+    // would read as a model of tools nobody here has modelled.
     for (let i = tools.length; i < padTo; i += 1) {
+      const name = `unmodelled_placeholder_${String(i - specs.length + 1)}`
+      // Every live tool declares the same output (capture of 2026-10-19), so a
+      // stand-in does too.
+      const outputSchema = outputSchemaFor(name, DEFAULT_OUTPUT)
       tools.push({
-        name: `unmodelled_placeholder_${String(i - specs.length + 1)}`,
+        name,
         description: 'stands in for one of the pmmcp tools nobody here has read the name of',
         inputSchema: { type: 'object' as const, properties: {} },
+        ...(outputSchema === undefined ? {} : { outputSchema: { ...outputSchema, type: 'object' as const } }),
       })
     }
   }

@@ -394,7 +394,7 @@ test("structured goal tools declare object-rooted output schemas and answer with
   assert.match(wrappedText, /^✅ Goal created: /u)
   assert.deepEqual(wrapped.structuredContent, { result: wrappedText })
 
-  // A server with no outputSchema (pmmcp before its SDK wrapped) is asked for by name.
+  // A server that declares no outputSchema is asked for by name.
   const plain = await open(t, { outputs: { create_goal: 'prose' } })
   const plainList = await plain.client.listTools()
   assert.equal(plainList.tools.find((x) => x.name === 'create_goal')?.outputSchema, undefined)

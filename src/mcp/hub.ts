@@ -100,7 +100,7 @@ export interface HubOptions {
 export interface ToolDescription {
   readonly description: string
   readonly inputSchema: Record<string, unknown>
-  /** Absent when the tool declares none, which is today's pmmcp (contract P6 adds them). */
+  /** Absent when the tool declares none. Live pmmcp declares FastMCP's `{result}` on every tool (capture of 2026-10-19); contract P6 types the goal tools'. */
   readonly outputSchema?: Record<string, unknown>
 }
 

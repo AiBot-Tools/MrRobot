@@ -3046,8 +3046,10 @@ Kept so the next design pass can amend the docs:
   is still open below.
 - `recall`'s `project_id` now also takes `'*'`, which searches every project.
   That is a second road to cross-project reads beside an absent `project_id`,
-  so P2's refusal must cover it too. The kernel's gate already sets an
-  agent's `project_id` and refuses any other value, `'*'` included.
+  so P2's refusal must cover it too. The kernel's gate refuses any
+  `project_id` but the calling agent's own, `'*'` included, for a tool whose
+  view sets `namespaceArg: project_id`. It checks the argument; it does not
+  set it.
 
 **Still open:**
 

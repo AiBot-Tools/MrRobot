@@ -87,27 +87,27 @@ function outputShape(schema: unknown): string {
  * capture that records outputs: in an older one an absent outputSchema means
  * unknown, not none.
  *
- * Two beliefs rest on them. The double serves DEFAULT_OUTPUT to every test
- * that names no other, so its outputs must be the live ones. And the writer
- * reads the live create and update results, so they must be what the boot
- * check accepts: a capture the boot check would degrade on is a pmmcp the
- * kernel cannot write goals to.
+ * Two beliefs rest on them. The double serves DEFAULT_OUTPUT for every tool,
+ * modelled or placeholder, to every test that names no other, so every live
+ * tool's output must be that one. And the writer reads the live create and
+ * update results, so they must be what the boot check accepts. While the
+ * double serves the wrapper, the first check already fails any capture the
+ * second would; the second says why, and stands alone once the default for
+ * the goal tools is P6.
  */
-function outputFindings(live: ReadonlyMap<string, CapturedTool>, absent: ReadonlySet<string>, goals: GoalsConfig): string[] {
+function outputFindings(live: ReadonlyMap<string, CapturedTool>, goals: GoalsConfig): string[] {
   const out: string[] = []
-  for (const spec of PMMCP_TOOLS) {
-    const tool = live.get(spec.name)
-    if (tool === undefined || absent.has(spec.name)) continue
+  for (const tool of live.values()) {
     let served: string
     let declared: string
     try {
-      served = outputShape(outputSchemaFor(spec.name, DEFAULT_OUTPUT))
+      served = outputShape(outputSchemaFor(tool.name, DEFAULT_OUTPUT))
       declared = outputShape(tool.outputSchema)
     } catch (e) {
-      out.push(`${spec.name}: the live output schema cannot be read: ${e instanceof Error ? e.message : String(e)}`)
+      out.push(`${tool.name}: the live output schema cannot be read: ${e instanceof Error ? e.message : String(e)}`)
       continue
     }
-    if (served !== declared) out.push(`${spec.name}: the double serves ${served} by default; live declares ${declared}`)
+    if (served !== declared) out.push(`${tool.name}: the double serves ${served} by default; live declares ${declared}`)
   }
   const sent = Object.values(goals.statuses)
   for (const [tool, statuses] of [
@@ -226,7 +226,7 @@ export function compareCapture(input: CompareInput): string[] {
   // Outputs, since step 2.1.5: a capture that does not record them cannot
   // vouch for the double's default or for what the writer will read.
   if (input.capture.recordsOutputSchema === true) {
-    findings.push(...outputFindings(live, absent, input.goals))
+    findings.push(...outputFindings(live, input.goals))
   } else {
     findings.push('the capture does not record output schemas; re-run `npm run capture:pmmcp` (step 2.1.3 or later)')
   }
@@ -284,7 +284,9 @@ export function agreeingCapture(): PmmcpCapture {
     }
   })
   for (let i = tools.length; i < PMMCP_TOOL_COUNT; i += 1) {
-    tools.push({ name: `live_tool_${String(i)}`, inputSchema: { properties: {} } })
+    const name = `live_tool_${String(i)}`
+    const outputSchema = outputSchemaFor(name, DEFAULT_OUTPUT)
+    tools.push({ name, inputSchema: { properties: {} }, ...(outputSchema === undefined ? {} : { outputSchema }) })
   }
   return { recordsOutputSchema: true, toolCount: PMMCP_TOOL_COUNT, tools }
 }

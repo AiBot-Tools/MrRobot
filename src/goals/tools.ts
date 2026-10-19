@@ -80,8 +80,9 @@ const RESULT_TYPES: Readonly<Record<string, 'string' | 'number'>> = {
 
 /**
  * Why a create or update result the server declares is one the writer cannot
- * read. No schema (today's pmmcp) and FastMCP's `{result: string}` wrapper are
- * prose and serve. A P6 result must be GoalResult's four fields, all required,
+ * read. No schema (a server that declares none) and FastMCP's `{result: string}`
+ * wrapper (live pmmcp, every tool, capture of 2026-10-19) are prose and
+ * serve. A P6 result must be GoalResult's four fields, all required,
  * of types that admit what the writer reads, with a status enum (if any) that
  * holds every status the kernel will see. Anything else would be refused per
  * call AFTER pmmcp had written the goal, one orphan per run; named here, it is

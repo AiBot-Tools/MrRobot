@@ -252,6 +252,10 @@ test('output schemas are compared only in a capture that records them, and then 
     'recall: the double serves {result: string} by default; live declares {items?: array<>}',
   ])
 
+  // Every live tool, not only those the double models: a stand-in serves the default too.
+  const unmodelled = compare(withOutputs({ live_tool_60: { type: 'object', properties: { rows: { type: 'array' } } } }))
+  assert.deepEqual(unmodelled, ['live_tool_60: the double serves {result: string} by default; live declares {rows?: array<>}'])
+
   // P6 as the kernel reads it: the double is behind (named), the boot check serves.
   const p6 = compare(withOutputs({ create_goal: GOAL_RESULT_OUTPUT, update_goal: GOAL_RESULT_OUTPUT }))
   assert.deepEqual([...p6].sort(), [

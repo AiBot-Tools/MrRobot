@@ -299,6 +299,22 @@ test('a validated plan becomes objective → milestone → task with the SERVER�
   assert.equal(adopted[0]?.['objectiveGoalId'], tree.objectiveGoalId)
 })
 
+test("the writer reads the live {result} wrapper and a server with no output schema alike: a tree is written and a move confirmed", async (t) => {
+  const forms: [string, Parameters<typeof pmmcpMock>[0]][] = [
+    ['the live wrapper (the default)', {}],
+    ['no output schema', { outputs: { create_goal: 'prose', update_goal: 'prose' } }],
+  ]
+  for (const [why, options] of forms) {
+    const { store, mock, writer } = await wired(t, options)
+    const tree = await writer.materialise(parsePlan(PLAN, { knownTemplates: ['researcher'] }), PROJECT, 'run_1')
+    await writer.setStatus(String(tree.tasks.get('t1')), 'in_progress', { projectId: PROJECT })
+    assert.equal(mock.state.goals.size, 4, why)
+    assert.equal(payloads(store, 'goal.created').length, 4, why)
+    assert.equal(payloads(store, 'goal.status').length, 1, why)
+    assert.equal(payloads(store, 'goal.unconfirmed').length, 0, why)
+  }
+})
+
 test('a bare-string id is accepted; a prose result fails the write and names what was written', async (t) => {
   // The result shape is UNCONFIRMED, so both plausible forms work.
   const bare = await wired(t, { goalIdShape: 'bare' })

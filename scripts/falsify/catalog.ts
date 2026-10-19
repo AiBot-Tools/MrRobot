@@ -229,8 +229,9 @@ const goals: Suite = {
     { id: 'G65', file: 'test/helpers/mock-pmmcp.ts', from: "export const DEFAULT_OUTPUT: OutputMode = 'wrapped'", to: "export const DEFAULT_OUTPUT: OutputMode = 'prose'", why: 'the double serves a form the live server does not, and every test that names none is tested against it' },
     { id: 'G66', file: 'test/helpers/pmmcp-capture.ts', from: '  if (input.capture.recordsOutputSchema === true) {', to: '  if (true) {', why: "a capture from before outputs were recorded is read as one whose tools declare none" },
     { id: 'G67', file: 'test/helpers/pmmcp-capture.ts', from: '    if (served !== declared) out.push(', to: '    if (false) out.push(', why: "a double whose default output is not the live one passes the drift guard" },
-    { id: 'G68', file: 'test/helpers/pmmcp-capture.ts', from: '      out.push(`the boot check would degrade goals on this capture: ${problem}`)', to: '      void problem', why: 'a live capture the boot check would degrade goals on passes the drift guard' },
+    { id: 'G68', file: 'test/helpers/pmmcp-capture.ts', from: '      out.push(`the boot check would degrade goals on this capture: ${problem}`)', to: '      void problem', why: 'the drift guard stops saying why the boot check would degrade goals on a capture (while the double serves the wrapper, the shape check still fails it)' },
     { id: 'G69', file: 'test/helpers/pmmcp-capture.ts', from: "  } else {\n    findings.push('the capture does not record output schemas", to: "  } else if (false) {\n    findings.push('the capture does not record output schemas", why: 'a capture that cannot vouch for any output passes the drift guard' },
+    { id: 'G70', file: WRITER, from: "  if (structured === undefined) return { kind: 'prose' }", to: "  if (structured === undefined) throw new UnconfirmedReply(undefined, 'no structuredContent')", why: 'a server that declares no output schema can no longer have a goal tree written to it' },
   ],
   control: {
     id: 'C',

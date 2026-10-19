@@ -1,8 +1,10 @@
 {
-  "capturedAt": "2026-10-18T08:04:51.469Z",
+  "capturedAt": "2026-10-19T18:49:07.424Z",
   "server": "pmmcp",
   "url": "http://127.0.0.1:8766/mcp",
+  "pages": 1,
   "toolCount": 64,
+  "recordsOutputSchema": true,
   "tools": [
     {
       "name": "add_blocker",
@@ -26,6 +28,19 @@
           "blocker"
         ],
         "title": "add_blockerArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "add_blockerOutput"
       }
     },
     {
@@ -142,6 +157,19 @@
           "action"
         ],
         "title": "adminArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "adminOutput"
       }
     },
     {
@@ -166,6 +194,19 @@
           "question"
         ],
         "title": "ask_memoryArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "ask_memoryOutput"
       }
     },
     {
@@ -188,6 +229,19 @@
           }
         },
         "title": "audit_secretsArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "audit_secretsOutput"
       }
     },
     {
@@ -205,6 +259,19 @@
           "project_id"
         ],
         "title": "auto_diagnose_projectArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "auto_diagnose_projectOutput"
       }
     },
     {
@@ -239,6 +306,19 @@
           "project_id"
         ],
         "title": "coding_agentArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "coding_agentOutput"
       }
     },
     {
@@ -257,6 +337,19 @@
           "goal_id"
         ],
         "title": "complete_goalArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "complete_goalOutput"
       }
     },
     {
@@ -359,6 +452,19 @@
           "project_id"
         ],
         "title": "create_goalArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "create_goalOutput"
       }
     },
     {
@@ -383,6 +489,19 @@
           "project_id"
         ],
         "title": "cross_ide_activityArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "cross_ide_activityOutput"
       }
     },
     {
@@ -407,6 +526,19 @@
           "project_id"
         ],
         "title": "cross_ide_discoverArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "cross_ide_discoverOutput"
       }
     },
     {
@@ -437,6 +569,19 @@
           "query"
         ],
         "title": "cross_project_error_searchArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "cross_project_error_searchOutput"
       }
     },
     {
@@ -467,6 +612,19 @@
           "project_id"
         ],
         "title": "cross_project_recommendArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "cross_project_recommendOutput"
       }
     },
     {
@@ -497,6 +655,19 @@
           "project_id"
         ],
         "title": "decompose_goalArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "decompose_goalOutput"
       }
     },
     {
@@ -515,6 +686,19 @@
           "source_id"
         ],
         "title": "delete_context_sourceArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "delete_context_sourceOutput"
       }
     },
     {
@@ -545,6 +729,19 @@
           "label"
         ],
         "title": "delete_secretArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "delete_secretOutput"
       }
     },
     {
@@ -574,6 +771,19 @@
           }
         },
         "title": "error_trendsArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "error_trendsOutput"
       }
     },
     {
@@ -634,6 +844,19 @@
           "project_id"
         ],
         "title": "find_codeArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "find_codeOutput"
       }
     },
     {
@@ -696,6 +919,19 @@
           "error_message"
         ],
         "title": "find_fix_patternsArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "find_fix_patternsOutput"
       }
     },
     {
@@ -733,6 +969,19 @@
           "key"
         ],
         "title": "forgetArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "forgetOutput"
       }
     },
     {
@@ -760,6 +1009,19 @@
           }
         },
         "title": "get_audit_logsArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_audit_logsOutput"
       }
     },
     {
@@ -838,6 +1100,19 @@
           "project_id"
         ],
         "title": "get_context_bundleArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_context_bundleOutput"
       }
     },
     {
@@ -847,6 +1122,19 @@
         "type": "object",
         "properties": {},
         "title": "get_coordination_statusArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_coordination_statusOutput"
       }
     },
     {
@@ -879,6 +1167,19 @@
           "file_path"
         ],
         "title": "get_dependenciesArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_dependenciesOutput"
       }
     },
     {
@@ -925,6 +1226,19 @@
           "project_id"
         ],
         "title": "get_git_historyArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_git_historyOutput"
       }
     },
     {
@@ -943,6 +1257,19 @@
           "goal_id"
         ],
         "title": "get_goal_treeArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_goal_treeOutput"
       }
     },
     {
@@ -967,6 +1294,19 @@
           "project_id"
         ],
         "title": "get_recent_changesArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_recent_changesOutput"
       }
     },
     {
@@ -998,6 +1338,19 @@
           "label"
         ],
         "title": "get_secretArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_secretOutput"
       }
     },
     {
@@ -1027,6 +1380,19 @@
           "name"
         ],
         "title": "get_secret_templateArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_secret_templateOutput"
       }
     },
     {
@@ -1057,6 +1423,19 @@
           "test_name"
         ],
         "title": "get_test_trendArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_test_trendOutput"
       }
     },
     {
@@ -1075,6 +1454,19 @@
           "project_id"
         ],
         "title": "get_write_activityArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "get_write_activityOutput"
       }
     },
     {
@@ -1141,6 +1533,19 @@
           "operation"
         ],
         "title": "graph_queryArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "graph_queryOutput"
       }
     },
     {
@@ -1150,6 +1555,19 @@
         "type": "object",
         "properties": {},
         "title": "health_checkArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "health_checkOutput"
       }
     },
     {
@@ -1159,6 +1577,19 @@
         "type": "object",
         "properties": {},
         "title": "heartbeatArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "heartbeatOutput"
       }
     },
     {
@@ -1186,6 +1617,19 @@
           "project_id"
         ],
         "title": "index_git_historyArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "index_git_historyOutput"
       }
     },
     {
@@ -1225,6 +1669,19 @@
           "root_path"
         ],
         "title": "index_projectArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "index_projectOutput"
       }
     },
     {
@@ -1241,6 +1698,19 @@
           }
         },
         "title": "list_active_agentsArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "list_active_agentsOutput"
       }
     },
     {
@@ -1277,6 +1747,19 @@
           }
         },
         "title": "list_context_sourcesArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "list_context_sourcesOutput"
       }
     },
     {
@@ -1327,6 +1810,19 @@
           "project_id"
         ],
         "title": "list_goalsArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "list_goalsOutput"
       }
     },
     {
@@ -1355,6 +1851,19 @@
           }
         },
         "title": "list_recent_errorsArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "list_recent_errorsOutput"
       }
     },
     {
@@ -1364,6 +1873,19 @@
         "type": "object",
         "properties": {},
         "title": "list_rootsArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "list_rootsOutput"
       }
     },
     {
@@ -1386,6 +1908,19 @@
           }
         },
         "title": "list_secretsArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "list_secretsOutput"
       }
     },
     {
@@ -1425,6 +1960,19 @@
           }
         },
         "title": "list_sessionsArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "list_sessionsOutput"
       }
     },
     {
@@ -1449,6 +1997,19 @@
           "memory_id"
         ],
         "title": "mark_error_resolvedArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "mark_error_resolvedOutput"
       }
     },
     {
@@ -1458,6 +2019,19 @@
         "type": "object",
         "properties": {},
         "title": "pingArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "pingOutput"
       }
     },
     {
@@ -1481,7 +2055,7 @@
               }
             ],
             "default": null,
-            "description": "Project scope, or global if None",
+            "description": "Project scope, or global if None. Pass '*' to search every project.",
             "title": "Project Id"
           },
           "limit": {
@@ -1512,6 +2086,19 @@
           "query"
         ],
         "title": "recallArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "recallOutput"
       }
     },
     {
@@ -1555,6 +2142,19 @@
           "query"
         ],
         "title": "recall_commandsArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "recall_commandsOutput"
       }
     },
     {
@@ -1609,6 +2209,19 @@
           "command"
         ],
         "title": "record_commandArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "record_commandOutput"
       }
     },
     {
@@ -1657,6 +2270,19 @@
           "error_message"
         ],
         "title": "record_errorArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "record_errorOutput"
       }
     },
     {
@@ -1729,6 +2355,19 @@
           "error_message"
         ],
         "title": "record_test_failureArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "record_test_failureOutput"
       }
     },
     {
@@ -1772,11 +2411,15 @@
                 "type": "string"
               },
               {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
                 "type": "null"
               }
             ],
             "default": null,
-            "description": "Extra structured data (JSON string) for specialized types. E.g. for 'decision': {\"context\":\"...\",\"consequences\":\"...\"}, for 'command': {\"exit_code\":0,\"output\":\"...\"}, for 'skill': {\"tags\":[\"python\",\"async\"]}, for 'fix_pattern': {\"error_type\":\"TypeError\",\"language\":\"python\"}",
+            "description": "Extra structured data for specialized types — a JSON object or a JSON-encoded string. E.g. for 'decision': {\"context\":\"...\",\"consequences\":\"...\"}, for 'command': {\"exit_code\":0,\"output\":\"...\"}, for 'skill': {\"tags\":[\"python\",\"async\"]}, for 'fix_pattern': {\"error_type\":\"TypeError\",\"language\":\"python\"}",
             "title": "Extra"
           }
         },
@@ -1785,6 +2428,19 @@
           "value"
         ],
         "title": "rememberArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "rememberOutput"
       }
     },
     {
@@ -1809,6 +2465,19 @@
           "blocker_index"
         ],
         "title": "remove_blockerArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "remove_blockerOutput"
       }
     },
     {
@@ -1831,6 +2500,19 @@
           }
         },
         "title": "repair_and_healArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "repair_and_healOutput"
       }
     },
     {
@@ -1865,6 +2547,19 @@
           "outcome"
         ],
         "title": "retrieval_feedbackArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "retrieval_feedbackOutput"
       }
     },
     {
@@ -1907,6 +2602,19 @@
           "fields"
         ],
         "title": "save_secret_templateArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "save_secret_templateOutput"
       }
     },
     {
@@ -1949,6 +2657,19 @@
           "context_type"
         ],
         "title": "scrape_contextArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "scrape_contextOutput"
       }
     },
     {
@@ -1986,6 +2707,19 @@
           "query"
         ],
         "title": "search_contextArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "search_contextOutput"
       }
     },
     {
@@ -2035,6 +2769,19 @@
           "query"
         ],
         "title": "search_episodesArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "search_episodesOutput"
       }
     },
     {
@@ -2071,6 +2818,19 @@
           "query"
         ],
         "title": "search_errorsArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "search_errorsOutput"
       }
     },
     {
@@ -2114,6 +2874,19 @@
           "project_id"
         ],
         "title": "search_test_failuresArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "search_test_failuresOutput"
       }
     },
     {
@@ -2136,6 +2909,19 @@
           "project_id"
         ],
         "title": "session_insight_agentArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "session_insight_agentOutput"
       }
     },
     {
@@ -2202,6 +2988,19 @@
           "value"
         ],
         "title": "set_secretArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "set_secretOutput"
       }
     },
     {
@@ -2237,6 +3036,19 @@
           "expires_at"
         ],
         "title": "set_secret_expiryArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "set_secret_expiryOutput"
       }
     },
     {
@@ -2276,6 +3088,19 @@
           }
         },
         "title": "statusArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "statusOutput"
       }
     },
     {
@@ -2418,6 +3243,19 @@
           "goal_id"
         ],
         "title": "update_goalArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "update_goalOutput"
       }
     }
   ]

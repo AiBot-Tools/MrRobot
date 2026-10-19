@@ -212,6 +212,10 @@ const goals: Suite = {
     { id: 'G50', file: WRITER, from: '    throw new UnconfirmedReply(undefined, `the text and structuredContent of ${tool} disagree: the text names', to: '    throw new UnconfirmedReply(id, `the text and structuredContent of ${tool} disagree: the text names', why: 'a create whose two forms name two goals is recorded under one of them, maybe a goal that does not exist' },
     { id: 'G51', file: WRITER, from: "        const named = e.goalId !== undefined && e.goalId !== goalId ? `; pmmcp names ${e.goalId}` : ''", to: "        const named = ''", why: 'a refused move drops the other goal pmmcp named from the record' },
     { id: 'G52', file: WRITER, from: '    if (said === id) throw new UnconfirmedReply(id, ', to: '    if (false) throw new UnconfirmedReply(id, ', why: 'a create whose two forms name one goal and differ elsewhere is recorded with no goal id' },
+    { id: 'G53', file: WRITER, from: "    if (structured['result'] !== text) throw new UnconfirmedReply(", to: '    if (false) throw new UnconfirmedReply(', why: 'a FastMCP {result} that says something its text does not is read as the text' },
+    { id: 'G54', file: WRITER, from: '  return /^✅ Goal (?:created|updated): (\\S+)/u.exec(text)?.[1] === goalId', to: '  return true', why: 'prose naming one goal beside a typed result naming another is believed' },
+    { id: 'G55', file: GOAL_TOOLS, from: '      if (!options.writer.available) return\n', to: '', why: 'every later drift is recorded again under a writer already off' },
+    { id: 'G56', file: KERNEL, from: '    const unwatchGoals = watchGoalTools({ store, hub, goals: config.goals, writer: goalWriter })', to: '    const unwatchGoals = (): void => {}', why: 'the daemon never re-checks a pmmcp redeployed under it' },
   ],
   control: {
     id: 'C',

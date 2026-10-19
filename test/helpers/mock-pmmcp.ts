@@ -495,10 +495,13 @@ export interface PmmcpMockOptions {
   /** The text block beside a `structured` result: its JSON (P6, the default), today's prose, or none. */
   readonly structuredText?: 'json' | 'prose' | 'none'
   /**
-   * Bend a tool's structured result, from its `fromCall`-th call on (1-based,
+   * Bend a tool's structuredContent, from its `fromCall`-th call on (1-based,
    * default 1). `both` (the default) bends it before the JSON text is made, so
    * the two forms agree on the bent value; `structured` bends only
-   * structuredContent, so they disagree.
+   * structuredContent, so they disagree. Only a `structured` result's JSON text
+   * is ever bent: under `structuredText: 'prose'`, or a `wrapped` output (whose
+   * `{result}` field it bends), `both` would not be what the reply says, so it
+   * is refused at construction and the skew must say `structured`.
    */
   readonly skew?: Readonly<Record<string, SkewSpec>>
   /** Declare a different outputSchema for the named tools, for the boot check to meet. Handlers are unchanged. */
@@ -653,6 +656,14 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
       throw new Error(`outputs.${tool} is structured, which needs refusals: 'p5'`)
     }
   }
+  for (const [tool, spec] of Object.entries(options.skew ?? {})) {
+    const mode = outputs[tool] ?? 'prose'
+    if (mode === 'prose') throw new Error(`skew.${tool} bends structuredContent, which a prose output does not have`)
+    const textBent = mode === 'structured' && options.structuredText !== 'prose'
+    if ((spec.where ?? 'both') === 'both' && !textBent) {
+      throw new Error(`skew.${tool} would bend both forms, but this reply's text is never bent: say where: 'structured'`)
+    }
+  }
 
   const state: PmmcpState = {
     goals: new Map(),
@@ -773,12 +784,14 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     const mode = outputs[tool] ?? 'prose'
     if (mode === 'prose' || result.isError === true) return result
     const text = (result.content as { text?: unknown }[]).map((b) => (typeof b.text === 'string' ? b.text : '')).join('')
-    if (mode === 'wrapped') return { ...result, structuredContent: { result: text } }
-    const value = typed.get(result)
-    if (value === undefined) throw new Error(`${tool} produced no typed result to structure`)
     const skew = options.skew?.[tool]
     const nth = calls.filter((c) => c.tool === tool).length
-    const bent = skew !== undefined && nth >= (skew.fromCall ?? 1) ? { ...value, ...skew.fields } : value
+    const bend = (v: Record<string, unknown>): Record<string, unknown> =>
+      skew !== undefined && nth >= (skew.fromCall ?? 1) ? { ...v, ...skew.fields } : v
+    if (mode === 'wrapped') return { ...result, structuredContent: bend({ result: text }) }
+    const value = typed.get(result)
+    if (value === undefined) throw new Error(`${tool} produced no typed result to structure`)
+    const bent = bend(value)
     const textual = skew?.where === 'structured' ? value : bent
     const how = options.structuredText ?? 'json'
     const content =

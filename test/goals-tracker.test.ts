@@ -30,7 +30,7 @@ import { writeProbeRecord } from '../src/models/probe.js'
 import { anthropicEndTurn, anthropicToolUse, fakeProvider, type ScriptedResponse } from './helpers/fake-provider.js'
 import { bootOn, fixture, REPO_ROOT, rows, TEST_TOKEN, withKernel } from './helpers/kernel.js'
 import type { Kernel } from '../src/kernel.js'
-import { pmmcpMock, type PmmcpMock } from './helpers/mock-pmmcp.js'
+import { GOAL_RESULT_OUTPUT, pmmcpMock, type PmmcpMock } from './helpers/mock-pmmcp.js'
 import { freshProbe } from './helpers/probe.js'
 import { withStore } from './helpers/store.js'
 import { Writable } from 'node:stream'
@@ -621,4 +621,29 @@ test('a run serving a goal in ANOTHER namespace moves it there, not in its own',
     moves.map((m) => `${m.to}@${m.projectId}`),
     [`in_progress@${CEO_PROJECT}`, `review@${CEO_PROJECT}`],
   )
+})
+
+test('the booted kernel re-checks the goal tools when pmmcp reconnects: a redeploy that drifted is degraded and recorded', async (t) => {
+  // The writer-level test wires the watch by hand; this one proves boot does.
+  const first = pmmcpMock()
+  const drifted = pmmcpMock({
+    outputSchemas: {
+      create_goal: { ...GOAL_RESULT_OUTPUT, properties: { ...(GOAL_RESULT_OUTPUT['properties'] as Record<string, unknown>), created_at: { type: 'string' } } },
+    },
+  })
+  t.after(async () => {
+    await first.close()
+    await drifted.close()
+  })
+  let current = first
+  const { kernel } = await withKernel(t, { clientFactory: () => current.connect() })
+  assert.equal(kernel.store.query({ type: 'goals.degraded' }).length, 0, 'boot against the first server is clean')
+
+  current = drifted
+  first.expireSession()
+  assert.equal(await kernel.hub.heartbeat('pmmcp'), 'reconnected')
+  await new Promise((resolve) => setImmediate(resolve))
+  const degraded = kernel.store.query({ type: 'goals.degraded' }).map((r) => JSON.parse(r.payload) as { reason: string })
+  assert.equal(degraded.length, 1)
+  assert.match(String(degraded[0]?.reason), /pmmcp\.create_goal returns created_at/)
 })

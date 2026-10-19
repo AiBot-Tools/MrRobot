@@ -330,7 +330,8 @@ const P6 = { refusals: 'p5', outputs: { create_goal: 'structured', update_goal: 
 const plan = (): ReturnType<typeof parsePlan> => parsePlan(PLAN, { knownTemplates: ['researcher'] })
 
 test('a create is read from structuredContent when there is one, with or without a text block beside it', async (t) => {
-  for (const structuredText of ['json', 'none'] as const) {
+  // P6's JSON, pmmcp's prose naming the same goal, or no text at all.
+  for (const structuredText of ['json', 'prose', 'none'] as const) {
     const { store, mock, writer } = await wired(t, { ...P6, structuredText })
     const tree = await writer.materialise(plan(), PROJECT, 'run_1')
     assert.ok(mock.state.goals.has(tree.objectiveGoalId), structuredText)
@@ -348,6 +349,8 @@ test('a typed create the kernel will not confirm is refused, records the orphan,
     // Only structuredContent names another goal: only the agreement check can,
     // and with two ids for one write the row claims neither and names both.
     ['forms that disagree on the goal', { ...P6, skew: { create_goal: { fields: { goal_id: 'goal_ffffffffffff' }, where: 'structured' } } }, /disagree: the text names goal_000000000001, structuredContent goal_ffffffffffff/, undefined],
+    // The same, with pmmcp's prose as the text: it names the goal it wrote.
+    ['prose that names another goal', { ...P6, structuredText: 'prose', skew: { create_goal: { fields: { goal_id: 'goal_ffffffffffff' }, where: 'structured' } } }, /disagree: the text names goal_000000000001, structuredContent goal_ffffffffffff/, undefined],
     // Both forms name one goal and differ elsewhere: that goal is the orphan.
     ['forms that disagree on another field', { ...P6, skew: { create_goal: { fields: { project_id: 'aos/elsewhere' }, where: 'structured' } } }, /disagree on a field other than goal_id/, ONE],
     // A field the kernel never read, which the SDK's validator admits.
@@ -575,7 +578,16 @@ test('a pmmcp redeployed under a running kernel is re-checked when the hub re-li
   await hub.connect('pmmcp', good.connect)
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(writer.available, false)
-  assert.equal(payloads(store, 'goals.degraded').length, 1, 'a second degradation was recorded for one drift')
+
+  // Nor does a writer already off record each later drift again.
+  const again = pmmcpMock({ outputSchemas: { update_goal: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] } } })
+  t.after(async () => {
+    await again.close()
+  })
+  await hub.connect('pmmcp', again.connect)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(payloads(store, 'goals.degraded').length, 1, 'a writer already degraded recorded another degradation')
+  assert.match(String(writer.degradedReason), /returns created_at/, 'the first reason is the one that stands')
 })
 
 test('a reconnected pmmcp whose drift fills the reason past any payload, or with a lone surrogate, degrades with one bounded record and ends nothing', async (t) => {
@@ -638,6 +650,26 @@ test("FastMCP's {result} wrapper reads as the prose it wraps", async (t) => {
   assert.equal(payloads(store, 'goal.created').length, 4)
   assert.equal(payloads(store, 'goal.status').length, 1)
   assert.equal(payloads(store, 'goal.unconfirmed').length, 0)
+})
+
+test('a FastMCP {result} that says something its text does not is refused and recorded, not read as prose', async (t) => {
+  const { store, mock, writer } = await wired(t, {
+    outputs: { create_goal: 'wrapped', update_goal: 'wrapped' },
+    skew: { create_goal: { fields: { result: '✅ Goal created: goal_ffffffffffff' }, where: 'structured' } },
+  })
+  await assert.rejects(
+    () => writer.materialise(plan(), PROJECT, 'run_1'),
+    (e: unknown) => {
+      assert.ok(e instanceof GoalWriteFailed, `escaped as ${String(e)}`)
+      assert.match(e.message, /the text and structuredContent of create_goal disagree/)
+      return true
+    },
+  )
+  assert.equal(mock.state.goals.size, 1)
+  assert.equal(payloads(store, 'goal.created').length, 0)
+  const orphans = payloads(store, 'goal.unconfirmed')
+  assert.equal(orphans.length, 1)
+  assert.equal(orphans[0]?.['goalId'], undefined)
 })
 
 test('a failure partway through reports the ids already written', async (t) => {

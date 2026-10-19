@@ -457,6 +457,20 @@ test("FastMCP's wrapper and the skew option: the forms the kernel must tell apar
     broken.client.callTool({ name: 'create_goal', arguments: { project_id: 'aos/ceo', goal_type: 'objective', title: 'x' } }),
   )
 
+  // A wrapped reply's {result} bends alone; its text is the handler's.
+  const bentWrap = await open(t, { outputs: { create_goal: 'wrapped' }, skew: { create_goal: { fields: { result: 'other' }, where: 'structured' } } })
+  await bentWrap.client.listTools()
+  const bw = await bentWrap.client.callTool({ name: 'create_goal', arguments: { project_id: 'aos/ceo', goal_type: 'objective', title: 'x' } })
+  assert.deepEqual(bw.structuredContent, { result: 'other' })
+  assert.match((bw.content as { text: string }[])[0]?.text ?? '', /^✅ Goal created: /)
+  // 'both' only where the text is the JSON the double makes.
+  assert.throws(() => pmmcpMock({ outputs: { create_goal: 'wrapped' }, skew: { create_goal: { fields: { result: 'x' } } } }), /say where: 'structured'/)
+  assert.throws(
+    () => pmmcpMock({ refusals: 'p5', outputs, structuredText: 'prose', skew: { create_goal: { fields: { goal_id: 'goal_ffffffffffff' } } } }),
+    /say where: 'structured'/,
+  )
+  assert.throws(() => pmmcpMock({ skew: { create_goal: { fields: { goal_id: 'x' } } } }), /a prose output does not have/)
+
   assert.throws(() => pmmcpMock({ outputs: { create_goal: 'structured' } }), /needs refusals: 'p5'/)
   assert.throws(() => pmmcpMock({ refusals: 'p5', outputs: { list_goals: 'structured' } }), /no structured result for list_goals/)
 })

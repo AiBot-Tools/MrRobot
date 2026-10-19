@@ -37,6 +37,7 @@
 // untrusted material does not become trusted by passing through another agent.
 
 import type { AgentRegistry } from '../agents/registry.js'
+import { recordable } from '../events/bound.js'
 import type { EventStore } from '../events/store.js'
 import { parsePlan, PlanInvalid, tasksOf, type PlanTask, type ProposedPlan } from '../goals/plan.js'
 import { GoalWriteFailed, GoalsUnavailable, type GoalWriter, type WrittenTree } from '../goals/writer.js'
@@ -161,8 +162,11 @@ export class Delegation {
       payload: {
         schemaVersion: 1,
         parentRunId,
-        ...(taskId === undefined ? {} : { taskId: taskId.slice(0, 64) }),
-        reason: reason.slice(0, 500),
+        // Model and pmmcp text: recordable, or the append throws and the
+        // refusal goes unrecorded (a slice can halve a surrogate, and cuts
+        // before redaction).
+        ...(taskId === undefined ? {} : { taskId: recordable(taskId, 64) }),
+        reason: recordable(reason, 500),
       },
     })
     return { ok: false, text: `[refused] ${reason}` }

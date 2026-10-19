@@ -16,6 +16,7 @@
 // useless; "pmmcp declares no tool `create_goal` (it has: …)" is one line of YAML
 // away from fixed.
 
+import { recordable } from '../events/bound.js'
 import type { EventStore } from '../events/store.js'
 import { log } from '../log.js'
 import type { McpHub } from '../mcp/hub.js'
@@ -65,6 +66,9 @@ export function sentArgs(goals: GoalsConfig): { tool: string; args: SentArg[] }[
     { tool: goals.tools.get, args: [s(a.goalId)] },
   ]
 }
+
+/** Room for every problem a real drift names; a reason past it is a server listing junk. */
+export const GOALS_REASON_BYTES = 8_192
 
 /** The JSON type the kernel's P6 result (GoalResult) reads for each field. */
 const RESULT_TYPES: Readonly<Record<string, 'string' | 'number'>> = {
@@ -221,7 +225,10 @@ export function goalToolsUnusable(
   }
 
   if (problems.length === 0) return undefined
-  return `${problems.join('; ')}. Set goals.tools / goals.args in kernel.yaml, or run \`npm run capture:pmmcp\` to read the live schemas.`
+  // The problems quote the server (property names, enum values), so they are
+  // bounded and made well-formed here, once, for every place the reason goes:
+  // the goals.degraded row at boot and on reconnect, the log line, the refusal.
+  return `${recordable(problems.join('; '), GOALS_REASON_BYTES)}. Set goals.tools / goals.args in kernel.yaml, or run \`npm run capture:pmmcp\` to read the live schemas.`
 }
 
 /**
@@ -233,7 +240,10 @@ export function goalToolsUnusable(
  * there is no event that says goals came back, so a restart is what does that.
  *
  * Deferred a microtask: the hub records the listing before it installs the new
- * tool descriptions, in the same synchronous run.
+ * tool descriptions, in the same synchronous run. That also takes the work out
+ * of the store's listener guard, where nothing would catch a throw and the
+ * daemon would end, so the body catches its own. It fails closed: a re-check
+ * that cannot finish degrades the writer too.
  */
 export function watchGoalTools(options: {
   readonly store: EventStore
@@ -249,11 +259,18 @@ export function watchGoalTools(options: {
     if (payload.server !== serverId) return
     queueMicrotask(() => {
       if (!options.writer.available) return
-      const reason = goalToolsUnusable(options.hub, options.goals, serverId)
-      if (reason === undefined) return
-      options.writer.degrade(reason)
-      options.store.append({ type: 'goals.degraded', payload: { schemaVersion: 1, reason } })
-      log.warn({ reason }, 'the reconnected pmmcp no longer serves the goal tools; no goal tree can be written or read')
+      try {
+        const reason = goalToolsUnusable(options.hub, options.goals, serverId)
+        if (reason === undefined) return
+        // Degraded before the append, so a failed append cannot leave it writing.
+        options.writer.degrade(reason)
+        options.store.append({ type: 'goals.degraded', payload: { schemaVersion: 1, reason } })
+        log.warn({ reason }, 'the reconnected pmmcp no longer serves the goal tools; no goal tree can be written or read')
+      } catch (e) {
+        const err = e instanceof Error ? e.message : String(e)
+        options.writer.degrade(recordable(`the re-check after ${serverId} reconnected failed: ${err}`, GOALS_REASON_BYTES))
+        log.error({ err }, 'the goal tools could not be re-checked after a reconnect; goal writing is off until a restart')
+      }
     })
   })
 }

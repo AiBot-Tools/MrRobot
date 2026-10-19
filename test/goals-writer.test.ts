@@ -20,11 +20,12 @@ import { readFileSync } from 'node:fs'
 import { parse as parseYaml } from 'yaml'
 
 import { PolicyDenied } from '../src/errors.js'
-import type { EventStore } from '../src/events/store.js'
+import { EventStore, type AppendInput } from '../src/events/store.js'
+import type { EventRow } from '../src/events/chain.js'
 import { GoalsUnavailable, GoalWriteFailed, GoalWriter, goalIdOf } from '../src/goals/writer.js'
 import { createGoal, getGoalTree, updateGoal } from '../src/goals/pmmcp.js'
 import { parsePlan } from '../src/goals/plan.js'
-import { goalToolsUnusable, requiredArgs, watchGoalTools } from '../src/goals/tools.js'
+import { GOALS_REASON_BYTES, goalToolsUnusable, requiredArgs, watchGoalTools } from '../src/goals/tools.js'
 import { McpHub } from '../src/mcp/hub.js'
 import { parseToolViews, type ToolViewsFile } from '../src/mcp/tool-views.js'
 import { parseKernelConfig, type KernelConfig } from '../src/config.js'
@@ -47,12 +48,13 @@ function toolViews(): ToolViewsFile {
 async function wired(
   t: TestContext,
   options: Parameters<typeof pmmcpMock>[0] = {},
+  given?: EventStore,
 ): Promise<{ store: EventStore; hub: McpHub; mock: PmmcpMock; writer: GoalWriter }> {
   const mock = pmmcpMock(options)
   t.after(async () => {
     await mock.close()
   })
-  const store = withStore(t)
+  const store = given ?? withStore(t)
   const hub = new McpHub({ store, views: toolViews() })
   t.after(async () => {
     await hub.close()
@@ -85,6 +87,27 @@ const PLAN = `\`\`\`json
   "questionsForOperator": ["which matters more, write latency or auditability?"]
 }
 \`\`\``
+
+/** A store that refuses one event type, as a full disk or a closed handle would. */
+class RefusingStore extends EventStore {
+  readonly #refused: string
+  constructor(refused: string) {
+    super(':memory:')
+    this.#refused = refused
+  }
+  override append(input: AppendInput): EventRow {
+    if (input.type === this.#refused) throw new Error(`this store refuses ${input.type}`)
+    return super.append(input)
+  }
+}
+
+function refusing(t: TestContext, type: string): RefusingStore {
+  const store = new RefusingStore(type)
+  t.after(() => {
+    store.close()
+  })
+  return store
+}
 
 function payloads(store: EventStore, type: string): Record<string, unknown>[] {
   return store
@@ -361,6 +384,63 @@ test('a result the SDK refuses mid-tree is a GoalWriteFailed naming what was wri
   assert.equal(payloads(store, 'goal.unconfirmed').length, 1)
 })
 
+test('what pmmcp says in a refused create reaches goal.unconfirmed redacted, whole and well-formed, and the refusal stays a GoalWriteFailed', async (t) => {
+  // Fabricated, as everywhere in the tests.
+  const pem = `-----BEGIN RSA PRIVATE KEY-----\n${'Q'.repeat(1_000)}\n-----END RSA PRIVATE KEY-----`
+  // The reason is "pmmcp reports it in <project_id>, not aos/ceo": 20 units of
+  // preamble put this emoji's high surrogate at unit 499, where a 500 cut halves it.
+  const split = `${'x'.repeat(479)}\u{1F600}tail`
+  const cases: [string, string][] = [
+    ['a credential across the cut', pem],
+    ['an astral character across the cut', split],
+    ['a lone surrogate', 'proj\ud800x'],
+  ]
+  for (const [why, project] of cases) {
+    const { store, mock, writer } = await wired(t, { ...P6, skew: { create_goal: { fields: { project_id: project } } } })
+    await assert.rejects(
+      () => writer.materialise(plan(), PROJECT, 'run_1'),
+      (e: unknown) => {
+        assert.ok(e instanceof GoalWriteFailed, `${why}: escaped as ${String(e)}`)
+        assert.ok(!e.message.includes('QQQQ'), `${why}: the refusal carries the key`)
+        return true
+      },
+    )
+    assert.equal(mock.state.goals.size, 1, why)
+    const orphans = payloads(store, 'goal.unconfirmed')
+    assert.equal(orphans.length, 1, `${why}: the orphan went unrecorded`)
+    const reason = String(orphans[0]?.['reason'])
+    assert.ok(!reason.includes('QQQQ'), `${why}: the key body is in the log`)
+    assert.match(reason, /^pmmcp reports it in /, why)
+    assert.ok(Buffer.byteLength(reason, 'utf8') <= 500, why)
+    assert.equal(orphans[0]?.['goalId'], 'goal_000000000001', why)
+    assert.equal(store.verifyChain().ok, true, why)
+  }
+})
+
+test('a goal.unconfirmed the store will not take still leaves the refusal a GoalWriteFailed', async (t) => {
+  const store = refusing(t, 'goal.unconfirmed')
+  const { writer } = await wired(t, { ...P6, skew: { create_goal: { fields: { project_id: 'aos/elsewhere' } } } }, store)
+  await assert.rejects(
+    () => writer.materialise(plan(), PROJECT, 'run_1'),
+    (e: unknown) => {
+      assert.ok(e instanceof GoalWriteFailed, `escaped as ${String(e)}`)
+      assert.match(e.message, /pmmcp reports it in aos\/elsewhere/)
+      return true
+    },
+  )
+})
+
+test('a typed goal id longer than any record holds is refused, and the orphan is recorded without a cut id', async (t) => {
+  const long = `goal_${'f'.repeat(200)}`
+  const { store, writer } = await wired(t, { ...P6, skew: { create_goal: { fields: { goal_id: long } } } })
+  await assert.rejects(() => writer.materialise(plan(), PROJECT, 'run_1'), GoalWriteFailed)
+  assert.equal(payloads(store, 'goal.created').length, 0)
+  const orphans = payloads(store, 'goal.unconfirmed')
+  assert.equal(orphans.length, 1)
+  assert.equal(orphans[0]?.['goalId'], undefined, 'a cut id names some other goal')
+  assert.match(String(orphans[0]?.['reason']), /^pmmcp's goal id is not recordable verbatim; .*not a P6 goal result/s)
+})
+
 test("a move is confirmed from structuredContent: P6's JSON-only reply is a move, and a reply naming another status, goal or project, or a review below 100 %, is not recorded", async (t) => {
   const { store, writer } = await wired(t, P6)
   const { task } = await written(writer)
@@ -461,6 +541,59 @@ test('a pmmcp redeployed under a running kernel is re-checked when the hub re-li
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(writer.available, false)
   assert.equal(payloads(store, 'goals.degraded').length, 1, 'a second degradation was recorded for one drift')
+})
+
+test('a reconnected pmmcp whose drift fills the reason past any payload, or with a lone surrogate, degrades with one bounded record and ends nothing', async (t) => {
+  const P = GOAL_RESULT_OUTPUT['properties'] as Record<string, unknown>
+  const many = Object.fromEntries(Array.from({ length: 900 }, (_, i) => [`created_${String(i).padStart(4, '0')}_${'n'.repeat(80)}`, { type: 'string' }]))
+  const cases: [string, Record<string, Record<string, unknown>>][] = [
+    ['900 fields it does not read', { create_goal: { ...GOAL_RESULT_OUTPUT, properties: { ...P, ...many } } }],
+    ['a status enum value with a lone surrogate', { update_goal: { ...GOAL_RESULT_OUTPUT, properties: { ...P, status: { type: 'string', enum: ['pending', 'x\ud800'] } } } }],
+  ]
+  // A throw out of the re-check's microtask would be uncaught, and in the daemon
+  // nothing catches one: it would end the process.
+  const uncaught: unknown[] = []
+  const onUncaught = (e: unknown): void => {
+    uncaught.push(e)
+  }
+  const listeners = process.listeners('uncaughtException')
+  process.removeAllListeners('uncaughtException')
+  process.on('uncaughtException', onUncaught)
+  t.after(() => {
+    process.removeListener('uncaughtException', onUncaught)
+    for (const l of listeners) process.on('uncaughtException', l)
+  })
+  for (const [why, outputSchemas] of cases) {
+    const { store, hub, writer } = await wired(t)
+    const unwatch = watchGoalTools({ store, hub, goals: shippedConfig().goals, writer })
+    t.after(unwatch)
+    const redeployed = pmmcpMock({ outputSchemas })
+    t.after(async () => {
+      await redeployed.close()
+    })
+    await hub.connect('pmmcp', redeployed.connect)
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.deepEqual(uncaught, [], why)
+    assert.equal(writer.available, false, why)
+    const degraded = payloads(store, 'goals.degraded')
+    assert.equal(degraded.length, 1, `${why}: the degradation went unrecorded`)
+    assert.ok(Buffer.byteLength(String(degraded[0]?.['reason']), 'utf8') <= GOALS_REASON_BYTES + 200, why)
+    assert.equal(store.verifyChain().ok, true, why)
+  }
+
+  // A store that will not take the record: still no throw out of the microtask,
+  // and the writer is degraded for the drift itself, not for the lost row.
+  const store = refusing(t, 'goals.degraded')
+  const { hub, writer } = await wired(t, {}, store)
+  t.after(watchGoalTools({ store, hub, goals: shippedConfig().goals, writer }))
+  const redeployed = pmmcpMock({ outputSchemas: { create_goal: { ...GOAL_RESULT_OUTPUT, properties: { ...P, created_at: { type: 'string' } } } } })
+  t.after(async () => {
+    await redeployed.close()
+  })
+  await hub.connect('pmmcp', redeployed.connect)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(uncaught, [], 'a store that refused the record ended the process')
+  assert.match(String(writer.degradedReason), /returns created_at/)
 })
 
 test("FastMCP's {result} wrapper reads as the prose it wraps", async (t) => {

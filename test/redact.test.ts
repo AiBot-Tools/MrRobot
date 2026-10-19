@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { sha256Hex } from '../src/events/canonical.js'
-import { boundOutput, MAX_LOGGED_OUTPUT } from '../src/events/bound.js'
+import { boundOutput, MAX_LOGGED_OUTPUT, recordable } from '../src/events/bound.js'
 import { CENSOR, MIN_MASK_LENGTH, redactString, redactValue, SecretMask } from '../src/events/redact.js'
 
 test('deny-listed keys censored at any depth, case-insensitive (Authorization, x-api-key, client_secret)', () => {
@@ -144,4 +144,31 @@ test('below the limit: truncated:false and no hash', () => {
   assert.equal(over.truncated, true)
   assert.equal(over.bytes, MAX_LOGGED_OUTPUT + 1)
   assert.equal(over.text.length, MAX_LOGGED_OUTPUT)
+})
+
+test('recordable redacts the whole before it cuts, cuts whole code points with a mark, and leaves no lone surrogate', () => {
+  // A .slice(0, n) would keep the front of this key: the PEM pattern needs its END line.
+  const pem = `-----BEGIN RSA PRIVATE KEY-----\n${'Q'.repeat(600)}\n-----END RSA PRIVATE KEY-----`
+  const cut = recordable(`project ${pem} tail`, 500)
+  assert.ok(!cut.includes('QQQQ'), 'the key body survived the cut')
+  assert.equal(cut, `project ${CENSOR} tail`)
+
+  // An astral character across the cut is dropped whole, and the cut is marked.
+  const emoji = recordable(`${'x'.repeat(498)}\u{1F600}tail`, 500)
+  assert.equal(emoji, `${'x'.repeat(497)}…`)
+  assert.ok(Buffer.byteLength(emoji, 'utf8') <= 500)
+
+  // A lone surrogate, which the canonical form refuses, becomes U+FFFD; the
+  // byte count it was measured at does not change.
+  assert.equal(recordable('a\ud800b', 500), 'a\ufffdb')
+  assert.equal(recordable('\udc00', 4), '\ufffd')
+
+  // What needs none of this comes back as it was.
+  assert.equal(recordable('goal_000000000001', 128), 'goal_000000000001')
+  assert.throws(() => recordable('x', 3), RangeError)
+
+  // UTF-8 bytes bound UTF-16 units, so any .max(n) with n >= the budget holds.
+  for (const raw of ['\u{1F600}'.repeat(300), 'é'.repeat(400), 'z'.repeat(900)]) {
+    assert.ok(recordable(raw, 128).length <= 128, raw.slice(0, 4))
+  }
 })

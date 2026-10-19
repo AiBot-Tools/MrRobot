@@ -147,7 +147,9 @@ export const PMMCP_STATUSES = ['pending', 'in_progress', 'completed', 'abandoned
  */
 export const GoalResult = z
   .object({
-    goal_id: z.string().min(1),
+    // No longer than any record the kernel keeps of a goal (goal.unconfirmed's
+    // goalId): an id past it could be neither recorded nor named as an orphan.
+    goal_id: z.string().min(1).max(128),
     project_id: z.string().min(1),
     status: z.enum(PMMCP_STATUSES),
     progress_pct: z.number().min(0).max(100),

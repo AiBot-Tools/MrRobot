@@ -46,6 +46,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { z } from 'zod'
 
 import { PolicyDenied } from '../errors.js'
+import { recordable } from '../events/bound.js'
 import type { EventStore } from '../events/store.js'
 import type { McpHub } from '../mcp/hub.js'
 import { GoalResult, type GoalResultValue } from '../mcp/pmmcp-schemas.js'
@@ -239,23 +240,39 @@ export class GoalWriter {
     return result
   }
 
+  /**
+   * Record a goal pmmcp may hold that no other row claims.
+   *
+   * The reason and id carry text pmmcp chose, so both are made recordable first:
+   * an append that throws loses this record and turns the caller's refusal into
+   * a bare error. An id is kept only verbatim, since a cut or masked one names
+   * some other goal; the reason says when it was left out.
+   */
   #recordUnconfirmed(tool: string, projectId: string, goalId: string | undefined, reason: string): void {
-    this.#o.store.append({
-      type: 'goal.unconfirmed',
-      payload: {
-        schemaVersion: 1,
-        projectId,
-        tool,
-        ...(goalId === undefined ? {} : { goalId: goalId.slice(0, 128) }),
-        reason: reason.slice(0, 500),
-      },
-    })
+    const id = goalId !== undefined && recordable(goalId, 128) === goalId ? goalId : undefined
+    const why = goalId !== undefined && id === undefined ? `pmmcp's goal id is not recordable verbatim; ${reason}` : reason
+    try {
+      this.#o.store.append({
+        type: 'goal.unconfirmed',
+        payload: { schemaVersion: 1, projectId, tool, ...(id === undefined ? {} : { goalId: id }), reason: recordable(why, 500) },
+      })
+    } catch (e) {
+      // Still not silent: the refusal reaches the caller, and this line says
+      // pmmcp may hold a goal with no record.
+      log.error(
+        { tool, projectId, err: e instanceof Error ? e.message : String(e) },
+        'goal.unconfirmed could not be recorded; pmmcp may hold a goal no row names',
+      )
+    }
   }
 
   /** Record the orphan, then the refusal to throw. */
   #unconfirmed(tool: string, projectId: string, goalId: string | undefined, reason: string, written: readonly string[]): GoalWriteFailed {
     this.#recordUnconfirmed(tool, projectId, goalId, reason)
-    return new GoalWriteFailed(`${this.#serverId}.${tool} answered with a result the kernel will not confirm: ${reason}`, written)
+    return new GoalWriteFailed(
+      `${this.#serverId}.${tool} answered with a result the kernel will not confirm: ${recordable(reason, 500)}`,
+      written,
+    )
   }
 
   /**
@@ -488,7 +505,7 @@ export class GoalWriter {
         to,
         by: 'kernel',
         ...(context.runId === undefined ? {} : { runId: context.runId }),
-        ...(context.reason === undefined ? {} : { reason: context.reason.slice(0, 500) }),
+        ...(context.reason === undefined ? {} : { reason: recordable(context.reason, 500) }),
       },
     })
   }

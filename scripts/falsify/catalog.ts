@@ -46,6 +46,8 @@ const delegation: Suite = {
     { id: 'D13', file: KERNEL, from: '            usdMax: Math.min(caps.usdMax, ceiling?.usdMax ?? caps.usdMax),', to: '            usdMax: caps.usdMax,', why: 'the kernel ignores the cost ceiling it hands a child' },
     { id: 'D14', file: 'src/eval/checks.ts', from: '    const summed = own + delegated', to: '    const summed = own', why: 'the eval’s cost check ignores delegated spend' },
     { id: 'D15', file: 'src/runtime/kernel-tools.ts', from: '    PolicyEngine.assertTicketMatches(ticket, ref, args)', to: '    void PolicyEngine', why: 'the kernel tool runner skips the ticket check' },
+    { id: 'D16', file: DELEGATE, from: 'taskId: recordable(taskId, 64)', to: 'taskId: taskId.slice(0, 64)', why: 'a refused task id that halves an emoji at its bound loses the refusal record' },
+    { id: 'D17', file: DELEGATE, from: '        reason: recordable(reason, 500),', to: '        reason: reason.slice(0, 500),', why: 'a refusal reason that halves an emoji at its bound loses the refusal record' },
     { id: 'W1', file: KERNEL, from: '            wallclockMs: Math.min(caps.wallclockMs, ceiling?.wallclockMs ?? caps.wallclockMs),', to: '            wallclockMs: caps.wallclockMs,', why: 'the kernel ignores the wallclock ceiling' },
     { id: 'W2', file: DELEGATE, from: '      ceiling: { usdMax: ceilingMicroUsd, wallclockMs: ceilingWallclockMs },', to: '      ceiling: { usdMax: ceilingMicroUsd },', why: 'delegate hands down no wallclock' },
     { id: 'W3', file: DELEGATE, from: '    const ceilingWallclockMs = budget.remainingMs()', to: '    const ceilingWallclockMs = budget.caps.wallclockMs', why: 'the slice is the parent’s whole cap, not what it has left' },
@@ -196,6 +198,13 @@ const goals: Suite = {
     { id: 'G36', file: GOAL_TOOLS, from: '  if (extra.length > 0) problems.push(', to: '  if (false) problems.push(', why: 'a result field the kernel never read passes the boot check, then every strict parse refuses' },
     { id: 'G37', file: GOAL_TOOLS, from: '    if (!shape.required.includes(name)) problems.push(', to: '    if (false) problems.push(', why: 'a result pmmcp may leave a field out of passes the boot check' },
     { id: 'G38', file: GOAL_TOOLS, from: '    if (missing.length > 0) problems.push(`${where} returns status from', to: '    if (false) problems.push(`${where} returns status from', why: 'a result status enum without the statuses the kernel sends passes the boot check' },
+    { id: 'G39', file: WRITER, from: 'reason: recordable(why, 500)', to: 'reason: why.slice(0, 500)', why: 'a goal.unconfirmed reason is cut before it is redacted and can halve a surrogate: a credential is stored, or the orphan goes unrecorded' },
+    { id: 'G40', file: WRITER, from: '    const id = goalId !== undefined && recordable(goalId, 128) === goalId ? goalId : undefined', to: '    const id = goalId?.slice(0, 128)', why: 'an orphan is recorded under a cut id, which names some other goal' },
+    { id: 'G41', file: PMMCP_SCHEMAS, from: '    goal_id: z.string().min(1).max(128),', to: '    goal_id: z.string().min(1),', why: 'a typed goal id no record can hold is accepted as a goal' },
+    { id: 'G42', file: WRITER, from: '      // Still not silent: the refusal reaches the caller', to: '      throw e\n      // Still not silent: the refusal reaches the caller', why: 'a goal.unconfirmed the store refuses turns the refusal into a bare error' },
+    { id: 'G43', file: GOAL_TOOLS, from: "${recordable(problems.join('; '), GOALS_REASON_BYTES)}", to: "${problems.join('; ')}", why: 'a drift reason quoting the server unbounded is too big or ill-formed to record, and goes unrecorded' },
+    { id: 'G44', file: GOAL_TOOLS, from: '        const err = e instanceof Error ? e.message : String(e)\n', to: '        throw e\n', why: 'a re-check that throws after a reconnect ends the daemon' },
+    { id: 'G45', file: GOAL_TOOLS, from: "        options.writer.degrade(reason)\n        options.store.append({ type: 'goals.degraded', payload: { schemaVersion: 1, reason } })\n", to: "        options.store.append({ type: 'goals.degraded', payload: { schemaVersion: 1, reason } })\n        options.writer.degrade(reason)\n", why: 'a drift the log will not take degrades the writer for the lost row, not for the drift' },
   ],
   control: {
     id: 'C',
@@ -262,6 +271,7 @@ const CHAIN = 'src/events/chain.ts'
 const CANONICAL = 'src/events/canonical.ts'
 const SCHEMA = 'src/events/schema.ts'
 const REDACT = 'src/events/redact.ts'
+const BOUND = 'src/events/bound.ts'
 
 const integrity: Suite = {
   name: 'integrity',
@@ -332,6 +342,9 @@ const redaction: Suite = {
     { id: 'S12', file: 'src/log.ts', from: "  'req.headers.authorization',\n", to: '', why: 'pino logs a request Authorization header' },
     { id: 'S13', file: 'src/log.ts', from: '      inner.write(scrubLogLine(line))', to: '      inner.write(line)', why: 'a bearer a server echoes into an error message reaches stdout and the launchd log in clear: pino never looks at values' },
     { id: 'S14', file: 'src/log.ts', from: '    return redactString(line)\n', to: '    return line\n', why: 'a log line that is not JSON is written unscrubbed' },
+    { id: 'S15', file: BOUND, from: '  const whole = boundOutput(raw, maxBytes)', to: '  const whole = boundOutput(raw.slice(0, maxBytes), maxBytes)', why: 'a recordable field is cut before it is redacted, keeping the front of a credential' },
+    { id: 'S16', file: BOUND, from: "  return Buffer.from(text, 'utf8').toString('utf8')", to: '  return text', why: 'a recordable field keeps a lone surrogate, and the append it was made for throws' },
+    { id: 'S17', file: BOUND, from: '  const text = whole.truncated ? `${boundOutput(raw, maxBytes - 3).text}…` : whole.text', to: '  const text = whole.text', why: 'a cut field is not marked as cut' },
   ],
   control: {
     id: 'C',

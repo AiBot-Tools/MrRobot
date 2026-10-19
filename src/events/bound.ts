@@ -86,3 +86,25 @@ export function boundOutput(raw: string, max: number = MAX_LOGGED_OUTPUT): Bound
     sha256: sha256Hex(redacted),
   }
 }
+
+/**
+ * A short payload field built from text the kernel does not control (a peer's
+ * id, a property name, an error message): redacted, then cut to at most
+ * `maxBytes` of UTF-8 on a code point boundary, with `…` marking a cut, and
+ * holding no lone surrogate.
+ *
+ * Every step stops an append from throwing. The canonical form refuses a lone
+ * surrogate (canonical.ts) and a `.max(n)` field refuses length, and a throw at
+ * the append loses the very record the caller was writing. A `.slice(0, n)` fails
+ * twice: it cuts before redaction, and it can halve a surrogate pair. UTF-8 bytes
+ * bound UTF-16 units, so the result also satisfies `.max(n)` for any n >= maxBytes.
+ */
+export function recordable(raw: string, maxBytes: number): string {
+  if (!Number.isInteger(maxBytes) || maxBytes < 4) throw new RangeError(`recordable needs at least 4 bytes, not ${maxBytes}`)
+  const whole = boundOutput(raw, maxBytes)
+  const text = whole.truncated ? `${boundOutput(raw, maxBytes - 3).text}…` : whole.text
+  // An uncut text is the redacted string itself, lone surrogates included.
+  // Buffer's encoder writes each as U+FFFD, and boundOutput measured it that
+  // way, so the round trip changes nothing else and no byte count.
+  return Buffer.from(text, 'utf8').toString('utf8')
+}

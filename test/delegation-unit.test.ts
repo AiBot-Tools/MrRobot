@@ -245,6 +245,29 @@ test('a target above the caller’s tier is refused: limits only narrow', async 
   assert.match(result.text, /writer is tier 2, above the caller's tier 1/)
 })
 
+test('a refusal quoting model text is recorded: a task id or reason whose cut would halve an emoji is cut whole', async (t) => {
+  const h = await harness(t, ok)
+  const ctx = h.ctx()
+  await h.adopt.run({ plan: PLAN }, ctx)
+  // The first halves at taskId's 64-unit bound; the second at the reason's 500
+  // ("<taskId> is not a task in the adopted plan"). The log refuses a lone
+  // surrogate, so a plain slice made the append throw and lost the refusal.
+  for (const taskId of [`${'x'.repeat(63)}\u{1F600}tail`, `${'z'.repeat(499)}\u{1F600}`]) {
+    const result = await h.delegate.run({ taskId, brief: 'go' }, ctx)
+    assert.equal(result.ok, false)
+    assert.match(result.text, /is not a task in the adopted plan/)
+  }
+  const refused = h.store.query({ type: 'delegation.refused' }).map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+  assert.equal(refused.length, 2)
+  for (const p of refused) {
+    for (const field of ['taskId', 'reason']) {
+      const text = String(p[field])
+      assert.equal(Buffer.from(text, 'utf8').toString('utf8'), text, `${field} holds a lone surrogate`)
+    }
+  }
+  assert.equal(h.store.verifyChain().ok, true)
+})
+
 test('a plan naming a template that is not a standing worker is refused at adoption', async (t) => {
   // `ceo` is registered but is an orchestrator; `worker-template` is a template.
   // Neither is something a plan may hand a task to.

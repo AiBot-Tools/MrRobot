@@ -74,8 +74,9 @@ as arguments.
 The daemon needs `AOS_CONTROL_TOKEN` (at least 32 printable ASCII characters,
 with no whitespace, quote, backtick or `#`, from the shell and `.env` alike;
 `openssl rand -hex 32` makes one) and, to reach a
-model, `ANTHROPIC_API_KEY`. Both live in **your own `.env` in the repository
-root**: git-ignored, mode 0600, written only by you. `.env.example` is the
+model, `ANTHROPIC_API_KEY`: a key created inside a workspace, because an unscoped
+key needs an `anthropic-workspace-id` header the kernel does not send. Both live
+in **your own `.env` in the repository root**: git-ignored, mode 0600, written only by you. `.env.example` is the
 committed template: placeholders only, never edited to hold a real value, and it
 does not change when your `.env` does.
 
@@ -649,10 +650,18 @@ a change.
 ## Exit-criterion checklist
 
 CLAUDE.md's Phase 0 exit is: *"daemon boots with pmmcp connected and `aos run
-ceo "…"` produces `run.finished` with non-zero cost."* Phase 0 is **not**
-exited until line 2 passes on the Mac and line 3 is recorded here. Nothing in
-this repository can fill these in; they require the operator's machine, keys and
-money.
+ceo "…"` produces `run.finished` with non-zero cost."* Phase 0 is exited when
+line 2 passes on the Mac and line 3 is recorded here. Nothing in this repository
+can fill these in; they require the operator's machine, keys and money.
+
+**Phase 0 exited on 2026-10-19**, all three lines at commit `c80f7be`, run by the
+operator on the Mac against pmmcp at `127.0.0.1:8766` and `anthropic/claude-sonnet-5`.
+
+The first attempt was refused with HTTP 400 before any generation (nothing was
+spent): *"This API key is not scoped to a workspace, so this request must include
+the anthropic-workspace-id header"*. The kernel sends no such header, so the
+Anthropic key must be created inside a workspace in the Claude Console. A key made
+for one workspace needs no header.
 
 **1. LLM half — the provider path only.** Proves the router, the adapter and the
 cost accounting against real Claude, with no pmmcp connected, so it can never
@@ -670,10 +679,10 @@ terminal's spec output, `#` in TAP); that is the number recorded below.
 `AOS_LIVE_TESTS=1 npm test` runs the same test plus every other live test, at
 roughly twice the cost.
 
-- Result: _not yet run_
-- Date: —
-- Commit: —
-- `costMicroUsd`: —
+- Result: pass. 2 passed, 1 skipped by design: the exit-criterion test needs `PMMCP_URL`, and line 2 runs it. The rejected-tool-call replay passed against the real Messages API.
+- Date: 2026-10-19
+- Commit: c80f7be
+- `costMicroUsd`: 2770 (llmCalls 1)
 
 **2. The exit criterion, automated.** pmmcp connected and its tools classified,
 the key resolved from the environment (`secret.accessed { source: 'env' }`), a
@@ -692,10 +701,10 @@ shipped CEO against the operator's real pmmcp: a reply that plans could write
 goals under `aos/ceo`, and pmmcp has no tool to delete them. It prints
 `costMicroUsd=<N>` the same way.
 
-- Result: _not yet run_
-- Date: —
-- Commit: —
-- `costMicroUsd`: —
+- Result: pass. 1 passed. pmmcp connected (`degraded`: sandbox, router, egress; no `hub`), and its 46 unclassified tools defaulted to kernel-only.
+- Date: 2026-10-19
+- Commit: c80f7be
+- `costMicroUsd`: 2770 (llmCalls 1)
 
 **3. The literal criterion, by hand.** The sentence in CLAUDE.md names the
 daemon and the CLI, so it is exercised as written rather than only in-process.
@@ -713,12 +722,12 @@ npm run cli -- run ceo "reply with the word pong"
 npm run cli -- verify-chain
 ```
 
-- Result: _not yet run_
-- Date: —
-- Commit: —
-- `runId`: —
-- `costMicroUsd`: —
-- `verify-chain` output: —
+- Result: pass. `probe` reported `toolCalling=true`, and `run` printed `ok`. `run.finished` carried `"status":"ok"`, `llmCalls` 1 and `toolCalls` 0. `secret.accessed` carried `"source":"env"`. No `goal.created` row was written.
+- Date: 2026-10-19
+- Commit: c80f7be
+- `runId`: run_1792371549403_2lc91w
+- `costMicroUsd`: 2770
+- `verify-chain` output: `ok	31 events	head 277c4dd3c176dbfd7cec2b66047d5898650b85bd1d6aced9b66f9337c1e0c51f` (31 is the `run.finished` row; taken before a `kernel.shutdown` row was appended)
 
 ---
 

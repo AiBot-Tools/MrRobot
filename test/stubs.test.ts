@@ -236,10 +236,23 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   // small one, which is the only drift that has ever actually happened here.
   assert.ok(Number(passing) > 300, `CLAUDE.md claims only ${passing} passing tests`)
 
-  // And the two things that must not be claimed while they are untrue.
-  assert.match(section, /No real provider call has ever been made/)
-  assert.match(section, /is not claimed until that entry is filled/)
-  assert.equal(/Phase 0 (?:is )?(?:complete|exited|met)\b/i.test(section), false, 'CLAUDE.md claims Phase 0 is exited')
+  // And the claims tied to README's exit-criterion record, in both directions.
+  // While line 2 or 3 is unrun, Phase 0 must not be claimed and no real provider
+  // call may be. Once both are recorded the contract must say so, because a
+  // CLAUDE.md that trails the record is read as authoritative too.
+  const record = README.slice(README.indexOf('## Exit-criterion checklist'))
+  const results = [...record.matchAll(/- Result: (.*)\n/g)].map((m) => (m[1] ?? '').trim())
+  assert.equal(results.length, 3, 'README has no three-line exit-criterion record')
+  const exited = results[1] !== '_not yet run_' && results[2] !== '_not yet run_'
+  if (exited) {
+    assert.match(section, /Phase 0 exited on \d{4}-\d{2}-\d{2}/, 'README records the exit; CLAUDE.md does not say so')
+    assert.equal(/No real provider call has ever been made/.test(section), false, 'CLAUDE.md denies the recorded run')
+    assert.equal(/is not claimed until that entry is filled/.test(section), false, 'CLAUDE.md still waits on a filled entry')
+  } else {
+    assert.match(section, /No real provider call has ever been made/)
+    assert.match(section, /is not claimed until that entry is filled/)
+    assert.equal(/Phase 0 (?:is )?(?:complete|exited|met)\b/i.test(section), false, 'CLAUDE.md claims Phase 0 is exited')
+  }
 
   // The Apple driver's description matches what the code does, which is the
   // clause this rewrite had to correct: it said "throws", and a throwing probe

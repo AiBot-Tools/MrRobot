@@ -68,6 +68,12 @@ The brief for whoever changes pmmcp. Every quote is from §3 P5 and P6.
   with a non-recursive root. Every root is an object, every datetime is
   timezone-aware, the JSON is also returned as a text block, and `tools/list`
   is one page.
+- **Build the result before the write commits.** FastMCP validates a tool's
+  return against its outputSchema AFTER the body ran, and a failure there
+  reaches the client as `isError` (`Error executing tool …`). The kernel reads
+  every `isError` as a refusal, with nothing written, so a goal written before
+  its own result failed validation would be an orphan no `goal.unconfirmed`
+  names. Construct and validate the P6 model first, then write.
 - **Also state:** pmmcp's `mcp` SDK version, pinned per P1 (`mcp>=1.29.1,<2`, or
   MCPServer on 2.3+).
 - **Then the operator:** restart the daemon, re-capture (2.2.O2) and commit.

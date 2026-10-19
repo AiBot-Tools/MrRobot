@@ -460,7 +460,10 @@ change the frozen protocol v1. pmmcp's `update_goal` takes no `project_id` and
 moves any goal by id, so the kernel moves only goals its own `goal.created` log
 says it created, in the namespace it created them in. pmmcp also answers refusals
 as successful text (`Error: Cannot transition…`, `Goal x not found.`); the writer
-counts a move only on pmmcp's `✅ Goal updated: <id>`.
+counts a move only on pmmcp's own confirmation: `✅ Goal updated: <id>` today, or,
+from contract P6, a typed result naming the same goal, status and project (100 %
+for a review). A typed success it will not confirm is refused AND recorded as
+`goal.unconfirmed`, because pmmcp may have acted on it.
 
 Every pmmcp goal tool name and argument lives in `config/kernel.yaml` under
 `goals:`, confirmed by the operator's live capture of 2026-10-18, and every call

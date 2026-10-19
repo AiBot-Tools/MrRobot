@@ -555,8 +555,9 @@ export class GoalWriter {
    * For the run lifecycle, where the status update must never take down the run
    * that triggered it: a task goal that could not be moved is a stale status an
    * operator can see and fix, while a run killed by its own bookkeeping is work
-   * lost. The failure is loud in the log and absent from the chain, because
-   * nothing happened on the server to record.
+   * lost. The failure is loud in the log. It reaches the chain only when pmmcp's
+   * reply says it may have moved the goal anyway (`goal.unconfirmed`, from
+   * #unconfirmed); a move pmmcp refused left nothing on the server to record.
    */
   async trySetStatus(
     goalId: string,

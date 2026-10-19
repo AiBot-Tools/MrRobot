@@ -1045,12 +1045,15 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
     const value = state.secrets.get(label)
     state.audit.push({ action: 'get_secret', label, ok: value !== undefined, at: now() })
     if (!revealSecrets) {
-      // pmmcp's own replies, verbatim in shape: success text either way.
+      // pmmcp's own replies, verbatim in shape: success text either way, until
+      // P5 makes the miss an isError refusal.
       if (value === undefined) return refuse('get_secret', 'not_found', `Secret '${label}' not found.`, 'no such secret')
       const masked = value.length > 4 ? '*'.repeat(value.length - 4) + value.slice(-4) : '****'
       return ok(`Secret '${label}' exists (masked): ${masked}`)
     }
-    if (value === undefined) return fail(`no vault entry ${label}`)
+    // Revealing is the double's own (pmmcp never does), and so is this miss: an
+    // error in either mode, and under P5 one that quotes no label.
+    if (value === undefined) return refusals === 'p5' ? refuse('get_secret', 'not_found', '', 'no such secret') : fail(`no vault entry ${label}`)
     return ok(value)
   })
 

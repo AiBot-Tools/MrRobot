@@ -410,6 +410,12 @@ test('P5 refusals are isError with a code, in both wire forms, and a not-found m
   const secret = await call(client, 'get_secret', { label: 'no-such-label' })
   assert.match(secret.text, /not_found: /)
   assert.equal(secret.text.includes('no-such-label'), false)
+  // The double's revealing vault keeps the same promise.
+  const revealing = await open(t, { refusals: 'p5', revealSecrets: true })
+  const revealed = await call(revealing.client, 'get_secret', { label: 'no-such-label' })
+  assert.equal(revealed.isError, true)
+  assert.match(revealed.text, /^Error executing tool get_secret: not_found: /)
+  assert.equal(revealed.text.includes('no-such-label'), false)
 
   const dispatch = await open(t, { refusals: 'p5', p5Form: 'dispatch' })
   const bad = await call(dispatch.client, 'create_goal', { project_id: 'aos/ceo', goal_type: 'epic', title: 'x' })

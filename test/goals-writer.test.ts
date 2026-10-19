@@ -773,8 +773,8 @@ test('a FastMCP {result} that says something its text does not is refused and re
 })
 
 test("a move's FastMCP {result} that disagrees with its text names the goals pmmcp's update prose names", async (t) => {
-  // [the {result} pmmcp sends, the reason, the row's goalId]: the row names the
-  // goal the kernel asked to move; the reason, every goal either form names.
+  // [the {result} pmmcp sends, the reason]: the row always names the goal the
+  // kernel asked to move; the reason names every goal either form names.
   const cases: [string, RegExp][] = [
     ['✅ Goal updated: goal_ffffffffffff', /disagree: the text names goal_000000000003, structuredContent goal_ffffffffffff/],
     ['✅ Goal updated: goal_000000000003', /both name goal_000000000003 and disagree on a field other than goal_id/],

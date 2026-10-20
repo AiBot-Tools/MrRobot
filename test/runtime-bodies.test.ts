@@ -10,9 +10,11 @@ import './helpers/guard.js'
 
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import test from 'node:test'
 import { parse as parseYaml } from 'yaml'
 
+import { parseManifest, type AgentManifest } from '../src/agents/manifest.js'
 import { parseKernelConfig } from '../src/config.js'
 import { McpHub } from '../src/mcp/hub.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
@@ -248,4 +250,22 @@ test('evalHarnessAssumptions refuses a run whose calibration checks could not pa
     () => evalHarnessAssumptions({ port: kernel.port, token: TEST_TOKEN, dbPath: fx.dbPath, timeoutMs: 20_000 }),
     /llm-events-paired|cost-reconciles-with-log/,
   )
+})
+
+test("the live fleet's orchestrator is the shipped CEO in every field but its id, model and memory, and loses its kernel tools only when asked to", (t) => {
+  const read = (path: string): AgentManifest => parseManifest(parseYaml(readFileSync(path, 'utf8')), path)
+  const shipped = read(`${REPO_ROOT}/agents/ceo/agent.yaml`)
+  const other = 'openai/a-model'
+  for (const delegation of [true, false]) {
+    const live = read(join(liveFleet(tmpdir(t), other, { delegation }), LIVE_ORCHESTRATOR, 'agent.yaml'))
+    assert.equal(live.id, LIVE_ORCHESTRATOR)
+    assert.equal(live.model.primary, other)
+    assert.equal(live.memory.projectId, LIVE_TEST_PROJECT)
+    assert.deepEqual(live.tools.allow, delegation ? shipped.tools.allow : [], `delegation ${String(delegation)}`)
+    // Everything else, field for field: role, soul, tier, egress, spawn, budget, version.
+    const rest = (m: AgentManifest): unknown => ({ ...m, id: '', model: { ...m.model, primary: '' }, memory: {}, tools: { ...m.tools, allow: [] } })
+    assert.deepEqual(rest(live), rest(shipped), `delegation ${String(delegation)}`)
+  }
+  // The shipped CEO's tools are the kernel's two, so "with delegation" means it can fan out.
+  assert.deepEqual([...shipped.tools.allow].sort(), ['kernel.adopt_plan', 'kernel.delegate'])
 })

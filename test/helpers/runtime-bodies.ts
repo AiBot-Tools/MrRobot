@@ -33,6 +33,7 @@ import './guard.js'
 import assert from 'node:assert/strict'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 
 import type { EventStore } from '../../src/events/store.js'
 import { CEO_CHECKS } from '../../src/eval/checks.js'
@@ -58,13 +59,19 @@ export const LIVE_ORCHESTRATOR = 'live-ceo'
  * A fleet whose orchestrator writes into the test namespace.
  *
  * The real `ceo` manifest names `aos/ceo`, and a live plan adopted from it would
- * leave goals in the operator's own tree. So this copies the real researcher and
- * writer (the templates a plan names) and adds a `live-ceo` that is the shipped
- * CEO in every respect except where it remembers.
+ * leave goals in the operator's own tree. So this copies the shipped workers and
+ * template, and derives `live-ceo` from the SHIPPED CEO manifest, changing only
+ * its id, its model ref and where it remembers. A hand-written copy drifts:
+ * the last one had lost the CEO's kernel tools and could not delegate.
+ *
+ * `delegation: false` (the default) also takes away `kernel.adopt_plan` and
+ * `kernel.delegate`, for the plan-to-tree check, which measures a plan stated in
+ * the final message and must not turn into a fan-out with child runs of its own.
+ * The Phase 1 exit checks pass `delegation: true`: the CEO as shipped.
  */
-export function liveFleet(dir: string, modelRef: string): string {
+export function liveFleet(dir: string, modelRef: string, options: { readonly delegation?: boolean } = {}): string {
   const agents = join(dir, 'agents')
-  for (const id of ['researcher', 'writer']) {
+  for (const id of ['researcher', 'writer', 'worker-template']) {
     mkdirSync(join(agents, id, 'history'), { recursive: true })
     writeFileSync(
       join(agents, id, 'agent.yaml'),
@@ -72,25 +79,16 @@ export function liveFleet(dir: string, modelRef: string): string {
     )
     writeFileSync(join(agents, id, 'AGENTS.md'), `# ${id}\n`)
   }
+  const shipped = parseYaml(readFileSync(join(REPO_ROOT, 'agents', 'ceo', 'agent.yaml'), 'utf8')) as Record<string, Record<string, unknown>>
+  const manifest = {
+    ...shipped,
+    id: LIVE_ORCHESTRATOR,
+    model: { ...shipped['model'], primary: modelRef },
+    memory: { ...shipped['memory'], projectId: LIVE_TEST_PROJECT },
+    ...(options.delegation === true ? {} : { tools: { ...shipped['tools'], allow: [] } }),
+  }
   mkdirSync(join(agents, LIVE_ORCHESTRATOR, 'history'), { recursive: true })
-  writeFileSync(
-    join(agents, LIVE_ORCHESTRATOR, 'agent.yaml'),
-    `id: ${LIVE_ORCHESTRATOR}
-version: 1
-kind: standard
-role: orchestrator
-soul: ceo.md
-tier: 2
-model:
-  primary: ${modelRef}
-  fallbacks: []
-tools:
-  servers: [pmmcp]
-  allow: []
-memory:
-  projectId: ${LIVE_TEST_PROJECT}
-`,
-  )
+  writeFileSync(join(agents, LIVE_ORCHESTRATOR, 'agent.yaml'), stringifyYaml(manifest))
   writeFileSync(join(agents, LIVE_ORCHESTRATOR, 'AGENTS.md'), `# ${LIVE_ORCHESTRATOR}\n`)
   return agents
 }

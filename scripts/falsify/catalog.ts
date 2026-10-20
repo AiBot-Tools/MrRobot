@@ -280,6 +280,8 @@ const evalChecks: Suite = {
     { id: 'E9', file: CHECKS, from: '      calls.filter((c) => c.seq > d.seq && c.toolRef === d.toolRef).map((c) => c.toolRef),', to: '      calls.filter(() => false).map((c) => c.toolRef),', why: 'a call after its own denial passes' },
     { id: 'E10', file: CHECKS, from: '    if (finished !== undefined && finished.llmCalls !== responses.length) {', to: '    if (false) {', why: 'run.finished may miscount model calls' },
     { id: 'E11', file: CHECKS, from: "    const text = o.log.map((r) => `${r.type} ${r.payload}`).join('\\n')", to: "    const text = o.rows.map((r) => `${r.type} ${r.payload}`).join('\\n')", why: 'a canary leaked by a child run is missed' },
+    { id: 'E12', file: CHECKS, from: '    if (twice.length > 0) {', to: '    if (false) {', why: 'double-spawn: a delegated task dispatched twice passes' },
+    { id: 'E13', file: CHECKS, from: '    const unnamed = children.filter((id) => !taskOf.has(id))', to: '    const unnamed = children', why: 'two delegated tasks on one worker fail as a repeat' },
   ],
   control: {
     id: 'C',

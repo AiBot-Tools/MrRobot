@@ -334,6 +334,24 @@ test('objectiveFanOut holds against the double: a tree in the test namespace, tw
   assert.equal(result.caseId, 'ceo-objective-fanout')
 })
 
+test('objectiveFanOut holds when both write-ups go to one worker: two tasks, not a repeat', async (t) => {
+  // The shipped objective asks for two researched write-ups, so a plan giving
+  // both to the researcher is the natural one and must not fail the exit.
+  const sameWorker = JSON.parse(JSON.stringify(FAN_OUT_PLAN).replace('"template":"writer"', '"template":"researcher"')) as typeof FAN_OUT_PLAN
+  const { port, dbPath } = await fanOutKernel(t, [
+    anthropicToolUse({ name: 'kernel__adopt_plan', input: { plan: sameWorker } }),
+    anthropicToolUse({ name: 'kernel__delegate', input: { taskId: 't1', brief: 'Write up SQLite with triggers.' } }),
+    anthropicEndTurn({ text: 'SQLite note.', inputTokens: 300, outputTokens: 30 }),
+    anthropicToolUse({ name: 'kernel__delegate', input: { taskId: 't2', brief: 'Write up the flat file.' } }),
+    anthropicEndTurn({ text: 'Flat file note.', inputTokens: 300, outputTokens: 30 }),
+    (request) => {
+      const [first, second] = childIdsIn(request)
+      return anthropicEndTurn({ text: `Compared: ${String(first)} and ${String(second)}.`, inputTokens: 400, outputTokens: 20 })
+    },
+  ])
+  await objectiveFanOut({ port, token: TEST_TOKEN, dbPath, timeoutMs: 20_000 }, { agentId: LIVE_ORCHESTRATOR, projectId: LIVE_TEST_PROJECT })
+})
+
 test('objectiveFanOut refuses an orchestrator that answers alone, and one whose summary drops a child', async (t) => {
   const alone = await fanOutKernel(t, [anthropicEndTurn({ text: 'SQLite is better. Done.', inputTokens: 500, outputTokens: 20 })])
   await assert.rejects(

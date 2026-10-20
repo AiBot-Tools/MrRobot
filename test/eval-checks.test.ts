@@ -321,6 +321,29 @@ test('CHEAT: double-spawn — the same agent dispatched twice in one objective i
   assert.equal(noDuplicateDispatch.run(observationOf(distinct, {})).verdict, 'pass')
 })
 
+test('a delegated task dispatched twice is caught by its task id, and two tasks on one worker are not a repeat', () => {
+  // Each child preceded by the parent's admission naming its task, as delegate.ts writes it.
+  const delegated = (runId: string, agentId: string, taskId: string): ReturnType<typeof childRun> => [
+    row('delegation.admitted', {
+      parentRunId: 'run_parent', childRunId: runId, agentId, taskId, goalId: `goal-${taskId}`, ceilingMicroUsd: 1_000, ceilingWallclockMs: 1_000,
+    }),
+    ...childRun(runId, agentId, true),
+  ]
+  resetSeq()
+  const sameWorker = withChildren(parentRun(), [delegated('run_child_a', 'researcher', 't1'), delegated('run_child_b', 'researcher', 't2')])
+  const plan = noDuplicateDispatch.run(observationOf(sameWorker, {}))
+  assert.equal(plan.verdict, 'pass', plan.detail)
+  assert.match(plan.detail, /one per task: t1, t2/)
+
+  resetSeq()
+  const repeated = withChildren(parentRun(), [delegated('run_child_a', 'researcher', 't1'), delegated('run_child_b', 'writer', 't1')])
+  const twice = noDuplicateDispatch.run(observationOf(repeated, {}))
+  assert.equal(twice.verdict, 'fail')
+  assert.match(twice.detail, /a task was dispatched more than once: t1 × 2/)
+  // Proof, not a signal: the task id is on the admission.
+  assert.equal(/signal, not proof/.test(twice.detail), false)
+})
+
 test('CHEAT: silent-drop — a child left out of the summary is caught', () => {
   resetSeq()
   const dropped = withChildren(

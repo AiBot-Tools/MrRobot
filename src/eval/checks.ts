@@ -20,6 +20,7 @@
 
 import {
   AgentSpawnedPayload,
+  DelegationAdmittedPayload,
   DelegationResultPayload,
   RunQueuedPayload,
   RunStartedPayload,
@@ -374,23 +375,44 @@ export const noDuplicateDispatch: Check = {
   run(o) {
     const children = childRunIds(o)
     if (children.length === 0) return na('the run had no children')
+    // A delegated child's admission names its task, so for those this is proof:
+    // two runs for one task id. Two tasks on one worker is a plan, not a repeat.
+    const taskOf = new Map<string, string>()
+    for (const r of o.log) {
+      if (r.type !== 'delegation.admitted') continue
+      const a = DelegationAdmittedPayload.parse(JSON.parse(r.payload))
+      if (a.parentRunId === o.runId) taskOf.set(a.childRunId, a.taskId)
+    }
+    const byTask = new Map<string, string[]>()
+    for (const id of children) {
+      const task = taskOf.get(id)
+      if (task !== undefined) byTask.set(task, [...(byTask.get(task) ?? []), id])
+    }
+    const twice = [...byTask.entries()].filter(([, ids]) => ids.length > 1)
+    if (twice.length > 0) {
+      return fail(`a task was dispatched more than once: ${twice.map(([task, ids]) => `${task} × ${String(ids.length)} (${ids.join(', ')})`).join('; ')}`)
+    }
+    const unnamed = children.filter((id) => !taskOf.has(id))
+    if (unnamed.length === 0) {
+      return pass(`${String(children.length)} child run(s), one per task: ${[...byTask.keys()].join(', ')}`)
+    }
     const starts = o.log.filter((r) => r.type === 'run.started' && r.runId !== null)
     const byAgent = new Map<string, string[]>()
-    for (const id of children) {
+    for (const id of unnamed) {
       const row = starts.find((r) => r.runId === id)
       if (row === undefined) continue
       const p = RunStartedPayload.parse(JSON.parse(row.payload))
       byAgent.set(p.agentId, [...(byAgent.get(p.agentId) ?? []), id])
     }
-    // Without a task id on the run there is no stronger statement available than
-    // "the same agent twice", which is a signal and not proof. Reported as such.
+    // A child no admission names was not delegated, so there is no task id to
+    // read, and "the same agent twice" is a signal, not proof. Reported as such.
     const repeated = [...byAgent.entries()].filter(([, ids]) => ids.length > 1)
     return repeated.length === 0
       ? pass(`${String(children.length)} child run(s), each a distinct agent`)
       : fail(
           'the same agent ran more than once inside one objective: ' +
             repeated.map(([agent, ids]) => `${agent} × ${String(ids.length)}`).join(', ') +
-            '. Without a task id on run.started this is a signal, not proof.',
+            '. No admission names their task, so this is a signal, not proof.',
         )
   },
 }

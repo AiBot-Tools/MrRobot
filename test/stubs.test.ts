@@ -240,7 +240,13 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   // While line 2 or 3 is unrun, Phase 0 must not be claimed and no real provider
   // call may be. Once both are recorded the contract must say so, because a
   // CLAUDE.md that trails the record is read as authoritative too.
-  const record = README.slice(README.indexOf('## Exit-criterion checklist'))
+  const sectionOf = (heading: string): string => {
+    const start = README.indexOf(heading)
+    assert.notEqual(start, -1, `README has no ${heading}`)
+    const end = README.indexOf('\n## ', start + heading.length)
+    return README.slice(start, end === -1 ? undefined : end)
+  }
+  const record = sectionOf('## Exit-criterion checklist')
   const results = [...record.matchAll(/- Result: (.*)\n/g)].map((m) => (m[1] ?? '').trim())
   assert.equal(results.length, 3, 'README has no three-line exit-criterion record')
   const exited = results[1] !== '_not yet run_' && results[2] !== '_not yet run_'
@@ -252,6 +258,17 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
     assert.match(section, /No real provider call has ever been made/)
     assert.match(section, /is not claimed until that entry is filled/)
     assert.equal(/Phase 0 (?:is )?(?:complete|exited|met)\b/i.test(section), false, 'CLAUDE.md claims Phase 0 is exited')
+  }
+
+  // Phase 1 the same way: exited only once lines 1 and 2 of its record pass,
+  // and then the contract must say so.
+  const phaseOne = [...sectionOf('## Phase 1 exit-criterion checklist').matchAll(/- Result: (.*)\n/g)].map((m) => (m[1] ?? '').trim())
+  assert.equal(phaseOne.length, 3, 'README has no three-line Phase 1 exit record')
+  const phaseOneExited = phaseOne.slice(0, 2).every((r) => r.startsWith('pass'))
+  if (phaseOneExited) {
+    assert.match(section, /Phase 1 exited on \d{4}-\d{2}-\d{2}/, 'README records the Phase 1 exit; CLAUDE.md does not say so')
+  } else {
+    assert.equal(/Phase 1 (?:is )?(?:complete|exited|met)\b/i.test(section), false, 'CLAUDE.md claims Phase 1 is exited before README records it')
   }
 
   // The Apple driver's description matches what the code does, which is the

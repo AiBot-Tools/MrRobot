@@ -508,6 +508,8 @@ and a live test cannot rot unexercised the way a gated-only one does.
 | goal tools round-trip | pmmcp + both opt-ins | whether the real server still matches the captured goal tool names, arguments and types in `kernel.yaml`, and whether its replies are the ones read from its source — the first assertion is the boot check, and it names every disagreement |
 | plan → tree | pmmcp, `ANTHROPIC_API_KEY`, both opt-ins | whether a real model's plan survives the `.strict()` parser; on failure the message carries the parser's own reason and the model's words |
 | eval harness gates | `ANTHROPIC_API_KEY` | whether the harness's own gates — one terminal row, paired LLM events, cost equal to the sum of logged calls — hold against a real provider's accounting |
+| Phase 1 exit: objective → tree + children + summary | pmmcp, `ANTHROPIC_API_KEY`, both opt-ins | whether the shipped CEO, on a real model, adopts a plan into `aos/agent/aos-live-test`, delegates at least two tasks, and ends with a summary the log backs (every child named, every cited id real) |
+| Phase 1 exit: a restart mid-run | pmmcp, `ANTHROPIC_API_KEY`, both opt-ins | whether a kernel that dies with a child in its first real model call orphans nothing, and whether the real pmmcp accepts the recovery's move of that child's goal to `blocked` |
 
 `test/live-anthropic.test.ts` carries one more of these: **rejected-call replay**
 (needs `ANTHROPIC_API_KEY`). When a model calls a tool the kernel will not run, the
@@ -733,6 +735,59 @@ npm run cli -- verify-chain
 - `runId`: run_1792371549403_2lc91w
 - `costMicroUsd`: 2770
 - `verify-chain` output: `ok	31 events	head 277c4dd3c176dbfd7cec2b66047d5898650b85bd1d6aced9b66f9337c1e0c51f` (31 is the `run.finished` row; taken before a `kernel.shutdown` row was appended)
+
+---
+
+## Phase 1 exit-criterion checklist
+
+CLAUDE.md's Phase 1 exit is: *"one objective → goal tree + ≥2 child runs +
+trustworthy summary; kernel restart mid-run orphans nothing."* Phase 1 is exited
+when lines 1 and 2 pass on the Mac and are recorded here. Both run the shipped CEO
+as `live-ceo`, a copy that differs only in its id and in remembering in
+**`aos/agent/aos-live-test`**, so nothing is written to `aos/ceo`. The goals they
+write stay in that namespace; pmmcp has no delete the kernel calls.
+
+All three lines come from one run of the live runtime file, with pmmcp up and
+both opt-ins (`ANTHROPIC_API_KEY` from `.env`, or a shell export that is not
+blank):
+
+```bash
+AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_WRITES=1 PMMCP_URL=http://127.0.0.1:8766/mcp node --import tsx --test test/live-runtime.test.ts
+```
+
+Lines 1 and 2 print `runId=…` / `ceoRunId=…` and `costMicroUsd=…` as test
+diagnostics (`ℹ` in the terminal), which is what is recorded below. A failure in
+line 1 names the eval gate that failed and every check's verdict: a model that
+answers alone fails `child-runs`, a summary that leaves out a child fails
+`child-outcomes-accounted`.
+
+**1. One objective → goal tree + two child runs + a trustworthy summary.** The
+eval harness's fan-out case, judged from the log alone.
+
+- Result: _not yet run_
+- Date:
+- Commit:
+- `runId`:
+- `costMicroUsd`:
+
+**2. A kernel restart mid-run orphans nothing.** The kernel dies with a child in
+its first model call; a reboot on the same data closes every run and admission
+in causal order, blocks the child's goal in pmmcp, calls no model, and a second
+reboot finds nothing to do.
+
+- Result: _not yet run_
+- Date:
+- Commit:
+- `ceoRunId`:
+- `costMicroUsd`:
+
+**3. The other Phase 1 runtime checks.** Goal tools round-trip against the live
+server, a real plan through the strict parser into the test namespace, and the
+eval harness's gates against real accounting.
+
+- Result: _not yet run_
+- Date:
+- Commit:
 
 ---
 

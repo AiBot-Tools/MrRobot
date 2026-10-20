@@ -40,7 +40,7 @@ import { parseToolViews } from '../src/mcp/tool-views.js'
 import { parseProviders } from '../src/models/registry.js'
 import type { Kernel } from '../src/kernel.js'
 import { fakeSandbox } from './helpers/fake-sandbox.js'
-import { bootCrashable, bootOn, fixture, REPO_ROOT, runThroughControl, TEST_TOKEN, withKernel } from './helpers/kernel.js'
+import { bootCrashable, bootOn, fixture, REPO_ROOT, rows, runThroughControl, TEST_TOKEN, withKernel } from './helpers/kernel.js'
 import {
   evalHarnessAssumptions,
   goalTreeRoundTrip,
@@ -64,6 +64,12 @@ const ANTHROPIC_HOST = 'api.anthropic.com'
 
 // PMMCP_TOKEN is optional: pmmcp takes no bearer. Set it only for a server that does.
 const hasPmmcp = (): boolean => process.env['PMMCP_URL'] !== undefined
+
+/** Every micro-dollar the log records, probe included: what the run cost the operator. */
+const loggedCost = (dbPath: string): number =>
+  rows(dbPath)
+    .filter((r) => r.type === 'llm.response')
+    .reduce((n, r) => n + Number((JSON.parse(r.payload) as { costMicroUsd?: unknown }).costMicroUsd ?? 0), 0)
 
 /** The one non-placeholder ref in providers.yaml, read rather than hard-coded. */
 function realRef(): string {
@@ -255,8 +261,9 @@ test(
       { port: kernel.port, token: TEST_TOKEN, dbPath: fx.dbPath, timeoutMs: 600_000 },
       { agentId: LIVE_ORCHESTRATOR, projectId: LIVE_TEST_PROJECT },
     )
-    // Recorded in the TAP output, for the README checklist.
-    t.diagnostic(`runId=${result.runId} score=${String(result.score)} notApplicable=${result.notApplicable.join(',') || 'none'}`)
+    // Recorded in the TAP output, for the README checklist: every call in the
+    // log is this run's or its children's.
+    t.diagnostic(`runId=${result.runId} costMicroUsd=${String(loggedCost(fx.dbPath))} score=${String(result.score)} notApplicable=${result.notApplicable.join(',') || 'none'}`)
   },
 )
 
@@ -313,6 +320,6 @@ test(
       // The probe record is on disk; a restarted kernel must not call a model.
       reboot: () => bootOn(t, fx, { env, sandboxDriver: fakeSandbox(), agentsDir }),
     })
-    t.diagnostic(`ceoRunId=${result.ceoRunId} inFlight=${result.inFlight}`)
+    t.diagnostic(`ceoRunId=${result.ceoRunId} inFlight=${result.inFlight} costMicroUsd=${String(loggedCost(fx.dbPath))}`)
   },
 )

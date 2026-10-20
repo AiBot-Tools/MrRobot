@@ -65,7 +65,7 @@ const ANTHROPIC_HOST = 'api.anthropic.com'
 // PMMCP_TOKEN is optional: pmmcp takes no bearer. Set it only for a server that does.
 const hasPmmcp = (): boolean => process.env['PMMCP_URL'] !== undefined
 
-/** Every micro-dollar the log records, probe included: what the run cost the operator. */
+/** Every micro-dollar the log records, probe included. A call cut off by a crash is billed and not in it. */
 const loggedCost = (dbPath: string): number =>
   rows(dbPath)
     .filter((r) => r.type === 'llm.response')
@@ -261,8 +261,8 @@ test(
       { port: kernel.port, token: TEST_TOKEN, dbPath: fx.dbPath, timeoutMs: 600_000 },
       { agentId: LIVE_ORCHESTRATOR, projectId: LIVE_TEST_PROJECT },
     )
-    // Recorded in the TAP output, for the README checklist: every call in the
-    // log is this run's or its children's.
+    // Recorded in the TAP output, for the README checklist: this run's calls,
+    // its children's, and the probe's.
     t.diagnostic(`runId=${result.runId} costMicroUsd=${String(loggedCost(fx.dbPath))} score=${String(result.score)} notApplicable=${result.notApplicable.join(',') || 'none'}`)
   },
 )
@@ -292,12 +292,20 @@ test(
     const agentsDir = liveFleet(tmpdir(t), ref, { delegation: true })
     const env = { PMMCP_TOKEN: process.env['PMMCP_TOKEN'], ANTHROPIC_API_KEY: KEY }
 
-    // A dead process reads no reply: after the crash, a response that arrives
-    // for the old kernel never reaches it, as the offline script's hang does.
+    // A dead process reads no reply. After the crash the old kernel gets headers
+    // and a body that never ends, as the offline script's hang does: a promise
+    // that never settles would leave the SDK's 10-minute request timer armed and
+    // hold this file open after its last test.
     let crashed = false
-    const never = (): Promise<Response> => new Promise<Response>(() => undefined)
-    const fetch: typeof globalThis.fetch = (input, init) =>
-      crashed ? never() : globalThis.fetch(input, init).then((r) => (crashed ? never() : r))
+    const hung = (): Response =>
+      new Response(new ReadableStream<Uint8Array>({ start: () => undefined }), { status: 200, headers: { 'content-type': 'application/json' } })
+    const fetch: typeof globalThis.fetch = async (input, init) => {
+      if (crashed) return hung()
+      const response = await globalThis.fetch(input, init)
+      if (!crashed) return response
+      await response.body?.cancel()
+      return hung()
+    }
 
     const result = await restartMidFanOut({
       dbPath: fx.dbPath,
@@ -320,6 +328,7 @@ test(
       // The probe record is on disk; a restarted kernel must not call a model.
       reboot: () => bootOn(t, fx, { env, sandboxDriver: fakeSandbox(), agentsDir }),
     })
+    // Logged cost: the call the crash interrupted is billed but never logged.
     t.diagnostic(`ceoRunId=${result.ceoRunId} inFlight=${result.inFlight} costMicroUsd=${String(loggedCost(fx.dbPath))}`)
   },
 )

@@ -150,7 +150,8 @@ export function assertPlanCoherent(plan: ProposedPlan, knownTemplates: readonly 
     for (const { task } of tasks) {
       if (!known.has(task.template)) {
         throw new PlanInvalid(
-          `${task.id} names template ${task.template}, which is not a registered agent or template`,
+          `${task.id} names template ${task.template}, which is not a registered agent or template ` +
+            `(it may name: ${knownTemplates.join(', ')})`,
         )
       }
     }

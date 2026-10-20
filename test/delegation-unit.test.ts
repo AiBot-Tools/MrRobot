@@ -268,6 +268,19 @@ test('a refusal quoting model text is recorded: a task id or reason whose cut wo
   assert.equal(h.store.verifyChain().ok, true)
 })
 
+test('the model is told which workers a plan may name: adopt_plan lists the standing workers, and a refusal lists them again', async (t) => {
+  const h = await harness(t, ok)
+  const plan = h.delegation.handlers().find((x) => x.name === 'adopt_plan')
+  const described = JSON.stringify(plan?.inputSchema)
+  assert.match(described, /must name a standing worker, one of: researcher, writer/)
+  // An orchestrator and a template are not delegation targets, so they are not offered.
+  assert.equal(/\bceo\b|worker-template/.test(described), false, described)
+  const bad = JSON.parse(JSON.stringify(PLAN).replace('"researcher"', '"analyst"')) as typeof PLAN
+  const result = await h.adopt.run({ plan: bad }, h.ctx({ runId: 'run_analyst' }))
+  assert.equal(result.ok, false)
+  assert.match(result.text, /names template analyst, which is not a registered agent or template \(it may name: researcher, writer\)/)
+})
+
 test('a plan naming a template that is not a standing worker is refused at adoption', async (t) => {
   // `ceo` is registered but is an orchestrator; `worker-template` is a template.
   // Neither is something a plan may hand a task to.

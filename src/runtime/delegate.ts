@@ -95,6 +95,11 @@ export class Delegation {
   }
 
   handlers(): KernelToolHandler[] {
+    // Named to the model: it has no tool that lists agents, so a plan could
+    // otherwise only guess the ids a template must be. The registry is loaded
+    // before the kernel tools are built.
+    const workers = this.#delegable()
+    const named = workers.length === 0 ? 'no standing worker is registered' : `one of: ${workers.join(', ')}`
     return [
       {
         name: 'adopt_plan',
@@ -109,7 +114,7 @@ export class Delegation {
               description:
                 'A ProposedPlan: { objective: { title, successCriteria[] }, milestones: [{ id, title, ' +
                 'tasks: [{ id, title, template, acceptance[], dependsOn[] }] }], assumptions[], risks[], ' +
-                'questionsForOperator[] }. `template` must name a registered worker.',
+                `questionsForOperator[] }. \`template\` must name a standing worker, ${named}.`,
             },
           },
           required: ['plan'],

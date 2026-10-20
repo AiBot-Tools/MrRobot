@@ -509,6 +509,12 @@ export interface PmmcpMockOptions {
    * is refused at construction and the skew must say `structured`.
    */
   readonly skew?: Readonly<Record<string, SkewSpec>>
+  /**
+   * Answer the named tools only after this many milliseconds, as a server over
+   * HTTP does. The call takes effect at once; only the reply waits, so a client
+   * that hangs up early leaves the server changed and itself unanswered.
+   */
+  readonly answerAfterMs?: Readonly<Record<string, number>>
   /** Declare a different outputSchema for the named tools, for the boot check to meet. Handlers are unchanged. */
   readonly outputSchemas?: Readonly<Record<string, Readonly<Record<string, unknown>>>>
   /**
@@ -1182,7 +1188,8 @@ export function pmmcpMock(options: PmmcpMockOptions = {}): PmmcpMock {
           state.autoTransitions.push({ goalId: id, from: status, to: after })
         }
       }
-      return result
+      const wait = options.answerAfterMs?.[name]
+      return wait === undefined ? result : new Promise<CallToolResult>((resolve) => setTimeout(() => resolve(result), wait))
     })
 
     sessions.push(session)

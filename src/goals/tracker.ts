@@ -255,8 +255,29 @@ export class GoalTracker {
    * Never re-execution: a restart that re-issued paid work is the anti-pattern
    * the crash-recovery design names. The goal is moved to a state the CEO's next
    * continuation can act on, and the run stays orphaned in the log.
+   *
+   * On the tracker's queue, so shutdown's drain waits for it. Off the queue, a
+   * shutdown soon after boot closed the hub under the move: pmmcp could apply
+   * it with no goal.status row saying so, and the log called the goal stale.
    */
-  async blockOrphans(orphanRunIds: readonly string[]): Promise<void> {
+  blockOrphans(orphanRunIds: readonly string[]): Promise<void> {
+    return this.#serially(() => this.#blockOrphans(orphanRunIds), { orphans: orphanRunIds.length })
+  }
+
+  /** Queued work whose settling the caller can await; a failure is logged, never thrown. */
+  #serially(work: () => Promise<void>, context: Record<string, unknown>): Promise<void> {
+    return new Promise((resolve) => {
+      this.#enqueue(async () => {
+        try {
+          await work()
+        } finally {
+          resolve()
+        }
+      }, context)
+    })
+  }
+
+  async #blockOrphans(orphanRunIds: readonly string[]): Promise<void> {
     for (const runId of orphanRunIds) {
       const goalId = this.#goalOf.get(runId)
       if (goalId === undefined) continue

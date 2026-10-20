@@ -77,6 +77,7 @@ const recovery: Suite = {
     { id: 'K2', file: KERNEL, from: '    for (const run of recovered.orphanRuns) if (childIds.has(run.runId)) closeOrphan(run)', to: '    for (const run of recovered.orphanRuns) closeOrphan(run)\n    childIds.clear()', why: 'parents are closed before their children’s results' },
     { id: 'K3', file: KERNEL, from: '          status: d.status,', to: "          status: 'ok' as const,", why: 'a recovered result guesses ok' },
     { id: 'K4', file: KERNEL, from: '          taint: d.taint,', to: "          taint: 'tainted' as const,", why: 'a recovered result ignores what the log proves about taint' },
+    { id: 'K5', file: 'src/goals/tracker.ts', from: '    return this.#serially(() => this.#blockOrphans(orphanRunIds), { orphans: orphanRunIds.length })', to: '    return this.#blockOrphans(orphanRunIds)', why: "a shutdown soon after a restart closes the hub under the orphans' goal moves: pmmcp may apply them and the log says nothing" },
   ],
   control: {
     id: 'C',

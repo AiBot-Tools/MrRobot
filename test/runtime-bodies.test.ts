@@ -372,8 +372,13 @@ function hangingAt(script: readonly ScriptEntry[], hangAt: number): typeof globa
   }
 }
 
-async function restartFixture(t: TestContext, script: readonly ScriptEntry[], hangAt: number): Promise<Parameters<typeof restartMidFanOut>[0]> {
-  const mock = pmmcpMock()
+async function restartFixture(
+  t: TestContext,
+  script: readonly ScriptEntry[],
+  hangAt: number,
+  server: Parameters<typeof pmmcpMock>[0] = {},
+): Promise<Parameters<typeof restartMidFanOut>[0]> {
+  const mock = pmmcpMock(server)
   t.after(async () => {
     await mock.close()
   })
@@ -408,4 +413,20 @@ test('restartMidFanOut holds against the double: the crash comes with a child in
 test('restartMidFanOut refuses an orchestrator that never put a child in flight', async (t) => {
   const ctx = await restartFixture(t, [anthropicEndTurn({ text: 'Answered alone.', inputTokens: 300, outputTokens: 10 })], 99)
   await assert.rejects(() => restartMidFanOut(ctx), /finished before any child was in a model call/)
+})
+
+test('restartMidFanOut holds when pmmcp answers late, as it does over HTTP: shutdown waits for the restart to block the orphan', async (t) => {
+  // The in-memory double answers within the same turn, which hid a shutdown
+  // that closed the hub under the recovery's move. Here every goal move answers
+  // after 25 ms.
+  const ctx = await restartFixture(
+    t,
+    [
+      anthropicToolUse({ name: 'kernel__adopt_plan', input: { plan: FAN_OUT_PLAN }, inputTokens: 1_000, outputTokens: 50 }),
+      anthropicToolUse({ name: 'kernel__delegate', input: { taskId: 't1', brief: 'Write up SQLite with triggers.' }, inputTokens: 1_100, outputTokens: 40 }),
+    ],
+    3,
+    { answerAfterMs: { update_goal: 25 } },
+  )
+  await restartMidFanOut(ctx)
 })

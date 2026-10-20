@@ -686,7 +686,8 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     const detachGoals = goalTracker.attach()
     if (recovered.orphanRuns.length > 0 && goalWriter.available) {
       // Not awaited: boot must not wait on a network round trip per orphan, and a
-      // failure here is a stale goal, which the tracker logs.
+      // failure here is a stale goal, which the tracker logs. It rides the
+      // tracker's queue, so shutdown's drain does wait for it.
       void goalTracker
         .blockOrphans(recovered.orphanRuns.map((r) => r.runId))
         .catch((e: unknown) => {

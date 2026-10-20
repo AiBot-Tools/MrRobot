@@ -17,6 +17,7 @@ import { GoalWriter } from '../src/goals/writer.js'
 import { McpHub } from '../src/mcp/hub.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
 import { parseProviders } from '../src/models/registry.js'
+import { mintHumanActor } from '../src/control/actor.js'
 import { Budget } from '../src/runtime/budget.js'
 import { Delegation, type LaunchInput } from '../src/runtime/delegate.js'
 import type { KernelToolContext, KernelToolHandler } from '../src/runtime/kernel-tools.js'
@@ -51,6 +52,7 @@ interface Harness {
   readonly ctx: (overrides?: Partial<KernelToolContext>) => KernelToolContext
   readonly delegation: Delegation
   readonly store: ReturnType<typeof withStore>
+  readonly agents: AgentRegistry
 }
 
 async function harness(
@@ -116,6 +118,7 @@ async function harness(
     killed,
     delegation,
     store,
+    agents,
     ctx: (overrides = {}) => ({ runId: 'run_parent', agent: ceo, budget, ...overrides }),
   }
 }
@@ -279,6 +282,10 @@ test('the model is told which workers a plan may name: adopt_plan lists the stan
   const result = await h.adopt.run({ plan: bad }, h.ctx({ runId: 'run_analyst' }))
   assert.equal(result.ok, false)
   assert.match(result.text, /names template analyst, which is not a registered agent or template \(it may name: researcher, writer\)/)
+
+  // Read live: a worker the operator archives is no longer offered.
+  h.agents.archive('researcher', mintHumanActor('conn-test'))
+  assert.match(JSON.stringify(plan?.inputSchema), /must name a standing worker, one of: writer\./)
 })
 
 test('a plan naming a template that is not a standing worker is refused at adoption', async (t) => {

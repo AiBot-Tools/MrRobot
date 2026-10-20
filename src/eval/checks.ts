@@ -407,8 +407,9 @@ export const noDuplicateDispatch: Check = {
     // A child no admission names was not delegated, so there is no task id to
     // read, and "the same agent twice" is a signal, not proof. Reported as such.
     const repeated = [...byAgent.entries()].filter(([, ids]) => ids.length > 1)
+    const delegatedNote = byTask.size === 0 ? '' : `${String(children.length - unnamed.length)} delegated, one per task (${[...byTask.keys()].join(', ')}); `
     return repeated.length === 0
-      ? pass(`${String(children.length)} child run(s), each a distinct agent`)
+      ? pass(`${delegatedNote}${String(unnamed.length)} other child run(s), each a distinct agent`)
       : fail(
           'the same agent ran more than once inside one objective: ' +
             repeated.map(([agent, ids]) => `${agent} × ${String(ids.length)}`).join(', ') +

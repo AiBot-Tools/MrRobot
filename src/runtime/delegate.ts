@@ -96,28 +96,32 @@ export class Delegation {
 
   handlers(): KernelToolHandler[] {
     // Named to the model: it has no tool that lists agents, so a plan could
-    // otherwise only guess the ids a template must be. The registry is loaded
-    // before the kernel tools are built.
-    const workers = this.#delegable()
-    const named = workers.length === 0 ? 'no standing worker is registered' : `one of: ${workers.join(', ')}`
+    // otherwise only guess the ids a template must be. Read from the registry
+    // each time the schema is (a getter), so an archive or a promotion shows.
+    const named = (): string => {
+      const workers = this.#delegable()
+      return workers.length === 0 ? 'no standing worker is registered' : `one of: ${workers.join(', ')}`
+    }
     return [
       {
         name: 'adopt_plan',
         description:
           'Adopt a plan: the kernel validates it and writes it as your goal tree now, then returns ' +
           'each task id with its goal id. Call this once, before delegating any task.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            plan: {
-              type: 'object',
-              description:
-                'A ProposedPlan: { objective: { title, successCriteria[] }, milestones: [{ id, title, ' +
-                'tasks: [{ id, title, template, acceptance[], dependsOn[] }] }], assumptions[], risks[], ' +
-                `questionsForOperator[] }. \`template\` must name a standing worker, ${named}.`,
+        get inputSchema(): Record<string, unknown> {
+          return {
+            type: 'object',
+            properties: {
+              plan: {
+                type: 'object',
+                description:
+                  'A ProposedPlan: { objective: { title, successCriteria[] }, milestones: [{ id, title, ' +
+                  'tasks: [{ id, title, template, acceptance[], dependsOn[] }] }], assumptions[], risks[], ' +
+                  `questionsForOperator[] }. \`template\` must name a standing worker, ${named()}.`,
+              },
             },
-          },
-          required: ['plan'],
+            required: ['plan'],
+          }
         },
         run: (args, ctx) => this.#adoptPlan(args, ctx),
       },

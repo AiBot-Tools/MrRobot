@@ -342,6 +342,13 @@ test('a delegated task dispatched twice is caught by its task id, and two tasks 
   assert.match(twice.detail, /a task was dispatched more than once: t1 × 2/)
   // Proof, not a signal: the task id is on the admission.
   assert.equal(/signal, not proof/.test(twice.detail), false)
+
+  // Mixed: a delegated child and one no admission names. Each part is reported as what it is.
+  resetSeq()
+  const mixed = withChildren(parentRun(), [delegated('run_child_a', 'researcher', 't1'), childRun('run_child_b', 'researcher')])
+  const both = noDuplicateDispatch.run(observationOf(mixed, {}))
+  assert.equal(both.verdict, 'pass', both.detail)
+  assert.equal(both.detail, '1 delegated, one per task (t1); 1 other child run(s), each a distinct agent')
 })
 
 test('CHEAT: silent-drop — a child left out of the summary is caught', () => {

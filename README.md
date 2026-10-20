@@ -757,8 +757,9 @@ AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_WRITES=1 PMMCP_URL=http://127.0.0.1:8766/mcp nod
 
 Lines 1 and 2 print `runId=…` / `ceoRunId=…` and `costMicroUsd=…` as test
 diagnostics (`ℹ` in the terminal), which is what is recorded below. The cost is
-what the log records, the probe included; in line 2 the child call the crash
-interrupts is billed by Anthropic but never logged. A failure in
+what the log records, the probe included, and it is the whole bill: in line 2
+the crash comes before the child's first request leaves the process, so that
+call is logged as a request and never sent. A failure in
 line 1 names the eval gate that failed and every check's verdict: a model that
 answers alone fails `child-runs`, a summary that leaves out a child fails
 `child-outcomes-accounted`.

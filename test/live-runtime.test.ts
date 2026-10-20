@@ -65,7 +65,10 @@ const ANTHROPIC_HOST = 'api.anthropic.com'
 // PMMCP_TOKEN is optional: pmmcp takes no bearer. Set it only for a server that does.
 const hasPmmcp = (): boolean => process.env['PMMCP_URL'] !== undefined
 
-/** Every micro-dollar the log records, probe included. A call cut off by a crash is billed and not in it. */
+/**
+ * Every micro-dollar the log records, probe included. That is the bill: the
+ * restart check crashes before its child's request leaves the process.
+ */
 const loggedCost = (dbPath: string): number =>
   rows(dbPath)
     .filter((r) => r.type === 'llm.response')
@@ -295,7 +298,8 @@ test(
     // A dead process reads no reply. After the crash the old kernel gets headers
     // and a body that never ends, as the offline script's hang does: a promise
     // that never settles would leave the SDK's 10-minute request timer armed and
-    // hold this file open after its last test.
+    // hold this file open after its last test. The crash lands before the
+    // child's request is sent; a response that still lands late is cancelled.
     let crashed = false
     const hung = (): Response =>
       new Response(new ReadableStream<Uint8Array>({ start: () => undefined }), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -328,7 +332,7 @@ test(
       // The probe record is on disk; a restarted kernel must not call a model.
       reboot: () => bootOn(t, fx, { env, sandboxDriver: fakeSandbox(), agentsDir }),
     })
-    // Logged cost: the call the crash interrupted is billed but never logged.
+    // The child's first call is logged as a request and never sent, so this is the bill.
     t.diagnostic(`ceoRunId=${result.ceoRunId} inFlight=${result.inFlight} costMicroUsd=${String(loggedCost(fx.dbPath))}`)
   },
 )

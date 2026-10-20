@@ -267,8 +267,15 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   const phaseOneExited = phaseOne.slice(0, 2).every((r) => r.startsWith('pass'))
   if (phaseOneExited) {
     assert.match(section, /Phase 1 exited on \d{4}-\d{2}-\d{2}/, 'README records the Phase 1 exit; CLAUDE.md does not say so')
+    // And the sentences that contradict it are gone.
+    assert.equal(/runtime checks have not run/.test(section), false, 'CLAUDE.md still says the runtime checks have not run')
+    assert.equal(/Phase 1 mostly built/.test(section), false, 'CLAUDE.md still calls Phase 1 mostly built')
   } else {
-    assert.equal(/Phase 1 (?:is )?(?:complete|exited|met)\b/i.test(section), false, 'CLAUDE.md claims Phase 1 is exited before README records it')
+    assert.equal(
+      /Phase 1(?:'s exit(?: criterion)?)? (?:is |has )?(?:complete|exited|met|passed)\b/i.test(section),
+      false,
+      'CLAUDE.md claims Phase 1 is exited before README records it',
+    )
   }
 
   // The Apple driver's description matches what the code does, which is the

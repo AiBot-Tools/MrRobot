@@ -356,7 +356,8 @@ test('objectiveFanOut refuses an orchestrator that answers alone, and one whose 
   const alone = await fanOutKernel(t, [anthropicEndTurn({ text: 'SQLite is better. Done.', inputTokens: 500, outputTokens: 20 })])
   await assert.rejects(
     () => objectiveFanOut({ port: alone.port, token: TEST_TOKEN, dbPath: alone.dbPath, timeoutMs: 20_000 }, { agentId: LIVE_ORCHESTRATOR, projectId: LIVE_TEST_PROJECT }),
-    /child-runs/,
+    // The verdict, not the id: the message lists every check, so an id alone matches any refusal.
+    /child-runs: fail/,
   )
   const dropped = await fanOutKernel(t, [
     anthropicToolUse({ name: 'kernel__adopt_plan', input: { plan: FAN_OUT_PLAN } }),
@@ -368,7 +369,7 @@ test('objectiveFanOut refuses an orchestrator that answers alone, and one whose 
   ])
   await assert.rejects(
     () => objectiveFanOut({ port: dropped.port, token: TEST_TOKEN, dbPath: dropped.dbPath, timeoutMs: 20_000 }, { agentId: LIVE_ORCHESTRATOR, projectId: LIVE_TEST_PROJECT }),
-    /child-outcomes-accounted/,
+    /child-outcomes-accounted: fail/,
   )
 })
 

@@ -20,13 +20,14 @@ import { McpHub } from '../src/mcp/hub.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
 import { writeProbeRecord } from '../src/models/probe.js'
 import { anthropicEndTurn, anthropicToolUse, fakeProvider, http, type RecordedRequest, type ScriptEntry } from './helpers/fake-provider.js'
-import { REPO_ROOT, runThroughControl, TEST_TOKEN, withKernel } from './helpers/kernel.js'
+import { bootCrashable, bootOn, fixture, REPO_ROOT, runThroughControl, TEST_TOKEN, withKernel } from './helpers/kernel.js'
 import { pmmcpMock } from './helpers/mock-pmmcp.js'
 import { freshProbe } from './helpers/probe.js'
 import {
   evalHarnessAssumptions,
   goalTreeRoundTrip,
   objectiveFanOut,
+  restartMidFanOut,
   LIVE_ORCHESTRATOR,
   LIVE_TEST_PROJECT,
   liveFleet,
@@ -351,4 +352,60 @@ test('objectiveFanOut refuses an orchestrator that answers alone, and one whose 
     () => objectiveFanOut({ port: dropped.port, token: TEST_TOKEN, dbPath: dropped.dbPath, timeoutMs: 20_000 }, { agentId: LIVE_ORCHESTRATOR, projectId: LIVE_TEST_PROJECT }),
     /child-outcomes-accounted/,
   )
+})
+
+/**
+ * A provider whose `hangAt`-th call never returns a body, as a model call the
+ * crash interrupts: headers now, no end, so nothing is held open after the test.
+ */
+function hangingAt(script: readonly ScriptEntry[], hangAt: number): typeof globalThis.fetch {
+  const scripted = fakeProvider(script)
+  let calls = 0
+  return (input, init) => {
+    calls += 1
+    if (calls >= hangAt) {
+      return Promise.resolve(
+        new Response(new ReadableStream<Uint8Array>({ start: () => undefined }), { status: 200, headers: { 'content-type': 'application/json' } }),
+      )
+    }
+    return scripted.fetch(input, init)
+  }
+}
+
+async function restartFixture(t: TestContext, script: readonly ScriptEntry[], hangAt: number): Promise<Parameters<typeof restartMidFanOut>[0]> {
+  const mock = pmmcpMock()
+  t.after(async () => {
+    await mock.close()
+  })
+  const fx = fixture(t)
+  writeProbeRecord(fx.dataDir, freshProbe(REF))
+  const agentsDir = liveFleet(tmpdir(t), REF, { delegation: true })
+  const env = { ANTHROPIC_API_KEY: 'offline-fixture-credential-restart' }
+  return {
+    dbPath: fx.dbPath,
+    agentId: LIVE_ORCHESTRATOR,
+    waitMs: 20_000,
+    boot: () => bootCrashable(t, fx, { env, clientFactory: mock.connect, fetch: hangingAt(script, hangAt), agentsDir }),
+    // The reboot calls no model: an empty script throws on any call.
+    reboot: () => bootOn(t, fx, { env, clientFactory: mock.connect, fetch: fakeProvider([]).fetch, agentsDir }),
+  }
+}
+
+test('restartMidFanOut holds against the double: the crash comes with a child in its first model call, and nothing is orphaned', async (t) => {
+  // The orchestrator adopts and delegates t1; the child's first call (the third) hangs.
+  const ctx = await restartFixture(
+    t,
+    [
+      anthropicToolUse({ name: 'kernel__adopt_plan', input: { plan: FAN_OUT_PLAN }, inputTokens: 1_000, outputTokens: 50 }),
+      anthropicToolUse({ name: 'kernel__delegate', input: { taskId: 't1', brief: 'Write up SQLite with triggers.' }, inputTokens: 1_100, outputTokens: 40 }),
+    ],
+    3,
+  )
+  const { ceoRunId, inFlight } = await restartMidFanOut(ctx)
+  assert.notEqual(ceoRunId, inFlight)
+})
+
+test('restartMidFanOut refuses an orchestrator that never put a child in flight', async (t) => {
+  const ctx = await restartFixture(t, [anthropicEndTurn({ text: 'Answered alone.', inputTokens: 300, outputTokens: 10 })], 99)
+  await assert.rejects(() => restartMidFanOut(ctx), /finished before any child was in a model call/)
 })

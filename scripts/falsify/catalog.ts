@@ -63,7 +63,7 @@ const delegation: Suite = {
 
 const recovery: Suite = {
   name: 'recovery',
-  tests: ['test/projections.test.ts', 'test/delegation-restart.test.ts'],
+  tests: ['test/projections.test.ts', 'test/delegation-restart.test.ts', 'test/runtime-bodies.test.ts'],
   mutants: [
     { id: 'P1', file: PROJECTIONS, from: "        if (run !== undefined) run.costMicroUsd += numberAt(payload, 'costMicroUsd')", to: '        void run', why: 'an orphaned parent’s bill omits children it already paid for' },
     { id: 'P2', file: PROJECTIONS, from: '    if (parent !== undefined) parent.costMicroUsd += costMicroUsd', to: '    void parent', why: 'an orphaned parent’s bill omits the child in flight' },

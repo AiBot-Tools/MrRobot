@@ -40,7 +40,7 @@ import { parseToolViews } from '../src/mcp/tool-views.js'
 import { parseProviders } from '../src/models/registry.js'
 import type { Kernel } from '../src/kernel.js'
 import { fakeSandbox } from './helpers/fake-sandbox.js'
-import { REPO_ROOT, runThroughControl, TEST_TOKEN, withKernel } from './helpers/kernel.js'
+import { bootCrashable, bootOn, fixture, REPO_ROOT, runThroughControl, TEST_TOKEN, withKernel } from './helpers/kernel.js'
 import {
   evalHarnessAssumptions,
   goalTreeRoundTrip,
@@ -49,6 +49,7 @@ import {
   liveFleet,
   objectiveFanOut,
   PLAN_REQUEST,
+  restartMidFanOut,
   planToTree,
 } from './helpers/runtime-bodies.js'
 import { withStore } from './helpers/store.js'
@@ -256,5 +257,62 @@ test(
     )
     // Recorded in the TAP output, for the README checklist.
     t.diagnostic(`runId=${result.runId} score=${String(result.score)} notApplicable=${result.notApplicable.join(',') || 'none'}`)
+  },
+)
+
+// ── 5. Phase 1 exit: a restart mid-run orphans nothing ─────────────────────
+
+test(
+  "live model + pmmcp, Phase 1 exit: a kernel that dies with a child in its first model call orphans nothing, and the real pmmcp blocks that child's goal",
+  {
+    // Reasons inline, where the hygiene rule reads them: each names what to set.
+    skip: !LIVE
+      ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
+      : !hasPmmcp() || KEY === undefined
+        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer), and put ANTHROPIC_API_KEY in the shell or .env'
+        : !WRITES
+          ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
+          : false,
+  },
+  async (t) => {
+    const revoke = allowHost(ANTHROPIC_HOST)
+    t.after(revoke)
+    const ref = realRef()
+    const pmmcpUrl = process.env['PMMCP_URL'] ?? ''
+    const fx = fixture(t, {
+      kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `url: ${pmmcpUrl}`),
+    })
+    const agentsDir = liveFleet(tmpdir(t), ref, { delegation: true })
+    const env = { PMMCP_TOKEN: process.env['PMMCP_TOKEN'], ANTHROPIC_API_KEY: KEY }
+
+    // A dead process reads no reply: after the crash, a response that arrives
+    // for the old kernel never reaches it, as the offline script's hang does.
+    let crashed = false
+    const never = (): Promise<Response> => new Promise<Response>(() => undefined)
+    const fetch: typeof globalThis.fetch = (input, init) =>
+      crashed ? never() : globalThis.fetch(input, init).then((r) => (crashed ? never() : r))
+
+    const result = await restartMidFanOut({
+      dbPath: fx.dbPath,
+      agentId: LIVE_ORCHESTRATOR,
+      waitMs: 600_000,
+      boot: async () => {
+        const booted = await bootCrashable(t, fx, { env, sandboxDriver: fakeSandbox(), fetch, agentsDir })
+        assert.equal(booted.kernel.status().subsystems.hub.state, 'ok', booted.kernel.status().subsystems.hub.reason ?? '')
+        await probe(booted.kernel, ref)
+        return {
+          kernel: booted.kernel,
+          crash: async () => {
+            crashed = true
+            await booted.crash()
+            // Its pmmcp session dies with it.
+            await booted.kernel.hub.close()
+          },
+        }
+      },
+      // The probe record is on disk; a restarted kernel must not call a model.
+      reboot: () => bootOn(t, fx, { env, sandboxDriver: fakeSandbox(), agentsDir }),
+    })
+    t.diagnostic(`ceoRunId=${result.ceoRunId} inFlight=${result.inFlight}`)
   },
 )

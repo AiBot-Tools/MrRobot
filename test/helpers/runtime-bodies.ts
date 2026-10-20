@@ -26,6 +26,9 @@
 //   objectiveFanOut — the Phase 1 exit criterion itself: whether the shipped CEO,
 //     on a real model, turns one objective into a tree, two child runs and a
 //     summary the log backs. A model that answers alone fails it by name.
+//   restartMidFanOut — its second half: a kernel that dies with a child in its
+//     first real model call, rebooted, orphans nothing, and the in-flight child's
+//     goal is blocked in the REAL pmmcp, which must accept that move.
 //
 // None of this writes to `aos/ceo`. The goal-writing bodies take a project id and
 // the live file passes `aos/agent/aos-live-test`, which is the whole of what a
@@ -38,7 +41,9 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 
-import type { EventStore } from '../../src/events/store.js'
+import { connectControl } from '../../src/cli/client.js'
+import { readAllRows, type EventRow } from '../../src/events/chain.js'
+import { EventStore } from '../../src/events/store.js'
 import { CEO_CHECKS } from '../../src/eval/checks.js'
 import { runCase, type EvalTarget } from '../../src/eval/harness.js'
 import { claimsOf, readRunRows } from '../../src/eval/observe.js'
@@ -49,7 +54,8 @@ import { getGoalTree } from '../../src/goals/pmmcp.js'
 import { goalToolsUnusable, type GoalsConfig } from '../../src/goals/tools.js'
 import { GoalWriter } from '../../src/goals/writer.js'
 import type { McpHub } from '../../src/mcp/hub.js'
-import { REPO_ROOT, rows } from './kernel.js'
+import type { Kernel } from '../../src/kernel.js'
+import { REPO_ROOT, rows, TEST_TOKEN } from './kernel.js'
 
 /** The only namespace a live runtime test writes to. */
 export const LIVE_TEST_PROJECT = 'aos/agent/aos-live-test'
@@ -353,4 +359,121 @@ export async function objectiveFanOut(
   assert.equal(own.length, 1, `${result.runId} adopted ${String(own.length)} plans`)
   assert.equal(own[0]?.['projectId'], ctx.projectId, 'the tree was written somewhere other than the namespace it was told to use')
   return result
+}
+
+/** Every row, read back read-only and with run ids, which `rows()` does not carry. */
+function logOf(dbPath: string): EventRow[] {
+  const store = new EventStore(dbPath, { readOnly: true })
+  try {
+    return readAllRows(store.db)
+  } finally {
+    store.close()
+  }
+}
+
+const bodyOf = (row: EventRow): Record<string, unknown> => JSON.parse(row.payload) as Record<string, unknown>
+
+export interface RestartMidFanOutContext {
+  readonly dbPath: string
+  readonly agentId: string
+  /** Boots the kernel that will die mid-delegation. */
+  readonly boot: () => Promise<{ readonly kernel: Kernel; readonly crash: () => Promise<void> }>
+  /** Boots again on the same data, as the operator restarting the daemon would. */
+  readonly reboot: () => Promise<Kernel>
+  /** How long the orchestrator may take to put a child in its first model call. */
+  readonly waitMs: number
+}
+
+/**
+ * Phase 1's "a kernel restart mid-run orphans nothing", on the fan-out objective.
+ *
+ * The crash comes at the first moment a delegated child is inside a model call,
+ * with its parent blocked in kernel.delegate: the shape where one run waits on
+ * another, which test/delegation-restart.test.ts pins offline with a script.
+ * After the reboot every run has one terminal row, every admission one result in
+ * causal order, the in-flight child's goal is blocked (a goal.status row is
+ * written only once pmmcp confirms the move), nothing calls a model again, and a
+ * second reboot finds nothing to recover.
+ */
+export async function restartMidFanOut(ctx: RestartMidFanOutContext): Promise<{ ceoRunId: string; inFlight: string }> {
+  const { kernel, crash } = await ctx.boot()
+  const client = await connectControl({ port: kernel.port, token: TEST_TOKEN, timeoutMs: 20_000 })
+  let ceoRunId: string
+  try {
+    ;({ runId: ceoRunId } = (await client.call('run.start', { agentId: ctx.agentId, input: fanOutCase(ctx.agentId).input })) as { runId: string })
+  } finally {
+    client.close()
+  }
+
+  const inFlight = await new Promise<string>((resolve, reject) => {
+    const admitted = new Set<string>()
+    const types = (): string => logOf(ctx.dbPath).map((r) => r.type).join(', ')
+    let settled = false
+    const finish = (f: () => void): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      off()
+      f()
+    }
+    const see = (row: EventRow): void => {
+      if (row.type === 'delegation.admitted') admitted.add(String(bodyOf(row)['childRunId']))
+      else if (row.type === 'llm.request' && row.runId !== null && admitted.has(row.runId)) finish(() => resolve(String(row.runId)))
+      else if (row.type === 'run.finished' && row.runId === ceoRunId) {
+        finish(() => reject(new Error(`${ceoRunId} finished before any child was in a model call; the log holds: ${types()}`)))
+      }
+    }
+    const timer = setTimeout(() => {
+      finish(() => reject(new Error(`no child reached a model call within ${String(ctx.waitMs)} ms; the log holds: ${types()}`)))
+    }, ctx.waitMs)
+    timer.unref?.()
+    // Subscribed first, then what is already there: a fast run can pass the
+    // moment before this line is reached.
+    const off = kernel.store.subscribe(see)
+    for (const row of kernel.store.query()) see(row)
+  })
+  await crash()
+
+  const before = logOf(ctx.dbPath)
+  const admissions = before.filter((r) => r.type === 'delegation.admitted').map(bodyOf)
+  const open = admissions.find((a) => a['childRunId'] === inFlight)
+  assert.ok(open, `${inFlight} was not admitted`)
+  assert.equal(
+    before.filter((r) => r.type === 'delegation.result' && bodyOf(r)['childRunId'] === inFlight).length,
+    0,
+    'the crash did not happen mid-delegation',
+  )
+
+  const second = await ctx.reboot()
+  const recovered = second.recovered
+  await second.shutdown()
+  assert.ok(recovered.orphanRuns.some((r) => r.runId === ceoRunId), 'the orchestrator was not recovered as an orphan')
+  assert.ok(recovered.danglingDelegations.some((d) => d.childRunId === inFlight), 'the in-flight admission was not recovered')
+
+  const log = logOf(ctx.dbPath)
+  const reboot = log.filter((r) => r.type === 'kernel.booted')[1]?.seq ?? Infinity
+  for (const id of log.filter((r) => r.type === 'run.started').map((r) => String(bodyOf(r)['runId']))) {
+    const terminals = log.filter((r) => r.type === 'run.finished' && bodyOf(r)['runId'] === id).length
+    assert.equal(terminals, 1, `run ${id} has ${String(terminals)} terminal rows`)
+  }
+  for (const a of log.filter((r) => r.type === 'delegation.admitted').map(bodyOf)) {
+    const results = log.filter((r) => r.type === 'delegation.result' && bodyOf(r)['childRunId'] === a['childRunId']).length
+    assert.equal(results, 1, `admission of ${String(a['childRunId'])} has ${String(results)} results`)
+  }
+  const seqOf = (type: string, key: string, value: string): number => log.find((r) => r.type === type && bodyOf(r)[key] === value)?.seq ?? -1
+  const childEnd = seqOf('run.finished', 'runId', inFlight)
+  const childResult = seqOf('delegation.result', 'childRunId', inFlight)
+  const ceoEnd = seqOf('run.finished', 'runId', ceoRunId)
+  assert.ok(reboot < childEnd && childEnd < childResult && childResult < ceoEnd, 'recovery rows out of causal order')
+
+  const goalId = String(open['goalId'])
+  const blocked = log.filter((r) => r.seq > reboot && r.type === 'goal.status' && bodyOf(r)['goalId'] === goalId && bodyOf(r)['to'] === 'blocked')
+  assert.equal(blocked.length, 1, `the in-flight child's goal ${goalId} was not moved to blocked after the restart`)
+  assert.equal(log.filter((r) => r.seq > reboot && r.type === 'llm.request').length, 0, 'a model was called again after the restart')
+
+  const third = await ctx.reboot()
+  const again = third.recovered
+  await third.shutdown()
+  assert.deepEqual([again.orphanRuns.length, again.danglingDelegations.length], [0, 0], 'a second restart found work left over')
+  return { ceoRunId, inFlight }
 }

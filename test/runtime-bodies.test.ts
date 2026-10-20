@@ -11,7 +11,7 @@ import './helpers/guard.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import test from 'node:test'
+import test, { type TestContext } from 'node:test'
 import { parse as parseYaml } from 'yaml'
 
 import { parseManifest, type AgentManifest } from '../src/agents/manifest.js'
@@ -19,13 +19,14 @@ import { parseKernelConfig } from '../src/config.js'
 import { McpHub } from '../src/mcp/hub.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
 import { writeProbeRecord } from '../src/models/probe.js'
-import { anthropicEndTurn, fakeProvider, http } from './helpers/fake-provider.js'
+import { anthropicEndTurn, anthropicToolUse, fakeProvider, http, type RecordedRequest, type ScriptEntry } from './helpers/fake-provider.js'
 import { REPO_ROOT, runThroughControl, TEST_TOKEN, withKernel } from './helpers/kernel.js'
 import { pmmcpMock } from './helpers/mock-pmmcp.js'
 import { freshProbe } from './helpers/probe.js'
 import {
   evalHarnessAssumptions,
   goalTreeRoundTrip,
+  objectiveFanOut,
   LIVE_ORCHESTRATOR,
   LIVE_TEST_PROJECT,
   liveFleet,
@@ -268,4 +269,86 @@ test("the live fleet's orchestrator is the shipped CEO in every field but its id
   }
   // The shipped CEO's tools are the kernel's two, so "with delegation" means it can fan out.
   assert.deepEqual([...shipped.tools.allow].sort(), ['kernel.adopt_plan', 'kernel.delegate'])
+})
+
+// ── Phase 1 exit ───────────────────────────────────────────────────────────
+
+const FAN_OUT_PLAN = {
+  objective: { title: 'compare two event log stores', successCriteria: ['both written up and compared'] },
+  milestones: [
+    {
+      id: 'm1',
+      title: 'two independent write-ups',
+      tasks: [
+        { id: 't1', title: 'write up sqlite with triggers', template: 'researcher', acceptance: ['a findings note'], dependsOn: [] },
+        { id: 't2', title: 'write up an append-only file with an index', template: 'writer', acceptance: ['a findings note'], dependsOn: [] },
+      ],
+    },
+  ],
+  assumptions: [],
+  risks: [],
+  questionsForOperator: [],
+}
+
+/** Child run ids the kernel handed back in tool results, in order. */
+const childIdsIn = (request: RecordedRequest): string[] => [...new Set(JSON.stringify(request.body).match(/run_\d+_[a-z0-9]+/g) ?? [])]
+
+/** The live-test fleet, delegating as shipped, against the double and a script. */
+async function fanOutKernel(t: TestContext, script: readonly ScriptEntry[]): Promise<{ port: number; dbPath: string }> {
+  const mock = pmmcpMock()
+  t.after(async () => {
+    await mock.close()
+  })
+  const { kernel, fx } = await withKernel(t, {
+    clientFactory: mock.connect,
+    env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-fanout' },
+    fetch: fakeProvider(script).fetch,
+    agentsDir: liveFleet(tmpdir(t), REF, { delegation: true }),
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REF))
+    },
+  })
+  return { port: kernel.port, dbPath: fx.dbPath }
+}
+
+test('objectiveFanOut holds against the double: a tree in the test namespace, two children, a summary the log backs', async (t) => {
+  // Fetch order is call order: the orchestrator, each child during its delegate
+  // call, then the orchestrator's summary naming both children.
+  const { port, dbPath } = await fanOutKernel(t, [
+    anthropicToolUse({ name: 'kernel__adopt_plan', input: { plan: FAN_OUT_PLAN } }),
+    anthropicToolUse({ name: 'kernel__delegate', input: { taskId: 't1', brief: 'Write up SQLite with append-only triggers.' } }),
+    anthropicEndTurn({ text: 'SQLite: triggers refuse UPDATE and DELETE.', inputTokens: 800, outputTokens: 80 }),
+    anthropicToolUse({ name: 'kernel__delegate', input: { taskId: 't2', brief: 'Write up an append-only file with an index.' } }),
+    anthropicEndTurn({ text: 'Flat file: simple, but the index is a second thing to keep honest.', inputTokens: 900, outputTokens: 90 }),
+    (request) => {
+      const [first, second] = childIdsIn(request)
+      return anthropicEndTurn({
+        text: `Compared. t1 ran as ${String(first)} and t2 as ${String(second)}; both finished ok.`,
+        inputTokens: 1_200,
+        outputTokens: 60,
+      })
+    },
+  ])
+  const result = await objectiveFanOut({ port, token: TEST_TOKEN, dbPath, timeoutMs: 20_000 }, { agentId: LIVE_ORCHESTRATOR, projectId: LIVE_TEST_PROJECT })
+  assert.equal(result.caseId, 'ceo-objective-fanout')
+})
+
+test('objectiveFanOut refuses an orchestrator that answers alone, and one whose summary drops a child', async (t) => {
+  const alone = await fanOutKernel(t, [anthropicEndTurn({ text: 'SQLite is better. Done.', inputTokens: 500, outputTokens: 20 })])
+  await assert.rejects(
+    () => objectiveFanOut({ port: alone.port, token: TEST_TOKEN, dbPath: alone.dbPath, timeoutMs: 20_000 }, { agentId: LIVE_ORCHESTRATOR, projectId: LIVE_TEST_PROJECT }),
+    /child-runs/,
+  )
+  const dropped = await fanOutKernel(t, [
+    anthropicToolUse({ name: 'kernel__adopt_plan', input: { plan: FAN_OUT_PLAN } }),
+    anthropicToolUse({ name: 'kernel__delegate', input: { taskId: 't1', brief: 'one' } }),
+    anthropicEndTurn({ text: 'one', inputTokens: 100, outputTokens: 10 }),
+    anthropicToolUse({ name: 'kernel__delegate', input: { taskId: 't2', brief: 'two' } }),
+    anthropicEndTurn({ text: 'two', inputTokens: 100, outputTokens: 10 }),
+    (request) => anthropicEndTurn({ text: `Compared; see ${String(childIdsIn(request)[0])}.`, inputTokens: 100, outputTokens: 10 }),
+  ])
+  await assert.rejects(
+    () => objectiveFanOut({ port: dropped.port, token: TEST_TOKEN, dbPath: dropped.dbPath, timeoutMs: 20_000 }, { agentId: LIVE_ORCHESTRATOR, projectId: LIVE_TEST_PROJECT }),
+    /child-outcomes-accounted/,
+  )
 })

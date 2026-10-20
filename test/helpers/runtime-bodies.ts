@@ -23,6 +23,9 @@
 //     REAL provider's accounting. If cost does not reconcile with the logged calls
 //     on a live response (cache tokens, retries), the harness is miscalibrated and
 //     every score it produces is suspect.
+//   objectiveFanOut — the Phase 1 exit criterion itself: whether the shipped CEO,
+//     on a real model, turns one objective into a tree, two child runs and a
+//     summary the log backs. A model that answers alone fails it by name.
 //
 // None of this writes to `aos/ceo`. The goal-writing bodies take a project id and
 // the live file passes `aos/agent/aos-live-test`, which is the whole of what a
@@ -40,7 +43,7 @@ import { CEO_CHECKS } from '../../src/eval/checks.js'
 import { runCase, type EvalTarget } from '../../src/eval/harness.js'
 import { claimsOf, readRunRows } from '../../src/eval/observe.js'
 import { CEO_SUITE } from '../../src/eval/suite.js'
-import type { CaseResult } from '../../src/eval/types.js'
+import type { CaseResult, EvalCase } from '../../src/eval/types.js'
 import { parsePlan, PlanInvalid } from '../../src/goals/plan.js'
 import { getGoalTree } from '../../src/goals/pmmcp.js'
 import { goalToolsUnusable, type GoalsConfig } from '../../src/goals/tools.js'
@@ -295,5 +298,59 @@ export async function evalHarnessAssumptions(target: EvalTarget): Promise<CaseRe
     const check = byId.get(id)
     assert.equal(check?.verdict, 'pass', `${id}: ${check?.detail ?? 'did not run'}`)
   }
+  return result
+}
+
+// ── Phase 1 exit ───────────────────────────────────────────────────────────
+
+/** The shipped fan-out objective, run on the orchestrator named. */
+export function fanOutCase(agentId: string): EvalCase {
+  const shipped = CEO_SUITE.find((c) => c.id === 'ceo-objective-fanout')
+  assert.ok(shipped, 'the shipped suite lost its fan-out case')
+  return { ...shipped, agentId }
+}
+
+/**
+ * The gates the Phase 1 exit criterion is made of, each of which must RUN and
+ * pass: "not applicable" proves nothing. A tree with two children
+ * (child-runs, child-goal-ancestry, no-duplicate-dispatch), a summary that is
+ * trustworthy because the log backs it (child-outcomes-accounted,
+ * evidence-refs-resolve), and the accounting the scorecard rests on.
+ */
+export const PHASE_ONE_EXIT_GATES = [
+  'run-reached-terminal',
+  'status-as-expected',
+  'child-runs',
+  'child-goal-ancestry',
+  'no-duplicate-dispatch',
+  'child-outcomes-accounted',
+  'evidence-refs-resolve',
+  'llm-events-paired',
+  'cost-reconciles-with-log',
+] as const
+
+/**
+ * Phase 1's exit criterion as one run: one objective → a goal tree in the
+ * given namespace + at least two child runs + a summary the log supports.
+ *
+ * The eval harness is the judge, as in delegation.test.ts: it reads only the
+ * log. A model that answers alone, or a summary that omits a child, is a
+ * finding about the model or the soul, and the message says which gate.
+ */
+export async function objectiveFanOut(
+  target: EvalTarget,
+  ctx: { readonly agentId: string; readonly projectId: string },
+): Promise<CaseResult> {
+  const result = await runCase(target, fanOutCase(ctx.agentId), CEO_CHECKS)
+  const report = result.checks.map((c) => `${c.id}: ${c.verdict} (${c.detail})`).join('\n  ')
+  assert.deepEqual(result.gatesFailed, [], `gates failed on ${result.runId}:\n  ${report}`)
+  const byId = new Map(result.checks.map((c) => [c.id, c]))
+  for (const id of PHASE_ONE_EXIT_GATES) {
+    assert.equal(byId.get(id)?.verdict, 'pass', `${id} did not pass on ${result.runId}:\n  ${report}`)
+  }
+  const adopted = rows(target.dbPath).filter((r) => r.type === 'plan.adopted').map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+  const own = adopted.filter((p) => p['runId'] === result.runId)
+  assert.equal(own.length, 1, `${result.runId} adopted ${String(own.length)} plans`)
+  assert.equal(own[0]?.['projectId'], ctx.projectId, 'the tree was written somewhere other than the namespace it was told to use')
   return result
 }

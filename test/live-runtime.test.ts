@@ -47,6 +47,7 @@ import {
   LIVE_ORCHESTRATOR,
   LIVE_TEST_PROJECT,
   liveFleet,
+  objectiveFanOut,
   PLAN_REQUEST,
   planToTree,
 } from './helpers/runtime-bodies.js'
@@ -213,5 +214,47 @@ test(
       `ceo-inline-small-objective: gates failed [${result.gatesFailed.join(', ')}], ` +
         `score ${String(result.score)}, did not run ${String(result.notApplicable.length)}`,
     )
+  },
+)
+
+// ── 4. Phase 1 exit: one objective → tree + two children + a trustworthy summary ─
+
+test(
+  'live model + pmmcp, Phase 1 exit: one objective becomes a tree in the test namespace, two child runs, and a summary the log backs',
+  {
+    // Reasons inline, where the hygiene rule reads them: each names what to set.
+    skip: !LIVE
+      ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
+      : !hasPmmcp() || KEY === undefined
+        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer), and put ANTHROPIC_API_KEY in the shell or .env'
+        : !WRITES
+          ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
+          : false,
+  },
+  async (t) => {
+    const revoke = allowHost(ANTHROPIC_HOST)
+    t.after(revoke)
+    const ref = realRef()
+    const pmmcpUrl = process.env['PMMCP_URL'] ?? ''
+
+    // The shipped CEO, delegating, but remembering in the test namespace.
+    const { kernel, fx } = await withKernel(t, {
+      env: {
+        PMMCP_TOKEN: process.env['PMMCP_TOKEN'],
+        ANTHROPIC_API_KEY: KEY,
+      },
+      sandboxDriver: fakeSandbox(),
+      kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `url: ${pmmcpUrl}`),
+      agentsDir: liveFleet(tmpdir(t), ref, { delegation: true }),
+    })
+    assert.equal(kernel.status().subsystems.hub.state, 'ok', kernel.status().subsystems.hub.reason ?? '')
+    await probe(kernel, ref)
+
+    const result = await objectiveFanOut(
+      { port: kernel.port, token: TEST_TOKEN, dbPath: fx.dbPath, timeoutMs: 600_000 },
+      { agentId: LIVE_ORCHESTRATOR, projectId: LIVE_TEST_PROJECT },
+    )
+    // Recorded in the TAP output, for the README checklist.
+    t.diagnostic(`runId=${result.runId} score=${String(result.score)} notApplicable=${result.notApplicable.join(',') || 'none'}`)
   },
 )

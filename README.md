@@ -820,6 +820,42 @@ on two conditions the kernel enforces or will enforce:
 
 Revisit (a bearer in pmmcp) before Phase 4 makes Telegram and SMS inputs.
 
+## Sandbox checks on the Mac (2026-10-21)
+
+The operator ran these against both Colima VMs: Colima 0.10.3 from Homebrew,
+`vz` with virtiofs, Docker Engine 29.5.2, and 4 CPUs, 4 GiB and 60 GiB each, all
+from one uninterrupted `scripts/colima-up.sh` run. The container was `alpine:3.20`
+started with the driver's own `docker run` flags (`buildRunArgs` in
+`src/sandbox/docker.ts`, limits from `config/kernel.yaml`): uid 65534, on the
+domain's internal network, with the domain's `mountRoot` at `/workspace`. Both VMs
+gave identical results.
+
+| Check | Result |
+|---|---|
+| Identity and capabilities | `uid=65534`; `CapPrm`, `CapEff`, `CapBnd` and `CapAmb` all zero; `NoNewPrivs: 1` |
+| Filesystem | the root is mounted `ro`; `/tmp` is tmpfs `rw,nosuid,nodev,noexec,size=64m`, and a binary copied there does not execute |
+| Limits | `pids.max` 256, `memory.max` 2147483648, `cpu.max` `200000 100000` (cgroup v2) |
+| Network | no default route; `host.lima.internal`, `host.docker.internal` and `example.com` do not resolve, while the same image on the default bridge resolves `example.com`; `192.168.5.2:8766` is `Network unreachable` |
+| VM shares | exactly one virtiofs mount per VM, that domain's `mountRoot` |
+| Docker CLI environment | `docker version` works under `env -i` with only `PATH`, `DOCKER_HOST` and `DOCKER_CONFIG`, so the driver's environment needs no `HOME` |
+| File events | an `fs.watch` on the Mac sees a file a container writes into a workspace |
+
+Two results the Phase 2 design has to carry:
+
+- **The share does not enforce permissions per container user.** uid 65534
+  wrote into a mode-0755 folder the operator owns. Every file a container writes
+  lands on the Mac owned by the operator (`501:20`), whatever its uid in the
+  container. Mode bits on the Mac therefore isolate nothing inside a VM. What a
+  container can touch is decided only by what the driver mounts, which is one
+  run's workspace. A process that escapes into a VM can write the whole of that
+  domain's `mountRoot` as the operator. Anything on the Mac that reads a workspace
+  is reading untrusted input.
+- **The VMs themselves reach pmmcp.** Inside the hostile VM, `host.lima.internal`
+  is `192.168.5.2`, and `192.168.5.2:8766` accepts a connection. Today the internal
+  network is the only thing between a container and pmmcp. Anything with a route
+  out of a VM reaches it unauthenticated: the default bridge, a network that is
+  not internal, the Phase 2 proxy itself, or an escape into the VM.
+
 ## Still needs validation
 
 Facts this repository cannot check from Linux, and how each gets settled. The
@@ -827,15 +863,15 @@ first three of the plan's list are already resolved (Node v26.9.0; pmmcp at
 `http://127.0.0.1:8766/mcp`, loopback with **no** authentication — read from pmmcp's
 source, which trusts loopback and publishes RFC 9728 metadata with no authorization
 servers, so kernel.yaml declares no `tokenEnv`; `get_secret` takes `label`,
-not `key`).
+not `key`). The Colima sandbox rows were settled on 2026-10-21; see "Sandbox
+checks on the Mac" above.
 
 | Fact | How it gets settled |
 |---|---|
 | `node:sqlite` on darwin-arm64: `DatabaseSync` `timeout` runtime behaviour, `errcode 1811` stability, `t.mock.timers` | `npm test` on the Mac; `test/env.test.ts` fails first, with a named reason |
 | pmmcp: Streamable HTTP interop with SDK 1.32.1 (same-origin redirects only, from 1.32.0), idle timeout vs the 240 s heartbeat (the 64 tool names, their input schemas and their output schemas, every one FastMCP's `{result: string}`, are captured in `test/fixtures/pmmcp-listtools.json`, re-taken 2026-10-19) | boot with pmmcp up: `hub.connected` and `hub.tools.classified` list what is really there; checklist line 2 |
 | An Anthropic API key accepted as `Authorization: Bearer` (D20's alternative) | one `npm run cli -- probe anthropic/claude-sonnet-5` with `auth.header: Authorization` |
-| Docker on Colima: `--cap-drop=ALL` → empty `CapEff`; `--read-only` plus a `/workspace` writable by `65534` through virtiofs; `~/.colima/<profile>/docker.sock` paths; FSEvents through virtiofs | `scripts/colima-up.sh` (itself marked NEEDS VALIDATION on line 2) then the security check commands; Phase 2 live tests |
-| Whether the docker CLI works with a spawn env of only `PATH`, `DOCKER_HOST` and `DOCKER_CONFIG` (the kernel's own `.aos/docker`) | `env -i PATH="$PATH" DOCKER_CONFIG="$PWD/.aos/docker" DOCKER_HOST=unix://$HOME/.colima/trusted/docker.sock docker version`. If it needs `HOME`, the driver adds `HOME` **only** — never the full environment |
-| Whether a running Colima VM created with the old `~/.aos` mounts picks up the new `.aos/workspaces` mount after `colima stop` and a re-run of `colima-up.sh` | `colima ssh -p trusted -- ls <repo>/.aos/workspaces/trusted`; if absent, `colima delete trusted` and re-run |
+| Whether SIGKILL of the docker client leaves its container running, which is why the driver kills by name | Phase 2 live Docker driver tests |
+| `scripts/colima-up.sh` on a VM that is running but whose first start never finished: `colima status` fails, `colima start` answers `already running, ignoring`, and the script still prints `Done.` without its mounts or sizes applied (seen on 2026-10-21; still marked NEEDS VALIDATION on line 2) | Phase 2: the script fails unless `colima status` succeeds after the start and the VM's virtiofs mounts are exactly its `mountRoot` |
 | Moonshot base URL, model ids and pricing; OpenRouter `usage.cost` semantics; llama.cpp `include_usage`, named `tool_choice`, `--jinja`, and the `/props.chat_template_caps.supports_tool_calls` key name | `npm run cli -- probe <ref>` per entry, and `GET /v1/models` once keys are in the vault |
 | `@tauri-apps/plugin-websocket` custom-header support — a Phase 3 blocker for invariant 1 | a Phase 3 spike, before any protocol change |

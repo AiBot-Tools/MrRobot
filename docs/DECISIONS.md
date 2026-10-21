@@ -135,9 +135,9 @@ Not judgement calls, measurements. Listed as NEEDS VALIDATION in the plan, §7.
   until 2026-10-28.
 - **pmmcp endpoint**: **`http://127.0.0.1:8766/mcp`**, Streamable HTTP, port 8766 (dashboard on 8765), loopback confirmed, bearer token required.
 - **`get_secret` argument name**: **`label`** (not `key`). Set `kernel.yaml secrets.keyArg` to `'label'`, or update `SecretsBroker` code. Resolves the "unverified" status in CLAUDE.md.
+- **FSEvents through virtiofs** (2026-10-21, Colima 0.10.3, `vz` + virtiofs): **yes**. An `fs.watch` on the Mac saw a file a container wrote into its workspace. The same run settled the other sandbox facts; see README "Sandbox checks on the Mac".
 
 ### Pending 🔧
 
-- Whether FSEvents survives virtiofs in the Colima VMs. Test: host-side `fs.watch` + VM-side file write. Phase 2 concern, not Phase 0 blocker.
 - The llama.cpp build, whether it runs with `--jinja`, and the chat template in use. Validate when local model setup begins.
 - Live model ids for Moonshot and OpenRouter; auto-detect via `GET /v1/models` on each provider's API. Run after API keys are stored in vault.

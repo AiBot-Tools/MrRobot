@@ -767,30 +767,30 @@ answers alone fails `child-runs`, a summary that leaves out a child fails
 **1. One objective → goal tree + two child runs + a trustworthy summary.** The
 eval harness's fan-out case, judged from the log alone.
 
-- Result: _not yet run_
-- Date:
-- Commit:
-- `runId`:
-- `costMicroUsd`:
+- Result: pass. 1 passed. `live-ceo` adopted the objective into a tree in `aos/agent/aos-live-test` and delegated to the standing workers; every exit gate passed on the log alone (score 1). Not applicable to this case: `no-call-after-deny`, `declared-work-in-log`, `no-forbidden-string-in-log`, `depth-within-ceiling`.
+- Date: 2026-10-20 (operator local; 06:30 UTC on 2026-10-21)
+- Commit: d73c485
+- `runId`: run_1792564244840_grjrwc
+- `costMicroUsd`: 177456
 
 **2. A kernel restart mid-run orphans nothing.** The kernel dies with a child in
 its first model call; a reboot on the same data closes every run and admission
 in causal order, blocks the child's goal in pmmcp, calls no model, and a second
 reboot finds nothing to do.
 
-- Result: _not yet run_
-- Date:
-- Commit:
-- `ceoRunId`:
-- `costMicroUsd`:
+- Result: pass. 1 passed. The kernel died with child `run_1792564397130_0aa3u4` in its first model call. The reboot closed both runs and the child's admission, and the real pmmcp accepted the move of the child's goal to `blocked`. A third boot found nothing to do. The dead kernel's in-flight `in_progress` update for that goal failed with `Connection closed` (one warning, expected: the crash cut its connection), so it could not land after the block.
+- Date: 2026-10-20 (operator local; 06:32 UTC on 2026-10-21)
+- Commit: d73c485
+- `ceoRunId`: run_1792564367277_0hcd8x
+- `costMicroUsd`: 39252
 
 **3. The other Phase 1 runtime checks.** Goal tools round-trip against the live
 server, a real plan through the strict parser into the test namespace, and the
 eval harness's gates against real accounting.
 
-- Result: _not yet run_
-- Date:
-- Commit:
+- Result: pass. 3 passed: the goal tools match the server and a tree round-trips; the orchestrator's plan survives the strict parser into the test namespace; the eval harness's gates hold against real accounting (`ceo-inline-small-objective`: gates failed [], score 1, did not run 10). The whole file: 5 passed, 0 failed, 178 s.
+- Date: 2026-10-20 (operator local; 06:30 UTC on 2026-10-21)
+- Commit: d73c485
 
 ---
 

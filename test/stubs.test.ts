@@ -141,7 +141,10 @@ test("every STUBS entry is named in README's stub section", () => {
   // date, no commit or no cost reads like evidence and is not, and that is the
   // shape a hurried edit actually takes.
   assert.ok(README.includes('## Exit-criterion checklist'))
-  const checklist = README.slice(README.indexOf('## Exit-criterion checklist'))
+  // To the next heading only: the Phase 1 record below has the same shape.
+  const checklistStart = README.indexOf('## Exit-criterion checklist')
+  const checklistEnd = README.indexOf('\n## ', checklistStart + 1)
+  const checklist = README.slice(checklistStart, checklistEnd === -1 ? undefined : checklistEnd)
   const entries = [...checklist.matchAll(/- Result: (.*)\n- Date: (.*)\n- Commit: (.*)\n((?:- .*\n)*)/g)]
   assert.equal(entries.length, 3, `found ${String(entries.length)} checklist entries, expected 3`)
 
@@ -264,6 +267,25 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   // and then the contract must say so.
   const phaseOne = [...sectionOf('## Phase 1 exit-criterion checklist').matchAll(/- Result: (.*)\n/g)].map((m) => (m[1] ?? '').trim())
   assert.equal(phaseOne.length, 3, 'README has no three-line Phase 1 exit record')
+  // Not half-filled, as for Phase 0: a recorded line carries a date and a
+  // commit, lines 1 and 2 their logged cost, and an unrun line carries nothing.
+  const phaseOneEntries = [
+    ...sectionOf('## Phase 1 exit-criterion checklist').matchAll(/- Result: (.*)\n- Date:(.*)\n- Commit:(.*)\n((?:- .*\n)*)/g),
+  ]
+  assert.equal(phaseOneEntries.length, 3, 'a Phase 1 record line lacks its Date or Commit field')
+  for (const [i, [, result = '', date = '', commit = '', extra = '']] of phaseOneEntries.entries()) {
+    const label = `Phase 1 record line ${String(i + 1)}`
+    if (result.trim() === '_not yet run_') {
+      assert.equal(`${date}${commit}`.trim(), '', `${label} is unrun but carries a date or commit`)
+      for (const line of extra.trim().split('\n').filter((l) => l !== '')) {
+        assert.match(line, /:\s*$/, `${label} is unrun but ${line.trim()} is filled in`)
+      }
+      continue
+    }
+    assert.match(date.trim(), /^\d{4}-\d{2}-\d{2}\b/, `${label} claims a result with no date`)
+    assert.match(commit.trim(), /^[0-9a-f]{7,40}$/, `${label} claims a result with no commit`)
+    if (i < 2) assert.match(extra, /costMicroUsd`?: *[1-9]/, `${label} claims a result with no non-zero cost`)
+  }
   const phaseOneExited = phaseOne.slice(0, 2).every((r) => r.startsWith('pass'))
   if (phaseOneExited) {
     assert.match(section, /Phase 1 exited on \d{4}-\d{2}-\d{2}/, 'README records the Phase 1 exit; CLAUDE.md does not say so')

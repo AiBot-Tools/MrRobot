@@ -818,7 +818,11 @@ on two conditions the kernel enforces or will enforce:
 - **The Phase 2 egress proxy denies it**: `192.168.5.2`, `host.lima.internal`,
   `host.docker.internal`.
 
-Revisit (a bearer in pmmcp) before Phase 4 makes Telegram and SMS inputs.
+Revisit (a bearer in pmmcp) before Phase 4 makes Telegram and SMS inputs. Nothing on the
+client side blocks it. The operator's IDE, Antigravity, sends a configured
+`headers` Authorization over Streamable HTTP: a probe on 2026-10-25 pointed it at a
+listener with `Bearer aos-header-probe`, and the header arrived on its first
+request. The kernel already sends one once `kernel.yaml` declares `tokenEnv`.
 
 ## Sandbox checks on the Mac (2026-10-21)
 

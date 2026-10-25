@@ -4,7 +4,10 @@
 # Brings up the two sandbox VMs the Docker driver expects, one per trust
 # domain, plus an INTERNAL docker network in each. Two VMs rather than two
 # networks in one VM: a kernel escape from the hostile domain should not land
-# in the same VM as the trusted one.
+# in the same VM as the trusted one. The VMs still share one Lima user-v2
+# network (one `limactl usernet` process on 192.168.5.0/24), so the hostile VM
+# can reach the trusted VM's addresses, and both reach every port on the Mac's
+# loopback through 192.168.5.2 (README "Sandbox checks on the Mac").
 #
 # Idempotent — re-running it starts what is stopped and leaves the rest alone.
 #

@@ -843,6 +843,9 @@ gave identical results.
 | VM shares | exactly one virtiofs mount per VM, that domain's `mountRoot` |
 | Docker CLI environment | `docker version` works under `env -i` with only `PATH`, `DOCKER_HOST` and `DOCKER_CONFIG`, so the driver's environment needs no `HOME` |
 | File events | an `fs.watch` on the Mac sees a file a container writes into a workspace |
+| Docker firewall backend (2026-10-25) | `iptables`, so rules in `DOCKER-USER` apply to container traffic |
+| VM network (2026-10-25) | both VMs attach to one shared `limactl usernet` process (Lima 2.2.1) on `192.168.5.0/24`; each VM resolves through its own dnsmasq at its `eth0` address, which forwards to `192.168.5.2`; the hostile VM opens a TCP connection to the trusted VM's sshd |
+| Gateway NAT (2026-10-25) | a VM's connection to `192.168.5.2:8766` arrives at pmmcp from `127.0.0.1`, opened by that `limactl` process (`lsof` on the Mac), the same as a local client |
 
 Two results the Phase 2 design has to carry:
 
@@ -859,6 +862,14 @@ Two results the Phase 2 design has to carry:
   network is the only thing between a container and pmmcp. Anything with a route
   out of a VM reaches it unauthenticated: the default bridge, a network that is
   not internal, the Phase 2 proxy itself, or an escape into the VM.
+- **The gateway is the Mac's whole loopback, and the VMs share a network.**
+  Lima's user-v2 network rewrites `192.168.5.2` to `127.0.0.1` on every port
+  (`pkg/networks/usernet/gvproxy.go` at Lima v2.2.1). Every service listening on
+  the Mac's loopback or on all interfaces is therefore reachable from both VMs,
+  and a service cannot tell a VM's connection from a local one by its address.
+  Only a credential distinguishes them. The two VMs are separate kernels on one
+  switch, so the hostile VM can reach the trusted one. Neither Lima 2.2.1 nor
+  Colima 0.10.3 has a setting that turns the gateway rewrite off.
 
 ## Still needs validation
 

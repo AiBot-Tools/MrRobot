@@ -199,6 +199,14 @@ script uses, so nothing lands in `~/.docker` or `~/Library/Caches`:
 export DOCKER_CONFIG="$PWD/.aos/docker" COLIMA_CACHE_HOME="$HOME/.colima/_cache"
 ```
 
+That export also decides which engine every later `docker` in the shell talks
+to. `colima start` makes the VM it started the current context in
+`.aos/docker`, so in that shell a bare `docker` reaches a Colima VM, not Docker
+Desktop or any other engine you use. Another tool's script run there would not
+find its containers, and might create fresh ones inside the VM. Keep the export
+to a shell you use for AOS only, or `unset DOCKER_CONFIG` before managing other
+containers.
+
 **Uninstall:** run `colima delete trusted` and `colima delete hostile`, then
 delete this folder and `~/.colima` if nothing else uses Colima. Global installs
 of Node, npm, Docker and Colima are yours to keep or remove.

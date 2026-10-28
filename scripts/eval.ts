@@ -22,6 +22,7 @@ import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse as parseYaml } from 'yaml'
 
+import { namesRepoDotenv } from '../src/agents/protected.js'
 import { parseKernelConfig } from '../src/config.js'
 import { parseProviders } from '../src/models/registry.js'
 import { assertTokenUsable } from '../src/control/auth.js'
@@ -38,6 +39,13 @@ function flag(argv: readonly string[], name: string): string | undefined {
 
 async function main(argv: readonly string[]): Promise<number> {
   const repoRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
+  // Before anything else, as nothing after it can be undone: the report must
+  // not land on the operator's keys, however the path is spelled.
+  const jsonPath = flag(argv, 'json')
+  if (jsonPath !== undefined && namesRepoDotenv(jsonPath, repoRoot)) {
+    process.stderr.write(`--json ${jsonPath} names this checkout's credentials file, which holds your keys: give the report another path\n`)
+    return 2
+  }
   const configPath = flag(argv, 'config') ?? join(repoRoot, 'config', 'kernel.yaml')
   const config = parseKernelConfig(parseYaml(readFileSync(configPath, 'utf8')), { repoRoot })
 
@@ -100,7 +108,6 @@ async function main(argv: readonly string[]): Promise<number> {
   const suite = await runSuite(target, cases, CEO_CHECKS)
   process.stdout.write(`${renderSuite(suite)}\n`)
 
-  const jsonPath = flag(argv, 'json')
   if (jsonPath !== undefined) {
     writeFileSync(jsonPath, toJson(suite))
     process.stdout.write(`\nwrote ${jsonPath}\n`)

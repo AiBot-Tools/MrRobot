@@ -12,7 +12,8 @@
 // pmmcp takes no bearer (it trusts loopback), so nothing needs to be exported.
 // If kernel.yaml gives the server a `tokenEnv`, that variable must be set.
 //
-// It writes test/fixtures/pmmcp-listtools.json (or OUT) and nothing else. It
+// It writes test/fixtures/pmmcp-listtools.json (or OUT, never this checkout's
+// .env, which it refuses however it is spelled) and nothing else. It
 // makes one outbound connection, to the loopback URL in kernel.yaml, and calls
 // tools/list only — no tool is invoked, so nothing in the operator's memory or
 // vault is read or written.
@@ -31,6 +32,7 @@ import { fileURLToPath } from 'node:url'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { parse as parseYaml } from 'yaml'
 
+import { namesRepoDotenv } from '../src/agents/protected.js'
 import { parseKernelConfig } from '../src/config.js'
 import { captureOf } from '../src/mcp/capture.js'
 import { listToolPages, streamableHttpTransport } from '../src/mcp/hub.js'
@@ -55,6 +57,13 @@ async function main(argv: readonly string[]): Promise<number> {
     }
     configPath = resolve(value)
     args.splice(flag, 2)
+  }
+  // Refused before anything is dialled: the capture must not land on the
+  // operator's keys, however the path is spelled.
+  const out = args[0] ?? join(repoRoot, CAPTURE_PATH)
+  if (namesRepoDotenv(out, repoRoot)) {
+    process.stderr.write(`${out} names this checkout's credentials file, which holds your keys: give the capture another path\n`)
+    return 1
   }
   const config = parseKernelConfig(parseYaml(readFileSync(configPath, 'utf8')), { repoRoot })
 
@@ -86,7 +95,6 @@ async function main(argv: readonly string[]): Promise<number> {
     // one page deep, and a short capture reads exactly like a shrunken server.
     const { tools, pages } = await listToolPages(client)
     const capture = captureOf(tools, { capturedAt: new Date().toISOString(), server: 'pmmcp', url: server.url, pages })
-    const out = args[0] ?? join(repoRoot, CAPTURE_PATH)
     writeFileSync(out, `${JSON.stringify(capture, null, 2)}\n`)
     process.stdout.write(`captured ${String(tools.length)} tools to ${out}\n`)
     return 0

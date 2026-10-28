@@ -8,10 +8,10 @@ import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { linkSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { assertNotProtected, isUnder, PROTECTED_ROOTS, realpathNearest } from '../src/agents/protected.js'
+import { assertNotProtected, isUnder, namesRepoDotenv, PROTECTED_ROOTS, realpathNearest } from '../src/agents/protected.js'
 import * as souls from '../src/agents/souls.js'
 import { loadSoul, SOUL_BUDGET } from '../src/agents/souls.js'
 import { tmpdir } from './helpers/tmpdir.js'
@@ -182,4 +182,33 @@ test('assertNotProtected allows a path outside the roots', (t) => {
   // Compared with the resolved root: on macOS the temp root is under
   // /var -> /private/var, and resolving that is realpathNearest's whole job.
   assert.equal(realpathNearest(join(root, 'workspace')), join(realpathSync(root), 'workspace'))
+})
+
+test('namesRepoDotenv is the checkout\'s .env however a path reaches it, in any case, and nothing else', (t) => {
+  // For programs that write a path the operator types: eval's --json and
+  // capture-pmmcp's OUT must never land on the keys.
+  const root = tmpdir(t)
+  const outside = tmpdir(t)
+  mkdirSync(join(root, 'config'))
+  symlinkSync(root, join(outside, 'checkout'))
+  // No .env yet: a create there is refused by its name, folded as APFS folds it.
+  for (const target of [join(root, '.env'), join(root, '.ENV'), join(root, 'config', '..', '.Env'), `${root}/./.env/`, join(outside, 'checkout', '.env')]) {
+    assert.equal(namesRepoDotenv(target, root), true, target)
+  }
+  // Another name, the same name in another directory, a name that only starts or ends like it.
+  for (const target of [join(root, '.env.example'), join(root, 'x.env'), join(root, '.envrc'), join(root, 'config', '.env'), join(outside, '.env'), join(root, '.aos', 'eval.json')]) {
+    assert.equal(namesRepoDotenv(target, root), false, target)
+  }
+  // The file there: a link to it from anywhere, soft or hard, is it.
+  writeFileSync(join(root, '.env'), 'X=1\n', { mode: 0o600 })
+  symlinkSync(join(root, '.env'), join(outside, 'report.json'))
+  linkSync(join(root, '.env'), join(outside, 'capture.json'))
+  for (const target of [join(outside, 'report.json'), join(outside, 'capture.json')]) assert.equal(namesRepoDotenv(target, root), true, target)
+  assert.equal(namesRepoDotenv(join(outside, 'other.json'), root), false)
+  // The root by identity: on case-insensitive APFS /r and /R are one
+  // directory and two strings. A stat that answers by identity stands in.
+  const ids: Record<string, string> = { '/r': 'R', '/R': 'R', '/': '/' }
+  const id = (p: string): string | undefined => ids[p]
+  assert.equal(namesRepoDotenv('/R/.env', '/r', id), true)
+  assert.equal(namesRepoDotenv('/s/.env', '/r', id), false)
 })

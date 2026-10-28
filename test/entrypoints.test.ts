@@ -24,7 +24,7 @@ import './helpers/guard.js'
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync, spawn } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -390,6 +390,42 @@ test('the operator scripts are programs: each refuses with usage rather than doi
     }
   }
   t.diagnostic('both scripts refused as programs rather than exiting 0 silently')
+})
+
+test('eval --json and capture-pmmcp OUT refuse a path that is the checkout\'s .env, in another case or through a link, before anything else, and leave it byte for byte', (t) => {
+  // `npm run eval -- --json .env` would otherwise replace the operator's keys
+  // with the report. The shadow checkout's trap stands in for them.
+  const env = { PATH: process.env['PATH'] ?? '/usr/bin:/bin' }
+  const trap = join(ROOT, '.env')
+  const before = readFileSync(trap)
+  const dir = tmpdir(t)
+  symlinkSync(trap, join(dir, 'report.json'))
+  symlinkSync(ROOT, join(dir, 'checkout'))
+  const configPath = join(dir, 'closed.yaml')
+  writeFileSync(configPath, offlinePmmcp(readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8')))
+  const refused = /names this checkout's credentials file, which holds your keys/
+
+  for (const target of ['.ENV', join(dir, 'report.json'), join(dir, 'checkout', '.env')]) {
+    const evalRun = runEntry(CHECKOUT, 'scripts/eval.ts', ['--json', target], { env, timeout: 60_000 })
+    assert.equal(evalRun.status, 2, evalRun.stderr)
+    assert.match(evalRun.stderr, refused, target)
+    // Before the token: nothing else was looked at, let alone spent.
+    assert.doesNotMatch(evalRun.stderr, /AOS_CONTROL_TOKEN/, target)
+    assert.deepEqual(readFileSync(trap), before, target)
+  }
+  const captured = runEntry(CHECKOUT, 'scripts/capture-pmmcp.ts', ['.env', '--config', configPath], { env, timeout: 60_000 })
+  assert.equal(captured.status, 1, captured.stderr)
+  assert.match(captured.stderr, refused)
+  assert.deepEqual(readFileSync(trap), before)
+
+  // Any other path is the operator's: eval goes on to its token, capture to the (closed) port.
+  const report = runEntry(CHECKOUT, 'scripts/eval.ts', ['--json', join(dir, 'report.out.json')], { env, timeout: 60_000 })
+  assert.equal(report.status, 2, report.stderr)
+  assert.match(report.stderr, /AOS_CONTROL_TOKEN is not set/)
+  const elsewhere = runEntry(CHECKOUT, 'scripts/capture-pmmcp.ts', [join(dir, 'capture.json'), '--config', configPath], { env, timeout: 60_000 })
+  assert.equal(elsewhere.status, 1, elsewhere.stderr)
+  assert.doesNotMatch(elsewhere.stderr, refused)
+  assert.equal(existsSync(join(dir, 'capture.json')), false)
 })
 
 test('capture-pmmcp masks its bearer: a server that echoes it into a refusal prints none of it', async (t) => {

@@ -21,7 +21,7 @@
 
 import { lstatSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { homedir, userInfo } from 'node:os'
-import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 
 import { ConfigError } from '../errors.js'
 
@@ -153,6 +153,26 @@ export function isUnder(parent: string, child: string, id: Identify = identify):
     if (id(d) === target) return true
     if (dirname(d) === d) return false
   }
+}
+
+/**
+ * True when writing `target` would write <repoRoot>/.env, which holds the
+ * operator's keys: the same file by identity however it is reached (a link
+ * to it, another spelling of the repository), or a name that folds to `.env`
+ * in a directory that is the repository root by identity, whether or not the
+ * file is there yet. Folded because APFS folds case: a write to `.ENV`
+ * replaces `.env`. For a program that writes a path the operator types (eval's
+ * --json, capture-pmmcp's OUT), so a slip of the keyboard cannot replace the
+ * keys with a report.
+ */
+export function namesRepoDotenv(target: string, repoRoot: string, id: Identify = identify): boolean {
+  const abs = resolve(target)
+  const dotenv = id(join(resolve(repoRoot), '.env'))
+  if (dotenv !== undefined && id(abs) === dotenv) return true
+  if (foldName(basename(abs)) !== foldName('.env')) return false
+  const dir = realpathNearest(dirname(abs))
+  const root = realpathNearest(repoRoot)
+  return isUnder(root, dir, id) && isUnder(dir, root, id)
 }
 
 /**

@@ -26,7 +26,7 @@ import './helpers/guard.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
-import { join, relative } from 'node:path'
+import { join, posix, relative } from 'node:path'
 import ts from 'typescript'
 
 import { ENTRY_POINTS } from './helpers/checkout.js'
@@ -416,14 +416,17 @@ test('no source file writes to souls/ or AGENTS.md', () => {
   // Invariant 8: souls and AGENTS.md are read-only to agents, and the guarantee
   // is that NO code path writes them — not that the gate refuses, which would
   // put a model's persona one bug away from being editable by the model.
-  const WRITE = /\b(writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream|rmSync|unlinkSync|renameSync|mkdirSync|chmodSync|copyFileSync|truncateSync)\s*\(/
+  const WRITE = /\b(writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream|writeSync|rmSync|unlinkSync|renameSync|mkdirSync|chmodSync|fchmodSync|copyFileSync|truncateSync)\s*\(/
 
-  // Only three modules in src/ write to the filesystem at all, and each writes
-  // under the data directory. A fourth is a new writer and must be looked at.
+  // Only four modules in src/ write to the filesystem at all. Three write
+  // under the data directory; the fourth is the .env writer, which writes
+  // <repo>/.env and nothing else (its own rules below). A fifth is a new writer
+  // and must be looked at.
   assert.deepEqual(pathsOf(hits(SRC, WRITE)), [
     'src/events/anchor.ts',
     'src/kernel.ts',
     'src/models/probe.ts',
+    'src/secrets/dotenv-append.ts',
   ])
 
   // No write call site anywhere mentions a protected path.
@@ -440,24 +443,1576 @@ test('no source file writes to souls/ or AGENTS.md', () => {
 
 const SCRIPTS = files('scripts')
 
-test('only the entry points, the live helper and two tests import secrets/dotenv.js; kernel.ts, config.ts and the broker never do', () => {
+/**
+ * The repository modules a file imports by relative specifier, resolved to
+ * their .ts paths: `./dotenv.js` in src/secrets/x.ts is src/secrets/dotenv.ts,
+ * as surely as `../secrets/dotenv.js` elsewhere is. Static imports, re-exports
+ * and import() alike, read from the syntax tree, so a comment is not one.
+ */
+function relativeImports(file: SourceFile): string[] {
+  const out: string[] = []
+  const add = (spec: string): void => {
+    if (spec.startsWith('.')) out.push(posix.normalize(posix.join(posix.dirname(file.path), spec)).replace(/\.js$/, '.ts'))
+  }
+  const visit = (node: ts.Node): void => {
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier !== undefined && ts.isStringLiteral(node.moduleSpecifier)) {
+      add(node.moduleSpecifier.text)
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const spec = node.arguments[0]
+      if (spec !== undefined && ts.isStringLiteralLike(spec)) add(spec.text)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(parsed(file))
+  return out
+}
+
+/** The files in `pool` that import `target` (a repo-relative .ts path) directly. */
+function importersOfModule(pool: readonly SourceFile[], target: string): string[] {
+  return pool.filter((f) => relativeImports(f).includes(target)).map((f) => f.path).sort()
+}
+
+test('only the entry points, the .env writer, the live helper and three tests import secrets/dotenv.js; kernel.ts, config.ts and the broker never do', () => {
   // The operator's .env is opened from exactly three entry points, by flag. A
   // library module that imported the loader would be a fourth door with no
-  // argv to say whether it should open anything.
-  // Single-line imports and the closing line of a multi-line one alike.
-  const pattern = /(?:(?:^|\s)(?:import|export)[^\n]*|^\s*\}\s*)from\s+['"][^'"]*secrets\/dotenv\.js['"]|import\(\s*['"][^'"]*secrets\/dotenv\.js['"]/
-  const importers = [...SRC, ...TEST, ...SCRIPTS]
-    .filter((f) => codeLines(f).some((l) => pattern.test(l.text)))
-    .map((f) => f.path)
-    .sort()
-  assert.deepEqual(importers, [
+  // argv to say whether it should open anything. The writer imports it for its
+  // grammar and to read back what it wrote, and is held to its own callers
+  // below. Resolved, not matched as text: the writer's `./dotenv.js` names no
+  // `secrets/` directory, so a text match on `secrets/dotenv.js` misses it.
+  assert.deepEqual(importersOfModule([...SRC, ...TEST, ...SCRIPTS], 'src/secrets/dotenv.ts'), [
     'scripts/eval.ts',
     'src/cli/index.ts',
     'src/main.ts',
+    'src/secrets/dotenv-append.ts',
     'test/config-files.test.ts',
+    'test/dotenv-append.test.ts',
     'test/dotenv.test.ts',
     'test/helpers/live-env.ts',
   ])
+})
+
+/** Files reached from `roots` through relative imports, `roots` included. */
+function reachedFrom(roots: readonly string[], pool: readonly SourceFile[]): Set<string> {
+  const byPath = new Map(pool.map((f) => [f.path, f]))
+  const seen = new Set<string>()
+  const stack = [...roots]
+  for (let path = stack.pop(); path !== undefined; path = stack.pop()) {
+    if (seen.has(path)) continue
+    seen.add(path)
+    const file = byPath.get(path)
+    if (file !== undefined) stack.push(...relativeImports(file))
+  }
+  return seen
+}
+
+/** Where each fs call takes a path it writes, creates, moves or deletes. */
+const PATH_ARGS: ReadonlyMap<string, readonly number[]> = new Map<string, readonly number[]>([
+  ...['writeFileSync', 'writeFile', 'appendFileSync', 'appendFile', 'createWriteStream', 'truncateSync', 'truncate'].map((c): [string, number[]] => [c, [0]]),
+  ...['rmSync', 'rm', 'unlinkSync', 'unlink', 'chmodSync', 'chmod', 'chownSync', 'chown', 'utimesSync', 'utimes'].map((c): [string, number[]] => [c, [0]]),
+  // macOS changes a link's own mode, owner and times through these.
+  ...['lchmodSync', 'lchmod', 'lchownSync', 'lchown', 'lutimesSync', 'lutimes'].map((c): [string, number[]] => [c, [0]]),
+  // Through a descriptor, which is the file it opened (callTails): fchmod
+  // works through one opened read-only, so the open alone does not show it.
+  ...['fchmodSync', 'fchmod', 'fchownSync', 'fchown', 'futimesSync', 'futimes'].map((c): [string, number[]] => [c, [0]]),
+  // Both ends. From .env, a copy puts its keys in a second file, a link gives
+  // it a second name and a move takes it away; to .env, each one writes it.
+  ...['copyFileSync', 'copyFile', 'cpSync', 'cp', 'linkSync', 'link', 'symlinkSync', 'symlink', 'renameSync', 'rename'].map(
+    (c): [string, number[]] => [c, [0, 1]],
+  ),
+  // Only when its flags can write: see opensReadOnly.
+  ...['openSync', 'open'].map((c): [string, number[]] => [c, [0]]),
+])
+
+/** A FileHandle's own metadata writes: the file is the handle, which works opened read-only. */
+const HANDLE_WRITES = new Set(['chmod', 'chown', 'utimes'])
+
+/** Calls that read the bytes of the file their first argument names. */
+const READ_CALLS = new Set(['readFileSync', 'readFile', 'createReadStream', 'openSync', 'open'])
+
+/** The loader's calls, which read .env's values whatever path they are given: in the installer, a read of .env. */
+const LOADER_READS = new Set(['loadDotenv', 'oneCredential'])
+const INSTALLER = /^scripts\/install(?:\.ts$|\/)/
+
+/** Names an open() flags expression may be built from and still only read. */
+const READ_ONLY_FLAGS = new Set(['constants', 'fs', 'O_RDONLY', 'O_NOFOLLOW', 'O_NONBLOCK', 'O_CLOEXEC', 'O_DIRECTORY', 'O_NOATIME', 'O_NOCTTY'])
+
+/** No flags, 'r', or read-only constants or'd together. Anything else, a variable included, might write. */
+function opensReadOnly(flags: ts.Expression | undefined): boolean {
+  if (flags === undefined) return true
+  if (ts.isStringLiteralLike(flags)) return /^(?:r|rs|sr)$/.test(flags.text)
+  let readOnly = true
+  const visit = (node: ts.Node): void => {
+    if (ts.isIdentifier(node)) {
+      if (!READ_ONLY_FLAGS.has(node.text)) readOnly = false
+    } else if (!ts.isPropertyAccessExpression(node) && !ts.isParenthesizedExpression(node) && node.kind !== ts.SyntaxKind.BarToken) {
+      if (!ts.isBinaryExpression(node) || node.operatorToken.kind !== ts.SyntaxKind.BarToken) readOnly = false
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(flags)
+  return readOnly
+}
+
+const DECLARATIONS = new WeakMap<ts.Identifier, ts.Node | null>()
+
+/** The declaration an identifier names, by lexical scope within its file: a const or let, a parameter, a function. */
+function declarationOf(id: ts.Identifier): ts.Node | undefined {
+  const seen = DECLARATIONS.get(id)
+  if (seen !== undefined) return seen ?? undefined
+  const found = lexicalDeclaration(id)
+  DECLARATIONS.set(id, found ?? null)
+  return found
+}
+
+function lexicalDeclaration(id: ts.Identifier): ts.Node | undefined {
+  const named = (n: ts.BindingName | undefined): boolean => n !== undefined && ts.isIdentifier(n) && n.text === id.text
+  for (let scope: ts.Node | undefined = id.parent; scope !== undefined; scope = scope.parent) {
+    if (ts.isFunctionLike(scope)) {
+      const p = scope.parameters.find((q) => named(q.name))
+      if (p !== undefined) return p
+    }
+    if (ts.isSourceFile(scope) || ts.isBlock(scope) || ts.isModuleBlock(scope) || ts.isCaseClause(scope) || ts.isDefaultClause(scope)) {
+      for (const st of scope.statements) {
+        if (ts.isVariableStatement(st)) {
+          const d = st.declarationList.declarations.find((v) => named(v.name))
+          if (d !== undefined) return d
+        }
+        if (ts.isFunctionDeclaration(st) && named(st.name)) return st
+      }
+    }
+    if ((ts.isForStatement(scope) || ts.isForOfStatement(scope) || ts.isForInStatement(scope)) && scope.initializer !== undefined && ts.isVariableDeclarationList(scope.initializer)) {
+      const d = scope.initializer.declarations.find((v) => named(v.name))
+      if (d !== undefined) return d
+    }
+  }
+  return undefined
+}
+
+/**
+ * A path as far as the scan can know it: the whole string (`exact`), or only
+ * how it ends, after a part the scan cannot see. UNSEEN knows nothing. How a
+ * path ends is enough to tell it is not .env: whatever `root` holds,
+ * `${root}/.aos/install.lock` is not. An unseen part that can hold no '/' (a
+ * pid, a clock: a WORD) also keeps what its segment starts with, in `head`:
+ * whatever the pid, `${lock}.${process.pid}` ends in a segment that starts
+ * `install.lock.`, which .env does not. `anchored` when that start follows a
+ * '/' the scan saw; otherwise it is the string's own start, which a prefix
+ * runs on into.
+ */
+interface Tail {
+  readonly exact: boolean
+  readonly text: string
+  readonly head?: { readonly text: string; readonly anchored: boolean }
+}
+const UNSEEN: Tail = { exact: false, text: '' }
+const WORD: Tail = { exact: false, text: '', head: { text: '', anchored: false } }
+const known = (text: string): Tail => ({ exact: true, text })
+function then(a: Tail, b: Tail): Tail {
+  if (b.exact) return a.exact ? known(a.text + b.text) : { exact: false, text: a.text + b.text, ...(a.head === undefined ? {} : { head: a.head }) }
+  if (b.head === undefined || b.head.anchored) return b
+  // b's last segment starts where b does, so it runs on from a's end.
+  const slash = a.text.lastIndexOf('/')
+  if (slash >= 0) return { exact: false, text: b.text, head: { text: a.text.slice(slash + 1) + b.head.text, anchored: true } }
+  if (a.exact) return { exact: false, text: b.text, head: { text: a.text + b.head.text, anchored: false } }
+  return { exact: false, text: b.text, ...(a.head === undefined ? {} : { head: a.head }) }
+}
+const product = (a: readonly Tail[], b: readonly Tail[]): Tail[] => a.flatMap((x) => b.map((y) => then(x, y)))
+/** Whether a value can hold no '/' at all: then a replace() with no '/' in it is still a WORD. */
+const slashFree = (t: Tail): boolean => (t.exact ? !t.text.includes('/') : t.head !== undefined && !t.head.anchored && !(t.head.text + t.text).includes('/'))
+/** The most values one path is followed with; past it, the path is unseen. */
+const MAX_TAILS = 16
+function capped(tails: readonly Tail[]): Tail[] {
+  const unique = [...new Map(tails.map((t) => [JSON.stringify(t), t])).values()]
+  return unique.length <= MAX_TAILS ? unique : [UNSEEN]
+}
+
+/** Whether a path's last segment is .env, is not, or may be. */
+type Verdict = 'dotenv' | 'other' | 'unknown'
+
+const DOTENV = '.env'
+
+function verdictOf(tail: Tail): Verdict {
+  // Lower case: APFS folds case, so .ENV is the operator's .env there.
+  const text = tail.text.toLowerCase()
+  // After an unseen part, the text up to the first slash runs into that
+  // part's last segment; every segment after a slash is whole, and `..`
+  // takes one back, as path.join and the filesystem both read it.
+  const cut = tail.exact ? -1 : text.indexOf('/')
+  const whole: string[] = []
+  let lost = false
+  for (const segment of tail.exact ? text.split('/') : cut < 0 ? [] : text.slice(cut + 1).split('/')) {
+    if (segment === '..') lost = whole.pop() === undefined || lost
+    else if (segment !== '' && segment !== '.') whole.push(segment)
+  }
+  const last = whole.at(-1)
+  if (last !== undefined) return last === DOTENV ? 'dotenv' : 'other'
+  if (tail.exact) return 'other'
+  if (lost) return 'unknown'
+  // The last segment is the one the unseen part falls in, ending with `end`
+  // and, when the head is known, starting with it. It may be .env, or `.` or
+  // `..`, which would make the last segment an unseen one before it.
+  const end = cut < 0 ? text : text.slice(0, cut)
+  const head = tail.head?.text.toLowerCase()
+  const fits = (name: string): boolean => name.endsWith(end) && (head === undefined || (name.startsWith(head) && head.length + end.length <= name.length))
+  return fits(DOTENV) || fits('..') || fits('.') ? 'unknown' : 'other'
+}
+
+function verdictOfAll(tails: readonly Tail[]): Verdict {
+  const verdicts = tails.map(verdictOf)
+  return verdicts.includes('dotenv') ? 'dotenv' : verdicts.includes('unknown') ? 'unknown' : 'other'
+}
+
+/** Each parameter of a call being followed, bound to its arguments in order; undefined when the scan cannot line them up. */
+type Bound = ReadonlyMap<ts.ParameterDeclaration, readonly (readonly Tail[])[] | undefined>
+const NO_BOUND: Bound = new Map()
+
+/** The most nodes one path is worked out through; past it, what is left is unseen, so a file cannot stall the scan. */
+const MAX_STEPS = 10_000
+
+interface Trace {
+  /** The modules a relative import can be followed into, by repo-relative path. */
+  readonly pool: ReadonlyMap<string, ts.SourceFile>
+  readonly bound: Bound
+  /** Parameters taken to hold these values wherever they are read: how writeParams asks what a caller's argument reaches. */
+  readonly assume: Bound
+  /** The nodes being worked out, so a cycle reads as unseen rather than looping. */
+  readonly active: Set<ts.Node>
+  /** What each node was worked out to, under each binding: a value built from itself k times is worked out k times, not k! times. */
+  readonly memo: Map<ts.Node, Map<Bound, readonly Tail[]>>
+  readonly steps: { left: number }
+}
+
+const traceIn = (pool: ReadonlyMap<string, ts.SourceFile>, assume: Bound = NO_BOUND): Trace => ({
+  pool,
+  bound: NO_BOUND,
+  assume,
+  active: new Set(),
+  memo: new Map(),
+  steps: { left: MAX_STEPS },
+})
+
+type Fn = ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression
+
+/** An expression without the parentheses, casts and awaits that leave its value a path. */
+function unwrapped(node: ts.Expression): ts.Expression {
+  let e = node
+  while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e) || ts.isSatisfiesExpression(e) || ts.isTypeAssertionExpression(e) || ts.isAwaitExpression(e)) {
+    e = e.expression
+  }
+  return e
+}
+
+/** Every value `node` may have, as a path. Frozen: it is the memo's own copy. */
+function tailsOf(node: ts.Expression, trace: Trace): readonly Tail[] {
+  const e = unwrapped(node)
+  const cached = trace.memo.get(e)?.get(trace.bound)
+  if (cached !== undefined) return cached
+  if (trace.active.has(e) || trace.steps.left <= 0) return [UNSEEN]
+  trace.steps.left -= 1
+  trace.active.add(e)
+  try {
+    const tails = Object.freeze(capped(tailsWithin(e, trace)))
+    let byBinding = trace.memo.get(e)
+    if (byBinding === undefined) trace.memo.set(e, (byBinding = new Map()))
+    byBinding.set(trace.bound, tails)
+    return tails
+  } finally {
+    trace.active.delete(e)
+  }
+}
+
+function tailsWithin(e: ts.Expression, trace: Trace): readonly Tail[] {
+  if (ts.isStringLiteralLike(e)) return [known(e.text)]
+  if (ts.isNumericLiteral(e) || ts.isBigIntLiteral(e)) return [WORD]
+  if (ts.isTemplateExpression(e)) {
+    let tails = [known(e.head.text)]
+    for (const span of e.templateSpans) tails = product(product(tails, tailsOf(span.expression, trace)), [known(span.literal.text)])
+    return tails
+  }
+  if (ts.isBinaryExpression(e)) {
+    const op = e.operatorToken.kind
+    if (op === ts.SyntaxKind.PlusToken) return product(tailsOf(e.left, trace), tailsOf(e.right, trace))
+    if (op === ts.SyntaxKind.QuestionQuestionToken || op === ts.SyntaxKind.BarBarToken || op === ts.SyntaxKind.AmpersandAmpersandToken) {
+      return [...tailsOf(e.left, trace), ...tailsOf(e.right, trace)]
+    }
+    return op === ts.SyntaxKind.CommaToken ? tailsOf(e.right, trace) : [UNSEEN]
+  }
+  if (ts.isConditionalExpression(e)) return [...tailsOf(e.whenTrue, trace), ...tailsOf(e.whenFalse, trace)]
+  if (ts.isIdentifier(e)) {
+    if (e.text === 'DOTENV_FILE') return [known('.env')]
+    const decl = bindingOf(e, trace.pool)
+    return decl === undefined ? [UNSEEN] : bindingTails(decl, trace)
+  }
+  if (ts.isPropertyAccessExpression(e)) {
+    // A pid holds no '/'.
+    if (isGlobal(e.expression, 'process') && (e.name.text === 'pid' || e.name.text === 'ppid')) return [WORD]
+    return memberTails(e, trace)
+  }
+  if (ts.isCallExpression(e)) return callTails(e, trace)
+  // this.x, x[k], new URL(…) and the rest: unseen.
+  return [UNSEEN]
+}
+
+/** `name` itself, declared nowhere in its file: the global. */
+const isGlobal = (e: ts.Expression, name: string): boolean => ts.isIdentifier(e) && e.text === name && declarationOf(e) === undefined && importOf(e) === undefined
+
+/** The values a declaration may hold as a path: a const or let by everything it is given, a parameter by what it is passed. */
+function bindingTails(decl: ts.Node, trace: Trace): readonly Tail[] {
+  if (ts.isParameter(decl)) return parameterTails(decl, trace)
+  if (ts.isExportAssignment(decl)) return functionOf(decl) !== undefined ? [UNSEEN] : tailsOf(decl.expression, trace)
+  if (!ts.isVariableDeclaration(decl) || !ts.isIdentifier(decl.name)) return [UNSEEN]
+  const holder = decl.parent.parent
+  if (ts.isForOfStatement(holder)) {
+    const list = unwrapped(holder.expression)
+    return ts.isArrayLiteralExpression(list) ? list.elements.flatMap((el) => (ts.isSpreadElement(el) ? [UNSEEN] : tailsOf(el, trace))) : [UNSEEN]
+  }
+  if (ts.isForInStatement(holder)) return [UNSEEN]
+  const out = decl.initializer === undefined ? [] : functionOf(decl) !== undefined ? [UNSEEN] : [...tailsOf(decl.initializer, trace)]
+  for (const value of assignmentsTo(decl)) out.push(...(value === undefined ? [UNSEEN] : tailsOf(value, trace)))
+  return out
+}
+
+function parameterTails(p: ts.ParameterDeclaration, trace: Trace): readonly Tail[] {
+  const rest = p.dotDotDotToken !== undefined
+  for (const given of [trace.bound, trace.assume]) {
+    if (!given.has(p)) continue
+    const args = given.get(p)
+    // A rest parameter whole is an array, not a path; join() spreads it (argumentTails).
+    if (args === undefined || rest) return [UNSEEN]
+    const arg = args[0]
+    if (arg !== undefined) return [...arg]
+    return p.initializer === undefined ? [] : tailsOf(p.initializer, trace)
+  }
+  // Outside a call being followed: the default and what every caller in this
+  // file passes, and unseen when a caller may be where the scan cannot look.
+  const out = p.initializer === undefined ? [] : [...tailsOf(p.initializer, trace)]
+  const sites = callSites(p.parent)
+  if (sites === undefined || rest || !ts.isIdentifier(p.name)) return [...out, UNSEEN]
+  const index = p.parent.parameters.indexOf(p)
+  for (const call of sites) {
+    const args = argumentTails(call.arguments, { ...trace, bound: NO_BOUND })
+    if (args === undefined) out.push(UNSEEN)
+    else out.push(...(args[index] ?? []))
+  }
+  return out
+}
+
+/** Every call of a function by name, when those are all there are: none for an export, a method, a callback or a function used as a value. */
+function callSites(fn: ts.SignatureDeclaration): ts.CallExpression[] | undefined {
+  const binding = ts.isFunctionDeclaration(fn)
+    ? fn
+    : (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) && ts.isVariableDeclaration(fn.parent) && fn.parent.initializer === fn
+      ? fn.parent
+      : undefined
+  if (binding === undefined) return undefined
+  if (isExported(ts.isFunctionDeclaration(binding) ? binding : binding.parent.parent)) return undefined
+  const sites: ts.CallExpression[] = []
+  for (const ref of referencesTo(binding)) {
+    if (!ts.isCallExpression(ref.parent) || ref.parent.expression !== ref) return undefined
+    sites.push(ref.parent)
+  }
+  return sites
+}
+
+/** `x.name`, for an `x` the scan can follow: a namespace import's export, or a property of an object a variable holds. */
+function memberTails(e: ts.PropertyAccessExpression, trace: Trace): readonly Tail[] {
+  const object = unwrapped(e.expression)
+  if (!ts.isIdentifier(object)) return [UNSEEN]
+  const ns = namespaceOf(object, trace.pool)
+  if (ns !== undefined) {
+    const decl = exportedBinding(ns, e.name.text, trace.pool, 0)
+    return decl === undefined ? [UNSEEN] : bindingTails(decl, trace)
+  }
+  const decl = bindingOf(object, trace.pool)
+  return decl !== undefined && ts.isVariableDeclaration(decl) ? propertyTails(decl, e.name.text, trace) : [UNSEEN]
+}
+
+/**
+ * `x.name`: the matching property of each object literal `x` is given, or a
+ * function of this repository returns, and every `x.name = …`. Unseen when
+ * `x` holds anything else, or goes where it could be changed unseen: passed,
+ * spread, indexed or exported by name.
+ */
+function propertyTails(decl: ts.VariableDeclaration, name: string, trace: Trace): Tail[] {
+  const holder = decl.parent.parent
+  if (ts.isForOfStatement(holder) || ts.isForInStatement(holder)) return [UNSEEN]
+  const out: Tail[] = []
+  for (const value of [...(decl.initializer === undefined ? [] : [decl.initializer]), ...assignmentsTo(decl)]) {
+    const given = value === undefined ? undefined : unwrapped(value)
+    if (given !== undefined && ts.isCallExpression(given)) out.push(...returnedProperty(given, name, trace))
+    else if (given !== undefined && ts.isObjectLiteralExpression(given)) out.push(...literalProperty(given, name, trace))
+    else out.push(UNSEEN)
+  }
+  for (const ref of referencesTo(decl)) {
+    const use = ref.parent
+    // The whole object given again: read above, through assignmentsTo.
+    if (ts.isBinaryExpression(use) && use.left === ref && isAssignment(use.operatorToken.kind)) continue
+    if (!ts.isPropertyAccessExpression(use) || use.expression !== ref) {
+      out.push(UNSEEN)
+      continue
+    }
+    const write = use.parent
+    if (use.name.text === name && ts.isBinaryExpression(write) && write.left === use && isAssignment(write.operatorToken.kind)) {
+      out.push(...(SIMPLE_ASSIGN.has(write.operatorToken.kind) ? tailsOf(write.right, trace) : [UNSEEN]))
+    }
+  }
+  return out
+}
+
+/** Property `name` of an object literal: unseen where a spread, a computed key or an accessor could supply it. */
+function literalProperty(literal: ts.ObjectLiteralExpression, name: string, trace: Trace): Tail[] {
+  const out: Tail[] = []
+  for (const prop of literal.properties) {
+    if (ts.isSpreadAssignment(prop) || ts.isComputedPropertyName(prop.name)) out.push(UNSEEN)
+    else if (propertyKey(prop.name) !== name) continue
+    else if (ts.isPropertyAssignment(prop)) out.push(...tailsOf(prop.initializer, trace))
+    else if (ts.isShorthandPropertyAssignment(prop)) out.push(...tailsOf(prop.name, trace))
+    else out.push(UNSEEN)
+  }
+  return out
+}
+
+/** Property `name` of what a call returns: each object literal the called function returns, its parameters bound to the call's arguments. */
+function returnedProperty(call: ts.CallExpression, name: string, trace: Trace): Tail[] {
+  const fn = calledFunction(call.expression, trace.pool)
+  if (fn === undefined || fn.body === undefined) return [UNSEEN]
+  const inner: Trace = { ...trace, bound: bindCall(fn, call, trace) }
+  const out: Tail[] = []
+  for (const value of returnedValues(fn)) {
+    const literal = unwrapped(value)
+    out.push(...(ts.isObjectLiteralExpression(literal) ? literalProperty(literal, name, inner) : [UNSEEN]))
+  }
+  return out
+}
+
+const propertyKey = (name: ts.PropertyName): string | undefined => (ts.isComputedPropertyName(name) ? undefined : name.text)
+
+/** A function's parameters bound to a call's arguments, on top of the bindings already followed. */
+function bindCall(fn: Fn, call: ts.CallExpression, trace: Trace): Bound {
+  const args = argumentTails(call.arguments, trace)
+  const bound = new Map(trace.bound)
+  fn.parameters.forEach((p, i) => bound.set(p, args === undefined ? undefined : p.dotDotDotToken !== undefined ? args.slice(i) : args.slice(i, i + 1)))
+  return bound
+}
+
+function callTails(call: ts.CallExpression, trace: Trace): readonly Tail[] {
+  const fn = calledFunction(call.expression, trace.pool)
+  if (fn !== undefined) return returnTails(fn, bindCall(fn, call, trace), trace)
+  const callee = unwrapped(call.expression)
+  const name = builtinName(callee, trace.pool)
+  const first = call.arguments[0]
+  const whole = first !== undefined && !ts.isSpreadElement(first) ? first : undefined
+  // A descriptor is the file it opens: writeFileSync(fd, …) writes that path.
+  if ((name === 'openSync' || name === 'open') && whole !== undefined) return tailsOf(whole, trace)
+  const path = pathFunction(callee)
+  if (path === 'join' || path === 'resolve') return joinTails(call.arguments, trace)
+  // What holds no '/': a clock, a date in ISO form.
+  if ((ts.isPropertyAccessExpression(callee) && ((isGlobal(callee.expression, 'Date') || isGlobal(callee.expression, 'performance')) && callee.name.text === 'now')) || name === 'toISOString') {
+    return [WORD]
+  }
+  // String(x) and x.toString() are x, for every value tailsOf gives a path; a number is a WORD.
+  if (ts.isIdentifier(callee) && isGlobal(callee, 'String')) return whole === undefined ? [known('')] : tailsOf(whole, trace)
+  if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'toString') return tailsOf(callee.expression, trace)
+  // A replace that puts no '/' into a value holding none leaves it holding none.
+  if (ts.isPropertyAccessExpression(callee) && (callee.name.text === 'replace' || callee.name.text === 'replaceAll')) {
+    const by = call.arguments[1]
+    if (by !== undefined && ts.isStringLiteralLike(by) && !by.text.includes('/') && tailsOf(callee.expression, trace).every(slashFree)) return [WORD]
+  }
+  return [UNSEEN]
+}
+
+/** The expressions a function returns: its expression body, or each return in its block (not in a function nested in it). */
+function returnedValues(fn: Fn): ts.Expression[] {
+  const body = fn.body
+  if (body === undefined) return []
+  if (!ts.isBlock(body)) return [body]
+  const out: ts.Expression[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionLike(node)) return
+    if (ts.isReturnStatement(node) && node.expression !== undefined) out.push(node.expression)
+    ts.forEachChild(node, visit)
+  }
+  ts.forEachChild(body, visit)
+  return out
+}
+
+/** What a function returns, its parameters bound as `bound` says. */
+function returnTails(fn: Fn, bound: Bound, trace: Trace): Tail[] {
+  if (fn.body === undefined) return [UNSEEN]
+  const inner: Trace = { ...trace, bound }
+  return returnedValues(fn).flatMap((value) => tailsOf(value, inner))
+}
+
+/** Each argument's values in order, spreads opened where the scan can: an array literal, or a rest parameter the call being followed binds. */
+function argumentTails(args: readonly ts.Expression[], trace: Trace): (readonly Tail[])[] | undefined {
+  const out: (readonly Tail[])[] = []
+  for (const arg of args) {
+    if (!ts.isSpreadElement(arg)) {
+      out.push(tailsOf(arg, trace))
+      continue
+    }
+    const spread = unwrapped(arg.expression)
+    if (ts.isArrayLiteralExpression(spread) && !spread.elements.some((el) => ts.isSpreadElement(el))) {
+      out.push(...spread.elements.map((el) => tailsOf(el, trace)))
+      continue
+    }
+    const rest = ts.isIdentifier(spread) ? declarationOf(spread) : undefined
+    const bound = rest !== undefined && ts.isParameter(rest) && rest.dotDotDotToken !== undefined ? trace.bound.get(rest) : undefined
+    if (bound === undefined) return undefined
+    out.push(...bound)
+  }
+  return out
+}
+
+/**
+ * path.join and path.resolve: segments joined by '/'. Where resolve starts
+ * again at an absolute segment the last segment is the same, and that is all
+ * a verdict reads.
+ */
+function joinTails(args: readonly ts.Expression[], trace: Trace): Tail[] {
+  const [first, ...rest] = argumentTails(args, trace) ?? []
+  if (first === undefined) return [UNSEEN]
+  let tails: Tail[] = [...first]
+  for (const next of rest) tails = capped(tails.flatMap((a) => next.map((b) => then(then(a, known('/')), b))))
+  return tails
+}
+
+const FS_MODULE = /^(?:node:)?fs(?:\/promises)?$/
+const PATH_MODULE = /^(?:node:)?path(?:\/(?:posix|win32))?$/
+
+/** The import that binds `id` in its file: the module it names, and the export bound (`default`, `*` or a name). */
+function importOf(id: ts.Identifier): { readonly module: string; readonly name: string } | undefined {
+  for (const st of id.getSourceFile().statements) {
+    if (!ts.isImportDeclaration(st) || !ts.isStringLiteral(st.moduleSpecifier)) continue
+    const clause = st.importClause
+    const module = st.moduleSpecifier.text
+    if (clause?.name?.text === id.text) return { module, name: 'default' }
+    const bindings = clause?.namedBindings
+    if (bindings !== undefined && ts.isNamespaceImport(bindings) && bindings.name.text === id.text) return { module, name: '*' }
+    const el = bindings !== undefined && ts.isNamedImports(bindings) ? bindings.elements.find((e) => e.name.text === id.text) : undefined
+    if (el !== undefined) return { module, name: (el.propertyName ?? el.name).text }
+  }
+  return undefined
+}
+
+/**
+ * Which module object `e` is: node:fs (or fs/promises) or node:path, as an
+ * import, its `promises`/`posix`/`win32`, or a local that holds one. Bare
+ * `fs`, `fsp`, `promises`, `path`, `posix` and `win32` that nothing in the file
+ * declares are taken for them, as the scan's own examples write them.
+ */
+function moduleBinding(node: ts.Expression, depth = 0): 'fs' | 'path' | undefined {
+  const e = unwrapped(node)
+  if (depth > 8) return undefined
+  if (ts.isPropertyAccessExpression(e)) {
+    const of = moduleBinding(e.expression, depth + 1)
+    if (of === 'fs' && e.name.text === 'promises') return 'fs'
+    if (of === 'path' && (e.name.text === 'posix' || e.name.text === 'win32')) return 'path'
+    return undefined
+  }
+  if (!ts.isIdentifier(e)) return undefined
+  const local = declarationOf(e)
+  if (local !== undefined) return ts.isVariableDeclaration(local) && ts.isIdentifier(local.name) && local.initializer !== undefined ? moduleBinding(local.initializer, depth + 1) : undefined
+  const from = importOf(e)
+  if (from === undefined) return /^(?:fs|fsp|promises)$/.test(e.text) ? 'fs' : /^(?:path|posix|win32)$/.test(e.text) ? 'path' : undefined
+  if (FS_MODULE.test(from.module) && (from.name === 'default' || from.name === '*' || from.name === 'promises')) return 'fs'
+  if (PATH_MODULE.test(from.module) && (from.name === 'default' || from.name === '*' || from.name === 'posix' || from.name === 'win32')) return 'path'
+  return undefined
+}
+
+/**
+ * The node:fs export `e` provably is, under any name: an import renamed
+ * (`writeFileSync as put`), a module object's member (`fs.writeFileSync`,
+ * `fs['writeFileSync']`), or a const that holds one (`const put = fs.rmSync`),
+ * here or in a module of the pool. A bare name nothing in the file declares
+ * or imports is taken at its word, as the scan's own examples write it.
+ */
+function fsFunction(node: ts.Expression, pool: ReadonlyMap<string, ts.SourceFile>, depth = 0): string | undefined {
+  const e = unwrapped(node)
+  if (depth > 8) return undefined
+  if (ts.isPropertyAccessExpression(e)) return moduleBinding(e.expression) === 'fs' ? e.name.text : undefined
+  if (ts.isElementAccessExpression(e)) {
+    const key = e.argumentExpression
+    return ts.isStringLiteralLike(key) && moduleBinding(e.expression) === 'fs' ? key.text : undefined
+  }
+  if (!ts.isIdentifier(e)) return undefined
+  const local = declarationOf(e)
+  const from = local === undefined ? importOf(e) : undefined
+  if (local === undefined && from === undefined) return PATH_ARGS.has(e.text) || READ_CALLS.has(e.text) ? e.text : undefined
+  if (from !== undefined && FS_MODULE.test(from.module)) return from.name === 'default' || from.name === '*' ? undefined : from.name
+  const decl = local ?? bindingOf(e, pool)
+  return decl !== undefined && ts.isVariableDeclaration(decl) && ts.isIdentifier(decl.name) && decl.initializer !== undefined
+    ? fsFunction(decl.initializer, pool, depth + 1)
+    : undefined
+}
+
+/** The name a callee is matched by: the fs export it is, else its own name (any `x.writeFileSync` included), as before. */
+function builtinName(callee: ts.Expression, pool: ReadonlyMap<string, ts.SourceFile>): string | undefined {
+  const e = unwrapped(callee)
+  const fs = fsFunction(e, pool)
+  if (fs !== undefined) return fs
+  if (ts.isIdentifier(e)) return e.text
+  if (ts.isPropertyAccessExpression(e)) return e.name.text
+  if (ts.isElementAccessExpression(e) && ts.isStringLiteralLike(e.argumentExpression)) return e.argumentExpression.text
+  return undefined
+}
+
+/** `join` or `resolve` from node:path: imported under any name, bare, or called on a path module object. */
+function pathFunction(callee: ts.Expression): string | undefined {
+  const e = unwrapped(callee)
+  if (ts.isPropertyAccessExpression(e)) return moduleBinding(e.expression) === 'path' ? e.name.text : undefined
+  if (!ts.isIdentifier(e) || declarationOf(e) !== undefined) return undefined
+  const from = importOf(e)
+  if (from === undefined || from.module.startsWith('.')) return e.text
+  return PATH_MODULE.test(from.module) ? from.name : undefined
+}
+
+/** The function a callee names, in its own file or through a relative import. */
+function calledFunction(callee: ts.Expression, pool: ReadonlyMap<string, ts.SourceFile>): Fn | undefined {
+  const e = unwrapped(callee)
+  let decl: ts.Node | undefined
+  if (ts.isIdentifier(e)) decl = bindingOf(e, pool)
+  else if (ts.isPropertyAccessExpression(e) && ts.isIdentifier(e.expression)) {
+    const ns = namespaceOf(e.expression, pool)
+    decl = ns === undefined ? undefined : exportedBinding(ns, e.name.text, pool, 0)
+  }
+  return decl === undefined ? undefined : functionOf(decl)
+}
+
+function functionOf(decl: ts.Node): Fn | undefined {
+  if (ts.isFunctionDeclaration(decl)) return decl.body === undefined ? undefined : decl
+  const init = ts.isVariableDeclaration(decl) ? decl.initializer : ts.isExportAssignment(decl) ? decl.expression : undefined
+  if (init === undefined) return undefined
+  const fn = unwrapped(init)
+  return ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) ? fn : undefined
+}
+
+const SIMPLE_ASSIGN = new Set([ts.SyntaxKind.EqualsToken, ts.SyntaxKind.QuestionQuestionEqualsToken, ts.SyntaxKind.BarBarEqualsToken, ts.SyntaxKind.AmpersandAmpersandEqualsToken])
+const isAssignment = (kind: ts.SyntaxKind): boolean => kind >= ts.SyntaxKind.FirstAssignment && kind <= ts.SyntaxKind.LastAssignment
+
+/** What a variable is given after its declaration; undefined for a write the scan cannot read (`p += …`, `[p] = …`, `for (p of …)`). */
+function assignmentsTo(decl: ts.VariableDeclaration): (ts.Expression | undefined)[] {
+  const out: (ts.Expression | undefined)[] = []
+  for (const ref of referencesTo(decl)) {
+    const use = ref.parent
+    if (ts.isBinaryExpression(use) && use.left === ref && isAssignment(use.operatorToken.kind)) out.push(SIMPLE_ASSIGN.has(use.operatorToken.kind) ? use.right : undefined)
+    else if (((ts.isForOfStatement(use) || ts.isForInStatement(use)) && use.initializer === ref) || isDestructured(ref)) out.push(undefined)
+  }
+  return out
+}
+
+/** Whether an identifier is written by a destructuring assignment: `[p] = …`, `({ p } = …)`. */
+function isDestructured(id: ts.Identifier): boolean {
+  let node: ts.Node = id
+  const pattern = (n: ts.Node): boolean =>
+    ts.isArrayLiteralExpression(n) || ts.isObjectLiteralExpression(n) || ts.isShorthandPropertyAssignment(n) || ts.isPropertyAssignment(n) || ts.isSpreadElement(n) || ts.isSpreadAssignment(n)
+  while (pattern(node.parent)) node = node.parent
+  if (node === id) return false
+  const top = node.parent
+  return (
+    (ts.isBinaryExpression(top) && top.left === node && top.operatorToken.kind === ts.SyntaxKind.EqualsToken) ||
+    ((ts.isForOfStatement(top) || ts.isForInStatement(top)) && top.initializer === node)
+  )
+}
+
+const REFERENCES = new WeakMap<ts.Node, ts.Identifier[]>()
+
+/** The identifiers in a declaration's file that name it, by scope: never a property's name, an import's remote name or a type. Worked out once per declaration. */
+function referencesTo(decl: ts.VariableDeclaration | ts.FunctionDeclaration): ts.Identifier[] {
+  const seen = REFERENCES.get(decl)
+  if (seen !== undefined) return seen
+  const name = decl.name
+  const out: ts.Identifier[] = []
+  if (name !== undefined && ts.isIdentifier(name)) {
+    const visit = (node: ts.Node): void => {
+      if (ts.isTypeNode(node)) return
+      if (ts.isIdentifier(node) && node !== name && node.text === name.text && !isPropertyName(node) && declarationOf(node) === decl) out.push(node)
+      ts.forEachChild(node, visit)
+    }
+    visit(decl.getSourceFile())
+  }
+  REFERENCES.set(decl, out)
+  return out
+}
+
+function isPropertyName(id: ts.Identifier): boolean {
+  const p = id.parent
+  if (ts.isPropertyAccessExpression(p) || ts.isPropertyAssignment(p) || ts.isPropertyDeclaration(p) || ts.isMethodDeclaration(p) || ts.isPropertySignature(p)) return p.name === id
+  if (ts.isGetAccessor(p) || ts.isSetAccessor(p) || ts.isEnumMember(p)) return p.name === id
+  if (ts.isBindingElement(p) || ts.isImportSpecifier(p)) return p.propertyName === id
+  if (ts.isExportSpecifier(p)) return p.propertyName !== undefined && p.name === id
+  return ts.isLabeledStatement(p) || ts.isBreakOrContinueStatement(p)
+}
+
+const isExported = (node: ts.Node): boolean => ts.canHaveModifiers(node) && (ts.getModifiers(node) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword)
+const isDefault = (node: ts.Node): boolean => ts.canHaveModifiers(node) && (ts.getModifiers(node) ?? []).some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)
+
+/** A name's declaration: by scope in its own file, else through a relative import into the pool. */
+function bindingOf(id: ts.Identifier, pool: ReadonlyMap<string, ts.SourceFile>): ts.Node | undefined {
+  return declarationOf(id) ?? importedBinding(id.getSourceFile(), id.text, pool, 0)
+}
+
+/** The pool's module a relative specifier in `from` names. */
+function moduleAt(from: ts.SourceFile, spec: ts.Expression, pool: ReadonlyMap<string, ts.SourceFile>): ts.SourceFile | undefined {
+  if (!ts.isStringLiteral(spec) || !spec.text.startsWith('.')) return undefined
+  return pool.get(posix.normalize(posix.join(posix.dirname(from.fileName), spec.text)).replace(/\.js$/, '.ts'))
+}
+
+/** What a named or default import binds `name` to in `module`, followed into the module it comes from. */
+function importedBinding(module: ts.SourceFile, name: string, pool: ReadonlyMap<string, ts.SourceFile>, hops: number): ts.Node | undefined {
+  for (const st of module.statements) {
+    if (!ts.isImportDeclaration(st)) continue
+    const clause = st.importClause
+    const bindings = clause?.namedBindings
+    const el = bindings !== undefined && ts.isNamedImports(bindings) ? bindings.elements.find((e) => e.name.text === name) : undefined
+    const remote = clause?.name?.text === name ? 'default' : el === undefined ? undefined : (el.propertyName ?? el.name).text
+    if (remote === undefined) continue
+    const from = moduleAt(module, st.moduleSpecifier, pool)
+    return from === undefined ? undefined : exportedBinding(from, remote, pool, hops + 1)
+  }
+  return undefined
+}
+
+/** The pool's module `id` names when it is a namespace import (`import * as paths`). */
+function namespaceOf(id: ts.Identifier, pool: ReadonlyMap<string, ts.SourceFile>): ts.SourceFile | undefined {
+  if (declarationOf(id) !== undefined) return undefined
+  const module = id.getSourceFile()
+  for (const st of module.statements) {
+    if (!ts.isImportDeclaration(st)) continue
+    const bindings = st.importClause?.namedBindings
+    if (bindings !== undefined && ts.isNamespaceImport(bindings) && bindings.name.text === id.text) return moduleAt(module, st.moduleSpecifier, pool)
+  }
+  return undefined
+}
+
+/** A top-level const, let or function named `name` in `st`. */
+function declaredIn(st: ts.Statement, name: string): ts.Node | undefined {
+  if (ts.isVariableStatement(st)) return st.declarationList.declarations.find((d) => ts.isIdentifier(d.name) && d.name.text === name)
+  return ts.isFunctionDeclaration(st) && st.name?.text === name && st.body !== undefined ? st : undefined
+}
+
+/** A module-level name in `module`: its own declaration, or what it imports under that name. */
+function moduleLevel(module: ts.SourceFile, name: string, pool: ReadonlyMap<string, ts.SourceFile>, hops: number): ts.Node | undefined {
+  for (const own of module.statements) {
+    const found = declaredIn(own, name)
+    if (found !== undefined) return found
+  }
+  return importedBinding(module, name, pool, hops + 1)
+}
+
+/** The declaration a module exports as `name` (`default` included): its own, one it re-exports, or one an `export *` passes on. */
+function exportedBinding(module: ts.SourceFile, name: string, pool: ReadonlyMap<string, ts.SourceFile>, hops: number): ts.Node | undefined {
+  if (hops > 8) return undefined
+  for (const st of module.statements) {
+    if (name === 'default') {
+      if (ts.isFunctionDeclaration(st) && isExported(st) && isDefault(st)) return st.body === undefined ? undefined : st
+      if (ts.isExportAssignment(st) && !st.isExportEquals) {
+        const value = unwrapped(st.expression)
+        return ts.isIdentifier(value) ? moduleLevel(module, value.text, pool, hops) : st
+      }
+    }
+    if (!ts.isExportDeclaration(st)) {
+      const own = isExported(st) && !isDefault(st) ? declaredIn(st, name) : undefined
+      if (own !== undefined) return own
+      continue
+    }
+    const from = st.moduleSpecifier === undefined ? undefined : moduleAt(module, st.moduleSpecifier, pool)
+    if (st.exportClause === undefined) {
+      const passed = from === undefined || name === 'default' ? undefined : exportedBinding(from, name, pool, hops + 1)
+      if (passed !== undefined) return passed
+      continue
+    }
+    const el = ts.isNamedExports(st.exportClause) ? st.exportClause.elements.find((e) => e.name.text === name) : undefined
+    if (el === undefined) continue
+    const local = (el.propertyName ?? el.name).text
+    if (st.moduleSpecifier !== undefined) return from === undefined ? undefined : exportedBinding(from, local, pool, hops + 1)
+    return moduleLevel(module, local, pool, hops)
+  }
+  return undefined
+}
+
+/** Every name a module exports: its own, its default, and what it re-exports, `export *` followed. */
+function exportNames(module: ts.SourceFile, pool: ReadonlyMap<string, ts.SourceFile>, hops = 0): string[] {
+  if (hops > 8) return []
+  const out: string[] = []
+  for (const st of module.statements) {
+    if (ts.isExportDeclaration(st)) {
+      const from = st.moduleSpecifier === undefined ? undefined : moduleAt(module, st.moduleSpecifier, pool)
+      if (st.exportClause === undefined) out.push(...(from === undefined ? [] : exportNames(from, pool, hops + 1).filter((n) => n !== 'default')))
+      else if (ts.isNamedExports(st.exportClause)) out.push(...st.exportClause.elements.map((e) => e.name.text))
+    } else if (ts.isExportAssignment(st)) {
+      if (!st.isExportEquals) out.push('default')
+    } else if (isExported(st)) {
+      if (isDefault(st)) out.push('default')
+      else if (ts.isVariableStatement(st)) out.push(...st.declarationList.declarations.flatMap((d) => (ts.isIdentifier(d.name) ? [d.name.text] : [])))
+      else if (ts.isFunctionDeclaration(st) && st.name !== undefined) out.push(st.name.text)
+    }
+  }
+  return out
+}
+
+/** Whether a module-level binding is, holds or returns .env's path: called with arguments the scan cannot see, a function counts by what it returns. */
+function holdsDotenv(decl: ts.Node, pool: ReadonlyMap<string, ts.SourceFile>): boolean {
+  const trace = traceIn(pool)
+  const fn = functionOf(decl)
+  if (fn !== undefined) return verdictOfAll(returnTails(fn, new Map(fn.parameters.map((p): [ts.ParameterDeclaration, undefined] => [p, undefined])), trace)) === 'dotenv'
+  const value = ts.isVariableDeclaration(decl) ? decl.initializer : ts.isExportAssignment(decl) ? decl.expression : undefined
+  const init = value === undefined ? undefined : unwrapped(value)
+  if (init === undefined || !ts.isObjectLiteralExpression(init)) return verdictOfAll(bindingTails(decl, trace)) === 'dotenv'
+  return init.properties.some((prop) => {
+    const key = ts.isSpreadAssignment(prop) ? undefined : propertyKey(prop.name)
+    if (key === undefined) return false
+    const tails = ts.isVariableDeclaration(decl) ? propertyTails(decl, key, trace) : literalProperty(init, key, trace)
+    return verdictOfAll(tails) === 'dotenv'
+  })
+}
+
+/**
+ * Whether a file speaks of .env's path: names it in a string ('.env', or a
+ * path ending /.env, in any case), a template's text (`${root}/.env`) or the
+ * loader's DOTENV_FILE, or imports, from a module the pool holds, a binding
+ * that is, holds or returns it. In such a file a write whose path the scan
+ * cannot follow is taken for a write of .env. Prose that mentions the file
+ * ("which reads .env") is not its path.
+ */
+function speaksOfDotenv(source: ts.SourceFile, pool: ReadonlyMap<string, ts.SourceFile>): boolean {
+  let found = false
+  const visit = (node: ts.Node): void => {
+    if (found) return
+    if (ts.isImportDeclaration(node)) found = importsDotenv(node, source, pool)
+    else if (ts.isStringLiteralLike(node)) {
+      const text = node.text.toLowerCase()
+      found = text === DOTENV || text.endsWith(`/${DOTENV}`)
+    } else if (ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) found = /(?:^|\/)\.env(?![\w.-])/i.test(node.text)
+    else if (ts.isIdentifier(node) && node.text === 'DOTENV_FILE') found = true
+    else ts.forEachChild(node, visit)
+  }
+  visit(source)
+  return found
+}
+
+function importsDotenv(st: ts.ImportDeclaration, source: ts.SourceFile, pool: ReadonlyMap<string, ts.SourceFile>): boolean {
+  const module = moduleAt(source, st.moduleSpecifier, pool)
+  const clause = st.importClause
+  if (module === undefined || clause === undefined) return false
+  const bindings = clause.namedBindings
+  const names = [
+    ...(clause.name === undefined ? [] : ['default']),
+    ...(bindings === undefined
+      ? []
+      : ts.isNamedImports(bindings)
+        ? bindings.elements.map((el) => (el.propertyName ?? el.name).text)
+        : // A namespace brings every export, re-exports included.
+          exportNames(module, pool)),
+  ]
+  return names.some((name) => {
+    const decl = exportedBinding(module, name, pool, 0)
+    return decl !== undefined && holdsDotenv(decl, pool)
+  })
+}
+
+/**
+ * A call that writes, creates, moves, copies, links or deletes a path, or a
+ * write function handed on as a value: what it is reported as, and the paths
+ * it writes as far as the scan can follow them.
+ */
+interface WriteCall {
+  readonly node: ts.Node
+  readonly name: string
+  readonly tails: (trace: Trace) => readonly Tail[]
+}
+
+/** The arguments a call passes its callee: `f.call(self, …)` and `f.apply(self, […])` pass theirs on; undefined when they cannot be lined up. */
+function passedArguments(call: ts.CallExpression, viaCall: 'call' | 'apply' | undefined): readonly ts.Expression[] | undefined {
+  if (viaCall === undefined) return call.arguments
+  if (viaCall === 'call') return call.arguments.slice(1)
+  const list = call.arguments[1]
+  const given = list === undefined ? undefined : unwrapped(list)
+  return given !== undefined && ts.isArrayLiteralExpression(given) ? given.elements : undefined
+}
+
+/** The tails of `args` at `positions`: unseen at a position a spread may fill. */
+function tailsAt(args: readonly ts.Expression[] | undefined, positions: readonly number[], trace: Trace): Tail[] {
+  if (args === undefined) return [UNSEEN]
+  const tails: Tail[] = []
+  for (const i of positions) {
+    const arg = args[i]
+    if (args.slice(0, i + 1).some((a) => ts.isSpreadElement(a))) tails.push(UNSEEN)
+    else if (arg !== undefined) tails.push(...tailsOf(arg, trace))
+  }
+  return tails
+}
+
+const WRITE_CALLS = new WeakMap<ts.SourceFile, WriteCall[]>()
+
+/**
+ * Every write in a file: an fs write call by whatever name it is made
+ * (renamed, aliased, through a module object, `.call`/`.apply`), a
+ * FileHandle's chmod/chown/utimes, an fs write function used as a value
+ * (its path unseen), and, when `across` is set, a call into another module's
+ * function that writes the path a parameter gives it (writeParams).
+ */
+function writeCallsIn(source: ts.SourceFile, pool: ReadonlyMap<string, ts.SourceFile>, across: boolean): WriteCall[] {
+  const cached = across ? WRITE_CALLS.get(source) : undefined
+  if (cached !== undefined) return cached
+  const out: WriteCall[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node) || ts.isTypeNode(node)) return
+    if (ts.isCallExpression(node)) {
+      const write = writeOf(node, source, pool, across)
+      if (write !== undefined) out.push(write)
+    } else if ((ts.isIdentifier(node) && !isPropertyName(node)) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const name = valueUse(node, pool)
+      if (name !== undefined) {
+        out.push({ node, name, tails: () => [UNSEEN] })
+        return
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(source)
+  if (across) WRITE_CALLS.set(source, out)
+  return out
+}
+
+function writeOf(call: ts.CallExpression, source: ts.SourceFile, pool: ReadonlyMap<string, ts.SourceFile>, across: boolean): WriteCall | undefined {
+  let callee = unwrapped(call.expression)
+  let viaCall: 'call' | 'apply' | undefined
+  if (ts.isPropertyAccessExpression(callee) && (callee.name.text === 'call' || callee.name.text === 'apply')) {
+    const target = builtinName(callee.expression, pool)
+    if (target !== undefined && PATH_ARGS.has(target)) {
+      viaCall = callee.name.text
+      callee = unwrapped(callee.expression)
+    }
+  }
+  const args = passedArguments(call, viaCall)
+  const name = builtinName(callee, pool)
+  const positions = name === undefined ? undefined : PATH_ARGS.get(name)
+  if (name !== undefined && positions !== undefined) {
+    if ((name === 'openSync' || name === 'open') && args !== undefined && opensReadOnly(args[1])) return undefined
+    // A FileHandle's chmod(mode): the file is the handle, not the argument.
+    if (HANDLE_WRITES.has(name) && ts.isPropertyAccessExpression(callee) && moduleBinding(callee.expression) === undefined) {
+      const handle = callee.expression
+      return { node: call, name, tails: (trace) => tailsOf(handle, trace) }
+    }
+    return { node: call, name, tails: (trace) => tailsAt(args, positions, trace) }
+  }
+  if (!across) return undefined
+  const fn = calledFunction(callee, pool)
+  if (fn === undefined || fn.getSourceFile() === source) return undefined
+  const through = writeParams(fn, pool)
+  if (through.length === 0) return undefined
+  return { node: call, name: callee.getText(source), tails: (trace) => tailsAt(args, through, trace) }
+}
+
+/** The fs write function `node` is, when it is used as a value rather than called: handed to forEach, bound, exported, stored. */
+function valueUse(node: ts.Expression, pool: ReadonlyMap<string, ts.SourceFile>): string | undefined {
+  const name = fsFunction(node, pool)
+  if (name === undefined || !PATH_ARGS.has(name)) return undefined
+  let at: ts.Node = node
+  while (ts.isParenthesizedExpression(at.parent) || ts.isAsExpression(at.parent) || ts.isNonNullExpression(at.parent) || ts.isSatisfiesExpression(at.parent)) at = at.parent
+  const parent = at.parent
+  // Called: the call is the write.
+  if (ts.isCallExpression(parent) && parent.expression === at) return undefined
+  if (ts.isPropertyAccessExpression(parent) && parent.expression === at && (parent.name.text === 'call' || parent.name.text === 'apply')) {
+    if (ts.isCallExpression(parent.parent) && parent.parent.expression === parent) return undefined
+  }
+  // A declaration's own name; an alias, followed wherever it is used; typeof is not a use.
+  if ((ts.isVariableDeclaration(parent) || ts.isParameter(parent) || ts.isBindingElement(parent) || ts.isFunctionDeclaration(parent)) && parent.name === at) return undefined
+  if (ts.isVariableDeclaration(parent) && parent.initializer === at && ts.isIdentifier(parent.name)) return undefined
+  if (ts.isTypeOfExpression(parent)) return undefined
+  return name
+}
+
+const WRITE_PARAMS = new WeakMap<Fn, readonly number[]>()
+
+/**
+ * The parameters whose value a function writes as a path: those that, taken
+ * to be .env, make a write in its module .env, and taken to be another file,
+ * do not. A function that writes .env whatever it is given (the writer) has
+ * none; its callers hand it no path. One level: a write two modules away is
+ * not followed.
+ */
+function writeParams(fn: Fn, pool: ReadonlyMap<string, ts.SourceFile>): readonly number[] {
+  const seen = WRITE_PARAMS.get(fn)
+  if (seen !== undefined) return seen
+  const writes = writeCallsIn(fn.getSourceFile(), pool, false)
+  const out: number[] = []
+  if (writes.length > 0) {
+    fn.parameters.forEach((p, i) => {
+      if (p.dotDotDotToken !== undefined) return
+      const assume = (probe: Tail): Bound => new Map(fn.parameters.map((q): [ts.ParameterDeclaration, (readonly Tail[])[]] => [q, [q === p ? [probe] : [UNSEEN]]]))
+      const asEnv = assume(known('/.env'))
+      const asOther = assume(known('/other'))
+      const through = writes.some((w) => verdictOfAll(w.tails(traceIn(pool, asEnv))) === 'dotenv' && verdictOfAll(w.tails(traceIn(pool, asOther))) !== 'dotenv')
+      if (through) out.push(i)
+    })
+  }
+  WRITE_PARAMS.set(fn, out)
+  return out
+}
+
+/** Whether a file reads .env's values: a read call whose path is .env, or, in the installer, the loader's own calls. */
+function readsDotenv(source: ts.SourceFile, pool: ReadonlyMap<string, ts.SourceFile>): boolean {
+  const installer = INSTALLER.test(source.fileName)
+  return calls(source).some((call) => {
+    const callee = builtinName(call.expression, pool)
+    if (callee === undefined) return false
+    if (installer && LOADER_READS.has(callee)) return true
+    return READ_CALLS.has(callee) && verdictOfAll(tailsAt(call.arguments, [0], traceIn(pool))) === 'dotenv'
+  })
+}
+
+/** Which of the scan's rules apply: following each path (always), and the two that stand in where a path cannot be followed. */
+interface Rules {
+  /** In a file that reads .env's values, every write counts: a read and a write make a copy. */
+  readonly copy: boolean
+  /** In a file that speaks of .env, a write the scan cannot follow counts. */
+  readonly unseen: boolean
+}
+const ALL_RULES: Rules = { copy: true, unseen: true }
+
+/**
+ * The calls in a file that write, create, move, copy, link or delete .env,
+ * or may, as `callee:line`. A call counts when a path it takes is .env, or
+ * when the scan cannot follow that path and the file speaks of .env; in a
+ * file that reads .env's bytes every such call counts, since a read and a
+ * write make a copy. An open() counts only with flags that can write. A
+ * message that names .env, or a lock file beside one, is not one.
+ */
+function dotenvWrites(source: ts.SourceFile, pool: ReadonlyMap<string, ts.SourceFile>, rules: Rules = ALL_RULES): string[] {
+  const speaks = rules.unseen && speaksOfDotenv(source, pool)
+  const reads = rules.copy && readsDotenv(source, pool)
+  const out: string[] = []
+  for (const write of writeCallsIn(source, pool, true)) {
+    const verdict = reads ? 'dotenv' : verdictOfAll(write.tails(traceIn(pool)))
+    if (verdict === 'dotenv' || (verdict === 'unknown' && speaks)) {
+      out.push(`${write.name}:${String(source.getLineAndCharacterOfPosition(write.node.getStart(source)).line + 1)}`)
+    }
+  }
+  return out
+}
+
+/** src/ and scripts/ as the compiler reads them, by path: the pool the scan follows imports through. */
+const WRITE_POOL: ReadonlyMap<string, ts.SourceFile> = new Map([...SRC, ...SCRIPTS].map((f) => [f.path, parsed(f)]))
+
+test('only src/secrets/dotenv-append.ts opens .env for writing in src/ or scripts/, and only scripts/install.ts, scripts/install/* and their tests import it; the kernel, main, cli and eval never do', () => {
+  // CLAUDE.md: exactly one code path writes <repo>/.env, the installer's.
+  // A second writer, or a kernel that could reach this one, would be a way
+  // to change the operator's keys that no confirmation stands in front of.
+  const WRITER = 'src/secrets/dotenv-append.ts'
+  const writers = [...WRITE_POOL.values()].map((s) => ({ path: s.fileName, writes: dotenvWrites(s, WRITE_POOL) })).filter((f) => f.writes.length > 0)
+  assert.deepEqual(writers.map((f) => f.path), [WRITER])
+  // The writer's write calls: the create, the fchmod through its descriptor,
+  // the append, and the removal of a file it created and then refused. Its
+  // read-only opens are not writes. A new write call here is looked at.
+  const callees = (writes: readonly string[]): string[] => writes.map((w) => w.split(':')[0] ?? '').sort()
+  const WRITES = ['fchmodSync', 'openSync', 'openSync', 'unlinkSync']
+  assert.deepEqual(callees(writers[0]?.writes ?? []), WRITES, JSON.stringify(writers[0]?.writes))
+  // The writer reads .env and speaks of it, so either stand-in rule alone
+  // flags every write in it, followed or not. With both off, each of those
+  // calls must still be found by following its path to .env, through the
+  // writer's own helpers (dotenvPathIn, append, create, appendTo, removeCreated).
+  const writer = WRITE_POOL.get(WRITER)
+  assert.ok(writer !== undefined && readsDotenv(writer, WRITE_POOL) && speaksOfDotenv(writer, WRITE_POOL), 'the scan no longer sees the writer read .env')
+  assert.deepEqual(callees(dotenvWrites(writer, WRITE_POOL, { copy: false, unseen: false })), WRITES, 'the scan no longer follows the writer\'s path to .env')
+
+  // And in src/ the write-mode open flags are the writer's alone.
+  const WRITE_FLAGS = new Set(['O_WRONLY', 'O_RDWR', 'O_CREAT', 'O_APPEND', 'O_TRUNC'])
+  const flagged = SRC.filter((f) => {
+    let found = false
+    const visit = (node: ts.Node): void => {
+      if (ts.isIdentifier(node) && WRITE_FLAGS.has(node.text)) found = true
+      else ts.forEachChild(node, visit)
+    }
+    visit(parsed(f))
+    return found
+  })
+  assert.deepEqual(flagged.map((f) => f.path), [WRITER])
+
+  // Who imports the writer: the installer and its tests, nothing else.
+  const importers = importersOfModule([...SRC, ...TEST, ...SCRIPTS], WRITER)
+  assert.ok(importers.includes('test/dotenv-append.test.ts'), 'the scan no longer sees the writer\'s own test importing it')
+  for (const path of importers) {
+    assert.match(path, /^(?:scripts\/install\.ts|scripts\/install\/[^/]+\.ts|test\/(?:dotenv-append|install-[\w-]+)\.test\.ts)$/, `${path} imports the .env writer`)
+  }
+  // Nor through anything they import, however deep.
+  for (const root of ['src/kernel.ts', 'src/main.ts', 'src/cli/index.ts', 'scripts/eval.ts']) {
+    const reached = reachedFrom([root], [...SRC, ...SCRIPTS])
+    assert.equal(reached.has(WRITER), false, `${root} reaches the .env writer`)
+  }
+  // The walk is real: the daemon reaches the kernel and the loader.
+  const daemon = reachedFrom(['src/main.ts'], [...SRC, ...SCRIPTS])
+  assert.ok(daemon.has('src/kernel.ts') && daemon.has('src/secrets/dotenv.ts'), 'the import walk reaches nothing')
+})
+
+/** The scan over files written out here, by path: a scratch pool of their own. */
+function scanFiles(files: Readonly<Record<string, string>>): Record<string, string[]> {
+  const pool = new Map(Object.entries(files).map(([path, text]) => [path, ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)]))
+  return Object.fromEntries([...pool].map(([path, source]) => [path, dotenvWrites(source, pool)]))
+}
+const scanOne = (text: string, path = 'scripts/install.ts'): string[] => scanFiles({ [path]: text })[path] ?? []
+
+test('the .env write scan follows a path through a const, a parameter and a helper\'s return, and passes a lock file beside a message that names .env', () => {
+  // The rule above is only as good as this: the plan's installer entry point
+  // takes a lock with O_EXCL and reports the .env path, and must pass; a
+  // second writer must not, however its path is spelled or passed around.
+  const entryPoint = [
+    "import { closeSync, openSync, writeSync } from 'node:fs'",
+    "import { join } from 'node:path'",
+    'export function main(root: string): string {',
+    "  const lock = openSync(join(root, '.aos', 'install.lock'), 'wx')",
+    '  writeSync(lock, String(process.pid))',
+    '  closeSync(lock)',
+    "  return `${join(root, '.env')}: names appended`",
+    '}',
+  ].join('\n')
+  assert.deepEqual(scanOne(entryPoint), [])
+  // Reading it is not writing it.
+  assert.deepEqual(scanOne("openSync(join(root, '.env'), constants.O_RDONLY | constants.O_NOFOLLOW); readFileSync(join(root, DOTENV_FILE))"), [])
+
+  const secondWriters = [
+    "writeFileSync(join(root, '.env'), 'x')",
+    "const p = join(root, DOTENV_FILE); appendFileSync(p, 'x')",
+    "let p = ''; p = resolve(root, '.env'); createWriteStream(p)",
+    'openSync(`${root}/.env`, constants.O_WRONLY | constants.O_APPEND)',
+    "openSync(join(root, '.env'), flags)",
+    "function put(file: string): void { writeFileSync(file, 'x') }\nput(join(root, '.env'))",
+    "const envAt = (r: string): string => join(r, '.env')\nfs.openSync(envAt(root), 'a')",
+    'function envAt(r: string): string { return join(r, DOTENV_FILE) }\nrenameSync(tmp, envAt(root))',
+    "for (const f of [join(root, '.env')]) unlinkSync(f)",
+  ]
+  for (const text of secondWriters) assert.equal(scanOne(text).length, 1, text)
+})
+
+test('the .env write scan passes the installer\'s lock, logs and state file beside a message that names .env: through a paths object, a path helper and a paths module', () => {
+  // A7 holds .aos/install.lock (O_EXCL plus pid, a stale one taken over); A3
+  // writes each step's output to a 0600 file under .aos/install/<stamp>/ and
+  // its state to .aos/install/active.json. In a file that speaks of .env every
+  // write must be one the scan can follow, so these are the shapes it follows.
+  const pathsObject = [
+    "import { closeSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'",
+    "import { join } from 'node:path'",
+    'export function main(root: string): string {',
+    "  const paths = { env: join(root, '.env'), lock: join(root, '.aos', 'install.lock') }",
+    '  type Paths = typeof paths',
+    '  let lock: number',
+    "  try { lock = openSync(paths.lock, 'wx') } catch {",
+    "    if (alive(Number(readFileSync(paths.lock, 'utf8')))) throw new Error('another install is running')",
+    '    unlinkSync(paths.lock)',
+    "    lock = openSync(paths.lock, 'wx')",
+    '  }',
+    '  // A descriptor is the file it opened.',
+    '  writeFileSync(lock, String(process.pid))',
+    '  closeSync(lock)',
+    '  unlinkSync(paths.lock)',
+    '  return `${paths.env}: names appended`',
+    '}',
+  ].join('\n')
+  assert.deepEqual(scanOne(pathsObject), [])
+
+  const pathHelper = [
+    "import { closeSync, openSync, writeSync } from 'node:fs'",
+    "import { join } from 'node:path'",
+    'export function main(root: string): string {',
+    '  const at = (...parts: string[]): string => join(root, ...parts)',
+    "  const lock = openSync(at('.aos', 'install.lock'), 'wx')",
+    '  writeSync(lock, String(process.pid))',
+    '  closeSync(lock)',
+    "  return `${at('.env')}: names appended`",
+    '}',
+  ].join('\n')
+  assert.deepEqual(scanOne(pathHelper), [])
+
+  const logs = [
+    "import { appendFileSync, mkdirSync, openSync, renameSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs'",
+    "import { join } from 'node:path'",
+    'export function logTo(root: string, step: string): number {',
+    "  const stamp = new Date().toISOString().replace(/[:.]/g, '-')",
+    "  const dir = join(root, '.aos', 'install', stamp)",
+    '  mkdirSync(dir, { recursive: true, mode: 0o700 })',
+    '  const log = join(dir, `${step}.log`)',
+    "  const fd = openSync(log, 'wx', 0o600)",
+    "  appendFileSync(log, `appending to ${join(root, '.env')}\\n`)",
+    '  truncateSync(log)',
+    "  const active = join(root, '.aos', 'install', 'active.json')",
+    '  writeFileSync(`${active}.tmp`, JSON.stringify({ step, pid: process.pid }), { mode: 0o600 })',
+    '  renameSync(`${active}.tmp`, active)',
+    "  for (const old of [join(dir, 'stdout.log'), join(dir, 'stderr.log')]) unlinkSync(old)",
+    '  return fd',
+    '}',
+  ].join('\n')
+  assert.deepEqual(scanOne(logs, 'scripts/install/run.ts'), [])
+
+  // A paths module: its helpers are followed into, so the lock beside the
+  // message passes, and the module itself, which writes nothing, does too.
+  const paths = [
+    "import { join } from 'node:path'",
+    "export const envPath = (root: string): string => join(root, '.env')",
+    "export function lockPath(root: string): string { return join(root, '.aos', 'install.lock') }",
+    "export const installDir = (root: string): string => join(root, '.aos', 'install')",
+    "export const LOCK_NAME = 'install.lock'",
+    "export const files = { env: join(process.cwd(), '.env') }",
+  ].join('\n')
+  const entry = [
+    "import { openSync, writeFileSync, writeSync } from 'node:fs'",
+    "import { join } from 'node:path'",
+    "import { envPath, installDir, lockPath } from './install/paths.js'",
+    'export function main(root: string): string {',
+    "  const lock = openSync(lockPath(root), 'wx')",
+    '  writeSync(lock, String(process.pid))',
+    "  writeFileSync(join(installDir(root), 'active.json'), '{}')",
+    '  return `${envPath(root)}: names appended`',
+    '}',
+  ].join('\n')
+  assert.deepEqual(scanFiles({ 'scripts/install/paths.ts': paths, 'scripts/install.ts': entry }), { 'scripts/install/paths.ts': [], 'scripts/install.ts': [] })
+  const asNamespace = [
+    "import { openSync } from 'node:fs'",
+    "import { join } from 'node:path'",
+    "import * as paths from './install/paths.js'",
+    'export function main(root: string): string {',
+    "  openSync(paths.lockPath(root), 'wx')",
+    "  openSync(join(root, '.aos', paths.LOCK_NAME), 'wx')",
+    '  return `${paths.envPath(root)}: names appended`',
+    '}',
+  ].join('\n')
+  assert.deepEqual(scanFiles({ 'scripts/install/paths.ts': paths, 'scripts/install.ts': asNamespace })['scripts/install.ts'], [])
+
+  // A write helper of its own, followed to each call: the paths it is given
+  // are what it writes. `process.stdout.write` is a property, not a call of it.
+  const helpers = [
+    "import { appendFileSync, writeFileSync } from 'node:fs'",
+    "import { join } from 'node:path'",
+    'export function record(root: string): void {',
+    '  function write(file: string, text: string): void { writeFileSync(file, text) }',
+    '  const append = (file: string, text: string): void => appendFileSync(file, text)',
+    "  write(join(root, '.aos', 'install', 'active.json'), '{}')",
+    "  append(join(root, '.aos', 'install', 'run.log'), `checked ${join(root, '.env')}\\n`)",
+    "  process.stdout.write('done\\n')",
+    '}',
+  ].join('\n')
+  assert.deepEqual(scanOne(helpers, 'scripts/install/run.ts'), [])
+  // A file whose name only ends in .env is another file: pmmcp's beside the lock.
+  assert.deepEqual(scanOne("const base = join(root, '.aos', 'pmmcp')\nwriteFileSync(base + '.env', 'x')\nconsole.log(join(root, '.env'))"), [])
+
+  // A path given on the command line is the operator's (eval's --json): in
+  // a file whose prose mentions .env but which never builds its path, it is
+  // not taken for one. The scan cannot see what the operator will type, so
+  // that limit is held by the programs themselves: eval and capture-pmmcp
+  // refuse a path that names this checkout's .env however it is spelled
+  // (namesRepoDotenv; entrypoints.test.ts runs both against the trap).
+  assert.deepEqual(scanOne("writeFileSync(flag(argv, 'json'), report)\nprocess.stderr.write('export it, or run npm run eval, which reads .env\\n')", 'scripts/eval.ts'), [])
+
+  // A7's stale-lock takeover and A3's stamped logs: a pid or a clock holds no
+  // '/', so the segment it ends keeps the start the scan saw, which .env lacks.
+  // And a lock helper's { fd, path }, followed into the object it returns.
+  const speaking = "\nconsole.log(`${join(root, '.env')}: names appended`)"
+  const locks = [
+    "const lock = join(root, '.aos', 'install.lock')\nconst tmp = `${lock}.${process.pid}`\nwriteFileSync(tmp, String(process.pid), { flag: 'wx' })\nrenameSync(tmp, lock)",
+    "const lock = join(root, '.aos', 'install.lock')\nwriteFileSync(lock + '.' + String(process.pid), 'x')",
+    "function takeLock(root: string): { fd: number; path: string } {\n  const path = join(root, '.aos', 'install.lock')\n  const fd = openSync(path, 'wx')\n  return { fd, path }\n}\nconst lock = takeLock(root)\nwriteSync(lock.fd, String(process.pid))\ncloseSync(lock.fd)\nunlinkSync(lock.path)",
+    "const stamp = new Date().toISOString().replace(/[:.]/g, '-')\nwriteFileSync(join(root, '.aos', 'install', `${stamp}.json`), '{}')\nwriteFileSync(`${join(root, '.aos', 'install', 'run')}-${stamp}-${Date.now()}`, '{}')",
+    // The fs functions under other names, and a FileHandle's chmod: each followed to its path.
+    "import { writeFileSync as put } from 'node:fs'\nput(join(root, '.aos', 'install.lock'), String(process.pid))",
+    "import { promises } from 'node:fs'\nconst fsp = promises\nconst h = await fsp.open(join(root, '.aos', 'install.lock'), 'r')\nawait h.chmod(0o600)",
+    "import fs from 'node:fs'\nconst rm = fs.rmSync\nrm(join(root, '.aos', 'install', 'old'), { recursive: true })\nfs['writeFileSync'].call(null, join(root, '.aos', 'install.lock'), 'x')",
+    "import { writeFileSync } from 'node:fs'\nwriteFileSync.apply(null, [join(root, '.aos', 'install.lock'), String(process.pid)])",
+    // An await, and a spread of known segments, are followed.
+    "async function lockPath(r: string): Promise<string> { return join(r, '.aos', 'install.lock') }\nwriteFileSync(await lockPath(root), String(process.pid))",
+    "writeFileSync(join(root, ...['.aos', 'install.lock']), String(process.pid))",
+    // path's own join, called on the module as the examples here write it; a numbered or radix-36 suffix.
+    "writeFileSync(path.join(root, '.aos', 'install.lock'), String(process.pid))",
+    "const lock = join(root, '.aos', 'install.lock')\nwriteFileSync(lock + '.' + 1, 'x')\nwriteFileSync(`${lock}.${Date.now().toString(36)}`, 'x')",
+  ]
+  for (const text of locks) assert.deepEqual(scanOne(`${text}${speaking}`), [], text)
+  // .envrc and .env.example are other files: naming them is not speaking of .env.
+  assert.deepEqual(scanOne("writeFileSync(target, 'x')\nconsole.log(`${home}/.envrc`, join(root, '.env.example'))"), [])
+  // An fs function handed on as a value writes a path the scan cannot see:
+  // only in a file that speaks of .env is that taken for a write of it.
+  assert.deepEqual(scanOne("import { unlinkSync } from 'node:fs'\n;[join(root, '.aos', 'a.log')].forEach(unlinkSync)"), [])
+  // A helper in another module, called with a path under .aos, writes that path.
+  const io = "import { writeFileSync } from 'node:fs'\nexport function put(file: string, text: string): void { writeFileSync(file, text) }"
+  const record = `import { put } from './io.js'\nexport function record(root: string): void {\n  put(join(root, '.aos', 'install', 'active.json'), '{}')${speaking}\n}`
+  assert.deepEqual(scanFiles({ 'scripts/install/io.ts': io, 'scripts/install/run.ts': record }), { 'scripts/install/io.ts': [], 'scripts/install/run.ts': [] })
+  // The installer's own calls into the writer, which writes .env whatever it
+  // is handed: they pass no path, so they are not a second writer.
+  const writer = WRITE_POOL.get('src/secrets/dotenv-append.ts')?.text ?? ''
+  assert.ok(writer.includes('export function appendCredentials('), 'the writer moved')
+  const installer = [
+    "import { appendCredentials, inspectCredentials } from '../src/secrets/dotenv-append.js'",
+    'export function credentials(root: string, accepted: ReadonlySet<string>): void {',
+    "  const seen = inspectCredentials({ repoRoot: root, accepted, names: ['AOS_CONTROL_TOKEN'] })",
+    "  if (seen.missing.length > 0) appendCredentials({ repoRoot: root, accepted, generate: new Map([['AOS_CONTROL_TOKEN', () => 'x']]) })",
+    "  console.log(`${join(root, '.env')}: ${seen.missing.join(', ')}`)",
+    '}',
+  ].join('\n')
+  assert.deepEqual(scanFiles({ 'src/secrets/dotenv-append.ts': writer, 'scripts/install.ts': installer })['scripts/install.ts'], [])
+  // The loader read as a read of .env is the installer's rule only: eval and
+  // the daemon read it and write other files by design.
+  const loaded = "const got = loadDotenv(join(root, DOTENV_FILE), opts)\nwriteFileSync(join(root, '.aos', 'install', 'state.json'), JSON.stringify(Object.keys(got.values)))"
+  assert.deepEqual(scanOne(loaded, 'scripts/report.ts'), [])
+})
+
+test('the .env write scan works out a path built from itself once per binding, and past its step budget calls a path unseen rather than stall', () => {
+  // `p = join(p, …)` k times was followed into every order of the k
+  // assignments: k! walks, so nine of them in a 300-function file took
+  // minutes, and npm test with it. Each node is now worked out once per
+  // binding, and any path that would take more than MAX_STEPS nodes is
+  // unseen: flagged in a file that speaks of .env, like any path the scan
+  // cannot follow.
+  const chain = (k: number, segment: (i: number) => string): string =>
+    ["let p = join(root, '.aos')", ...Array.from({ length: k }, (_, i) => `if (c${String(i)}) p = join(p, '${segment(i)}')`), "writeFileSync(p, 'x')"].join('\n')
+  const functions = Array.from({ length: 300 }, (_, i) => `export function g${String(i)}(a: string): string { const b = join(a, 'x${String(i)}'); return b }`).join('\n')
+  const started = Date.now()
+  assert.deepEqual(scanOne(`${functions}\n${chain(9, (i) => `d${String(i)}`)}`), [])
+  // Once each node, it is a fraction of a second; every order of nine, minutes.
+  assert.ok(Date.now() - started < 10_000, `the scan took ${String(Date.now() - started)} ms over a self-built path`)
+  // Worked out, not given up on: every value it can hold ends in .aos or x,
+  // so in a file that speaks of .env it still passes. Walked in every order,
+  // six of them run past the step budget and the path would be unseen.
+  assert.deepEqual(scanOne(`${chain(6, () => 'x')}\nconsole.log(join(root, '.env'))`), [])
+  // A path no binding repeats, past the budget: f14 calls f13 twice, each
+  // call its own binding, 2^14 of them. Unseen, so flagged here, though every
+  // value it could hold is a file under .aos.
+  const doubling = [
+    'const f0 = (x: string): string => x',
+    ...Array.from({ length: 14 }, (_, i) => `const f${String(i + 1)} = (x: string): string => f${String(i)}(x) + f${String(i)}(x)`),
+    "writeFileSync(join(root, '.aos', f14('a')), 'x')",
+    "console.log(join(root, '.env'))",
+  ].join('\n')
+  assert.equal(scanOne(doubling).length, 1)
+  // And without .env spoken of, an unseen path is not a write of it.
+  assert.deepEqual(scanOne(doubling.replace("console.log(join(root, '.env'))", '')), [])
+})
+
+test('the .env write scan flags a second writer however its path arrives: a copy, link or move from .env, a field, a method, a property, an import, a read and a write, an fs function under another name, a helper in another module, any case, and a path it cannot follow in a file that speaks of .env', () => {
+  const at = 'scripts/install/env.ts'
+  const secondWriters = [
+    // From .env: the source of a copy, a link or a move.
+    "copyFileSync(join(root, '.env'), join(root, '.aos', 'env.bak'))",
+    "await copyFile(join(root, DOTENV_FILE), join(root, '.aos', 'env.bak'))",
+    "await fs.promises.cp(join(root, '.env'), backup)",
+    "linkSync(join(root, '.env'), join(root, '.aos', 'env'))",
+    "symlink(join(root, '.env'), join(root, '.aos', 'env'), () => undefined)",
+    "renameSync(join(root, '.env'), join(root, '.aos', 'env.old'))",
+    // A class field, an object-literal method, a property write.
+    "export class Env {\n  private readonly file: string\n  constructor(root: string) { this.file = join(root, '.env') }\n  put(text: string): void { writeFileSync(this.file, text) }\n}",
+    "const io = { put: (file: string, text: string): void => writeFileSync(file, text) }\nexport function restore(root: string, text: string): void { io.put(join(root, '.env'), text) }",
+    "export function restore(root: string, text: string): void {\n  const where: { env?: string } = {}\n  where.env = join(root, '.env')\n  writeFileSync(where.env, text)\n}",
+    // Its bytes read, and any file written: a copy by hand.
+    "writeFileSync(join(root, '.aos', 'env.bak'), readFileSync(join(root, '.env')))",
+    "createReadStream(join(root, DOTENV_FILE)).pipe(createWriteStream(join(root, '.aos', 'env.bak')))",
+    // A path the scan cannot follow, in a file that speaks of .env.
+    "const target = process.argv[2] ?? ''\nwriteFileSync(target, 'x')\nconsole.log(`left ${join(root, '.env')} alone`)",
+    "rmSync(root, { recursive: true, force: true })\nconsole.log(`${root}/.env is gone`)",
+    "const paths = { env: join(root, '.env') }\nwriteFileSync(paths['env'], 'x')",
+    "const { env } = { env: join(root, '.env') }\nwriteFileSync(env, 'x')",
+    "export class Env {\n  file = join(root, DOTENV_FILE)\n  put(text: string): void { writeFileSync(this.file, text) }\n}",
+    "openSync(`${base}.env`, 'w')",
+    "rmSync(`${root}.old/..`, { recursive: true, force: true })\nconst env = join(root, '.env')",
+    "writeFileSync([root, '.env'].join('/'), 'x')",
+    // path.join reads `..` as the filesystem would.
+    "writeFileSync(join(root, '.env', 'old', '..'), 'x')",
+    // A helper a caller the scan cannot see may call: exported, or handed on as a value.
+    "export function put(file: string, text: string): void { writeFileSync(file, text) }\nexport const envFile = join(root, '.env')",
+    "function put(file: string): void { writeFileSync(file, 'x') }\n[join(root, '.env')].forEach(put)",
+    // A value given where the scan cannot read it.
+    "let p = join(root, '.aos', 'x')\n;[p] = [join(root, '.env')]\nwriteFileSync(p, 'x')",
+    "let p = join(root, '.aos')\np += '/../.env'\nwriteFileSync(p, 'x')",
+    "const paths = { lock: join(root, '.aos', 'install.lock') }\nObject.assign(paths, { lock: join(root, '.env') })\nwriteFileSync(paths.lock, 'x')",
+    // More values than the scan carries, and a path built from itself.
+    "for (const f of ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', join(root, '.env')]) unlinkSync(f)",
+    "let p = join(root, '.aos', 'x')\np = `${p}/../../.env`\nwriteFileSync(p, 'x')",
+    // A default, both branches of a choice, the comma operator, `.` as a segment.
+    "const envAt = (r = join(root, '.env')): string => r\nwriteFileSync(envAt(), 'x')",
+    "function put(file = join(root, '.env')): void { writeFileSync(file, 'x') }\nput()",
+    "writeFileSync(dry ? join(root, '.aos', 'plan.txt') : join(root, '.env'), 'x')",
+    "writeFileSync((0, join(root, '.env')), 'x')",
+    "writeFileSync(join(root, '.env', '.'), 'x')",
+    // A spread, a getter, a loop over objects or keys, a spread in a loop or a call.
+    "const base = { env: join(root, '.env') }\nconst paths = { ...base, lock: join(root, '.aos', 'install.lock') }\nwriteFileSync(paths.env, 'x')",
+    "const paths = { get env(): string { return join(root, '.env') } }\nwriteFileSync(paths.env, 'x')",
+    "for (const o of [{ p: join(root, '.env') }]) writeFileSync(o.p, 'x')",
+    "for (const f in { [join(root, '.env')]: 1 }) unlinkSync(f)",
+    "const extra = [join(root, '.env')]\nfor (const f of [...extra, join(root, '.aos', 'install.lock')]) rmSync(f, { force: true })",
+    "function put(file: string): void { writeFileSync(file, 'x') }\nconst targets = [join(root, '.env')]\nput(...targets)",
+    // A compound write to a property, and a rest parameter used whole.
+    "const p = { f: join(root, '.e') }\np.f += 'nv'\nwriteFileSync(p.f, 'x')\nconsole.log(join(root, '.env'))",
+    "function put(...files: string[]): void { writeFileSync(`${files}`, 'x') }\nput(join(root, '.aos', 'a'), join(root, '.env'))",
+    "const at = (...parts: string[]): string => `${parts}`\nwriteFileSync(at(join(root, '.aos', 'a'), join(root, '.env')), 'x')",
+    // The fs function under another name, handed on as a value, called through call/apply/bind.
+    "import { writeFileSync as put } from 'node:fs'\nput(join(root, '.env'), 'x')",
+    "import { writeFileSync } from 'node:fs'\nconst put = writeFileSync\nput(join(root, '.env'), 'x')",
+    "import * as fs from 'node:fs'\nconst put = fs.writeFileSync\nput(join(root, '.env'), 'x')",
+    "import { unlinkSync } from 'node:fs'\n;[join(root, '.env')].forEach(unlinkSync)",
+    "import * as fs from 'node:fs'\n;[join(root, '.env')].forEach(fs['unlinkSync'])",
+    "import fs from 'node:fs'\nawait Promise.all([join(root, '.env')].map(fs.promises.unlink))",
+    "import fs from 'node:fs'\nfs['writeFileSync'](join(root, '.env'), 'x')",
+    "import { writeFileSync } from 'node:fs'\nwriteFileSync.call(null, join(root, '.env'), 'x')",
+    "import { writeFileSync } from 'node:fs'\nwriteFileSync.apply(null, [join(root, '.env'), 'x'])",
+    "import { writeFileSync } from 'node:fs'\nconst put = writeFileSync.bind(null, join(root, '.env'))\nput('x')",
+    // Its mode, owner or times: through a descriptor opened only to read, a link's own, a FileHandle's.
+    "import { fchmodSync, openSync } from 'node:fs'\nfchmodSync(openSync(join(root, '.env'), 'r'), 0o644)",
+    "import { lchmodSync } from 'node:fs'\nlchmodSync(join(root, '.env'), 0o644)",
+    "import { lutimesSync } from 'node:fs'\nlutimesSync(join(root, DOTENV_FILE), 0, 0)",
+    "import { open } from 'node:fs/promises'\nconst h = await open(join(root, '.env'), 'r')\nawait h.chmod(0o644)",
+    // Any case: on APFS, .ENV is the operator's .env.
+    "writeFileSync(join(root, '.ENV'), 'x')",
+    "copyFileSync(join(root, '.Env'), backup)",
+    "writeFileSync(target, 'x')\nconsole.log(join(root, '.ENV'))",
+    "writeFileSync(target, 'x')\nconsole.log(`${root}/.ENV`)",
+    "writeFileSync(`${root}/.E${'v'.replace('v', 'NV')}`, 'x')\nconsole.log(join(root, '.env'))",
+    // A part the scan cannot see may hold a '/': the start it saw before it is no guide.
+    "export function stage(root: string, suffix: string): void {\n  writeFileSync(`${join(root, '.aos', 'install.lock')}.${suffix}`, 'x')\n  console.log(join(root, '.env'))\n}",
+    "export function stage(root: string, suffix: string): void {\n  writeFileSync(join(root, '.aos', 'install.lock') + '.' + suffix, 'x')\n  console.log(join(root, '.env'))\n}",
+    "export function stage(root: string, name: string): void {\n  writeFileSync(`${join(root, '.aos', 'x')}.${name.replace(':', '-')}`, 'x')\n  console.log(join(root, '.env'))\n}",
+    "writeFileSync(`${join(root, '.aos', 'x')}.${'v'.replace('v', '/../../.env')}`, 'x')",
+    // A segment with no '/' in it, after a '/' the scan saw: what came before that '/' is not its start.
+    "writeFileSync(join(root, 'abc') + `/${'v'.replace('v', '.env')}`, 'x')",
+    // `..` as the last segment makes the one before it last.
+    "export function stage(root: string, x: string): void {\n  writeFileSync(`${x}..`, 'x')\n  console.log(join(root, '.env'))\n}",
+  ]
+  for (const text of secondWriters) assert.equal(scanOne(text, at).length, 1, text)
+
+  // In the installer, the loader's own reads are reads of .env: a write
+  // beside one can carry its values out, as the plan's "no backup copy" forbids.
+  for (const [path, text] of [
+    ['scripts/install/state.ts', "const got = loadDotenv(join(root, DOTENV_FILE), opts)\nwriteFileSync(join(root, '.aos', 'install', 'state.json'), JSON.stringify(got.values))"],
+    ['scripts/install.ts', "import { oneCredential } from '../src/secrets/dotenv.js'\nconst token = oneCredential('AOS_PMMCP_TOKEN', path, opts)\nwriteFileSync(join(root, '.aos', 'install', 'digest'), digestOf(token))"],
+  ] as const) {
+    assert.equal(scanOne(text, path).length, 1, text)
+  }
+
+  // Through an import, into a module that writes nothing and spells .env
+  // where the writer does not: a helper, a field, a re-export, a namespace.
+  const paths = [
+    "import { join } from 'node:path'",
+    "export const envPath = (root: string): string => join(root, '.env')",
+    "export const files = { env: join(process.cwd(), '.env') }",
+  ].join('\n')
+  const viaImport = [
+    "import { envPath } from './paths.js'\nexport function restore(root: string, text: string): void { writeFileSync(envPath(root), text) }",
+    "import { envPath } from './paths.js'\nexport class Env {\n  private readonly file: string\n  constructor(root: string) { this.file = envPath(root) }\n  put(text: string): void { writeFileSync(this.file, text) }\n}",
+    "import { dotenvAt } from './index.js'\nexport function restore(root: string, text: string): void { writeFileSync(dotenvAt(root), text) }",
+    "import * as where from './paths.js'\nexport function restore(root: string, text: string): void { writeFileSync(where.envPath(root), text) }",
+    "import { files } from './paths.js'\nexport class Env {\n  target = files.env\n  put(text: string): void { writeFileSync(this.target, text) }\n}",
+    "import * as where from './paths.js'\nexport class Env {\n  target = where.envPath(process.cwd())\n  put(text: string): void { writeFileSync(this.target, text) }\n}",
+  ]
+  for (const text of viaImport) {
+    const found = scanFiles({ 'scripts/install/paths.ts': paths, 'scripts/install/index.ts': "export { envPath as dotenvAt } from './paths.js'", [at]: text })
+    assert.deepEqual(found['scripts/install/paths.ts'], [], text)
+    assert.deepEqual(found['scripts/install/index.ts'], [], text)
+    assert.deepEqual(found[at]?.map((w) => w.split(':')[0]), ['writeFileSync'], text)
+  }
+
+  // A default export, and a namespace of a barrel that only re-exports.
+  const envClass = (file: string): string => `export class Env {\n  file = ${file}\n  put(t: string): void { writeFileSync(this.file, t) }\n}`
+  const restore = "import envAt from './paths.js'\nexport function restore(root: string, t: string): void { writeFileSync(envAt(root), t) }"
+  const viaModules: [Record<string, string>, string][] = [
+    [{ 'scripts/install/paths.ts': "import { join } from 'node:path'\nexport default function (root: string): string { return join(root, '.env') }" }, restore],
+    [{ 'scripts/install/paths.ts': "import { join } from 'node:path'\nexport default (root: string): string => join(root, '.env')" }, restore],
+    [{ 'scripts/install/paths.ts': "import { join } from 'node:path'\nconst envPath = (root: string): string => join(root, '.env')\nexport default envPath" }, `import envAt from './paths.js'\n${envClass('envAt(process.cwd())')}`],
+    [{ 'scripts/install/paths.ts': paths, 'scripts/install/index.ts': "export { envPath } from './paths.js'" }, `import * as where from './index.js'\n${envClass('where.envPath(process.cwd())')}`],
+    [{ 'scripts/install/paths.ts': paths, 'scripts/install/index.ts': "export * from './paths.js'" }, `import * as where from './index.js'\n${envClass('where.envPath(process.cwd())')}`],
+  ]
+  for (const [modules, text] of viaModules) {
+    const found = scanFiles({ ...modules, [at]: text })
+    for (const path of Object.keys(modules)) assert.deepEqual(found[path], [], `${path} for ${text}`)
+    assert.deepEqual(found[at]?.map((w) => w.split(':')[0]), ['writeFileSync'], text)
+  }
+
+  // A write helper in a module that never names .env, handed .env's path:
+  // the call is the write, by name, default or namespace, directly or
+  // through a helper of its own; and in a file that speaks of .env, handed a
+  // path the scan cannot follow.
+  const io = "import { writeFileSync } from 'node:fs'\nexport function put(file: string, text: string): void { writeFileSync(file, text) }"
+  const viaHelper: [string, string, string][] = [
+    [io, "import { put } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { put(envPath(root), t) }", 'put'],
+    [
+      "import { writeFileSync } from 'node:fs'\nfunction write(file: string, text: string): void { writeFileSync(file, text) }\nexport function put(file: string, text: string): void { write(file, text) }",
+      "import * as io from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { io.put(envPath(root), t) }",
+      'io.put',
+    ],
+    ["import { writeFileSync } from 'node:fs'\nexport default function (file: string, text: string): void { writeFileSync(file, text) }", "import put from './io.js'\nexport function restore(root: string, t: string): void { put(join(root, '.env'), t) }", 'put'],
+    [io, "import { put } from './io.js'\nexport class Env {\n  target = join(process.cwd(), '.env')\n  save(t: string): void { put(this.target, t) }\n}", 'put'],
+    // A spread fills the position the helper writes: what lands there is unseen.
+    [
+      "import { writeFileSync } from 'node:fs'\nexport function put(text: string, file: string): void { writeFileSync(file, text) }",
+      "import { put } from './io.js'\nexport function restore(root: string): void { put(...['x', join(root, '.env')]) }",
+      'put',
+    ],
+  ]
+  for (const [helper, text, callee] of viaHelper) {
+    const found = scanFiles({ 'scripts/install/paths.ts': paths, 'scripts/install/io.ts': helper, [at]: text })
+    assert.deepEqual(found['scripts/install/io.ts'], [], text)
+    assert.deepEqual(found[at]?.map((w) => w.split(':')[0]), [callee], text)
+  }
+})
+
+test('a test calls appendCredentials and inspectCredentials only through appendIn and inspectIn helpers that refuse any repository but a scratch directory', () => {
+  // The writer's tests are the one place an offline test writes a .env, and
+  // its inspection reads the one it is handed. Each call must go through a
+  // helper that first proves its root is a temp directory and not this
+  // checkout, which on the operator's Mac holds the real <repo>/.env. The
+  // writer comes in one way, under its own names: one static import that
+  // names each as itself. A rename, a namespace or default import, a
+  // re-export, import() or a path spelled in a string would put it under a
+  // name the call check below does not follow.
+  const WRITER_SPEC = /(?:^|\/)dotenv-append(?:\.[cm]?[jt]s)?$/
+  const HELPERS = new Map([
+    ['appendCredentials', 'appendIn'],
+    ['inspectCredentials', 'inspectIn'],
+  ])
+  const INERT = new Set(['CREATED_HEADER', 'MIN_GENERATED_LENGTH', 'DotenvWriteError'])
+  const viaHelper = new Map<string, number>()
+  let imports = 0
+  for (const file of TEST) {
+    const source = parsed(file)
+    const at = (node: ts.Node): string => `${file.path}:${String(source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1)}`
+    const visit = (node: ts.Node): void => {
+      if (ts.isImportDeclaration(node)) {
+        if (ts.isStringLiteral(node.moduleSpecifier) && WRITER_SPEC.test(node.moduleSpecifier.text)) {
+          const clause = node.importClause
+          assert.equal(clause?.name, undefined, `${at(node)} default-imports the .env writer`)
+          const bindings = clause?.namedBindings
+          assert.ok(bindings === undefined || ts.isNamedImports(bindings), `${at(node)} imports the .env writer as a namespace`)
+          for (const el of bindings !== undefined && ts.isNamedImports(bindings) ? bindings.elements : []) {
+            assert.equal(el.propertyName, undefined, `${at(el)} imports ${(el.propertyName ?? el.name).text} from the .env writer as ${el.name.text}`)
+            // A function of the writer's that opens .env has a helper here; a constant, a type or its error class does not open anything.
+            assert.ok(el.isTypeOnly || clause?.isTypeOnly === true || HELPERS.has(el.name.text) || INERT.has(el.name.text), `${at(el)} imports ${el.name.text} from the .env writer, which this rule holds to no helper`)
+          }
+          imports += 1
+        }
+        return
+      }
+      if (ts.isExportDeclaration(node) && node.moduleSpecifier !== undefined && ts.isStringLiteral(node.moduleSpecifier)) {
+        assert.equal(WRITER_SPEC.test(node.moduleSpecifier.text), false, `${at(node)} re-exports the .env writer`)
+        return
+      }
+      if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        const spec = node.arguments[0]
+        assert.ok(spec !== undefined && ts.isStringLiteralLike(spec), `${at(node)} imports a module this rule cannot name`)
+      }
+      if (ts.isStringLiteralLike(node) && /dotenv-append/.test(node.text)) assert.fail(`${at(node)} names the .env writer's module in a string`)
+      const helper = ts.isIdentifier(node) ? HELPERS.get(node.text) : undefined
+      if (ts.isIdentifier(node) && helper !== undefined) {
+        let fn: ts.Node | undefined = node.parent
+        while (fn !== undefined && !ts.isFunctionDeclaration(fn)) fn = fn.parent
+        const call = node.parent
+        assert.ok(
+          fn !== undefined && ts.isFunctionDeclaration(fn) && fn.name?.text === helper && ts.isCallExpression(call) && call.expression === node,
+          `${at(node)} reaches ${node.text} outside an ${helper} helper`,
+        )
+        const body = fn.getText(source)
+        assert.match(body, /realpathSync\(osTmpdir\(\)\)/, `${file.path}: ${helper} does not hold its root to the temp directory`)
+        assert.match(body, /realpathSync\(REPO_ROOT\)/, `${file.path}: ${helper} does not refuse this checkout`)
+        viaHelper.set(node.text, (viaHelper.get(node.text) ?? 0) + 1)
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+  }
+  assert.ok(imports >= 1 && [...HELPERS.keys()].every((name) => (viaHelper.get(name) ?? 0) >= 1), 'no test imports and calls the .env writer and its inspection; the rule no longer sees them')
 })
 
 test('nothing in src/ or scripts/ writes process.env or uses Node\'s .env loaders, and the loader imports no write API', () => {

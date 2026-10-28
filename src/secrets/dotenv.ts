@@ -16,8 +16,12 @@
 //   admits a pathless call there only as a thunk proving liveCredential's own
 //   refusal.
 //
-//   Who writes it: the operator. No code path writes it, or .env.example, which
-//   is the committed, placeholder-only template and never holds a real value.
+//   Who writes it: the operator, and one code path, src/secrets/dotenv-append.ts
+//   (npm run aos-install), which creates it at 0600 when missing and otherwise
+//   appends only the names it lacks, never changing or removing a line. This
+//   module writes nothing (hygiene.test.ts holds it to no write API), and no
+//   code path writes .env.example, which is the committed, placeholder-only
+//   template and never holds a real value.
 //
 //   Where the values go: into a plain object the caller hands to bootKernel as
 //   its env. NEVER into process.env, so child processes, the Anthropic SDK's own

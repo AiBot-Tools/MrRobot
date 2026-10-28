@@ -589,6 +589,50 @@ const dotenvDefault: Suite = {
   },
 }
 
+const DOTENV_APPEND = 'src/secrets/dotenv-append.ts'
+
+// The one .env writer. Its tests hand it scratch repositories only, through
+// appendIn, which refuses any other root (hygiene.test.ts holds every call to
+// it), so a mutant here writes into temp directories and nowhere else. No test
+// here spawns an entry point. The plan named WA1-WA4 W1-W4; the delegation
+// suite already holds W1-W3 and an id must mean one mutant across the catalog.
+// WA5-WA11 are the guards the stage-1 review found no test for; WA12-WA13
+// the order and message of the refusal after a create, from the re-review;
+// WA14-WA19 the removal that must spare another's file, the checks after the
+// write, and what a failure says it changed, from the second re-review.
+const dotenvAppend: Suite = {
+  name: 'dotenvAppend',
+  tests: ['test/dotenv-append.test.ts', 'test/dotenv.test.ts'],
+  mutants: [
+    { id: 'WA1', file: DOTENV_APPEND, from: "    const lead = buf.length > 0 && buf[buf.length - 1] !== NEWLINE ? '\\n' : ''", to: "    const lead = ''", why: 'an append to a file with no final newline joins the first new line onto the operator\'s last key' },
+    { id: 'WA2', file: DOTENV_APPEND, from: 'constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW', to: 'constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW', why: 'a .env that appears while the installer prepares one is written over from its first byte' },
+    { id: 'WA3', file: DOTENV_APPEND, from: '    const line = occupied.get(name)', to: '    const line = parsed.get(name)?.line', why: 'a name on a blank line is taken for missing: the writer refuses the operator\'s file as the duplicate it would make, instead of reporting the line blank' },
+    { id: 'WA4', file: DOTENV_APPEND, from: '  if ((st.mode & 0o077) !== 0) {', to: '  if (false) {', why: 'a .env that group or others can read is appended to, and the new token is readable by them' },
+    { id: 'WA5', file: DOTENV_APPEND, from: '    if ((held.before.mode & 0o200) === 0) {', to: '    if (false) {', why: 'a .env its owner cannot write is opened for writing anyway: a raw EACCES for the operator, an append to a 0400 file for root' },
+    { id: 'WA6', file: DOTENV_APPEND, from: '    if (now.dev !== read.dev || now.ino !== read.ino || now.size !== read.size || now.mtimeMs !== read.mtimeMs) {', to: '    if (false) {', why: 'a .env an editor saved between the read and the write is appended to as if unchanged: lines worked out from the old file land on the new one' },
+    { id: 'WA7', file: DOTENV_APPEND, from: '      unlinkSync(path)\n', to: '', why: 'a .env the writer created and then refused is left behind empty, so a missing file does not stay missing' },
+    { id: 'WA8', file: DOTENV_APPEND, from: '    fchmodSync(fd, 0o600)', to: '    void fd', why: 'a created .env keeps whatever the umask leaves (0400 under umask 277), not 0600' },
+    { id: 'WA9', file: DOTENV_APPEND, from: '  if (!st.isFile()) throw new ConfigError(`${path} is not a regular file`)', to: '', why: 'a FIFO at .env is read and appended to like a file, and the new token goes to whoever holds its read end' },
+    { id: 'WA10', file: DOTENV_APPEND, from: '    if (missing.length === 0) return { path, created: false, appended: [], present, blank }', to: '', why: 'a run with nothing to add still opens .env for writing: a 0400 file is refused, and one without a final newline gains one' },
+    { id: 'WA11', file: DOTENV_APPEND, from: '    refuseLikeTheLoader(now, path, uid)', to: '', why: 'a .env made readable by others, or hard-linked elsewhere, between the read and the write is appended to, and the new token is exposed there' },
+    { id: 'WA12', file: DOTENV_APPEND, from: '    const refused = removeCreated(path, fd, e, fix)\n    closeSync(fd)\n', to: '    closeSync(fd)\n    const refused = removeCreated(path, fd, e, fix)\n', why: 'the descriptor is closed before the check, which then cannot run, so a .env created and refused is left behind' },
+    { id: 'WA13', file: DOTENV_APPEND, from: '    if ((made.mode & 0o077) !== 0) {\n', to: '    if (false) {\n', why: 'on a filesystem that keeps no chmod, the refusal tells the operator to chmod 600 a file it has already removed' },
+    { id: 'WA14', file: DOTENV_APPEND, from: '    const held = fstatSync(fd)\n', to: '    const held = lstatSync(path)\n', why: 'the created file is checked by whatever the path names now, not by the inode its descriptor holds: an empty file another process put there is removed in its place' },
+    { id: 'WA15', file: DOTENV_APPEND, from: '    if (now.dev === held.dev && now.ino === held.ino && held.size === 0) {', to: '    if (held.size === 0) {', why: 'a created file refused is removed by its path whatever the path now names: an empty file another process put there is removed in its place' },
+    { id: 'WA16', file: DOTENV_APPEND, from: '    sameFile(path, held.before)\n', to: '', why: 'an editor\'s save-by-rename during the append carries the new lines away, and the operator is told only that a value does not read back, not that the file was replaced' },
+    { id: 'WA17', file: DOTENV_APPEND, from: '    verify(path, values, options, uid)\n    return { path, created: false, appended, present, blank }', to: '    return { path, created: false, appended, present, blank }', why: 'an append whose new name does not read back from the file is reported as done, and the daemon boots without the value the installer staged' },
+    { id: 'WA18', file: DOTENV_APPEND, from: '    progress.written = true\n    writeAll(fd, chunk, path)', to: '    writeAll(fd, chunk, path)', why: 'a failure after bytes went into .env says the file was not written, and the installer reports "refused, nothing changed" for a file it changed' },
+    { id: 'WA19', file: DOTENV_APPEND, from: "      fix = 'delete it; this filesystem cannot hold a credentials file'\n", to: '', why: 'a file left on a filesystem that keeps no chmod is followed by "re-run", which fails the same way every time' },
+  ],
+  control: {
+    id: 'C',
+    file: DOTENV_APPEND,
+    from: "// The one writer of the operator's credentials file, <repo>/.env.",
+    to: "// The one writer of the operator's credentials file, <repo>/.env. (control)",
+    why: 'comment only',
+  },
+}
+
 const GITIGNORE = 'src/gitignore.ts'
 
 const gitignore: Suite = {
@@ -660,6 +704,7 @@ export const CATALOG: readonly Suite[] = [
   sandbox,
   dotenv,
   dotenvDefault,
+  dotenvAppend,
   gitignore,
   runner,
 ]

@@ -5,7 +5,7 @@ One index over every open question in this repository. Nothing in `docs/plan/` o
 session protocol and its change-control rule on dependencies.
 
 **Sources of truth.** This file is an index; the full reasoning lives in the section each
-row cites. `D1`–`D30` come from `docs/plan/phase-0-bootstrap.md` §6; `D31` and `D32` were
+row cites. `D1`–`D30` come from `docs/plan/phase-0-bootstrap.md` §6; `D31` to `D33` were
 decided here (2026-10) and are complete in their rows. `Q*` rows come from
 `docs/design/agent-fleet.md` §13. Where a row is clipped here, the source is complete.
 
@@ -13,12 +13,12 @@ decided here (2026-10) and are complete in their rows. `Q*` rows come from
 defaults" and name only what you want changed, for example `D3: better-sqlite3` or
 `Q2: per-order approval only, no mandate`. Answers get recorded here and in the source.
 
-**Totals.** 32 Phase 0 decisions (30 from the plan, D31 and D32 added later), 29 fleet
+**Totals.** 33 Phase 0 decisions (30 from the plan, D31 to D33 added later), 29 fleet
 design decisions, 16 of them blocking.
 
 **Status.** The original 59 answered on 2026-09-21, all defaults accepted except D13. Since
 then, by the operator (2026-10): D7 and D25 reversed, and D31 (credentials in `<repo>/.env`)
-and D32 answered. D8's answer still stands as written, but D31 made `secrets.source: env` the
+and D32 answered; on 2026-10-28, D33 (the installer may create and append to `.env`). D8's answer still stands as written, but D31 made `secrets.source: env` the
 shipped default, so the vault it calls primary is dormant.
 
 ## 1. Blocking — answer before any code is written
@@ -83,8 +83,9 @@ package is installed.
 | D27 ★ | Acknowledge the T37 rewrite of CLAUDE.md "Current state" with the text in T37? | as written | ✅ default |
 | D28 | Reading of "a model is bound to an agent only after `aos probe` reports `toolCalling: true`": **registry** accepts a manifest naming an unprobed ref (so the CEO manifest can ship before the operator has run a probe); the **router** refuses… | registry accepts, router refuses (T18 `routable`, T19, T34) | ✅ default |
 | D29 ★ | Ship a test that is skipped by default (`test/live-anthropic.test.ts`, gated by `AOS_LIVE_TESTS=1`, and T35's hygiene rule whitelisting `test/live-*.test.ts`)? CLAUDE.md lists "skipping a test" as ask-before, so this cannot be decided sile… | gated skip inside the suite, whitelisted by name only | ✅ default |
-| D31 | Where provider keys and `AOS_CONTROL_TOKEN` live. Decision 1A (2026-09): exported from a prompt at boot, never a file (pmmcp's `get_secret` masks by design). Reversed by the operator (2026-10): the operator's own `<repo>/.env`, git-ignored and mode 0600, written only by the operator; `.env.example` committed with placeholders only and never changed by the live file. | `--dotenv .env` on `dev`/`cli`/`eval`; strict loader; shell export wins; CLI/eval take only the token; CLAUDE.md "Never" carries the one exception | ✅ operator |
+| D31 | Where provider keys and `AOS_CONTROL_TOKEN` live. Decision 1A (2026-09): exported from a prompt at boot, never a file (pmmcp's `get_secret` masks by design). Reversed by the operator (2026-10): the operator's own `<repo>/.env`, git-ignored and mode 0600, written only by the operator; `.env.example` committed with placeholders only and never changed by the live file. | `--dotenv .env` on `dev`/`cli`/`eval`; strict loader; shell export wins; CLI/eval take only the token; CLAUDE.md "Never" carries the one exception | ✅ operator. *Amended 2026-10-28 by D33: the installer may create the file and append to it.* |
 | D32 | Record a file-sourced credential as `secret.accessed { source: 'file' }`? | no: stays `source: 'env'` (no event-schema change); the daemon's startup log line names which credentials came from `.env` | ✅ operator |
+| D33 | Who writes `<repo>/.env`. D31 left it to the operator alone; the operator (2026-10-28) let `npm run aos-install` create it when it is missing and fill in what it lacks, from pmmcp and the AOS alike. | exactly one code path, `src/secrets/dotenv-append.ts`, called by the installer: creates the file at 0600 (O_EXCL, O_NOFOLLOW) only when it is missing and `.gitignore` ignores it, appends only names no line holds, never changes or removes a line, never writes a placeholder, a blank value or `ANTHROPIC_API_KEY`, never prints a value and never makes a backup; pmmcp's own keys stay in pmmcp's 0600 files under `~/.persistent-memory-mcp`; `test/hygiene.test.ts` holds every other module to reading it | ✅ operator |
 | D30 | Kernel run-cap defaults shipped in `config/kernel.yaml` (T32): `defaultRunMicroUsd: 2000000` ($2 per run), `defaultWallclockMs: 600000` (10 min), `maxLlmCallsPerRun: 50`, `maxToolCallsPerRun: 100`? A manifest may only lower them (T27b). | as written | ✅ default |
 
 ## 3. Agent fleet design — `docs/design/agent-fleet.md` §13

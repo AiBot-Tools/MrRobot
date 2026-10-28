@@ -281,6 +281,28 @@ export function parseDotenv(text: string, accepted: ReadonlySet<string>, label =
   return out
 }
 
+/**
+ * Every name that holds a line in a credentials file, with the first line it
+ * is on. Pure: names and line numbers only, never a value.
+ *
+ * parseDotenv drops a blank value as unset; this keeps it, with `export`
+ * prefixes and quoted values alike, because the .env writer must never append
+ * a name the operator already gave a line, even an empty one: the file would
+ * then hold it twice and the loader would refuse it. A comment is not a line
+ * for a name. It judges nothing, so call it on text parseDotenv accepted.
+ */
+export function occupiedLines(text: string): ReadonlyMap<string, number> {
+  const out = new Map<string, number>()
+  const lines = text.split('\n')
+  for (let i = 0; i < lines.length; i += 1) {
+    let line = lines[i] ?? ''
+    if (line.endsWith('\r')) line = line.slice(0, -1)
+    const name = LINE.exec(line)?.[1]
+    if (name !== undefined && !out.has(name)) out.set(name, i + 1)
+  }
+  return out
+}
+
 /** Read the file through one descriptor that refused to follow a symlink. */
 function readGuarded(path: string, uid: number | undefined): Buffer | undefined {
   let fd: number

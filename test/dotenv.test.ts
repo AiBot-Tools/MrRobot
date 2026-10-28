@@ -26,6 +26,7 @@ import {
   dotenvPathFrom,
   gitignoresDotenv,
   loadDotenv,
+  occupiedLines,
   oneCredential,
   parseDotenv,
   placeInRepo,
@@ -283,6 +284,30 @@ test('a blank value means unset, never the empty string', () => {
   const parsed = parseDotenv(`ANTHROPIC_API_KEY=\nAOS_CONTROL_TOKEN=""\n`, ACCEPTED)
   assert.equal(parsed.size, 0)
   assert.equal(parsed.has('ANTHROPIC_API_KEY'), false)
+})
+
+test('occupiedLines reports a blank, an export and a quoted line by name and number, and never a value', () => {
+  const text = [
+    '# AOS_PMMCP_TOKEN=commented-out-is-not-a-line',
+    'AOS_CONTROL_TOKEN=',
+    '',
+    `  export ANTHROPIC_API_KEY = '${KEY}'\r`,
+    `AOS_PMMCP_TOKEN="${TOKEN}"`,
+  ].join('\n')
+  const occupied = occupiedLines(text)
+  assert.deepEqual([...occupied], [
+    ['AOS_CONTROL_TOKEN', 2],
+    ['ANTHROPIC_API_KEY', 4],
+    ['AOS_PMMCP_TOKEN', 5],
+  ])
+  // Names and numbers only: no value, quoted or bare, rides along.
+  const said = JSON.stringify([...occupied])
+  for (const value of [KEY, TOKEN, 'commented-out']) assert.equal(said.includes(value), false, value)
+  // The blank line is exactly what parseDotenv drops as unset and this keeps.
+  const accepted = new Set([...ACCEPTED, 'AOS_PMMCP_TOKEN'])
+  assert.deepEqual([...parseDotenv(text, accepted).keys()], ['ANTHROPIC_API_KEY', 'AOS_PMMCP_TOKEN'])
+  // A name given twice keeps its first line (parseDotenv refuses the file).
+  assert.deepEqual([...occupiedLines('AOS_CONTROL_TOKEN=\nAOS_CONTROL_TOKEN=x\n')], [['AOS_CONTROL_TOKEN', 1]])
 })
 
 test('a value still holding the .env.example placeholder is refused, so the template cannot reach a provider', () => {

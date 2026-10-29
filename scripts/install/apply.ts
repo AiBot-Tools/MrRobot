@@ -46,9 +46,10 @@
 //   marked ownSession), with no timeout, and nothing here ever signals one.
 //   A read-only probe (lsof, ps, docker, pgrep, git, the facts, a check) is
 //   the installer's own child, in its process group, so the terminal's
-//   Ctrl-C reaches it even while the installer traps it: inside the window a
-//   probe that ended by SIGINT (or exit 130) is run again, up to
-//   INTERRUPT_RERUNS times, rather than read as a finding. A question asked
+//   Ctrl-C or hangup reaches it even while the installer traps it: inside
+//   the window a probe that ended by SIGINT or SIGHUP (or exit 130 or 129)
+//   is run again, up to INTERRUPT_RERUNS times, rather than read as a
+//   finding. A question asked
 //   from inside the window ("start pmmcp again?", "start the old
 //   revision?") is asked with the window closed, so a Ctrl-C there answers
 //   it as no; a yes opens it again for the start.
@@ -204,11 +205,21 @@ export const PROBE_TRIES = 10
 export const PROBE_WAIT_MS = 3_000
 
 /**
- * Inside the window, how many times a probe the terminal's Ctrl-C ended
- * (SIGINT, or exit 130) is run again before its end is read as it is: the
- * probe shares the installer's process group, and the window goes on.
+ * Inside the window, how many times a probe the terminal's Ctrl-C or hangup
+ * ended (SIGINT or SIGHUP, or exit 130 or 129) is run again before its end
+ * is read as it is: the probe shares the installer's process group, which
+ * the terminal signals as a whole, the installer traps both there, and the
+ * window goes on. No terminal sends SIGTERM, so a probe it ended is read as
+ * it is.
  */
 export const INTERRUPT_RERUNS = 3
+
+/** The terminal's signal that ended a probe, in words; undefined for any other end. */
+function endedBy(result: Pick<RunResult, 'signal' | 'code'>): string | undefined {
+  if (result.signal === 'SIGINT' || result.code === 130) return 'Ctrl-C'
+  if (result.signal === 'SIGHUP' || result.code === 129) return 'SIGHUP (the terminal closed)'
+  return undefined
+}
 
 /** How much of a pmmcp log is read from its end. */
 const LOG_TAIL_BYTES = 256 * 1024
@@ -1608,10 +1619,10 @@ export class Applier {
   /**
    * Run one child through the runner; a step (with a label) prints its
    * elapsed time and the tail of its logs. Inside the window, a probe the
-   * terminal's Ctrl-C ended is run again (INTERRUPT_RERUNS at most): only a
-   * probe is given a timeout here, and only a probe is the installer's own
-   * child, so a spec with timeoutMs is one; a step in its own session never
-   * sees the Ctrl-C, and a step that writes is never run twice.
+   * terminal's Ctrl-C or hangup ended is run again (INTERRUPT_RERUNS at
+   * most): only a probe is given a timeout here, and only a probe is the
+   * installer's own child, so a spec with timeoutMs is one; a step in its own
+   * session never sees the Ctrl-C, and a step that writes is never run twice.
    */
   async #exec(spec: RunSpec, label?: string): Promise<Ran> {
     for (let rerun = 0; ; rerun += 1) {
@@ -1632,9 +1643,9 @@ export class Applier {
         for (const line of this.#tailOf(result.out, 5)) this.#print(`  | ${line}`)
         for (const line of this.#tailOf(result.err, 5)) this.#print(`  ! ${line}`)
       }
-      const interrupted = result.exited && (result.signal === 'SIGINT' || result.code === 130)
-      if (interrupted && this.#windowOpen && spec.timeoutMs !== undefined && spec.ownSession !== true && rerun < INTERRUPT_RERUNS) {
-        this.#print(`${spec.step}: ended by Ctrl-C, which does not end the window: asked again`)
+      const by = result.exited ? endedBy(result) : undefined
+      if (by !== undefined && this.#windowOpen && spec.timeoutMs !== undefined && spec.ownSession !== true && rerun < INTERRUPT_RERUNS) {
+        this.#print(`${spec.step}: ended by ${by}, which does not end the window: asked again`)
         continue
       }
       if (result.timedOut || !result.exited) return { ok: false, why: `${spec.step}: ${spec.command} gave no answer within ${seconds(spec.timeoutMs ?? 0)}`, result }

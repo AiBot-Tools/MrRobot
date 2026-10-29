@@ -12,7 +12,8 @@
     "build": "tsc -p tsconfig.build.json",
     "capture:pmmcp": "node --import tsx scripts/capture-pmmcp.ts",
     "eval": "node --import tsx scripts/eval.ts --dotenv .env",
-    "falsify": "node --import tsx scripts/falsify.ts"
+    "falsify": "node --import tsx scripts/falsify.ts",
+    "aos-install": "node --import tsx scripts/install.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.127.0",

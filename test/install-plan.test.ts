@@ -1164,6 +1164,37 @@ test('the jobs gate prompts only when something runs: running jobs: 0 goes strai
   assert.ok(has(down.blocked, /^not offered: Enable the Qdrant API key now \(live cutover\)\?: this stop script sends the dashboard token to whatever listens on 8765/), down.blocked.join('\n'))
 })
 
+test("the fresh install's screen, D36, CLAUDE.md and README name the same footprint outside both program folders, uv's cache and the Keychain item included", () => {
+  // The operator accepted pmmcp's footprint as it is listed (D36): a path the
+  // screen shows and the docs leave out, or the reverse, is one of them wrong.
+  const plan = planInstall(input({ pmmcp: ABSENT }))
+  const screen = plan.screen.find((l) => l.startsWith('Written outside both program folders: ')) ?? ''
+  const read = (rel: string): string[] => readFileSync(join(REPO_ROOT, rel), 'utf8').split('\n')
+  const places: readonly (readonly [string, string])[] = [
+    ['the S3b screen', screen],
+    ['D36', read('docs/DECISIONS.md').find((l) => l.startsWith('| D36 |')) ?? ''],
+    ["CLAUDE.md's footprint line", read('CLAUDE.md').find((l) => l.includes('outside this rule (decision D36)')) ?? ''],
+    ["README's pmmcp row", read('README.md').find((l) => l.startsWith('| pmmcp (D36) |')) ?? ''],
+  ]
+  const FOOTPRINT = [
+    '~/.persistent-memory-mcp',
+    '~/.ollama/models',
+    '~/.gemini/config/plugins/pmmcp-plugin',
+    '~/Library/LaunchAgents/com.aibot.pmmcp.plist',
+    '~/.local',
+    // uv's default cache: setup.sh sets no UV_CACHE_DIR, and its uv sync and CPU torch install fill it.
+    '~/.cache/uv',
+    // init_dbs.py's master passphrase.
+    'Keychain',
+    'master_key',
+    'pmmcp-qdrant-data',
+  ]
+  for (const [where, text] of places) {
+    assert.notEqual(text, '', `${where} is not found`)
+    for (const item of FOOTPRINT) assert.ok(text.includes(item), `${where} does not name ${item}`)
+  }
+})
+
 test('a fresh install asks one typed install, and any other answer changes nothing', async () => {
   const absent = ABSENT
   const plan = planInstall(input({ config: DECLARED, dotenv: dotenv({ AOS_CONTROL_TOKEN: 3, AOS_PMMCP_TOKEN: 'missing', ANTHROPIC_API_KEY: 'missing' }), pmmcp: absent }))

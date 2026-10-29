@@ -1022,7 +1022,8 @@ class Planner {
         "and the four Ollama instances on 11434-11437, including whatever answers on 11434 once the start script's PID file for it exists, " +
         "which setup's launchd load can write: your own Ollama there included.",
       'Written outside both program folders: ~/.persistent-memory-mcp, ~/.ollama/models, ~/.gemini/config/plugins/pmmcp-plugin, ~/Library/LaunchAgents/com.aibot.pmmcp.plist, ' +
-        "uv and Python under ~/.local, and Docker Desktop's volume pmmcp-qdrant-data.",
+        "uv and Python under ~/.local, uv's cache ~/.cache/uv (setup's uv sync and its CPU torch install fill it: several GB), " +
+        "the macOS Keychain item (service persistent-memory-mcp, user master_key), and Docker Desktop's volume pmmcp-qdrant-data.",
       '~/.gemini/config/skills/pmmcp-skill will be deleted (rm -rf, under -y), if it exists.',
       'An existing ~/.persistent-memory-mcp/config.yaml will be backed up and replaced.',
       "It takes about 10-30 min and several GB of disk (both estimates; setup.sh's ~7.5 GB is unreliable).",
@@ -1132,11 +1133,22 @@ function bearerCheck(): Step {
 
 /** The plan as S2-S4 show it: .env by name and line, pmmcp, the numbered steps with their tags, the notes. Never a value. */
 export function describe(plan: Plan): string[] {
+  return [...describeDotenv(plan), ...describePlan(plan)]
+}
+
+/** S2: .env by name, line and state, and the names the shell exports. */
+export function describeDotenv(plan: Plan): string[] {
   const out: string[] = []
   const { dotenv } = plan
   out.push(`.env  ${dotenv.path}  ${dotenv.found ? 'present' : 'absent (created at 0600 when something is appended)'}`)
   for (const line of dotenv.lines) out.push(`  ${line.name.padEnd(20)} ${line.text}`)
   out.push(`  ${'shell exports'.padEnd(20)} ${dotenv.exported.length === 0 ? 'none of these' : dotenv.exported.join(', ')}`)
+  return out
+}
+
+/** S3b and S4: pmmcp as the plan takes it, the numbered steps with their tags, the notes. */
+export function describePlan(plan: Plan): string[] {
+  const out: string[] = []
   if (plan.kind === 'found') out.push(`pmmcp  ${plan.pmmcpDir ?? ''}`)
   else if (plan.kind === 'aos-only') out.push('pmmcp  not touched (--aos-only)')
   else if (plan.kind === 'not-installed') out.push('pmmcp  not installed (--no-install)')

@@ -35,8 +35,12 @@ const COPIED_FILES = ['package.json', 'tsconfig.json', '.gitignore', '.npmrc'] a
 /** What the trap holds: refused for its mode before its content is ever parsed. */
 export const TRAP_DOTENV = 'NODE_OPTIONS=--require=/nonexistent/aos-dotenv-trap.js\n'
 
-/** The programs an operator runs, each of which may open <repo>/.env given --dotenv. */
-export const ENTRY_POINTS = ['src/main.ts', 'src/cli/index.ts', 'scripts/eval.ts', 'scripts/capture-pmmcp.ts'] as const
+/**
+ * The programs an operator runs: each of the first four may open <repo>/.env
+ * given --dotenv, and the installer inspects and appends to it through the one
+ * writer, so each runs here, against the trap.
+ */
+export const ENTRY_POINTS = ['src/main.ts', 'src/cli/index.ts', 'scripts/eval.ts', 'scripts/capture-pmmcp.ts', 'scripts/install.ts'] as const
 export type EntryPoint = (typeof ENTRY_POINTS)[number]
 
 export interface ShadowCheckout {

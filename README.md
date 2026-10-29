@@ -71,14 +71,89 @@ and `npm test` green. No shell block in this README carries a `#` comment: stock
 zsh does not treat one as a comment when you paste, and hands it to the command
 as arguments.
 
+### Install with npm run aos-install
+
+```bash
+npm run aos-install -- --dry-run
+```
+
+```bash
+npm run aos-install
+```
+
+The first only looks: it finds pmmcp, reads what `.env` holds by name, and
+prints the plan, every step as "would" and every question and word it would ask
+you, then `dry run: nothing was changed`. The second does it, asking first. Run
+it from the repository root (npm runs it there) and in a terminal: with stdin
+not a terminal it prints the plan and exits 3, because only you, at a terminal,
+may confirm a change. What it does, in order (`scripts/install.ts`; decisions
+D33, D35 and D36):
+
+- **Preflight**, read-only. It refuses root, a tree a falsify run holds, a Node
+  outside `engines`, a `.gitignore` that stops ignoring `.env` or `/.aos/`, and
+  a missing program that pmmcp or the installer runs (git, curl, uv, ollama,
+  python3, bash, docker, lsof, ps, pgrep, launchctl, plutil, and Docker
+  Desktop's credential helper when `~/.docker/config.json` names it; not
+  checked with `--aos-only`). It names any of `DOCKER_CONFIG`, `DOCKER_HOST`,
+  `DOCKER_CONTEXT` or `PMMCP_*` your shell exports: no program it starts sees
+  them, nor any other `DOCKER_*`, `AOS_*` or credential name.
+- **`.env`**: created at mode 0600 when it is missing, or appended with the
+  token names it lacks (64 random hex each). It never changes or removes a
+  line, never writes a placeholder or a blank value, and never prints a value.
+  It never writes `ANTHROPIC_API_KEY`: add that yourself. A `.env` the loader
+  would refuse is refused with its fix, and nothing is written.
+- **pmmcp**: found from its launchd plist, the process on 8766, or
+  `~/Github/Persistent-Memory-MCP`, with every fact read from pmmcp's own
+  interfaces. With none, it offers to install it there, after one typed
+  `install` (what pmmcp's `setup.sh` then writes outside this folder is in
+  "Where things live"). Once `kernel.yaml` declares `AOS_PMMCP_TOKEN`, pmmcp is
+  given only the `sha256:` digest of that `aos-kernel` token, never the token
+  (until then there is none to stage). pmmcp's own keys (the Qdrant key, the
+  dashboard token, the curator secret) are made by pmmcp's CLIs in its 0600
+  files under `~/.persistent-memory-mcp`, and never go into `.env`. Its bearer
+  gate stays in warn mode: switching it to enforce is your later step.
+- **Live pmmcp changes** (a restart to load the digest, the Qdrant key
+  cutover, the dashboard token and curator secret, a fast-forward of its code)
+  are each offered with a default of no, and run only after a warning that
+  says what stops and for how long, a first typed confirmation, `stop pmmcp`,
+  pmmcp's job count, and a second, the folder name `Persistent-Memory-MCP`.
+  pmmcp is stopped only by `stop-pmmcp-server.sh` without `--force`, and
+  nothing ever sends it or the start script a signal or a timeout: inside that
+  window neither Ctrl-C nor a closed terminal (SIGHUP) nor a SIGTERM ends the
+  installer, which goes on to the start and its checks, and its steps run in
+  sessions of their own. There is no `--yes` and no `--force`.
+
+Flags: `--dry-run`; `--aos-only` (`.env` only, pmmcp is never touched);
+`--pmmcp-dir PATH` (use this install, still validated); `--no-install` (never
+offer the clone and `setup.sh`); `--help`. Exit codes: 0 done or nothing to do,
+1 a step failed (the end report says what state it left), 2 refused before any
+change, 3 changes are needed but stdin is not a terminal, 4 a live step failed
+and pmmcp is not in its intended state, 130 interrupted outside the stopped
+window (129 and 143 for SIGHUP and SIGTERM). The flags go after `--`: npm
+takes `npm run aos-install --dry-run` as its own `--dry-run` and hands the
+installer nothing, so the installer refuses any flag npm took that way. A dry
+run writes only the installer's probe logs under `.aos/install/<stamp>/`
+(`active.json` too, while a `--jobs` count runs) and its lock while it runs.
+If its output goes away mid-run (a `| tee` the same Ctrl-C ended, a closed
+terminal), it goes on, and what it said lands in `installer.out` beside those
+logs. After a failure, run it again: it picks up from the state on disk, and
+once everything is in place it says so and asks nothing.
+
+When you pull the commit that makes `kernel.yaml` declare `AOS_PMMCP_TOKEN`,
+run `npm run aos-install` before you restart `npm run dev`: a daemon restarted
+first boots with its hub degraded, because the token it then needs is not set.
+
+### The `.env` file
+
 The daemon needs `AOS_CONTROL_TOKEN` (at least 32 printable ASCII characters,
 with no whitespace, quote, backtick or `#`, from the shell and `.env` alike;
 `openssl rand -hex 32` makes one) and, to reach a
 model, `ANTHROPIC_API_KEY`: a key created inside a workspace, because an unscoped
 key needs an `anthropic-workspace-id` header the kernel does not send. Both live
-in **your own `.env` in the repository root**: git-ignored, mode 0600, written only by you. `.env.example` is the
+in **your own `.env` in the repository root**: git-ignored, mode 0600, written by you, or appended by `npm run aos-install`. `.env.example` is the
 committed template: placeholders only, never edited to hold a real value, and it
-does not change when your `.env` does.
+does not change when your `.env` does. To make it by hand rather than with the
+installer:
 
 ```bash
 test -e .env || (umask 077 && cp .env.example .env)
@@ -131,6 +206,15 @@ How it is read (`src/secrets/dotenv.ts`, decision D31):
   into one, a name set twice, a second `--dotenv`. It parses with its own strict
   grammar: Node's built-in `.env` parser gives a whitespace-only value the whole
   next line. An exported value that is empty or only whitespace counts as unset.
+- The installer (`npm run aos-install`, through `src/secrets/dotenv-append.ts`,
+  decision D33) is the only program that writes `.env`: it creates it at 0600
+  (exclusively, never through a link) only when it is missing and `.gitignore`
+  ignores it, and appends only names no line holds, after a newline when the
+  last line lacks one. It never changes, removes or reorders a line, makes no
+  backup, refuses whatever the loader refuses before it writes, and reads every
+  name it appended back through the loader before it returns. It is given no
+  value to write: it generates the tokens itself, and hands pmmcp only their
+  digest. Every other program only reads `.env`.
 - Live tests (`AOS_LIVE_TESTS=1 npm test`) take the key from the shell or
   `.env`; every other test file strips credential names from its own process,
   on the live run too.
@@ -163,17 +247,21 @@ is missing. That is the designed behaviour, not a failure — see below.
 
 ### Where things live
 
-Everything the kernel writes lives in the program folder, under `.aos/`, which
-git ignores. The one exception is `~/.colima`, Colima's own home.
+Everything the kernel and the installer write lives in the program folder, under
+`.aos/`, which git ignores. The one exception is `~/.colima`, Colima's own home.
+pmmcp, which the installer installs when it finds none, is a product of its own
+and outside this rule (decision D36, the last row).
 
 | Path | What |
 |---|---|
 | `.aos/events.db`, `.aos/events.head` | the event log and its anchor |
 | `.aos/workspaces/{trusted,hostile}` | sandbox mount roots, one per Colima VM |
 | `.aos/docker` | `DOCKER_CONFIG` for the kernel's docker calls and `colima-up.sh`, never `~/.docker` |
-| `.env` | your credentials (`AOS_CONTROL_TOKEN`, `ANTHROPIC_API_KEY`): written by you, mode 0600, git-ignored; read, never written, by the npm entry scripts; deleted by `git clean -fdx` like `.aos/` |
+| `.env` | your credentials (`AOS_CONTROL_TOKEN`, `ANTHROPIC_API_KEY`): written by you, or created at 0600 and appended to by `npm run aos-install`, which never changes a line; mode 0600, git-ignored; read, never written, by the other npm entry scripts; deleted by `git clean -fdx` like `.aos/` |
+| `.aos/install/`, `.aos/install.lock` | the installer's logs: a 0700 folder per run, `<UTC stamp>/`, holding each program's `<step>.out` and `<step>.err` (0600), `installer.out` (what it said, when its own output went away mid-run), and `active.json` while a step it started in a session of its own runs; its lock, held while it runs and removed at its exit (one left by a killed run is taken over, even after a reboot gave its pid to another process) |
 | `.aos/npm-cache` | npm's cache (`.npmrc`); run npm from the repo root, because npm resolves a relative path against the shell's directory |
 | `~/.colima` | Colima's VMs and sockets; `colima-up.sh` also sets `COLIMA_CACHE_HOME=~/.colima/_cache`, which would otherwise be `~/Library/Caches/colima` |
+| pmmcp (D36) | outside the rule: `~/Github/Persistent-Memory-MCP`, where `npm run aos-install` clones it when there is none, and what its `setup.sh` writes: `~/.persistent-memory-mcp`, `~/.ollama/models`, `~/.gemini/config/plugins/pmmcp-plugin`, `~/Library/LaunchAgents/com.aibot.pmmcp.plist`, uv and Python under `~/.local`, uv's cache `~/.cache/uv` (several GB), a macOS Keychain item (service `persistent-memory-mcp`, user `master_key`), and Docker Desktop's volume `pmmcp-qdrant-data` |
 
 `dataDir` is `./.aos`, relative to the repo root, and is kept `0700`: created
 so on first boot, or tightened at boot when npm made `.aos` first for its cache
@@ -225,6 +313,7 @@ of Node, npm, Docker and Colima are yours to keep or remove.
 | `npm run capture:pmmcp` | operator-only: record pmmcp's live tool schemas |
 | `npm run eval` | operator-only: score the orchestration suite (**spends money**) |
 | `npm run falsify` | the mutation catalog: does the suite catch the bugs it claims to? (slow, offline) |
+| `npm run aos-install` | operator-only: find or install pmmcp, append the tokens `.env` lacks, and, once `kernel.yaml` declares `AOS_PMMCP_TOKEN`, stage pmmcp's `aos-kernel` digest; `npm run aos-install -- --dry-run` changes nothing (its flags go after `--`), and live pmmcp changes need two typed confirmations (see Setup) |
 
 `eval` needs a running daemon (`npm run dev`) and `AOS_CONTROL_TOKEN`. It runs
 the orchestration suite in `src/eval/suite.ts` as real runs against whatever

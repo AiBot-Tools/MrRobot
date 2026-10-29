@@ -38,6 +38,7 @@ import {
 import { AgentRegistry } from '../src/agents/registry.js'
 import { loadSoul } from '../src/agents/souls.js'
 import { DENY_KEYS, TOKEN_PATTERNS } from '../src/events/redact.js'
+import { DOCKER_NAMES } from '../scripts/install/preflight.js'
 import { credentialNames, gitignoresDotenv, parseDotenv, PLACEHOLDER_PREFIX } from '../src/secrets/dotenv.js'
 import { ConfigError } from '../src/errors.js'
 import { withStore } from './helpers/store.js'
@@ -494,6 +495,46 @@ test('package.json passes --dotenv .env to dev, cli and eval and to nothing else
   }
   for (const command of Object.values(scripts)) assert.equal(command.includes('--env-file'), false)
   assert.equal(read('.npmrc').includes('env-file'), false)
+})
+
+test('package.json names the installer aos-install, never install/preinstall/postinstall, and it passes no --dotenv', () => {
+  // npm runs a script named install (and its pre/post, and prepare) on every
+  // `npm install`, which would start the installer, and its probes of pmmcp,
+  // whenever dependencies are installed. So it is reached only by the name the
+  // operator types, and runs the entry point and nothing else.
+  const scripts = (JSON.parse(read('package.json')) as { scripts: Record<string, string> }).scripts
+  // A pattern, not a string: the entry-point rule (hygiene.test.ts) holds every string naming one to runEntry.
+  assert.match(scripts['aos-install'] ?? '', /^node --import tsx scripts\/install\.ts$/)
+  // `dependencies` too: npm runs it after any command that changes node_modules.
+  for (const lifecycle of ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare', 'dependencies']) {
+    assert.equal(lifecycle in scripts, false, `package.json has a ${lifecycle} script, which npm install runs`)
+  }
+  // It reads .env only through the writer's inspection, never the loader's --dotenv.
+  assert.equal((scripts['aos-install'] ?? '').includes('--dotenv'), false)
+  // No other script runs it, by its file or by its name (`npm run aos-install` from a script npm runs on its own).
+  const runners = Object.entries(scripts).filter(([, command]) => /\bscripts\/install(?:\.ts|\/)/.test(command) || /\baos-install\b/.test(command))
+  assert.deepEqual(runners.map(([name]) => name), ['aos-install'], 'another script runs the installer')
+})
+
+test("README's installer section and D35 say what the installer does: the exports it names, the dry run's writes, the digest only once declared, flags after --, and the fresh install's one typed word", () => {
+  const readme = read('README.md')
+  const start = readme.indexOf('### Install with npm run aos-install')
+  assert.notEqual(start, -1, 'README has no installer section')
+  const section = readme.slice(start, readme.indexOf('### The `.env` file', start)).replace(/\s+/g, ' ')
+  // The preflight names exactly these and PMMCP_*; the runner drops every other DOCKER_* without a word.
+  for (const name of DOCKER_NAMES) assert.ok(section.includes(`\`${name}\``), `README does not name ${name}`)
+  assert.match(section, /`DOCKER_CONTEXT` or `PMMCP_\*` your shell exports/)
+  assert.doesNotMatch(section, /any `DOCKER_\*` or `PMMCP_\*` your shell exports/)
+  assert.match(section, /`active\.json` too, while a `--jobs` count runs/)
+  assert.match(section, /Once `kernel\.yaml` declares `AOS_PMMCP_TOKEN`, pmmcp is given only the `sha256:` digest/)
+  assert.match(section, /The flags go after `--`: npm takes `npm run aos-install --dry-run` as its own `--dry-run`/)
+  const row = readme.split('\n').find((l) => l.startsWith('| `npm run aos-install` |')) ?? ''
+  assert.match(row, /once `kernel\.yaml` declares `AOS_PMMCP_TOKEN`, stage pmmcp's `aos-kernel` digest; `npm run aos-install -- --dry-run` changes nothing/)
+  // CLAUDE.md's Commands line names the dry run as npm must be given it.
+  assert.match(read('CLAUDE.md'), /^npm run aos-install +# .*npm run aos-install -- --dry-run changes nothing/m)
+  // D35's two typed confirmations, and the one exception the plan's Q24 makes.
+  const d35 = read('docs/DECISIONS.md').split('\n').find((l) => l.startsWith('| D35 |')) ?? ''
+  assert.match(d35, /a second typed `Persistent-Memory-MCP` \(one exception, the plan's Q24: on a fresh install the one typed `install` also covers the first stop and start/)
 })
 
 test('every README shell block pastes cleanly into stock macOS zsh: no # comments', () => {

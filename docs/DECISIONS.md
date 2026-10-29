@@ -5,20 +5,23 @@ One index over every open question in this repository. Nothing in `docs/plan/` o
 session protocol and its change-control rule on dependencies.
 
 **Sources of truth.** This file is an index; the full reasoning lives in the section each
-row cites. `D1`–`D30` come from `docs/plan/phase-0-bootstrap.md` §6; `D31` to `D33` were
-decided here (2026-10) and are complete in their rows. `Q*` rows come from
+row cites. `D1`–`D30` come from `docs/plan/phase-0-bootstrap.md` §6; `D31` to `D33`, `D35` and
+`D36` were decided here (2026-10) and are complete in their rows (`D34`, the name of pmmcp's
+bearer, is recorded when `kernel.yaml` declares it). `Q*` rows come from
 `docs/design/agent-fleet.md` §13. Where a row is clipped here, the source is complete.
 
 **How to answer.** Every row carries a conservatively chosen default. Reply "accept all
 defaults" and name only what you want changed, for example `D3: better-sqlite3` or
 `Q2: per-order approval only, no mandate`. Answers get recorded here and in the source.
 
-**Totals.** 33 Phase 0 decisions (30 from the plan, D31 to D33 added later), 29 fleet
+**Totals.** 35 Phase 0 decisions (30 from the plan, D31 to D33, D35 and D36 added later), 29 fleet
 design decisions, 16 of them blocking.
 
 **Status.** The original 59 answered on 2026-09-21, all defaults accepted except D13. Since
 then, by the operator (2026-10): D7 and D25 reversed, and D31 (credentials in `<repo>/.env`)
-and D32 answered; on 2026-10-28, D33 (the installer may create and append to `.env`). D8's answer still stands as written, but D31 made `secrets.source: env` the
+and D32 answered; on 2026-10-28, D33 (the installer may create and append to `.env`) and D35
+(it alone may change a running pmmcp, after a warning and two typed confirmations); D36
+(pmmcp's footprint outside the program folder) takes the installer plan's recommended answer. D8's answer still stands as written, but D31 made `secrets.source: env` the
 shipped default, so the vault it calls primary is dormant.
 
 ## 1. Blocking — answer before any code is written
@@ -86,6 +89,8 @@ package is installed.
 | D31 | Where provider keys and `AOS_CONTROL_TOKEN` live. Decision 1A (2026-09): exported from a prompt at boot, never a file (pmmcp's `get_secret` masks by design). Reversed by the operator (2026-10): the operator's own `<repo>/.env`, git-ignored and mode 0600, written only by the operator; `.env.example` committed with placeholders only and never changed by the live file. | `--dotenv .env` on `dev`/`cli`/`eval`; strict loader; shell export wins; CLI/eval take only the token; CLAUDE.md "Never" carries the one exception | ✅ operator. *Amended 2026-10-28 by D33: the installer may create the file and append to it.* |
 | D32 | Record a file-sourced credential as `secret.accessed { source: 'file' }`? | no: stays `source: 'env'` (no event-schema change); the daemon's startup log line names which credentials came from `.env` | ✅ operator |
 | D33 | Who writes `<repo>/.env`. D31 left it to the operator alone; the operator (2026-10-28) let `npm run aos-install` create it when it is missing and fill in what it lacks, from pmmcp and the AOS alike. | exactly one code path, `src/secrets/dotenv-append.ts`, called by the installer: creates the file at 0600 (O_EXCL, O_NOFOLLOW) only when it is missing and `.gitignore` ignores it, appends only names no line holds, never changes or removes a line, never writes a placeholder, a blank value or `ANTHROPIC_API_KEY`, never prints a value and never makes a backup; pmmcp's own keys stay in pmmcp's 0600 files under `~/.persistent-memory-mcp`; `test/hygiene.test.ts` holds every other module to reading it | ✅ operator |
+| D35 | Live changes to a running pmmcp. The operator (2026-10-28): `npm run aos-install` may make them (a restart, the Qdrant key cutover, a secret file pmmcp reads per request, a code update), and only after a warning and two typed confirmations; pmmcp is stopped gracefully or not at all. | each change offered with a default of no, all of them inside one stopped window, after a warning that says what stops and for how long, a first typed `stop pmmcp`, pmmcp's own job count (`stop-pmmcp-server.sh --jobs`), and a second typed `Persistent-Memory-MCP` (one exception, the plan's Q24: on a fresh install the one typed `install` also covers the first stop and start of the service its `setup.sh` has just loaded, which serves nothing yet); stopped only by `stop-pmmcp-server.sh` without `--force` (never `launchctl kickstart -k`), and neither it nor `start-pmmcp-server.sh` is ever sent a signal or a timeout: they and the steps between them run in sessions of their own, and Ctrl-C inside the window is trapped; no `--yes`, no `--force`; a stdin that is not a terminal changes nothing (exit 3), nor does a dry run; enforce mode is not switched on (the operator's later step); every pmmcp command runs without `DOCKER_CONFIG`, `DOCKER_HOST`, `DOCKER_CONTEXT` or any `PMMCP_*`; CLAUDE.md "Never" carries the rule | ✅ operator |
+| D36 | pmmcp's footprint outside both program folders. The operator's rule keeps everything in the program folder (D25), but has the installer install pmmcp, when none is found, at `~/Github/Persistent-Memory-MCP`, and pmmcp's `setup.sh` writes beyond it. | accepted as pmmcp's, outside the rule: the clone, and what `setup.sh` writes, `~/.persistent-memory-mcp`, `~/.ollama/models`, `~/.gemini/config/plugins/pmmcp-plugin`, `~/Library/LaunchAgents/com.aibot.pmmcp.plist`, uv and Python under `~/.local`, uv's cache `~/.cache/uv` (setup.sh sets no `UV_CACHE_DIR`, and its `uv sync` and CPU torch install fill it with several GB), the macOS Keychain item of its master passphrase (service `persistent-memory-mcp`, user `master_key`), Docker Desktop's volume `pmmcp-qdrant-data`; all listed on the fresh install's screen before its one typed `install`; named in CLAUDE.md's footprint line and README "Where things live" | ✅ default (the installer plan's Q4) |
 | D30 | Kernel run-cap defaults shipped in `config/kernel.yaml` (T32): `defaultRunMicroUsd: 2000000` ($2 per run), `defaultWallclockMs: 600000` (10 min), `maxLlmCallsPerRun: 50`, `maxToolCallsPerRun: 100`? A manifest may only lower them (T27b). | as written | ✅ default |
 
 ## 3. Agent fleet design — `docs/design/agent-fleet.md` §13

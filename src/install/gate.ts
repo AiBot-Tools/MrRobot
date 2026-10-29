@@ -14,7 +14,9 @@
 //   control and scrubbed (redactString) first. The kernel never imports it.
 //
 //   In order:
-//     1. The plan is printed (describe).
+//     1. The plan is printed: the .env screen (S2), then what discovery
+//        found (S3, handed in as `discovery`), then pmmcp as the plan takes
+//        it and the numbered steps (describe).
 //     2. A plan with stops is refused: they are printed and nothing is
 //        asked (exit 2).
 //     3. Nothing to do: exit 0, with no prompt. It says everything the
@@ -69,7 +71,8 @@
 import { redactString } from '../events/redact.js'
 import {
   PMMCP_FOLDER,
-  describe,
+  describeDotenv,
+  describePlan,
   nonLiveNumbers,
   nothingToDo,
   opensWindow,
@@ -136,6 +139,8 @@ export interface GateIO {
 
 export interface GateOptions {
   readonly dryRun: boolean
+  /** S3, what discovery found: printed between the .env screen and the plan, in plan §5's order. */
+  readonly discovery?: readonly string[]
   /** Where the runner's logs of this run are, for the dry run's last line. */
   readonly logs?: string
 }
@@ -186,7 +191,9 @@ class Gate {
 
   async run(): Promise<GateOutcome> {
     const plan = this.#plan
-    for (const line of describe(plan)) this.#print(line)
+    for (const line of describeDotenv(plan)) this.#print(line)
+    for (const line of this.#options.discovery ?? []) this.#print(line)
+    for (const line of describePlan(plan)) this.#print(line)
     if (plan.stops.length > 0) {
       this.#print('refused, and nothing was changed:')
       for (const stop of plan.stops) this.#print(`  - ${stop}`)
@@ -207,7 +214,7 @@ class Gate {
       return { kind: 'dry-run', exitCode: 0 }
     }
     if (!this.#io.interactive) {
-      this.#print('stdin is not a terminal: changes are needed, and only an operator at a terminal may confirm them, so nothing was changed. Run npm run aos-install in a terminal (or with --dry-run)')
+      this.#print('stdin is not a terminal: changes are needed, and only an operator at a terminal may confirm them, so nothing was changed. Run npm run aos-install in a terminal (or npm run aos-install -- --dry-run to see the plan alone)')
       return { kind: 'not-a-terminal', exitCode: 3 }
     }
     return plan.kind === 'fresh-install' ? this.#freshInstall() : this.#choose()

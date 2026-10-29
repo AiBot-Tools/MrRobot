@@ -2694,7 +2694,7 @@ test('no test runs an entry point except through runEntry/spawnEntry, which run 
   // string (`execSync('node --import tsx src/main.ts')`). A bare file name in
   // prose, like an assertion message, is not a path.
   const ENTRY_NAME =
-    /^(?:\.{0,2}\/)?(?:[\w.-]+\/)*(?:main|index|eval|capture-pmmcp)\.ts$|(?:^|[\s'"=])(?:\.{0,2}\/)?(?:[\w.-]+\/)+(?:main|index|eval|capture-pmmcp)\.ts(?![\w.])/
+    /^(?:\.{0,2}\/)?(?:[\w.-]+\/)*(?:main|index|eval|capture-pmmcp|install)\.ts$|(?:^|[\s'"=])(?:\.{0,2}\/)?(?:[\w.-]+\/)+(?:main|index|eval|capture-pmmcp|install)\.ts(?![\w.])/
   const HELPER = new Set(['runEntry', 'spawnEntry'])
   let viaHelper = 0
   const seen = new Set<string>()

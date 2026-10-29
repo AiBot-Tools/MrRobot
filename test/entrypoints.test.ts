@@ -24,17 +24,25 @@ import './helpers/guard.js'
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync, spawn } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { chmodSync, existsSync, lchownSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { createServer } from 'node:http'
+import { createServer, type IncomingHttpHeaders } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { fileURLToPath } from 'node:url'
+
+import { PassThrough, Writable } from 'node:stream'
 
 import { closeVerified, withStore } from './helpers/store.js'
 import { EventStore } from '../src/events/store.js'
 import { tmpdir } from './helpers/tmpdir.js'
-import { runEntry, shadowCheckout, spawnEntry } from './helpers/checkout.js'
+import { runEntry, shadowCheckout, spawnEntry, TRAP_DOTENV, type ShadowCheckout } from './helpers/checkout.js'
 import { CEO_SUITE } from '../src/eval/suite.js'
+import { BOOT_SLACK_MS, lockPath, takeLock, type LockOptions } from '../scripts/install/lock.js'
+import { Output, TRANSCRIPT_FILE } from '../scripts/install/output.js'
+import { npmTookFlags, preflight, productVersion, stubRefusals } from '../scripts/install/preflight.js'
+import { HANDLED_SIGNALS, REPEAT_MS, SIGNAL_EXIT, defectExit, handleSignal, onSignal, type HandledSignal, type SignalState, type SignalView } from '../scripts/install/signals.js'
+import { TYPE_AHEAD_MS, Terminal } from '../scripts/install/terminal.js'
 
 // Every program here runs from a copy of the checkout holding a trap .env,
 // never from the checkout itself, where the operator keeps the real one (see
@@ -631,4 +639,911 @@ test('eval.ts takes AOS_CONTROL_TOKEN from --dotenv in either form, refuses a se
   })
   assert.equal(twice.status, 2, twice.stderr)
   assert.match(twice.stderr, /--dotenv may be given once/)
+})
+
+// ── npm run aos-install ─────────────────────────────────────────────────────
+//
+// The installer as a program: what the operator's `npm run aos-install` runs.
+// Its steps are tested in process (test/install-*.test.ts); here only that the
+// file is a program that refuses, plans and stops where it must. Every run has
+// a shadow checkout of its own and a HOME made here, never the real one. Every
+// program the installer could start is a fake in that HOME's ~/.local/bin,
+// which the runner puts first on a child's PATH (scripts/install/run.ts), so
+// no real lsof, ps, docker, launchctl or git runs; each fake logs its argv and
+// its environment's names to a file outside the HOME, and one that is not
+// expected exits 97. The AOS daemon the installer looks for is a fake HTTP
+// server on an ephemeral loopback port. The installer refuses root, so a
+// suite run as root (a container) runs it as nobody, who then owns its
+// checkout and HOME.
+
+/** Who the installer runs as here: the suite's own user, or nobody when that is root. */
+const INSTALLER_AS: { readonly uid: number; readonly gid: number } | undefined = process.getuid?.() === 0 ? { uid: 65534, gid: 65534 } : undefined
+
+/** Hand a tree to the installer's user, links themselves and never what they lead to (node_modules). */
+function handOver(path: string): void {
+  if (INSTALLER_AS === undefined) return
+  lchownSync(path, INSTALLER_AS.uid, INSTALLER_AS.gid)
+  const st = lstatSync(path)
+  if (st.isDirectory() && !st.isSymbolicLink()) for (const entry of readdirSync(path)) handOver(join(path, entry))
+}
+
+/** Every program the installer starts, or checks for on a child's PATH (its preflight). */
+const FAKED = ['git', 'curl', 'uv', 'ollama', 'python3', 'bash', 'docker', 'lsof', 'ps', 'pgrep', 'launchctl', 'plutil'] as const
+
+/**
+ * A fake: logs `<name> <args>` and `env <names>`, answers the three probes an
+ * empty HOME gets (and `ps -o etime=` with what a file beside the log holds,
+ * when there is one), refuses anything else.
+ */
+function fakeProgram(log: string): string {
+  const q = `'${log.replace(/'/g, "'\\''")}'`
+  return [
+    '#!/bin/sh',
+    `{ printf '%s' "\${0##*/}"; for a in "$@"; do printf ' %s' "$a"; done; printf '\\n'; } >> ${q}`,
+    `printf 'env %s\\n' "$(env | cut -d= -f1 | sort | tr '\\n' ' ')" >> ${q}`,
+    'case "${0##*/} $*" in',
+    "  'lsof -nP -iTCP:8766 -sTCP:LISTEN -Fpu') exit 1 ;;",
+    `  'ps -o etime= -p '*) if [ -e ${q}.etime ]; then cat ${q}.etime; exit 0; fi ;;`,
+    // A release file beside the log holds this probe until the test removes it (the Ctrl-C test's slow discovery).
+    `  'docker context show') i=0; while [ -e ${q}.hold ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; echo desktop-linux; exit 0 ;;`,
+    "  'docker info --format {{.ServerVersion}}') echo 29.5.2; exit 0 ;;",
+    'esac',
+    'echo "fake ${0##*/}: not expected in this test" >&2',
+    'exit 97',
+    '',
+  ].join('\n')
+}
+
+interface InstallerMachine {
+  readonly checkout: ShadowCheckout
+  readonly home: string
+  /** What the fakes logged. */
+  calls(): string[]
+  /** Hold `docker context show` until release() (at most 10 s). */
+  hold(): void
+  release(): void
+  /** What the fake `ps -o etime= -p <pid>` prints (exit 0); undefined: it refuses, as an unexpected call. */
+  etime(text: string | undefined): void
+  /** The fake daemon's requests. */
+  readonly requests: { method: string | undefined; url: string | undefined; headers: IncomingHttpHeaders }[]
+}
+
+/**
+ * A shadow checkout (its trap .env kept or removed), a HOME holding nothing
+ * but the fakes, and the fake daemon on the port kernel.yaml names.
+ */
+async function installerMachine(t: Parameters<typeof tmpdir>[0], opts: { readonly trap: boolean }): Promise<InstallerMachine> {
+  const checkout = shadowCheckout()
+  t.after(() => checkout.dispose())
+  if (!opts.trap) rmSync(join(checkout.root, '.env'))
+  const base = tmpdir(t)
+  const home = join(base, 'home')
+  const bin = join(home, '.local', 'bin')
+  mkdirSync(bin, { recursive: true })
+  const logs = join(base, 'calls')
+  mkdirSync(logs)
+  const log = join(logs, 'calls.log')
+  for (const name of FAKED) writeFileSync(join(bin, name), fakeProgram(log), { mode: 0o755 })
+
+  const requests: InstallerMachine['requests'] = []
+  const daemon = createServer((req, res) => {
+    requests.push({ method: req.method, url: req.url, headers: req.headers })
+    req.resume()
+    res.writeHead(404).end()
+  })
+  await new Promise<void>((resolve) => daemon.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise<void>((resolve) => daemon.close(() => resolve())))
+  const kernelYaml = join(checkout.root, 'config', 'kernel.yaml')
+  const shipped = readFileSync(kernelYaml, 'utf8')
+  assert.match(shipped, /^ {2}port: 7777$/m, 'the shipped control port moved; update this test')
+  writeFileSync(kernelYaml, shipped.replace(/^ {2}port: 7777$/m, `  port: ${String((daemon.address() as AddressInfo).port)}`))
+
+  handOver(checkout.root)
+  handOver(base)
+  return {
+    checkout,
+    home,
+    calls: () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter((l) => l !== '') : []),
+    hold: () => writeFileSync(`${log}.hold`, ''),
+    release: () => rmSync(`${log}.hold`, { force: true }),
+    etime: (text) => (text === undefined ? rmSync(`${log}.etime`, { force: true }) : writeFileSync(`${log}.etime`, text)),
+    requests,
+  }
+}
+
+/** The environment the installer gets: PATH, the HOME made here, and `extra`. Nothing of the test runner's. */
+const installerEnv = (m: InstallerMachine, extra: Record<string, string> = {}): Record<string, string> => ({
+  PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+  HOME: m.home,
+  ...extra,
+})
+
+/** Run the installer to its exit. Blocks: for runs that reach no in-process fake. */
+function installer(m: InstallerMachine, args: readonly string[], extra: Record<string, string> = {}): { status: number | null; stdout: string; stderr: string } {
+  const run = runEntry(m.checkout, 'scripts/install.ts', args, { env: installerEnv(m, extra), timeout: 90_000, ...INSTALLER_AS })
+  return { status: run.status, stdout: run.stdout ?? '', stderr: run.stderr ?? '' }
+}
+
+/** Run the installer while this process serves the fake daemon. stdin is /dev/null: not a terminal. */
+async function installerAsync(m: InstallerMachine, args: readonly string[], extra: Record<string, string> = {}): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  const child = spawnEntry(m.checkout, 'scripts/install.ts', args, { env: installerEnv(m, extra), ...INSTALLER_AS })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')))
+  child.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')))
+  const timer = setTimeout(() => child.kill('SIGKILL'), 90_000)
+  const status = await new Promise<number | null>((resolve) => child.on('close', (code) => resolve(code)))
+  clearTimeout(timer)
+  return { status, stdout, stderr }
+}
+
+/** Every path under `root` (links not followed) with its kind, mode and content digest: what "nothing changed" compares. */
+function snapshot(root: string): Map<string, string> {
+  const out = new Map<string, string>()
+  const walk = (rel: string): void => {
+    const path = rel === '' ? root : join(root, rel)
+    const st = lstatSync(path)
+    const mode = (st.mode & 0o7777).toString(8)
+    if (st.isSymbolicLink()) out.set(rel, `link ${readlinkSync(path)}`)
+    else if (st.isDirectory()) {
+      out.set(rel, `dir ${mode}`)
+      for (const entry of readdirSync(path)) walk(rel === '' ? entry : `${rel}/${entry}`)
+    } else out.set(rel, `file ${mode} ${createHash('sha256').update(readFileSync(path)).digest('hex')}`)
+  }
+  walk('')
+  return out
+}
+
+/** What changed between two snapshots, by path. */
+function changed(before: Map<string, string>, after: Map<string, string>): string[] {
+  const paths = new Set([...before.keys(), ...after.keys()])
+  return [...paths].filter((p) => before.get(p) !== after.get(p)).sort()
+}
+
+/** The run folders the runner made under .aos/install, by name. */
+const runFolders = (root: string): string[] => {
+  const dir = join(root, '.aos', 'install')
+  return existsSync(dir) ? readdirSync(dir).filter((n) => /^\d{8}T\d{6}Z(?:-\d+)?$/.test(n)) : []
+}
+
+test("aos-install refuses the shadow checkout's trap .env, exits 2 and leaves it byte for byte", async (t) => {
+  // The trap stands in for the operator's real .env: mode 0644 and a name no
+  // config declares. The writer's inspection refuses it at S2, so nothing is
+  // planned, discovered or run: no child, no log, and no lock left.
+  for (const args of [[], ['--aos-only'], ['--dry-run']]) {
+    const m = await installerMachine(t, { trap: true })
+    const trap = join(m.checkout.root, '.env')
+    const before = readFileSync(trap)
+    assert.equal(before.toString('utf8'), TRAP_DOTENV)
+    const run = installer(m, args)
+    const printed = `${run.stdout}${run.stderr}`
+    assert.equal(run.status, 2, `${JSON.stringify(args)}: ${printed}`)
+    assert.match(printed, /refused before any change: .*\.env has mode 0644/, JSON.stringify(args))
+    assert.deepEqual(readFileSync(trap), before, `${JSON.stringify(args)}: the trap changed`)
+    assert.equal(lstatSync(trap).mode & 0o777, 0o644)
+    assert.deepEqual(m.calls(), [], `${JSON.stringify(args)}: a program ran before the .env refusal`)
+    assert.deepEqual(runFolders(m.checkout.root), [], `${JSON.stringify(args)}: the runner made a log folder`)
+    assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false, 'the lock was left behind')
+    assert.equal(printed.includes('aos-dotenv-trap'), false, 'a byte of the trap was printed')
+  }
+})
+
+test('aos-install --dry-run with an empty HOME finds no pmmcp, prints the plan and writes nothing', async (t) => {
+  const m = await installerMachine(t, { trap: false })
+  const root = m.checkout.root
+  const checkoutBefore = snapshot(root)
+  const homeBefore = snapshot(m.home)
+  // Names the installer's children must never see: a Colima DOCKER_CONFIG and a PMMCP_ name pmmcp would refuse to start under.
+  const run = await installerAsync(m, ['--dry-run'], { DOCKER_CONFIG: '/nonexistent/colima-docker', PMMCP_DEBUG: '1' })
+  const printed = `${run.stdout}${run.stderr}`
+  assert.equal(run.status, 0, printed)
+
+  // S1, by name only, then discovery's finding: no pmmcp anywhere it looked.
+  assert.match(run.stdout, /exports {5}DOCKER_CONFIG and PMMCP_DEBUG: pmmcp's commands run without them/)
+  assert.match(run.stdout, /pmmcp {6}not found \(looked at .*com\.aibot\.pmmcp\.plist.*the listener on 127\.0\.0\.1:8766.*Github\/Persistent-Memory-MCP\)/)
+  assert.match(run.stdout, /^kernel {5}kernel\.yaml url matches; no pmmcp tokenEnv declared; AOS daemon listening on \d+$/m)
+  assert.match(run.stdout, /^ {2}- the AOS daemon listens on \d+: restart it after this run$/m)
+  // The plan: .env by name, the fresh install it would make, every step as would-do, and the typed word it would ask.
+  assert.match(run.stdout, /^\.env {2}.*\.env {2}absent \(created at 0600 when something is appended\)$/m)
+  assert.match(run.stdout, /^ {2}AOS_CONTROL_TOKEN +missing {2}-> will be generated \(64 hex\)$/m)
+  assert.match(run.stdout, /^ {2}ANTHROPIC_API_KEY +missing {2}-> add it yourself; the installer never writes it$/m)
+  assert.match(run.stdout, /pmmcp {2}not installed: a fresh install at .*\/Github\/Persistent-Memory-MCP/)
+  assert.match(run.stdout, /^would 1\. \[AOS file\] create .*\.env at 0600 with AOS_CONTROL_TOKEN/m)
+  assert.match(run.stdout, /^would \d+\. \[fresh install\] clone pmmcp to /m)
+  assert.match(run.stdout, /would ask you to type `install` before anything is installed/)
+  assert.match(run.stdout, /dry run: nothing was changed, nothing was stopped or started \(probe output in .*\.aos\/install\/\d{8}T\d{6}Z\)/)
+  // In plan §5's order: S1, S2 (.env), S3 (what discovery found), then the plan.
+  const lines = run.stdout.split('\n')
+  const order = [/^preflight:$/, /^\.env {2}/, /^pmmcp {6}not found/, /^discovery notes:$/, /^plan:$/].map((re) => lines.findIndex((l) => re.test(l)))
+  assert.ok(order.every((n, i) => n >= 0 && (i === 0 || n > (order[i - 1] ?? 0))), `out of order (${order.join(', ')}):\n${run.stdout}`)
+
+  // Only the probes an empty HOME gets ran, and none of them saw a DOCKER_*, PMMCP_* or AOS_* name.
+  const calls = m.calls()
+  assert.deepEqual(
+    calls.filter((l) => !l.startsWith('env ')),
+    ['lsof -nP -iTCP:8766 -sTCP:LISTEN -Fpu', 'docker context show', 'docker info --format {{.ServerVersion}}'],
+    calls.join('\n'),
+  )
+  for (const line of calls.filter((l) => l.startsWith('env '))) assert.doesNotMatch(line, /\b(?:DOCKER|PMMCP|AOS)_/, line)
+  // The daemon probe was a bare GET on loopback: no credential, nothing else asked.
+  assert.deepEqual(m.requests.map((r) => `${r.method ?? ''} ${r.url ?? ''}`), ['GET /'])
+  assert.equal(m.requests[0]?.headers.authorization, undefined)
+
+  // Nothing changed but the probes' logs: no .env, no lock, no active.json, nothing in HOME.
+  const stamps = runFolders(root)
+  assert.equal(stamps.length, 1, JSON.stringify(stamps))
+  const logs = `.aos/install/${stamps[0] ?? ''}`
+  const diff = changed(checkoutBefore, snapshot(root)).filter((p) => p !== logs && !p.startsWith(`${logs}/`))
+  assert.deepEqual(diff, ['.aos', '.aos/install'], `the dry run changed the checkout: ${diff.join(', ')}`)
+  assert.deepEqual(readdirSync(join(root, logs)).sort(), ['docker-context.err', 'docker-context.out', 'docker-info.err', 'docker-info.out', 'lsof-8766.err', 'lsof-8766.out'])
+  assert.equal(existsSync(join(root, '.env')), false, 'the dry run created .env')
+  assert.equal(existsSync(join(root, '.aos', 'install.lock')), false, 'the lock was left behind')
+  assert.equal(existsSync(join(root, '.aos', 'install', 'active.json')), false)
+  assert.deepEqual(changed(homeBefore, snapshot(m.home)), [], 'the dry run changed HOME')
+})
+
+test('aos-install with stdin not a terminal prints the plan and exits 3', async (t) => {
+  // Changes are needed (no .env; no pmmcp), and a pipe of "y" lines is no
+  // operator: the gate ends the run before its first prompt.
+  const m = await installerMachine(t, { trap: false })
+  const run = await installerAsync(m, [])
+  assert.equal(run.status, 3, `${run.stdout}${run.stderr}`)
+  assert.match(run.stdout, /pmmcp {2}not installed: a fresh install at /)
+  assert.match(run.stdout, /^ {2}\d+\. \[fresh install\] clone pmmcp to /m)
+  assert.match(run.stdout, /stdin is not a terminal: changes are needed, and only an operator at a terminal may confirm them, so nothing was changed/)
+  // Its hint names the dry run as npm must be given it: after --.
+  assert.match(run.stdout, /\(or npm run aos-install -- --dry-run /)
+  assert.doesNotMatch(run.stdout, /\[y\/N\]|Type `install`/, 'a question was asked of a pipe')
+  assert.equal(existsSync(join(m.checkout.root, '.env')), false, '.env was written')
+  assert.deepEqual(m.calls().filter((l) => !l.startsWith('env ')), ['lsof -nP -iTCP:8766 -sTCP:LISTEN -Fpu', 'docker context show', 'docker info --format {{.ServerVersion}}'])
+
+  // --aos-only: the .env screen alone, no probe at all, and the same refusal to act.
+  const aos = await installerMachine(t, { trap: false })
+  const only = installer(aos, ['--aos-only'])
+  assert.equal(only.status, 3, `${only.stdout}${only.stderr}`)
+  assert.match(only.stdout, /pmmcp {2}not touched \(--aos-only\)/)
+  assert.match(only.stdout, /^ {2}1\. \[AOS file\] create .*\.env at 0600 with AOS_CONTROL_TOKEN/m)
+  assert.match(only.stdout, /stdin is not a terminal/)
+  assert.equal(existsSync(join(aos.checkout.root, '.env')), false)
+  assert.deepEqual(aos.calls(), [])
+  assert.deepEqual(runFolders(aos.checkout.root), [], 'a program ran for --aos-only')
+})
+
+test('aos-install rejects an unknown flag with usage and exit 2', async (t) => {
+  const m = await installerMachine(t, { trap: true })
+  const before = snapshot(m.checkout.root)
+  // Neither --yes nor --force exists; a repeat, a flag without its value, and --aos-only beside a pmmcp flag are refused too.
+  for (const args of [
+    ['--yes'],
+    ['--force'],
+    ['-y'],
+    ['install'],
+    ['--dry-run', '--dry-run'],
+    ['--pmmcp-dir'],
+    ['--pmmcp-dir', '--dry-run'],
+    ['--pmmcp-dir=-x'],
+    ['--help', '-h'],
+    ['--aos-only', '--pmmcp-dir', '/tmp'],
+    ['--aos-only', '--no-install'],
+  ]) {
+    const run = installer(m, args)
+    assert.equal(run.status, 2, `${JSON.stringify(args)}: ${run.stdout}${run.stderr}`)
+    assert.match(run.stderr, /usage: npm run aos-install/, JSON.stringify(args))
+    assert.match(run.stderr, /There is no --yes and no --force/)
+    assert.equal(run.stdout, '', `${JSON.stringify(args)}: printed more than usage`)
+  }
+  // Refused before anything was looked at: not even the lock's folder was made.
+  assert.deepEqual(changed(before, snapshot(m.checkout.root)), [])
+  assert.deepEqual(m.calls(), [])
+  // A flag's value that starts with - is a flag, not a path.
+  assert.match(installer(m, ['--pmmcp-dir', '--dry-run']).stderr, /^--pmmcp-dir needs a path$/m)
+  for (const flag of ['--help', '-h']) {
+    const help = installer(m, [flag])
+    assert.equal(help.status, 0, `${flag}: ${help.stderr}`)
+    assert.match(help.stdout, /--dry-run {10}discover and plan only/, flag)
+    assert.match(help.stdout, /The flags go after --, as in npm run aos-install -- --dry-run/, flag)
+  }
+  assert.deepEqual(changed(before, snapshot(m.checkout.root)), [])
+})
+
+test('aos-install refuses a flag npm took as its own (a flag before --): usage, exit 2, nothing looked at', async (t) => {
+  // npm 10 reads `npm run aos-install --dry-run` as its own --dry-run: the
+  // script gets no argument and npm_config_dry_run=true, so without this the
+  // "dry run" is a real run, and `--aos-only` so given touches pmmcp. npm
+  // leaves these names (`--no-install` sets npm_config_install to '';
+  // `--pmmcp-dir PATH` sets npm_config_pmmcp_dir and hands PATH on as an
+  // argument).
+  const m = await installerMachine(t, { trap: false })
+  const before = snapshot(m.checkout.root)
+  const homeBefore = snapshot(m.home)
+  const cases: readonly (readonly [Record<string, string>, readonly string[], string])[] = [
+    [{ npm_config_dry_run: 'true' }, [], '--dry-run'],
+    [{ npm_config_aos_only: 'true' }, [], '--aos-only'],
+    [{ npm_config_pmmcp_dir: 'true' }, ['/tmp/x'], '--pmmcp-dir'],
+    [{ npm_config_help: 'true' }, [], '--help'],
+    [{ npm_config_install: '' }, [], '--no-install'],
+    [{ npm_config_dry_run: 'true', npm_config_aos_only: 'true' }, ['--dry-run'], '--dry-run and --aos-only'],
+  ]
+  for (const [env, args, named] of cases) {
+    const run = installer(m, args, env)
+    const what = JSON.stringify(env)
+    assert.equal(run.status, 2, `${what}: ${run.stdout}${run.stderr}`)
+    assert.equal(run.stdout, '', `${what}: it went on to the preflight`)
+    assert.ok(run.stderr.startsWith(`npm took ${named} as its own option`), `${what}: ${run.stderr}`)
+    assert.match(run.stderr, /put the installer's flags after --, as in npm run aos-install -- --dry-run/)
+    assert.match(run.stderr, /usage: npm run aos-install/)
+  }
+  assert.deepEqual(changed(before, snapshot(m.checkout.root)), [], 'a refused run wrote in the checkout')
+  assert.deepEqual(changed(homeBefore, snapshot(m.home)), [])
+  assert.deepEqual(m.calls(), [])
+})
+
+test('aos-install refuses at the preflight, before the lock or any program: root, a HOME with a colon, a .gitignore that ignores neither .env nor /.aos/, Node outside engines, a missing credential helper', async (t) => {
+  // Each refusal is printed with its fix, and nothing is made: no .aos (the
+  // lock's folder), no log folder, no program run.
+  const refusedAt = (m: InstallerMachine, run: { status: number | null; stdout: string; stderr: string }, why: RegExp): void => {
+    assert.equal(run.status, 2, `${run.stdout}${run.stderr}`)
+    assert.match(run.stdout, /^refused before any change:$/m)
+    assert.match(run.stdout, why)
+    assert.equal(existsSync(join(m.checkout.root, '.aos')), false, 'the lock was taken before the preflight passed')
+    assert.equal(existsSync(join(m.checkout.root, '.env')), false)
+    assert.deepEqual(m.calls(), [], 'a program ran before the preflight passed')
+  }
+
+  // Root: `sudo npm run aos-install` would make a root-owned .aos and lock in the checkout.
+  if (INSTALLER_AS !== undefined) {
+    const root = await installerMachine(t, { trap: false })
+    const run = runEntry(root.checkout, 'scripts/install.ts', ['--dry-run'], { env: installerEnv(root), timeout: 90_000 })
+    refusedAt(root, { status: run.status, stdout: run.stdout, stderr: run.stderr }, /^ {2}- the installer does not run as root: run it as your own account, without sudo/m)
+  } else {
+    t.diagnostic('the suite does not run as root, so the root refusal is covered in process only')
+  }
+
+  // A HOME with a colon in it: it would split the PATH a child is given.
+  const colon = await installerMachine(t, { trap: false })
+  const odd = join(colon.home, '..', 'ho:me')
+  mkdirSync(join(odd, '.local'), { recursive: true })
+  symlinkSync(join(colon.home, '.local', 'bin'), join(odd, '.local', 'bin'))
+  handOver(odd)
+  refusedAt(colon, installer(colon, ['--dry-run'], { HOME: odd }), /^ {2}- HOME is not set to an absolute path without a colon/m)
+
+  // A .gitignore that ignores neither .env* nor /.aos/: the installer would create both where git can commit them.
+  const ignores = await installerMachine(t, { trap: false })
+  const gitignore = join(ignores.checkout.root, '.gitignore')
+  writeFileSync(gitignore, readFileSync(gitignore, 'utf8').split('\n').filter((l) => l.trim() !== '.env*' && l.trim() !== '/.aos/').join('\n'))
+  handOver(gitignore)
+  const unignored = installer(ignores, ['--dry-run'])
+  refusedAt(ignores, unignored, /\.gitignore does not ignore \.env, which the installer may create: restore the \.env\* line, then re-run/)
+  assert.match(unignored.stdout, /\.gitignore does not ignore \/\.aos\/, where the installer keeps its lock and logs: add the line \/\.aos\/, then re-run/)
+
+  // A Node outside package.json's engines.
+  const engines = await installerMachine(t, { trap: false })
+  const pkgPath = join(engines.checkout.root, 'package.json')
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as Record<string, unknown>
+  writeFileSync(pkgPath, `${JSON.stringify({ ...pkg, engines: { node: '>=999.0.0' } }, null, 2)}\n`)
+  handOver(pkgPath)
+  refusedAt(engines, installer(engines, ['--dry-run']), /^ {2}- Node v[\d.]+ is outside package\.json's engines \(>=999\.0\.0\): install a Node that meets them, then re-run$/m)
+
+  // ~/.docker/config.json names Docker Desktop's helper and no docker-credential-desktop is on the child's PATH.
+  const helper = await installerMachine(t, { trap: false })
+  mkdirSync(join(helper.home, '.docker'))
+  writeFileSync(join(helper.home, '.docker', 'config.json'), JSON.stringify({ auths: {}, credsStore: 'desktop' }))
+  handOver(join(helper.home, '.docker'))
+  const missing = installer(helper, ['--dry-run'])
+  refusedAt(helper, missing, /^ {2}- docker-credential-desktop is not on the PATH pmmcp's commands get \(above\): it ships with Docker Desktop .*remove credsStore from ~\/\.docker\/config\.json$/m)
+  // With the helper there, the same HOME passes the preflight (and --aos-only never looks).
+  writeFileSync(join(helper.home, '.local', 'bin', 'docker-credential-desktop'), '#!/bin/sh\nexit 97\n', { mode: 0o755 })
+  handOver(join(helper.home, '.local', 'bin', 'docker-credential-desktop'))
+  const present = await installerAsync(helper, ['--dry-run'])
+  assert.equal(present.status, 0, `${present.stdout}${present.stderr}`)
+  assert.match(present.stdout, /programs {4}.*docker-credential-desktop on the PATH pmmcp's commands get/)
+})
+
+test('aos-install --dry-run in an empty HOME hands discovery and the planner what it was given: --no-install, --pmmcp-dir, the default folder in another case, a shell export', async (t) => {
+  // --no-install: no fresh install is offered, and the plan says why pmmcp is left out.
+  const none = await installerMachine(t, { trap: false })
+  const noInstall = await installerAsync(none, ['--dry-run', '--no-install'])
+  assert.equal(noInstall.status, 0, `${noInstall.stdout}${noInstall.stderr}`)
+  assert.match(noInstall.stdout, /^pmmcp {2}not installed \(--no-install\)$/m)
+  assert.match(noInstall.stdout, /--no-install offers no setup: install it, or give --pmmcp-dir, then re-run/)
+  assert.match(noInstall.stdout, /^would 1\. \[AOS file\] create .*\.env at 0600 with AOS_CONTROL_TOKEN/m)
+  assert.doesNotMatch(noInstall.stdout, /\[fresh install\]|type `install`/)
+
+  // --pmmcp-dir naming a folder that is no install: discovery stops on it, named as given, exit 2.
+  const dirMachine = await installerMachine(t, { trap: false })
+  const empty = join(dirMachine.home, '..', 'elsewhere', 'Persistent-Memory-MCP')
+  mkdirSync(empty, { recursive: true })
+  handOver(join(dirMachine.home, '..', 'elsewhere'))
+  const given = await installerAsync(dirMachine, ['--dry-run', '--pmmcp-dir', empty])
+  assert.equal(given.status, 2, `${given.stdout}${given.stderr}`)
+  assert.match(given.stdout, /^refused before any change:$/m)
+  assert.match(given.stdout, /Persistent-Memory-MCP \(--pmmcp-dir\) is not a pmmcp install: /)
+  assert.doesNotMatch(given.stdout, /^plan:|fresh install/m)
+
+  // The default folder stored in another case (APFS finds ~/github/persistent-memory-mcp at ~/Github/Persistent-Memory-MCP):
+  // the stop script and the second confirmation know it by its name, so discovery stops, exit 2.
+  const lower = await installerMachine(t, { trap: false })
+  const stored = join(lower.home, 'github', 'persistent-memory-mcp')
+  mkdirSync(stored, { recursive: true })
+  const typed = join(lower.home, 'Github', 'Persistent-Memory-MCP')
+  if (!existsSync(typed)) {
+    // A filesystem that tells case apart: the typed path leads to the stored one, as APFS's lookup would.
+    mkdirSync(join(lower.home, 'Github'))
+    symlinkSync(join('..', 'github', 'persistent-memory-mcp'), typed)
+  }
+  handOver(lower.home)
+  const variant = await installerAsync(lower, ['--dry-run'])
+  assert.equal(variant.status, 2, `${variant.stdout}${variant.stderr}`)
+  assert.match(variant.stdout, /\(the default place\) is stored as "persistent-memory-mcp", not Persistent-Memory-MCP/)
+  assert.doesNotMatch(variant.stdout, /^plan:|fresh install at/m)
+
+  // AOS_CONTROL_TOKEN exported by the shell: S2 names it among the exports and nothing is generated for it.
+  const shell = await installerMachine(t, { trap: false })
+  const value = createHash('sha256').update(`export ${String(Date.now())}`).digest('hex')
+  const exported = await installerAsync(shell, ['--dry-run'], { AOS_CONTROL_TOKEN: value })
+  const printed = `${exported.stdout}${exported.stderr}`
+  assert.equal(exported.status, 2, printed)
+  assert.match(exported.stdout, /^ {2}shell exports {8}AOS_CONTROL_TOKEN$/m)
+  assert.match(exported.stdout, /^ {2}AOS_CONTROL_TOKEN +missing, and exported by this shell -> not appended; unset it and re-run$/m)
+  assert.doesNotMatch(exported.stdout, /will be generated|create .*\.env at 0600/)
+  assert.equal(printed.includes(value), false, 'the exported value was printed')
+  assert.equal(existsSync(join(shell.checkout.root, '.env')), false)
+})
+
+test('aos-install --aos-only --dry-run asks whether only the tokens it generates fit in .env, never the names you add yourself', async (t) => {
+  // `fits` counts every missing name it is given: asked over the screen's
+  // names, a .env with room for the control token but not for every provider
+  // key beside it would be refused as over 64 KiB, though the installer never
+  // writes those keys.
+  const m = await installerMachine(t, { trap: false })
+  const path = join(m.checkout.root, '.env')
+  const line = `# ${'x'.repeat(96)}\n`
+  const room = 65_536 - `AOS_CONTROL_TOKEN=${'0'.repeat(64)}\n`.length - 20
+  const body = line.repeat(Math.floor(room / line.length)) + '#'.repeat(room % line.length - 1) + '\n'
+  assert.equal(Buffer.byteLength(body), room)
+  writeFileSync(path, body, { mode: 0o600 })
+  chmodSync(path, 0o600)
+  handOver(path)
+  const run = installer(m, ['--aos-only', '--dry-run'])
+  assert.equal(run.status, 0, `${run.stdout}${run.stderr}`)
+  assert.match(run.stdout, /^would 1\. \[AOS file\] append AOS_CONTROL_TOKEN to /m)
+  assert.doesNotMatch(run.stdout, /over 64 KiB/)
+  assert.equal(readFileSync(path, 'utf8'), body, 'a dry run changed .env')
+})
+
+test('aos-install refuses while a falsify run holds the tree', async (t) => {
+  // src/ may hold a planted bug while a falsify run is going or was cut off
+  // (src/falsify-hold.ts): the installer, which writes .env and stops pmmcp,
+  // must not run it. Refused at S1, before the lock or any probe.
+  const m = await installerMachine(t, { trap: false })
+  const root = m.checkout.root
+  const dir = join(root, '.falsify')
+  mkdirSync(dir)
+  writeFileSync(join(dir, 'journal.json'), JSON.stringify({ file: 'src/install/gate.ts', original: '', pid: 1 }))
+  handOver(dir)
+  const journal = installer(m, ['--dry-run'])
+  assert.equal(journal.status, 2, `${journal.stdout}${journal.stderr}`)
+  assert.match(journal.stdout, /refused before any change:\n {2}- .*a falsify run is in progress or was interrupted/)
+  assert.equal(existsSync(join(root, '.aos')), false, 'the lock was taken under a falsify hold')
+  assert.deepEqual(m.calls(), [])
+
+  // Between mutants a live run holds only its lock, naming its pid: refused too.
+  rmSync(join(dir, 'journal.json'))
+  writeFileSync(join(dir, 'lock.json'), JSON.stringify({ pid: process.pid, started: 'x', runId: 'other-run' }))
+  handOver(dir)
+  const held = installer(m, ['--dry-run'])
+  assert.equal(held.status, 2, `${held.stdout}${held.stderr}`)
+  assert.match(held.stdout, new RegExp(`a falsify run \\(pid ${String(process.pid)}\\) holds this tree`))
+  assert.equal(existsSync(join(root, '.aos')), false)
+  assert.equal(existsSync(join(root, '.env')), false)
+  assert.deepEqual(m.calls(), [])
+})
+
+test('aos-install takes over a stale lock (its pid gone, the machine booted since, or the pid given out again), and refuses a live one or anything else at its path, naming the removal', async (t) => {
+  // One installer at a time: .aos/install.lock, O_EXCL with the pid. A run
+  // killed outright (a SIGKILL, a crash, a reboot) leaves its lock behind,
+  // and the next run must not need a hand to remove it, even once macOS has
+  // given that pid to a process of its own.
+  const m = await installerMachine(t, { trap: false })
+  const root = m.checkout.root
+  const lockPath = join(root, '.aos', 'install.lock')
+  mkdirSync(join(root, '.aos'), { mode: 0o700 })
+  chmodSync(join(root, '.aos'), 0o700)
+  const lockWith = (text: string): void => {
+    writeFileSync(lockPath, text, { mode: 0o600 })
+    handOver(join(root, '.aos'))
+  }
+  const takenOver = (pid: number, why: RegExp): void => {
+    const taken = installer(m, ['--aos-only', '--dry-run'])
+    assert.equal(taken.status, 0, `${taken.stdout}${taken.stderr}`)
+    assert.match(taken.stdout, new RegExp(`took over .*install\\.lock: it named pid ${String(pid)}, ${why.source}`))
+    assert.match(taken.stdout, /dry run: nothing was changed/)
+    assert.equal(existsSync(lockPath), false, 'the lock taken over was left behind')
+  }
+  // A pid that ran and has exited.
+  const gone = spawnSync('true').pid
+  assert.ok(gone !== undefined && gone > 0)
+  lockWith(JSON.stringify({ pid: gone, started: new Date().toISOString() }))
+  takenOver(gone, /which no longer runs/)
+  assert.deepEqual(m.calls(), [], 'ps was asked about a pid that no longer runs')
+
+  // A live pid (this test's own) in a lock older than the machine's boot: whatever runs it now is not the installer.
+  lockWith(JSON.stringify({ pid: process.pid, started: '2000-01-01T00:00:00.000Z' }))
+  takenOver(process.pid, /from before the machine last started/)
+  assert.deepEqual(m.calls(), [], 'ps was asked though the boot already told')
+
+  // A live pid whose process started after the lock was taken (ps etime): the pid was given out again.
+  const recent = new Date(Date.now() - 30_000).toISOString()
+  m.etime('00:02\n')
+  lockWith(JSON.stringify({ pid: process.pid, started: recent }))
+  takenOver(process.pid, /which now belongs to a process that started after the lock was taken/)
+  assert.deepEqual(m.calls().filter((l) => !l.startsWith('env ')), [`ps -o etime= -p ${String(process.pid)}`])
+
+  // A live pid that started before its lock (a day ago), or one ps cannot describe: the installer's, refused and left as it was.
+  const remove = new RegExp(`remove it \\(rm ${lockPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\), then re-run`)
+  for (const answer of ['1-00:00:00\n', undefined]) {
+    m.etime(answer)
+    const text = JSON.stringify({ pid: process.pid, started: recent })
+    lockWith(text)
+    const refused = installer(m, ['--aos-only', '--dry-run'])
+    assert.equal(refused.status, 2, `${refused.stdout}${refused.stderr}`)
+    assert.match(refused.stdout, new RegExp(`another npm run aos-install \\(pid ${String(process.pid)}, since ${recent.replace(/\./g, '\\.')}\\) holds`))
+    assert.match(refused.stdout, remove)
+    assert.equal(readFileSync(lockPath, 'utf8'), text, 'a lock the installer does not hold was changed')
+  }
+
+  // A lock that names no pid: refused, left as it was, its removal named.
+  lockWith('')
+  const blank = installer(m, ['--aos-only', '--dry-run'])
+  assert.equal(blank.status, 2, `${blank.stdout}${blank.stderr}`)
+  assert.match(blank.stdout, /names no installer's pid: if no npm run aos-install is running, remove it \(rm /)
+  assert.equal(readFileSync(lockPath, 'utf8'), '')
+
+  // A link or a directory at the path is no lock, and re-running never helps: each names its removal.
+  rmSync(lockPath)
+  symlinkSync(join(m.home, 'elsewhere'), lockPath)
+  const link = installer(m, ['--aos-only', '--dry-run'])
+  assert.equal(link.status, 2, `${link.stdout}${link.stderr}`)
+  assert.match(link.stdout, /install\.lock is a symbolic link, not the installer's lock: remove the link \(rm .*install\.lock\), then re-run/)
+  assert.doesNotMatch(link.stdout, /at the same moment/)
+  assert.equal(existsSync(join(m.home, 'elsewhere')), false, 'the link was followed')
+  rmSync(lockPath)
+  mkdirSync(lockPath)
+  handOver(lockPath)
+  const dir = installer(m, ['--aos-only', '--dry-run'])
+  assert.equal(dir.status, 2, `${dir.stdout}${dir.stderr}`)
+  assert.match(dir.stdout, /install\.lock is a directory, not the installer's lock: .*\(rmdir .*install\.lock\), then re-run/)
+  assert.ok(lstatSync(lockPath).isDirectory())
+})
+
+test('aos-install ends at once on Ctrl-C, a hangup or SIGTERM outside the stopped window: exit 130, 129 or 143, nothing changed, no lock left', async (t) => {
+  // Outside the window nothing is half done that a re-run does not pick up
+  // from the state on disk, so a signal ends the run (plan A7), with the
+  // status its default would give, and the lock is released (a default
+  // SIGHUP or SIGTERM would leave it behind). Here it comes while discovery
+  // waits on docker.
+  for (const [signal, code, said] of [
+    ['SIGINT', 130, /interrupted: nothing more is done/],
+    ['SIGHUP', 129, /ended by SIGHUP: nothing more is done/],
+    ['SIGTERM', 143, /ended by SIGTERM: nothing more is done/],
+  ] as const) {
+    const m = await installerMachine(t, { trap: false })
+    m.hold()
+    t.after(() => m.release())
+    const child = spawnEntry(m.checkout, 'scripts/install.ts', [], { env: installerEnv(m), ...INSTALLER_AS })
+    let stdout = ''
+    child.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')))
+    child.stderr.on('data', (d: Buffer) => (stdout += d.toString('utf8')))
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => child.on('close', (c, s) => resolve({ code: c, signal: s })))
+    const deadline = Date.now() + 45_000
+    while (!m.calls().includes('docker context show') && Date.now() < deadline && child.exitCode === null) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    assert.ok(m.calls().includes('docker context show'), `${signal}: discovery never reached docker:\n${stdout}`)
+    child.kill(signal)
+    const ended = await closed
+    m.release()
+    assert.deepEqual(ended, { code, signal: null }, `${signal}: ${stdout}`)
+    assert.match(stdout, said)
+    assert.doesNotMatch(stdout, /^plan:/m, `${signal}: it went on to plan`)
+    assert.equal(existsSync(join(m.checkout.root, '.env')), false)
+    assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false, `${signal}: the lock was left behind`)
+  }
+})
+
+test('aos-install goes on when its stdout reader is gone: no EPIPE crash, its lines on stderr, and what it said kept in installer.out', async (t) => {
+  // `npm run aos-install 2>&1 | tee log` with tee gone: every write to stdout
+  // fails with EPIPE. Unheard, that 'error' ends Node with exit 1, which inside
+  // the stopped window leaves pmmcp stopped. A dry run shows it outside one.
+  const m = await installerMachine(t, { trap: false })
+  const child = spawnEntry(m.checkout, 'scripts/install.ts', ['--dry-run'], { env: installerEnv(m), ...INSTALLER_AS })
+  child.stdout.destroy()
+  let stderr = ''
+  child.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')))
+  const timer = setTimeout(() => child.kill('SIGKILL'), 90_000)
+  const code = await new Promise<number | null>((resolve) => child.on('close', (c) => resolve(c)))
+  clearTimeout(timer)
+  assert.equal(code, 0, stderr)
+  assert.doesNotMatch(stderr, /EPIPE\n\s+at |Unhandled 'error' event/)
+  assert.match(stderr, /dry run: nothing was changed, nothing was stopped or started/)
+  const stamps = runFolders(m.checkout.root)
+  assert.equal(stamps.length, 1)
+  const kept = join(m.checkout.root, '.aos', 'install', stamps[0] ?? '', TRANSCRIPT_FILE)
+  assert.match(stderr, new RegExp(`the installer's output went away \\(EPIPE\\) during the run; what it said is in ${kept.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
+  const text = readFileSync(kept, 'utf8')
+  assert.match(text, /^stdout went away \(EPIPE\) during this run; the installer went on\. What it said:\npreflight:\n/)
+  assert.match(text, /dry run: nothing was changed.*\nexit 0\n$/s)
+  assert.equal(lstatSync(kept).mode & 0o777, 0o600)
+})
+
+// ── the installer's entry point, in process ────────────────────────────────
+//
+// What the program does with a signal, a lost stdout, a typed-ahead line, a
+// lock left behind and the preflight's refusals, without a terminal, a
+// found install or a real signal: each piece is a module of its own
+// (scripts/install/*.ts) that install.ts only wires.
+
+test('a signal answers an open prompt, is trapped inside the window, ends a jobs count, or ends the run with 128 + its number; the same one again within REPEAT_MS is one delivery; a defect exits 4 once the window opened', () => {
+  const view = (o: Partial<SignalView> = {}): SignalView => ({ promptOpen: false, windowOpen: false, counting: false, last: undefined, ...o })
+  assert.deepEqual(HANDLED_SIGNALS, ['SIGINT', 'SIGHUP', 'SIGTERM'])
+  assert.deepEqual(SIGNAL_EXIT, { SIGINT: 130, SIGHUP: 129, SIGTERM: 143 })
+  for (const signal of HANDLED_SIGNALS) {
+    // In this order: a prompt's answer first, then the window, then the count.
+    assert.deepEqual(onSignal(view({ promptOpen: true, windowOpen: true, counting: true }), signal, 1000), { kind: 'answered' }, signal)
+    assert.deepEqual(onSignal(view({ windowOpen: true, counting: true }), signal, 1000), { kind: 'trapped' }, signal)
+    assert.deepEqual(onSignal(view({ counting: true }), signal, 1000), { kind: 'count-aborted' }, signal)
+    assert.deepEqual(onSignal(view(), signal, 1000), { kind: 'exit', code: SIGNAL_EXIT[signal] }, signal)
+  }
+  // npm forwards the terminal's Ctrl-C to a child that already got it: a millisecond later it is the same one.
+  const last = { signal: 'SIGINT' as const, at: 1000 }
+  assert.deepEqual(onSignal(view({ last }), 'SIGINT', 1001), { kind: 'repeat' })
+  assert.deepEqual(onSignal(view({ last, windowOpen: true }), 'SIGINT', 1000 + REPEAT_MS - 1), { kind: 'repeat' })
+  assert.deepEqual(onSignal(view({ last }), 'SIGINT', 1000 + REPEAT_MS), { kind: 'exit', code: 130 })
+  assert.deepEqual(onSignal(view({ last }), 'SIGHUP', 1001), { kind: 'exit', code: 129 }, 'another signal is no repeat')
+  assert.deepEqual(onSignal(view({ last }), 'SIGINT', 999), { kind: 'exit', code: 130 }, 'a clock that stepped back is no repeat')
+  assert.equal(defectExit(true), 4)
+  assert.equal(defectExit(false), 1)
+})
+
+test('handleSignal carries out the decision: a Ctrl-C delivered twice at "start pmmcp again?" answers it once and ends nothing; SIGHUP and SIGTERM inside the window are trapped and kept for the end', () => {
+  const done: string[] = []
+  let prompt = true
+  const effects = {
+    promptOpen: (): boolean => prompt,
+    answer: (): void => {
+      done.push('answer')
+      prompt = false
+    },
+    trapped: (s: HandledSignal): void => void done.push(`trapped ${s}`),
+    abortCount: (): void => void done.push('abort'),
+    exit: (code: number, s: HandledSignal): void => void done.push(`exit ${String(code)} ${s}`),
+  }
+  const state: SignalState & { windowOpen: boolean; counting: boolean } = { windowOpen: false, counting: false, last: undefined, trapped: new Set() }
+  // The window is closed while the question is asked (A6); the second delivery finds it answered.
+  assert.equal(handleSignal(state, 'SIGINT', 5000, effects).kind, 'answered')
+  assert.equal(handleSignal(state, 'SIGINT', 5001, effects).kind, 'repeat')
+  assert.deepEqual(done, ['answer'])
+  assert.deepEqual(state.last, { signal: 'SIGINT', at: 5000 }, 'a repeat moved the mark')
+  // A real second Ctrl-C, later, with no prompt open, ends the run.
+  assert.equal(handleSignal(state, 'SIGINT', 5000 + REPEAT_MS + 1, effects).kind, 'exit')
+  assert.deepEqual(done, ['answer', 'exit 130 SIGINT'])
+
+  done.length = 0
+  state.windowOpen = true
+  for (const [signal, at] of [['SIGHUP', 9000], ['SIGTERM', 9001], ['SIGINT', 9002], ['SIGINT', 9003]] as const) handleSignal(state, signal, at, effects)
+  assert.deepEqual(done, ['trapped SIGHUP', 'trapped SIGTERM', 'trapped SIGINT'])
+  assert.deepEqual([...state.trapped].sort(), ['SIGHUP', 'SIGINT', 'SIGTERM'])
+  state.windowOpen = false
+  state.counting = true
+  done.length = 0
+  handleSignal(state, 'SIGTERM', 20_000, effects)
+  assert.deepEqual(done, ['abort'])
+})
+
+/** A stream whose every write fails as a pipe with no reader does. */
+class BrokenPipe extends Writable {
+  override _write(_chunk: unknown, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    callback(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+  }
+}
+
+const drained = (stream: PassThrough): string => {
+  const chunks: Buffer[] = []
+  let chunk: unknown
+  while ((chunk = stream.read()) !== null) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+test('a write error on stdout never ends the installer: stdout is read as lost, its lines go to stderr, and at the end what it said goes to installer.out in the log folder', async (t) => {
+  // `npm run aos-install 2>&1 | tee log` and a Ctrl-C during L1: the same
+  // signal ends tee, and the next line raises EPIPE. Unheard, that 'error'
+  // ends Node mid-window with pmmcp stopped and nothing to start it again.
+  const stdout = new BrokenPipe()
+  const stderr = new PassThrough()
+  const out = new Output(stdout, stderr)
+  out.say('L1 stop-pmmcp-server.sh: exit 0 after 41 s')
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(out.lost, { stream: 'stdout', code: 'EPIPE' })
+  assert.equal(out.stdoutWorks, false)
+  // Another 'error' from the stream is heard too: without a listener this throws.
+  stdout.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+  out.say('pmmcp is left as the stop left it: start it with cd /Users/op/Github/Persistent-Memory-MCP && ./start-pmmcp-server.sh')
+  out.warn('a defect line')
+  assert.equal(drained(stderr), 'pmmcp is left as the stop left it: start it with cd /Users/op/Github/Persistent-Memory-MCP && ./start-pmmcp-server.sh\na defect line\n')
+  // A question nobody can see is not asked: answered as the input ending, not waited on for good.
+  const term = new Terminal({ input: new PassThrough(), output: new PassThrough(), interactive: true, raw: false, outputWorks: () => out.stdoutWorks, print: (l) => out.say(l) })
+  const waited = new Promise<'waited'>((resolve) => setTimeout(() => resolve('waited'), 2000).unref())
+  assert.deepEqual(await Promise.race([term.ask('start pmmcp again to restore service? [Y/n]'), waited]), { kind: 'eof' })
+  assert.equal(term.promptOpen, false)
+
+  const dir = tmpdir(t)
+  const kept = out.keep(dir, 4)
+  assert.equal(kept, join(dir, TRANSCRIPT_FILE))
+  assert.equal(lstatSync(kept).mode & 0o777, 0o600)
+  const text = readFileSync(kept, 'utf8')
+  assert.match(text, /^stdout went away \(EPIPE\) during this run; the installer went on\. What it said:\n/)
+  assert.match(text, /L1 stop-pmmcp-server\.sh: exit 0 after 41 s\n.*start it with cd \/Users\/op\/Github\/Persistent-Memory-MCP && \.\/start-pmmcp-server\.sh\n! a defect line\nexit 4\n$/s)
+  // Exclusive: a second keep never writes over the first.
+  assert.match(out.keep(dir, 4) ?? '', /could not be created \(EEXIST\)/)
+  // Both streams gone: nothing is written, nothing throws, and flush still calls back.
+  const both = new Output(new BrokenPipe(), new BrokenPipe())
+  both.say('x')
+  both.warn('y')
+  await new Promise((resolve) => setImmediate(resolve))
+  both.say('z')
+  await new Promise<void>((resolve) => both.flush(resolve))
+  assert.deepEqual(both.transcript, ['x', '! y', 'z'])
+
+  // While output works, nothing is kept.
+  const fine = new Output(new PassThrough(), new PassThrough())
+  fine.say('fine')
+  const quiet = tmpdir(t)
+  assert.equal(fine.keep(quiet, 0), undefined)
+  assert.deepEqual(readdirSync(quiet), [])
+})
+
+test("a line typed before a question was shown is dropped, not taken as its answer; a stdin that is not a terminal is never asked", async () => {
+  let clock = 0
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const printed: string[] = []
+  const term = new Terminal({ input, output, interactive: true, raw: false, outputWorks: () => true, print: (l) => printed.push(l), now: () => clock })
+  // Typed while the jobs were counted, before the second confirmation was shown.
+  input.write('Persistent-Memory-MCP\n')
+  const answer = term.ask('Second confirmation: type the folder name `Persistent-Memory-MCP` to stop it now')
+  assert.equal(term.promptOpen, true)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(printed, ['(dropped what was typed before the question was shown: answer it now)'])
+  clock += TYPE_AHEAD_MS
+  input.write('no\n')
+  assert.deepEqual(await answer, { kind: 'line', text: 'no' })
+  assert.equal(term.promptOpen, false)
+  assert.match(drained(output), /Second confirmation: type the folder name `Persistent-Memory-MCP` to stop it now /)
+
+  // A Ctrl-C delivered as a signal answers the open question.
+  const asked = term.ask('Apply the non-live steps 1-2 now? [y/N]')
+  assert.equal(term.interrupt(), true)
+  assert.deepEqual(await asked, { kind: 'interrupt' })
+  assert.equal(term.interrupt(), false, 'with no question open a signal is no answer')
+
+  const pipe = new Terminal({ input: new PassThrough(), output: new PassThrough(), interactive: false, raw: false, outputWorks: () => true, print: () => undefined })
+  assert.deepEqual(await pipe.ask('Type `stop pmmcp` to continue'), { kind: 'eof' })
+})
+
+test('the lock: a stale one is taken over (its pid gone, a boot since, a pid given out again), a live one refused; every refusal names its fix with the path shell-quoted', async (t) => {
+  // A checkout under a folder with a space: each command printed must paste back as one path.
+  const root = join(tmpdir(t), 'My Projects', 'MrRobot')
+  mkdirSync(root, { recursive: true })
+  const path = lockPath(root)
+  const quoted = `'${path}'`
+  const printed: string[] = []
+  const at = Date.parse('2026-10-29T10:00:00.000Z')
+  const asked: number[] = []
+  const options = (o: Partial<LockOptions> = {}): LockOptions => ({
+    root,
+    print: (l) => printed.push(l),
+    alive: () => true,
+    bootedAt: () => at - 3_600_000,
+    startOf: async (pid) => {
+      asked.push(pid)
+      return at - 60_000
+    },
+    ...o,
+  })
+  const holder = (pid: number): void => writeFileSync(path, JSON.stringify({ pid, started: new Date(at).toISOString() }), { mode: 0o600 })
+
+  const lock = await takeLock(options())
+  assert.ok(typeof lock !== 'string', String(lock))
+  assert.equal(lstatSync(path).mode & 0o777, 0o600)
+  assert.equal(lstatSync(join(root, '.aos')).mode & 0o777, 0o700)
+  lock.release()
+  assert.equal(existsSync(path), false)
+
+  // A live holder that started before its lock: refused, and the removal pastes back as one path.
+  holder(4242)
+  assert.equal(
+    await takeLock(options()),
+    `another npm run aos-install (pid 4242, since 2026-10-29T10:00:00.000Z) holds ${path}: let it finish; if no npm run aos-install is running, remove it (rm ${quoted}), then re-run`,
+  )
+  assert.deepEqual(asked, [4242])
+  // One whose start ps cannot tell: refused the same way.
+  assert.match(String(await takeLock(options({ startOf: async () => undefined }))), /^another npm run aos-install \(pid 4242/)
+  // Its pid gone (kill 0), or ps finding none: taken over.
+  for (const o of [{ alive: () => false }, { startOf: async (): Promise<'gone'> => 'gone' }]) {
+    holder(4242)
+    const taken = await takeLock(options(o))
+    assert.ok(typeof taken !== 'string', String(taken))
+    taken.release()
+    assert.equal(printed.pop(), `took over ${path}: it named pid 4242, which no longer runs`)
+  }
+  // The machine booted after the lock was taken: whatever has pid 4242 now is not that installer. ps is not asked.
+  holder(4242)
+  asked.length = 0
+  const rebooted = await takeLock(options({ bootedAt: () => at + BOOT_SLACK_MS + 1000 }))
+  assert.ok(typeof rebooted !== 'string', String(rebooted))
+  rebooted.release()
+  assert.match(printed.pop() ?? '', /it named pid 4242, from before the machine last started/)
+  assert.deepEqual(asked, [])
+  // A boot within the slack is the same moment: not stale by it.
+  holder(4242)
+  assert.match(String(await takeLock(options({ bootedAt: () => at + BOOT_SLACK_MS }))), /^another npm run aos-install/)
+  // The process with that pid started after the lock was taken: the pid was given out again.
+  const reused = await takeLock(options({ startOf: async () => at + 5000 }))
+  assert.ok(typeof reused !== 'string', String(reused))
+  reused.release()
+  assert.match(printed.pop() ?? '', /it named pid 4242, which now belongs to a process that started after the lock was taken/)
+
+  // No pid in it, a link, a directory, a FIFO: each refused with its own removal, never "re-run".
+  writeFileSync(path, '{"pid":"x"}')
+  assert.equal(await takeLock(options()), `${path} is there but names no installer's pid: if no npm run aos-install is running, remove it (rm ${quoted}), then re-run`)
+  rmSync(path)
+  symlinkSync(join(root, 'nowhere'), path)
+  assert.equal(await takeLock(options()), `${path} is a symbolic link, not the installer's lock: remove the link (rm ${quoted}), then re-run`)
+  rmSync(path)
+  mkdirSync(path)
+  assert.equal(await takeLock(options()), `${path} is a directory, not the installer's lock: move what you keep in it elsewhere and remove it (rmdir ${quoted}), then re-run`)
+  rmSync(path, { recursive: true })
+  if (spawnSync('mkfifo', [path]).status === 0) {
+    assert.equal(await takeLock(options()), `${path} is not a regular file, not the installer's lock: remove it (rm ${quoted}), then re-run`)
+    rmSync(path)
+  } else {
+    t.diagnostic('mkfifo is unavailable here; the FIFO case is not run')
+  }
+
+  // A .aos others may write in: refused, the chmod pasting back as one path.
+  chmodSync(join(root, '.aos'), 0o770)
+  assert.equal(await takeLock(options()), `${join(root, '.aos')} is writable by group or others: chmod go-w '${join(root, '.aos')}', then re-run`)
+})
+
+test("the preflight refuses root and a current directory that is not the checkout's root (its cd quoted), reads macOS's version, and on macOS holds /usr/bin's git and python3 stubs to the Command Line Tools", (t) => {
+  const base = tmpdir(t)
+  const root = join(base, 'My Projects', 'MrRobot')
+  mkdirSync(join(root, 'node_modules'), { recursive: true })
+  writeFileSync(join(root, 'package.json'), '{"engines":{"node":">=20.0.0"}}\n')
+  writeFileSync(join(root, '.gitignore'), '.env*\n!.env.example\n/.aos/\n')
+  const home = join(base, 'home')
+  mkdirSync(home)
+  const input = { aosOnly: true, root, home, env: {}, cwd: root, euid: 501, uid: 501, user: 'op' } as const
+  assert.deepEqual(preflight(input).refusals, [])
+  assert.deepEqual(preflight({ ...input, euid: 0, uid: 0, user: 'root' }).refusals, [
+    "the installer does not run as root: run it as your own account, without sudo (the .env it writes and pmmcp's files must be yours)",
+  ])
+  assert.deepEqual(preflight({ ...input, cwd: home }).refusals, [`the current directory is not this checkout's root (${root}): run it from there, cd '${root}' && npm run aos-install`])
+  assert.match(preflight({ ...input, platform: 'linux' }).lines[1] ?? '', /^ {2}system {6}Linux \S+ \S+, user op \(uid 501\)$/)
+
+  assert.equal(productVersion('<plist><dict>\n\t<key>ProductName</key>\n\t<string>macOS</string>\n\t<key>ProductVersion</key>\n\t<string>15.6.1</string>\n</dict></plist>'), '15.6.1')
+  assert.equal(productVersion('<key>ProductVersion</key><string>$(rm -rf ~)</string>'), undefined)
+
+  const stubs = new Map([['git', '/usr/bin/git'], ['python3', '/usr/bin/python3'], ['curl', '/usr/bin/curl']])
+  const clt = '/Library/Developer/CommandLineTools'
+  assert.deepEqual(stubRefusals(stubs, 'linux', [clt], () => false), [], 'only macOS puts a stub in /usr/bin')
+  const without = stubRefusals(stubs, 'darwin', [clt], () => false)
+  assert.equal(without.length, 2)
+  assert.match(without[0] ?? '', /^git on the PATH pmmcp's commands get is \/usr\/bin\/git, the stub that asks to install the Command Line Tools, .*xcode-select --install/)
+  assert.match(without[1] ?? '', /^python3 on the PATH/)
+  assert.deepEqual(stubRefusals(stubs, 'darwin', ['/Applications/Xcode.app/Contents/Developer', clt], (p) => p.startsWith(`${clt}/usr/bin/`)), [])
+  assert.deepEqual(stubRefusals(new Map([['git', '/opt/homebrew/bin/git']]), 'darwin', [clt], () => false), [], 'a git of its own needs no developer folder')
+
+  assert.deepEqual(npmTookFlags({ PATH: '/usr/bin', npm_config_cache: '/x', npm_config_local_prefix: '/r' }), [], "npm's own settings are no trace")
+  assert.deepEqual(npmTookFlags({ npm_config_install: '', npm_config_dry_run: 'true' }), ['--dry-run', '--no-install'])
 })

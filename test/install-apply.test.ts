@@ -1775,11 +1775,14 @@ test('after an L2 update, a check that gives no verdict is asked once more, and 
   assert.equal(itemNamed(applier.items, /http_auth check with the updated code/).state, 'done')
 })
 
-test("inside the window a probe that Ctrl-C ended is asked again and the window goes on; past INTERRUPT_RERUNS, and outside the window, its end is read as it is", async (t) => {
+test("inside the window a probe that Ctrl-C or a hangup ended is asked again and the window goes on; past INTERRUPT_RERUNS, and outside the window, its end is read as it is", async (t) => {
   // The terminal's Ctrl-C reaches the installer's own children: L1's lsof, L2's facts and check with the new code, L5's ps (exit 130).
+  // So does its hangup (a closed terminal: SIGHUP, or exit 129), which the installer traps in the window too (A7).
   const m = new Machine(t)
   const plan = updating(m)
   m.over.set('lsof -nP -iTCP:8765 -sTCP:LISTEN -Fpu', once({ signal: 'SIGINT' }))
+  m.over.set('lsof -nP -iTCP:8767 -sTCP:LISTEN -Fpu', once({ signal: 'SIGHUP' }))
+  m.over.set('docker ps --all --filter name=pmmcp-qdrant --format {{.Names}} {{.State}}', once({ code: 129 }))
   m.over.set(`${m.py} -B -m src.transport.http_auth check`, once({ signal: 'SIGINT' }))
   // The applier's first facts are L2's, with the new code (discovery's were read before the window).
   m.over.set(`${m.py} scripts/pmmcp_facts.py --json`, once({ signal: 'SIGINT' }))
@@ -1793,6 +1796,8 @@ test("inside the window a probe that Ctrl-C ended is asked again and the window 
   assert.equal(m.ran(/src\.transport\.http_auth check$/).length, 2)
   assert.equal(m.ran(new RegExp(`^ps -o etime= -p ${String(NEW_PID)}$`)).length, 2)
   assert.equal(m.printed.filter((l) => l.includes('ended by Ctrl-C, which does not end the window: asked again')).length, 4, m.text())
+  assert.equal(m.ran(/^lsof -nP -iTCP:8767 /).length, 2)
+  assert.equal(m.printed.filter((l) => l.includes('ended by SIGHUP (the terminal closed), which does not end the window: asked again')).length, 2, m.text())
 
   // A probe ended so every time is asked INTERRUPT_RERUNS more times, then read as it is: what listens there cannot be checked.
   const always = new Machine(t)

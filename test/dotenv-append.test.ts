@@ -11,8 +11,9 @@
 import './helpers/guard.js'
 
 import assert from 'node:assert/strict'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import fs, {
+  appendFileSync,
   chmodSync,
   constants,
   existsSync,
@@ -32,6 +33,7 @@ import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir as osTmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import test, { type TestContext } from 'node:test'
+import { inspect } from 'node:util'
 import { parse as parseYaml } from 'yaml'
 
 import { parseKernelConfig } from '../src/config.js'
@@ -42,15 +44,17 @@ import { parseProviders } from '../src/models/registry.js'
 import {
   CREATED_HEADER,
   DotenvWriteError,
+  GENERATED_LENGTH,
   MIN_GENERATED_LENGTH,
   appendCredentials,
+  credentialNames,
   inspectCredentials,
   type AppendOptions,
   type AppendResult,
   type InspectOptions,
   type InspectResult,
 } from '../src/secrets/dotenv-append.js'
-import { DOTENV_MAX_BYTES, credentialNames, loadDotenv } from '../src/secrets/dotenv.js'
+import { DOTENV_MAX_BYTES, loadDotenv } from '../src/secrets/dotenv.js'
 import { REPO_ROOT } from './helpers/kernel.js'
 import { tmpdir } from './helpers/tmpdir.js'
 
@@ -64,6 +68,9 @@ interface Who {
   /** 'process': leave euid to the writer's own default, process.geteuid(). */
   readonly euid?: number | 'process'
   readonly accepted?: ReadonlySet<string>
+  readonly digests?: readonly string[]
+  /** inspectIn only. */
+  readonly valueLength?: number
 }
 
 /**
@@ -82,6 +89,7 @@ function appendIn(repo: string, generate: ReadonlyMap<string, () => string>, who
     generate,
     ...(who.uid === undefined ? {} : { uid: who.uid }),
     ...(euid === 'process' ? {} : { euid }),
+    ...(who.digests === undefined ? {} : { digests: who.digests }),
   }
   return appendCredentials(options)
 }
@@ -102,6 +110,8 @@ function inspectIn(repo: string, names: readonly string[], who: Who = {}): Inspe
     names,
     ...(who.uid === undefined ? {} : { uid: who.uid }),
     ...(euid === 'process' ? {} : { euid }),
+    ...(who.digests === undefined ? {} : { digests: who.digests }),
+    ...(who.valueLength === undefined ? {} : { valueLength: who.valueLength }),
   }
   return inspectCredentials(options)
 }
@@ -185,6 +195,35 @@ function untouched(fn: () => unknown): string {
 
 const modeOf = (path: string): number => lstatSync(path).mode & 0o777
 
+/** Run `fn` (synchronous) with everything the writer could print through captured into `said`. */
+function quietly<T>(said: string[], fn: () => T): T {
+  const say = (s: string): void => {
+    said.push(s)
+  }
+  const out = process.stdout.write.bind(process.stdout)
+  const err = process.stderr.write.bind(process.stderr)
+  const { log, error, warn, info, debug } = console
+  process.stdout.write = ((chunk: string | Uint8Array) => (say(String(chunk)), true)) as typeof process.stdout.write
+  process.stderr.write = ((chunk: string | Uint8Array) => (say(String(chunk)), true)) as typeof process.stderr.write
+  console.log = console.error = console.warn = console.info = console.debug = (...args: unknown[]) => say(args.map(String).join(' '))
+  try {
+    return fn()
+  } finally {
+    process.stdout.write = out
+    process.stderr.write = err
+    Object.assign(console, { log, error, warn, info, debug })
+  }
+}
+
+/** Whether any 8 characters of `value` appear in `text`. */
+function echoes(text: string, value: string): boolean {
+  for (let i = 0; i + 8 <= value.length; i += 1) if (text.includes(value.slice(i, i + 8))) return true
+  return false
+}
+
+/** An errno error as node:fs throws one. */
+const errno = (code: string, syscall: string): NodeJS.ErrnoException => Object.assign(new Error(`${code}: i/o error, ${syscall}`), { code, syscall })
+
 test('creates a missing .env at 0600 with O_EXCL, only when .gitignore ignores it and no case variant exists', (t) => {
   t.after(() => SecretMask.clear())
 
@@ -235,6 +274,7 @@ test('creates a missing .env at 0600 with O_EXCL, only when .gitignore ignores i
       ],
       present: [],
       blank: [],
+      digests: [],
     })
     assert.equal(modeOf(path), 0o600)
     assert.equal(lstatSync(path).nlink, 1)
@@ -250,7 +290,7 @@ test('creates a missing .env at 0600 with O_EXCL, only when .gitignore ignores i
   // Nothing to write: a missing file stays missing.
   {
     const repo = repoWith(t)
-    assert.deepEqual(appendIn(repo, new Map()), { path: join(repo, '.env'), created: false, appended: [], present: [], blank: [] })
+    assert.deepEqual(appendIn(repo, new Map()), { path: join(repo, '.env'), created: false, appended: [], present: [], blank: [], digests: [] })
     assert.equal(existsSync(join(repo, '.env')), false)
   }
 
@@ -358,6 +398,7 @@ test('appends only absent names, after a newline when the file lacks a final one
       appended: Object.entries(at).map(([name, line]) => ({ name, line })),
       present: hadKey ? [{ name: 'ANTHROPIC_API_KEY', line: 2 }] : [],
       blank: [],
+      digests: [],
     }, JSON.stringify(original))
     const now = readFileSync(path)
     // Every original byte, untouched, at the start.
@@ -382,6 +423,7 @@ test('appends only absent names, after a newline when the file lacks a final one
         { name: 'ANTHROPIC_API_KEY', line: at['ANTHROPIC_API_KEY'] ?? 2 },
       ],
       blank: [],
+      digests: [],
     })
     assert.equal(snapshot(path), after)
     assert.equal(again.calls(), 0)
@@ -410,7 +452,7 @@ test('a name present on any line, blank included, is never appended again', (t) 
     const entry = [{ name: 'AOS_CONTROL_TOKEN', line }]
     assert.deepEqual(
       appendIn(repo, g.generate),
-      { path, created: false, appended: [], present: kind === 'present' ? entry : [], blank: kind === 'blank' ? entry : [] },
+      { path, created: false, appended: [], present: kind === 'present' ? entry : [], blank: kind === 'blank' ? entry : [], digests: [] },
       original,
     )
     assert.equal(snapshot(path), before, original)
@@ -435,6 +477,7 @@ test('a blank line is reported apart from a set one, by line number: the loader 
     appended: [{ name: 'AOS_PMMCP_TOKEN', line: 4 }],
     present: [{ name: 'ANTHROPIC_API_KEY', line: 1 }],
     blank: [{ name: 'AOS_CONTROL_TOKEN', line: 3 }],
+    digests: [],
   })
   // The blank line is left as it was, and the one name made is the one written.
   assert.deepEqual([...g.made.keys()], ['AOS_PMMCP_TOKEN'])
@@ -465,6 +508,7 @@ test('a .env its owner cannot write: with nothing missing it is nothing to do, a
       appended: [],
       present: [{ name: 'AOS_CONTROL_TOKEN', line: 1 }],
       blank: [{ name: 'ANTHROPIC_API_KEY', line: 2 }],
+      digests: [],
     })
     assert.equal(snapshot(path), before)
 
@@ -644,26 +688,7 @@ test('reports names and line numbers only: no generated value appears in its res
       ]),
     )
   const said: string[] = []
-  const say = (s: string): void => {
-    said.push(s)
-  }
-  // Everything the writer could print through, captured for the duration of
-  // each (synchronous) call.
-  const quiet = <T>(fn: () => T): T => {
-    const out = process.stdout.write.bind(process.stdout)
-    const err = process.stderr.write.bind(process.stderr)
-    const { log, error, warn, info, debug } = console
-    process.stdout.write = ((chunk: string | Uint8Array) => (say(String(chunk)), true)) as typeof process.stdout.write
-    process.stderr.write = ((chunk: string | Uint8Array) => (say(String(chunk)), true)) as typeof process.stderr.write
-    console.log = console.error = console.warn = console.info = console.debug = (...args: unknown[]) => say(args.map(String).join(' '))
-    try {
-      return fn()
-    } finally {
-      process.stdout.write = out
-      process.stderr.write = err
-      Object.assign(console, { log, error, warn, info, debug })
-    }
-  }
+  const quiet = <T>(fn: () => T): T => quietly(said, fn)
   const messages: string[] = []
   const refusedQuietly = (fn: () => unknown): void => {
     messages.push(quiet(() => untouched(fn)))
@@ -703,11 +728,7 @@ test('reports names and line numbers only: no generated value appears in its res
   assert.equal(messages.length, 5)
   const everything = [JSON.stringify(results), ...messages, ...said]
   for (const text of everything) {
-    for (const value of made) {
-      for (let i = 0; i + 8 <= value.length; i += 1) {
-        assert.equal(text.includes(value.slice(i, i + 8)), false, `"${text}" echoes part of a value`)
-      }
-    }
+    for (const value of made) assert.equal(echoes(text, value), false, `"${text}" echoes part of a value`)
   }
   assert.deepEqual(said, [], 'the writer printed something')
   // And each generated value was masked before it was written, even where the
@@ -832,6 +853,7 @@ test('after an append, loadDotenv with the shipped credentialNames returns every
   const read = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
   const config = parseKernelConfig(read('config/kernel.yaml'), { repoRoot: REPO_ROOT })
   const providers = parseProviders(read('config/providers.yaml'))
+  // As the installer builds it: through the writer's re-export, never the loader.
   const names = credentialNames(config, providers)
   const control = config.control.tokenEnv
   assert.ok(names.has(control))
@@ -911,6 +933,8 @@ test('inspectCredentials reports each name present, blank or missing by line, th
       blank: [{ name: 'ANTHROPIC_API_KEY', line: 4 }],
       missing: ['AOS_PMMCP_TOKEN'],
       writable: mode === 0o600,
+      fits: true,
+      digests: [],
     })
     assert.ok(flags.length >= 1, 'the writer no longer opens .env through node:fs, so this test proves nothing')
     assert.deepEqual(flags.filter((f) => typeof f !== 'number' || (f & WRITE_FLAGS) !== 0), [], 'inspect opened .env for writing')
@@ -932,7 +956,7 @@ test('inspectCredentials reports each name present, blank or missing by line, th
   {
     const repo = repoWith(t)
     const { result, flags } = opens(() => inspectIn(repo, [...NAMES, 'AOS_CONTROL_TOKEN']))
-    assert.deepEqual(result, { path: join(repo, '.env'), found: false, present: [], blank: [], missing: NAMES, writable: true })
+    assert.deepEqual(result, { path: join(repo, '.env'), found: false, present: [], blank: [], missing: NAMES, writable: true, fits: true, digests: [] })
     assert.ok(flags.length >= 1)
     assert.deepEqual(flags.filter((f) => typeof f !== 'number' || (f & WRITE_FLAGS) !== 0), [])
     assert.deepEqual(readdirSync(repo).sort(), ['.gitignore'])
@@ -1037,6 +1061,22 @@ test('a .env replaced, or rewritten to another value, after the write is reporte
     assert.equal(e.message, `${path} does not read back AOS_CONTROL_TOKEN as written: check the file by hand`)
     assert.equal(e.written, true)
   }
+  // Created, then rewritten in place the same way: the create path reads back too.
+  {
+    const repo = repoWith(t)
+    const path = join(repo, '.env')
+    const theirs = `AOS_CONTROL_TOKEN=${'y'.repeat(40)}\n`
+    let ino = -1
+    const rewrite = (): void => {
+      ino = lstatSync(path).ino
+      writeFileSync(path, theirs)
+    }
+    const e = afterFirstFsync(t, rewrite, () => thrown(() => appendIn(repo, generators('AOS_CONTROL_TOKEN').generate)))
+    assert.equal(lstatSync(path).ino, ino, 'the rewrite was not in place, so this is the replaced case again')
+    assert.equal(e.message, `${path} does not read back AOS_CONTROL_TOKEN as written: check the file by hand`)
+    assert.equal(e.written, true)
+    assert.equal(readFileSync(path, 'utf8'), theirs)
+  }
 })
 
 test('a created .env refused after the path came to name another file is left to that file, and the refusal says what may be left and how to fix it', (t) => {
@@ -1075,5 +1115,371 @@ test('a created .env refused after the path came to name another file is left to
     // The other process's file is still there, as it left it.
     assert.equal(readFileSync(path, 'utf8'), '', why)
     assert.deepEqual(readdirSync(repo).sort(), ['.env', '.gitignore', 'moved-away'], why)
+  }
+
+  // Or the path still names the file this call created, but another process
+  // wrote into it through the path before the refusal: the file is no longer
+  // the empty one this call made, so its bytes are not this call's to remove.
+  {
+    const repo = repoWith(t)
+    const path = join(repo, '.env')
+    const realFchmod = fs.fchmodSync
+    const fchmod = t.mock.method(fs, 'fchmodSync', (fd: number) => {
+      realFchmod(fd, 0o600)
+      appendFileSync(path, '#')
+    })
+    syncBuiltinESMExports()
+    let e: DotenvWriteError
+    try {
+      e = thrown(() => appendIn(repo, generators('AOS_CONTROL_TOKEN').generate, { uid: me + 1 }))
+    } finally {
+      fchmod.mock.restore()
+      syncBuiltinESMExports()
+    }
+    assert.equal(fchmod.mock.callCount(), 1, 'the writer no longer calls fchmodSync through node:fs, so this test proves nothing')
+    assert.ok(e.message.endsWith(`Nothing was written to it, but ${path} may be left empty: delete it, then re-run npm run aos-install`), e.message)
+    assert.equal(e.written, true)
+    assert.equal(readFileSync(path, 'utf8'), '#')
+  }
+})
+
+test('a raw error while a created .env is prepared is named by its code and not kept, and the empty file is removed, or left as for any refusal', (t) => {
+  t.after(() => SecretMask.clear())
+  // The fchmod after the O_EXCL create fails with an errno no branch names.
+  // Its text is the thrower's, so it is named as failure() names one (by its
+  // code) and not kept as the cause, which util.inspect would print; where the
+  // path then names another file, that file is left, as after a refusal.
+  const CANARY = 'Vb7Qx2Lm9Rt4Wz6Kp1Hs8Dn3Fj5Gc0Ya'
+  for (const moved of [false, true]) {
+    const repo = repoWith(t)
+    const path = join(repo, '.env')
+    const fchmod = t.mock.method(fs, 'fchmodSync', () => {
+      if (moved) {
+        renameSync(path, join(repo, 'moved-away'))
+        writeFileSync(path, '', { mode: 0o600 })
+      }
+      throw errno('EIO', `fchmod ${CANARY}`)
+    })
+    syncBuiltinESMExports()
+    let e: DotenvWriteError
+    try {
+      e = thrown(() => appendIn(repo, generators('AOS_CONTROL_TOKEN').generate))
+    } finally {
+      fchmod.mock.restore()
+      syncBuiltinESMExports()
+    }
+    assert.equal(fchmod.mock.callCount(), 1, 'the writer no longer calls fchmodSync through node:fs, so this test proves nothing')
+    const said = moved
+      ? `${path} could not be prepared (EIO). Nothing was written to it, but ${path} may be left empty: delete it, then re-run npm run aos-install`
+      : `${path} could not be prepared (EIO). Nothing was written, and the empty file this created was removed`
+    assert.equal(e.message, said)
+    assert.equal(e.written, moved)
+    assert.equal(e.cause, undefined)
+    for (const text of [String(e.stack), inspect(e), inspect(e, { showHidden: true, depth: Infinity })]) {
+      assert.equal(echoes(text, CANARY), false, `"${text}" quotes the raw error`)
+    }
+    assert.deepEqual(readdirSync(repo).sort(), moved ? ['.env', '.gitignore', 'moved-away'] : ['.gitignore'])
+  }
+})
+
+test('a generator that throws is reported by its code or class only: nothing of its message is in the error, its inspection or anything printed, and nothing is written', (t) => {
+  t.after(() => SecretMask.clear())
+  // A generator's error may quote the value it was making, which SecretMask
+  // has not seen yet. Node's printer for an uncaught error is util.inspect,
+  // which prints a cause's message too, so the raw error is not kept, and
+  // what the message names is held to the shape of a code or a class name:
+  // both are set by whoever threw.
+  const SECRET = 'Zq8Wm3Xv7Ls2Ny5Bt9Hd4Fg1Jk6Rp0Cw'
+  const named = (name: string): Error => Object.assign(new Error('x'), { name })
+  const throwers: [string, () => never, string][] = [
+    ['an Error quoting the value', () => { throw new Error(`entropy source returned ${SECRET}`) }, 'Error'],
+    ['a RangeError with a Node code', () => { throw Object.assign(new RangeError(`size ${SECRET}`), { code: 'ERR_OUT_OF_RANGE' }) }, 'ERR_OUT_OF_RANGE'],
+    ['an errno error', () => { throw Object.assign(new Error(`EIO: ${SECRET}`), { code: 'EIO' }) }, 'EIO'],
+    ['a code that is the value', () => { throw Object.assign(new Error('x'), { code: SECRET }) }, 'Error'],
+    ['a class name that is the value', () => { throw named(SECRET) }, 'an unknown error'],
+    ['a string', () => { throw SECRET }, 'an unknown error'],
+  ]
+  for (const [why, make, name] of throwers) {
+    for (const original of [undefined, `ANTHROPIC_API_KEY=${KEY}\n`]) {
+      const repo = repoWith(t, original)
+      const path = join(repo, '.env')
+      const before = snapshot(path)
+      const said: string[] = []
+      const e = quietly(said, () => thrown(() => appendIn(repo, new Map([['AOS_CONTROL_TOKEN', make]]))))
+      assert.equal(e.message, `${path} was not written: ${name}`, why)
+      assert.equal(e.written, false, why)
+      assert.equal(e.cause, undefined, why)
+      assert.equal(snapshot(path), before, why)
+      for (const text of [e.message, String(e.stack), inspect(e), inspect(e, { showHidden: true, depth: Infinity }), ...said]) {
+        assert.equal(echoes(text, SECRET), false, `${why}: "${text}" quotes the generator`)
+      }
+      assert.deepEqual(said, [], why)
+    }
+  }
+})
+
+test('a write that cannot be synced says so and to check the last line; any raw error once bytes are in says the file may have changed', (t) => {
+  t.after(() => SecretMask.clear())
+  for (const original of [undefined, `ANTHROPIC_API_KEY=${KEY}\n`]) {
+    const kind = original === undefined ? 'created' : 'appended'
+    // The fsync that ends the write fails: the bytes are in, maybe not on disk.
+    {
+      const repo = repoWith(t, original)
+      const path = join(repo, '.env')
+      const fsync = t.mock.method(fs, 'fsyncSync', () => {
+        throw errno('EIO', 'fsync')
+      })
+      syncBuiltinESMExports()
+      let e: DotenvWriteError
+      try {
+        e = thrown(() => appendIn(repo, generators('AOS_CONTROL_TOKEN').generate))
+      } finally {
+        fsync.mock.restore()
+        syncBuiltinESMExports()
+      }
+      assert.equal(fsync.mock.callCount(), 1, `${kind}: the writer no longer syncs through node:fs, so this test proves nothing`)
+      assert.equal(e.message, `${path} was written but could not be synced (EIO): check its last line by hand before re-running`, kind)
+      assert.equal(e.written, true, kind)
+      assert.match(readFileSync(path, 'utf8'), /\nAOS_CONTROL_TOKEN=[0-9a-f]{64}\n$/, kind)
+    }
+    // The close after the synced write fails: an errno no branch names.
+    {
+      const repo = repoWith(t, original)
+      const path = join(repo, '.env')
+      const realFsync = fs.fsyncSync
+      const realClose = fs.closeSync
+      const synced = new Set<number>()
+      const fsync = t.mock.method(fs, 'fsyncSync', (fd: number) => {
+        realFsync(fd)
+        synced.add(fd)
+      })
+      const close = t.mock.method(fs, 'closeSync', (fd: number) => {
+        realClose(fd)
+        if (synced.delete(fd)) throw errno('EIO', 'close')
+      })
+      syncBuiltinESMExports()
+      let e: DotenvWriteError
+      try {
+        e = thrown(() => appendIn(repo, generators('AOS_CONTROL_TOKEN').generate))
+      } finally {
+        fsync.mock.restore()
+        close.mock.restore()
+        syncBuiltinESMExports()
+      }
+      assert.equal(e.message, `${path} may have been changed before EIO: check it by hand`, kind)
+      assert.equal(e.written, true, kind)
+      assert.equal(e.cause, undefined, kind)
+    }
+  }
+})
+
+test('a created .env is synced, then its directory, so the new entry outlives a crash; an append syncs the file alone', (t) => {
+  t.after(() => SecretMask.clear())
+  const synced = (repo: string, fn: () => unknown): string[] => {
+    const realFsync = fs.fsyncSync
+    const seen: string[] = []
+    const fsync = t.mock.method(fs, 'fsyncSync', (fd: number) => {
+      const st = fs.fstatSync(fd)
+      seen.push(st.isDirectory() ? (st.ino === lstatSync(repo).ino ? 'the repository' : 'another directory') : st.ino === lstatSync(join(repo, '.env')).ino ? '.env' : 'another file')
+      realFsync(fd)
+    })
+    syncBuiltinESMExports()
+    try {
+      fn()
+    } finally {
+      fsync.mock.restore()
+      syncBuiltinESMExports()
+    }
+    return seen
+  }
+  const created = repoWith(t)
+  assert.deepEqual(synced(created, () => appendIn(created, generators('AOS_CONTROL_TOKEN').generate)), ['.env', 'the repository'])
+  assert.deepEqual(synced(created, () => appendIn(created, generators('AOS_PMMCP_TOKEN').generate)), ['.env'])
+})
+
+test('inspectCredentials says whether the missing names fit within 64 KiB at the generated length, as the writer then finds', (t) => {
+  t.after(() => SecretMask.clear())
+  // AOS_PMMCP_TOKEN=<64 characters>\n is 81 bytes. A file of `#`, k x's and a
+  // newline, or the same without the newline (which the writer then adds),
+  // comes to k + 83 bytes after the append: at k = 65453 exactly 64 KiB.
+  const LINE = Buffer.byteLength(`AOS_PMMCP_TOKEN=\n`) + GENERATED_LENGTH
+  assert.equal(GENERATED_LENGTH, 64)
+  assert.equal(LINE, 81)
+  const k = DOTENV_MAX_BYTES - 83
+  for (const final of ['\n', '']) {
+    for (const [extra, fits] of [[0, true], [1, false]] as const) {
+      const repo = repoWith(t, `#${'x'.repeat(k + extra)}${final}`)
+      const seen = inspectIn(repo, ['AOS_PMMCP_TOKEN'])
+      assert.deepEqual([seen.missing, seen.fits], [['AOS_PMMCP_TOKEN'], fits], `${JSON.stringify(final)} + ${String(extra)}`)
+      if (fits) {
+        assert.deepEqual(appendIn(repo, generators('AOS_PMMCP_TOKEN').generate).appended.map((a) => a.name), ['AOS_PMMCP_TOKEN'])
+        assert.equal(lstatSync(join(repo, '.env')).size, DOTENV_MAX_BYTES)
+      } else {
+        assert.match(untouched(() => appendIn(repo, generators('AOS_PMMCP_TOKEN').generate)), new RegExp(`would be ${String(DOTENV_MAX_BYTES + 1)} bytes after the append`))
+      }
+    }
+  }
+  // At another length, if the caller generates another: one character less fits.
+  const tight = repoWith(t, `#${'x'.repeat(k + 1)}\n`)
+  assert.equal(inspectIn(tight, ['AOS_PMMCP_TOKEN'], { valueLength: GENERATED_LENGTH - 1 }).fits, true)
+  assert.deepEqual(appendIn(tight, new Map([['AOS_PMMCP_TOKEN', () => 'p'.repeat(GENERATED_LENGTH - 1)]])).appended.map((a) => a.name), ['AOS_PMMCP_TOKEN'])
+  // Nothing missing: nothing to fit, whatever the size.
+  const full = repoWith(t, `AOS_PMMCP_TOKEN=${KEY}\n#${'x'.repeat(DOTENV_MAX_BYTES - 60)}\n`)
+  assert.equal(inspectIn(full, ['AOS_PMMCP_TOKEN']).fits, true)
+  // No file: the one created must fit too, and one that would not is not created.
+  const none = repoWith(t)
+  assert.equal(inspectIn(none, ['AOS_PMMCP_TOKEN']).fits, true)
+  assert.equal(inspectIn(none, ['AOS_PMMCP_TOKEN'], { valueLength: DOTENV_MAX_BYTES }).fits, false)
+  const huge = new Map([['AOS_PMMCP_TOKEN', () => 'h'.repeat(DOTENV_MAX_BYTES)]])
+  assert.match(untouched(() => appendIn(none, huge)), /would be \d+ bytes when created; a credentials file is at most 65536\. Nothing was written$/)
+  assert.deepEqual(readdirSync(none).sort(), ['.gitignore'])
+})
+
+test('inspectCredentials with no file says whether the operator may create one in the repository, by the directory\'s mode bits', (t) => {
+  t.after(() => SecretMask.clear())
+  const me = process.getuid?.() ?? 0
+  const gid = process.getgid?.() ?? 0
+  // The repository's mode, who the operator is, and whether a .env may be made there.
+  const cases: [string, number, Who, boolean][] = [
+    ['owned, 0755', 0o755, {}, true],
+    ['owned, 0555', 0o555, {}, false],
+    ['owned, 0655 (write, no search)', 0o655, {}, false],
+    ['owned by another, in its group, 0775', 0o775, { uid: me + 1 }, true],
+    ['owned by another, in its group, 0755', 0o755, { uid: me + 1 }, false],
+    // The group's bits decide for a member, though the others' allow more.
+    ['owned by another, in its group, 0757', 0o757, { uid: me + 1 }, false],
+    // Write without search, where the process itself (the owner) may read the .gitignore.
+    ['owned by another, in its group, 0765', 0o765, { uid: me + 1 }, false],
+  ]
+  for (const [why, mode, who, writable] of cases) {
+    const repo = repoWith(t)
+    assert.equal(lstatSync(repo).gid, gid, 'the scratch directory is not in this process\'s group, so these cases prove nothing')
+    chmodSync(repo, mode)
+    try {
+      // Without search, the operator cannot read the repository's .gitignore
+      // either, so for them preflight refuses first; only root gets this far.
+      if (me !== 0 && (mode & 0o100) === 0) {
+        assert.match(refusal(() => inspectIn(repo, ['AOS_CONTROL_TOKEN'], who)), /is not ignored by/, why)
+        continue
+      }
+      assert.equal(inspectIn(repo, ['AOS_CONTROL_TOKEN'], who).writable, writable, why)
+      // As the operator (not root), the writer then meets what inspect said
+      // (where it may search the directory, so that the create is what fails).
+      if (me !== 0 && who.uid === undefined && !writable && (mode & 0o100) !== 0) {
+        assert.match(untouched(() => appendIn(repo, generators('AOS_CONTROL_TOKEN').generate, { euid: 'process' })), /cannot create .*: EACCES/, why)
+      }
+    } finally {
+      chmodSync(repo, 0o700)
+    }
+  }
+  // Neither the owner nor in the group: the others' bits, which only root can arrange here.
+  if (me === 0) {
+    for (const [mode, writable] of [[0o773, true], [0o775, false]] as const) {
+      const repo = repoWith(t)
+      fs.chownSync(repo, me + 1, gid + 54321)
+      chmodSync(repo, mode)
+      assert.equal(inspectIn(repo, ['AOS_CONTROL_TOKEN']).writable, writable, mode.toString(8))
+    }
+  }
+})
+
+test('a .env that cannot be examined or read is refused by its errno, the same way by inspect and the writer, with nothing written', (t) => {
+  t.after(() => SecretMask.clear())
+  // An EIO from fstat or read is the filesystem's, not the file's content:
+  // a ConfigError naming the code, so the installer reports it like any
+  // refusal, rather than a raw error escaping the dry run.
+  for (const call of ['fstatSync', 'readSync'] as const) {
+    const repo = repoWith(t, `ANTHROPIC_API_KEY=${KEY}\n`)
+    const path = join(repo, '.env')
+    const ino = lstatSync(path).ino
+    const before = snapshot(path)
+    const realFstat = fs.fstatSync
+    const realRead = fs.readSync
+    const isEnv = (fd: number): boolean => realFstat(fd).ino === ino
+    const failing = call === 'fstatSync'
+      ? t.mock.method(fs, 'fstatSync', ((fd: number, ...rest: unknown[]) => {
+          if (isEnv(fd)) throw errno('EIO', 'fstat')
+          return (realFstat as (fd: number, ...rest: unknown[]) => unknown)(fd, ...rest)
+        }) as typeof fs.fstatSync)
+      : t.mock.method(fs, 'readSync', ((fd: number, ...rest: unknown[]) => {
+          if (isEnv(fd)) throw errno('EIO', 'read')
+          return (realRead as (fd: number, ...rest: unknown[]) => number)(fd, ...rest)
+        }) as typeof fs.readSync)
+    syncBuiltinESMExports()
+    let inspected: string
+    let written: string
+    try {
+      inspected = refusal(() => inspectIn(repo, ['AOS_CONTROL_TOKEN']))
+      written = untouched(() => appendIn(repo, generators('AOS_CONTROL_TOKEN').generate))
+    } finally {
+      failing.mock.restore()
+      syncBuiltinESMExports()
+    }
+    assert.ok(failing.mock.callCount() >= 2, `${call}: the writer no longer calls it through node:fs, so this test proves nothing`)
+    assert.equal(inspected, `cannot read ${path}: EIO`, call)
+    assert.equal(written, inspected, call)
+    assert.equal(snapshot(path), before, call)
+  }
+})
+
+test('digests: each listed name that holds a value is given as pmmcp\'s sha256 digest of it, never the value; a blank or missing name has none', (t) => {
+  t.after(() => SecretMask.clear())
+  // KNOWN's digest as pmmcp makes it: digest_of in src/transport/http_auth.py
+  // ("sha256:" + hashlib.sha256(token.encode("utf-8")).hexdigest(), run at
+  // persistent-memory-mcp dfcc99a), the line rotate_http_auth_token.py
+  // --digest-stdin and http_auth check --expect read.
+  const KNOWN = 'aos-kernel-digest-fixture-0123456789abcdef'
+  const KNOWN_DIGEST = 'sha256:661beb83e38e9e7d4ab4687e2d0318685cab984f63005862b7f15ae2d2a215ec'
+  const digestOf = (value: string): string => `sha256:${createHash('sha256').update(value, 'utf8').digest('hex')}`
+  assert.equal(digestOf(KNOWN), KNOWN_DIGEST)
+  const ALL = ['AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN']
+  const clean = (result: unknown, ...values: string[]): void => {
+    for (const value of values) assert.equal(echoes(JSON.stringify(result), value), false, 'a value is in the result')
+  }
+
+  // Set (plain and quoted, as the loader reads it), blank, missing.
+  for (const line of [`AOS_PMMCP_TOKEN=${KNOWN}`, `export AOS_PMMCP_TOKEN="${KNOWN}"`]) {
+    const repo = repoWith(t, `${line}\nANTHROPIC_API_KEY=\n`)
+    const seen = inspectIn(repo, ALL, { digests: ALL })
+    assert.deepEqual(seen.digests, [{ name: 'AOS_PMMCP_TOKEN', digest: KNOWN_DIGEST }], line)
+    clean(seen, KNOWN)
+    // Appended: the new value's digest, beside the one found, in the order listed.
+    const g = generators('AOS_CONTROL_TOKEN')
+    const done = appendIn(repo, g.generate, { digests: ALL })
+    const made = g.made.get('AOS_CONTROL_TOKEN') ?? ''
+    assert.deepEqual(done.digests, [
+      { name: 'AOS_PMMCP_TOKEN', digest: KNOWN_DIGEST },
+      { name: 'AOS_CONTROL_TOKEN', digest: digestOf(made) },
+    ], line)
+    clean(done, KNOWN, made)
+    // A re-run with nothing to add gives the same, and inspect agrees.
+    const again = appendIn(repo, generators('AOS_CONTROL_TOKEN').generate, { digests: ALL })
+    assert.deepEqual([again.appended, again.digests], [[], done.digests], line)
+    assert.deepEqual(inspectIn(repo, ALL, { digests: ALL }).digests, done.digests, line)
+  }
+
+  // Created: the generated value's digest; and none asked, none given.
+  {
+    const repo = repoWith(t)
+    assert.deepEqual(inspectIn(repo, ALL, { digests: ALL }).digests, [])
+    const g = generators('AOS_PMMCP_TOKEN')
+    const done = appendIn(repo, g.generate, { digests: ['AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY'] })
+    const made = g.made.get('AOS_PMMCP_TOKEN') ?? ''
+    assert.deepEqual(done.digests, [{ name: 'AOS_PMMCP_TOKEN', digest: digestOf(made) }])
+    assert.match(done.digests[0]?.digest ?? '', /^sha256:[0-9a-f]{64}$/)
+    clean(done, made)
+    assert.deepEqual(appendIn(repo, generators('AOS_PMMCP_TOKEN').generate).digests, [])
+  }
+
+  // A name the config does not declare is refused, before anything is made.
+  {
+    const repo = repoWith(t, `AOS_PMMCP_TOKEN=${KNOWN}\n`)
+    const before = snapshot(join(repo, '.env'))
+    const g = generators('AOS_CONTROL_TOKEN')
+    const refused = /^AOS_SOMETHING_ELSE is not a credential name the config declares, so it is not written to \.env$/
+    assert.match(refusal(() => inspectIn(repo, ['AOS_PMMCP_TOKEN'], { digests: ['AOS_SOMETHING_ELSE'] })), refused)
+    assert.match(untouched(() => appendIn(repo, g.generate, { digests: ['AOS_SOMETHING_ELSE'] })), refused)
+    assert.equal(g.calls(), 0)
+    assert.equal(snapshot(join(repo, '.env')), before)
   }
 })

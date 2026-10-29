@@ -6,6 +6,12 @@
 //   scripts/install/*) and its tests, which hand it temp directories only. The
 //   kernel, the daemon, the CLI and eval never reach it, and no other module in
 //   src/ or scripts/ opens .env for writing (hygiene.test.ts holds all three).
+//   The installer imports this module and never the loader, src/secrets/
+//   dotenv.ts (hygiene.test.ts's list of the loader's importers holds it): it
+//   builds `accepted` with credentialNames, re-exported here; it needs no
+//   confirming read, since appendCredentials reads every name it writes back
+//   through loadDotenv before it returns; and what pmmcp is given for a token
+//   is its digest, from `digests` here, so the installer never holds a value.
 //
 //   What it writes: only <repoRoot>/.env, and only names the config declares
 //   (`accepted`) that hold no line in the file yet. A missing file is created at
@@ -25,19 +31,33 @@
 //   delete, since appending it again would make the file a duplicate the
 //   loader refuses). inspectCredentials reports the same, and what is missing,
 //   before anything is written: it is the installer's plan and its dry run,
-//   read through the same refusals and never opened for writing.
+//   read through the same refusals and never opened for writing. It also says
+//   what the write would meet: whether the missing names, at the length the
+//   installer generates, keep the file within 64 KiB, and whether the file's
+//   owner may write it (by its mode bits), or, with no file, whether the
+//   directory lets the operator create one.
+//
+//   Digests: for each name listed in `digests` that holds a value (set in the
+//   file, or appended by this call), both calls return its digest, never the
+//   value: `sha256:` and the 64 lowercase hex of SHA-256 over the value's UTF-8
+//   bytes, the form pmmcp's digest_of (src/transport/http_auth.py) writes and
+//   `rotate_http_auth_token.py --digest-stdin` and `http_auth check --expect`
+//   read on stdin. A blank or missing name has none.
 //
 //   What it refuses, changing nothing: running as root (the file would be
 //   root's, and the daemon run as the operator refuses it); a .gitignore that
 //   does not ignore .env; a .env that is a symlink or is stored under another
 //   case; every file the loader (dotenv.ts) refuses: not a regular file,
 //   another owner, group or other mode bits, a second hard link, over 64 KiB
-//   (after the append, too), invalid UTF-8, a NUL byte, any line parseDotenv
-//   refuses (a placeholder, an undeclared name, a duplicate); a file it must
-//   append to whose mode bits deny its owner writing; a file it created whose
-//   filesystem does not keep mode 0600; a file that changed between the read
-//   and the write; and a generated value shorter than the control token's
-//   floor or one the loader would not read back exactly as written. Every
+//   (after the append, or as created, too), invalid UTF-8, a NUL byte, any
+//   line parseDotenv refuses (a placeholder, an undeclared name, a
+//   duplicate); a name to generate, or asked for in `digests`, that the
+//   config does not declare; an fstat or read of the file that fails (named
+//   by its errno); a file it must append to whose mode bits deny its owner
+//   writing; a file it created whose filesystem does not keep mode 0600; a
+//   file that changed between the read and the write; and a generated value
+//   shorter than the control token's floor or one the loader would not read
+//   back exactly as written. Every
 //   refusal happens before a byte is written. A file this call created and
 //   then refused, before its first byte, is removed again.
 //
@@ -49,9 +69,13 @@
 //   step failed".
 //
 //   What it never says: a value. It prints nothing. Its result and its errors
-//   carry the path, names and line numbers only, and every generated value is
-//   registered with SecretMask before it is written, so anything that quotes
-//   one later is censored.
+//   carry the path, names, line numbers and digests only, and every generated
+//   value is registered with SecretMask before it is written, so anything that
+//   quotes one later is censored. A raw error (a generator's own, an errno no
+//   branch names) is reported by its errno or Node code, or its class name, and
+//   is not kept as the error's cause: util.inspect and Node's printer for an
+//   uncaught error print a cause's message, and a generator's may quote the
+//   value it was making, before SecretMask has it.
 //
 //   How it knows it worked: the descriptor it appends through must name the
 //   inode it read, at the size and mtime it read, so an editor's save between
@@ -61,6 +85,7 @@
 //   reported, never lost silently. Then loadDotenv must read every written name
 //   back as generated.
 
+import { createHash } from 'node:crypto'
 import {
   closeSync,
   constants,
@@ -70,6 +95,7 @@ import {
   lstatSync,
   openSync,
   readSync,
+  statSync,
   unlinkSync,
   writeSync,
   type Stats,
@@ -82,6 +108,9 @@ import { ConfigError } from '../errors.js'
 import { SecretMask } from '../events/redact.js'
 import { DOTENV_FILE, DOTENV_MAX_BYTES, gitignoresDotenv, loadDotenv, occupiedLines, parseDotenv } from './dotenv.js'
 
+/** What the installer builds `accepted` from, here so that it never imports the loader. */
+export { credentialNames } from './dotenv.js'
+
 /** The two lines a created file starts with: comments, no value, no placeholder. */
 export const CREATED_HEADER = '# Created by npm run aos-install, which only ever appends the names it lacks.\n# Add ANTHROPIC_API_KEY yourself.\n'
 
@@ -92,6 +121,12 @@ export const CREATED_HEADER = '# Created by npm run aos-install, which only ever
  * mask, wherever it went.
  */
 export const MIN_GENERATED_LENGTH = MIN_TOKEN_LENGTH
+
+/**
+ * The length inspectCredentials sizes a missing name's value at unless told
+ * otherwise: what the installer generates, 32 random bytes as hex.
+ */
+export const GENERATED_LENGTH = 64
 
 const NEWLINE = 0x0a
 
@@ -105,6 +140,12 @@ interface Where {
   readonly uid?: number
   /** Who is running, for the root refusal; defaults to process.geteuid(). Injected so a test run as root can stand for the operator. */
   readonly euid?: number
+  /**
+   * Names whose digest to return, in order, each one `accepted` holds: for
+   * each that holds a value (set in the file, or appended by this call), the
+   * `sha256:<hex>` pmmcp is given in place of the token. None by default.
+   */
+  readonly digests?: Iterable<string>
 }
 
 export interface AppendOptions extends Where {
@@ -115,12 +156,20 @@ export interface AppendOptions extends Where {
 export interface InspectOptions extends Where {
   /** The names to report, in order. Each must be one `accepted` holds. */
   readonly names: Iterable<string>
+  /** How many characters each missing name's value will have, for `fits`: GENERATED_LENGTH unless said. */
+  readonly valueLength?: number
 }
 
 /** A name and the line it is on, numbered as the loader numbers them (from 1). */
 export interface NameLine {
   readonly name: string
   readonly line: number
+}
+
+/** A name and the digest of its value: `sha256:` and 64 lowercase hex, as pmmcp's digest_of writes it. */
+export interface NameDigest {
+  readonly name: string
+  readonly digest: string
 }
 
 export interface AppendResult {
@@ -137,6 +186,8 @@ export interface AppendResult {
    * operator to fill in or delete. Appending it would make a duplicate.
    */
   readonly blank: readonly NameLine[]
+  /** For each name in `digests` that the file now holds a value for, in that order, its digest. */
+  readonly digests: readonly NameDigest[]
 }
 
 export interface InspectResult {
@@ -150,11 +201,21 @@ export interface InspectResult {
   /** Names that hold no line at all, in the order asked: the ones appendCredentials would add, given a value. */
   readonly missing: readonly string[]
   /**
-   * Whether its owner may write the file, by its mode bits, as an append
-   * needs: false for a 0400 file, which appendCredentials refuses to add a
-   * missing name to. True with no file, which would be created.
+   * Whether the write could be made, by mode bits: for a file, whether its
+   * owner may write it, as an append needs (false for a 0400 file, which
+   * appendCredentials refuses to add a missing name to); with no file,
+   * whether the operator may create one in its directory (write and search
+   * there, by owner, group or other bits as they apply to `uid`).
    */
   readonly writable: boolean
+  /**
+   * Whether every missing name, at `valueLength` characters, fits: the file
+   * (or the one created) stays within 64 KiB, as appendCredentials checks it,
+   * newline it adds included. True when nothing is missing.
+   */
+  readonly fits: boolean
+  /** For each name in `digests` set to a value in the file, in that order, its digest. */
+  readonly digests: readonly NameDigest[]
 }
 
 /**
@@ -184,13 +245,28 @@ export class DotenvWriteError extends ConfigError {
  */
 export function inspectCredentials(options: InspectOptions): InspectResult {
   const names = [...new Set(options.names)]
+  const wanted = [...new Set(options.digests ?? [])]
   const path = dotenvPathIn(options.repoRoot)
-  const uid = preflight(options, names, path)
+  const uid = preflight(options, [...names, ...wanted], path)
+  const length = options.valueLength ?? GENERATED_LENGTH
   const fd = openToRead(path)
-  if (fd === undefined) return { path, found: false, present: [], blank: [], missing: names, writable: true }
+  if (fd === undefined) {
+    const size = Buffer.byteLength(CREATED_HEADER) + assignedBytes(names, length)
+    return { path, found: false, present: [], blank: [], missing: names, writable: mayCreateIn(dirname(path), uid), fits: size <= DOTENV_MAX_BYTES, digests: [] }
+  }
   try {
     const held = readHeld(fd, path, names, options.accepted, uid)
-    return { path, found: true, present: held.present, blank: held.blank, missing: held.missing, writable: (held.before.mode & 0o200) !== 0 }
+    const size = held.before.size + (held.missing.length > 0 ? leadOf(held.buf).length + assignedBytes(held.missing, length) : 0)
+    return {
+      path,
+      found: true,
+      present: held.present,
+      blank: held.blank,
+      missing: held.missing,
+      writable: (held.before.mode & 0o200) !== 0,
+      fits: size <= DOTENV_MAX_BYTES,
+      digests: digestsOf(wanted, (name) => held.parsed.get(name)?.value),
+    }
   } finally {
     closeSync(fd)
   }
@@ -220,16 +296,18 @@ interface Progress {
 }
 
 function append(path: string, options: AppendOptions, progress: Progress): AppendResult {
-  const uid = preflight(options, options.generate.keys(), path)
+  const wanted = [...new Set(options.digests ?? [])]
+  const uid = preflight(options, [...options.generate.keys(), ...wanted], path)
   const fd = openToRead(path)
-  if (fd === undefined) return create(path, options, uid, progress)
+  if (fd === undefined) return create(path, options, uid, progress, wanted)
 
   // Held open to the end, so the inode read cannot be freed and its number
   // handed to a new file that would then pass for it.
   try {
     const held = readHeld(fd, path, options.generate.keys(), options.accepted, uid)
     const { buf, text, present, blank, missing } = held
-    if (missing.length === 0) return { path, created: false, appended: [], present, blank }
+    const inFile = (name: string): string | undefined => held.parsed.get(name)?.value
+    if (missing.length === 0) return { path, created: false, appended: [], present, blank, digests: digestsOf(wanted, inFile) }
 
     if ((held.before.mode & 0o200) === 0) {
       const mode = (held.before.mode & 0o777).toString(8).padStart(4, '0')
@@ -239,9 +317,7 @@ function append(path: string, options: AppendOptions, progress: Progress): Appen
       )
     }
     const values = generated(missing, options)
-    // Without it the first new line would join the file's last key.
-    const lead = buf.length > 0 && buf[buf.length - 1] !== NEWLINE ? '\n' : ''
-    const chunk = Buffer.from(lead + assignments(values), 'utf8')
+    const chunk = Buffer.from(leadOf(buf) + assignments(values), 'utf8')
     if (held.before.size + chunk.length > DOTENV_MAX_BYTES) {
       throw new ConfigError(
         `${path} would be ${String(held.before.size + chunk.length)} bytes after the append; a credentials file is at most ` +
@@ -252,10 +328,48 @@ function append(path: string, options: AppendOptions, progress: Progress): Appen
     appendTo(path, held.before, chunk, uid, progress)
     sameFile(path, held.before)
     verify(path, values, options, uid)
-    return { path, created: false, appended, present, blank }
+    return { path, created: false, appended, present, blank, digests: digestsOf(wanted, (name) => values.get(name) ?? inFile(name)) }
   } finally {
     closeSync(fd)
   }
+}
+
+/** What goes before the new lines: a newline when the file has bytes and does not end in one, without which the first new line would join its last key. */
+function leadOf(buf: Buffer): string {
+  return buf.length > 0 && buf[buf.length - 1] !== NEWLINE ? '\n' : ''
+}
+
+/** The bytes `NAME=<value>\n` takes for each name, at `length` characters a value: names and generated values are ASCII. */
+function assignedBytes(names: readonly string[], length: number): number {
+  return names.reduce((sum, name) => sum + Buffer.byteLength(`${name}=\n`) + length, 0)
+}
+
+/** Each listed name that `valueOf` gives a value for, with its digest, in order. */
+function digestsOf(names: readonly string[], valueOf: (name: string) => string | undefined): NameDigest[] {
+  const out: NameDigest[] = []
+  for (const name of names) {
+    const value = valueOf(name)
+    if (value !== undefined && value !== '') out.push({ name, digest: `sha256:${createHash('sha256').update(value, 'utf8').digest('hex')}` })
+  }
+  return out
+}
+
+/**
+ * Whether `uid` may create a file in `dir`, by its mode bits: write and
+ * search, in the owner's bits when it owns `dir`, else the group's when the
+ * process is in its group, else the others'. Mode bits rather than access():
+ * root may create anything, and the writer refuses root before this.
+ */
+function mayCreateIn(dir: string, uid: number): boolean {
+  let st: Stats
+  try {
+    st = statSync(dir)
+  } catch (e) {
+    throw new ConfigError(`cannot examine ${dir}: ${errorName(e)}`)
+  }
+  const groups = new Set([process.getgid?.(), ...(process.getgroups?.() ?? [])])
+  const bits = st.uid === uid ? st.mode >> 6 : groups.has(st.gid) ? st.mode >> 3 : st.mode
+  return (bits & 0o3) === 0o3
 }
 
 /** <repoRoot>/.env: the one path this module opens. */
@@ -319,13 +433,20 @@ interface Held {
   readonly before: Stats
   readonly buf: Buffer
   readonly text: string
+  /** The loader's reading of the file: every name set to a value, with it. */
+  readonly parsed: ReturnType<typeof parseDotenv>
   readonly present: NameLine[]
   readonly blank: NameLine[]
   readonly missing: string[]
 }
 
 function readHeld(fd: number, path: string, names: Iterable<string>, accepted: ReadonlySet<string>, uid: number): Held {
-  const before = fstatSync(fd)
+  let before: Stats
+  try {
+    before = fstatSync(fd)
+  } catch (e) {
+    throw new ConfigError(`cannot read ${path}: ${errorName(e)}`)
+  }
   // A FIFO, a directory or a device is refused here, before anything is
   // opened for writing: a FIFO's reader would receive the new token.
   refuseLikeTheLoader(before, path, uid)
@@ -344,7 +465,7 @@ function readHeld(fd: number, path: string, names: Iterable<string>, accepted: R
     // parseDotenv keeps only names with a value; a line it dropped is blank.
     else (parsed.has(name) ? present : blank).push({ name, line })
   }
-  return { before, buf, text, present, blank, missing }
+  return { before, buf, text, parsed, present, blank, missing }
 }
 
 /**
@@ -378,11 +499,17 @@ function appendTo(path: string, read: Stats, chunk: Buffer, uid: number, progres
 }
 
 /** A missing file: generate every value first, then create it with O_EXCL. */
-function create(path: string, options: AppendOptions, uid: number, progress: Progress): AppendResult {
+function create(path: string, options: AppendOptions, uid: number, progress: Progress, wanted: readonly string[]): AppendResult {
   const names = [...options.generate.keys()]
-  if (names.length === 0) return { path, created: false, appended: [], present: [], blank: [] }
+  if (names.length === 0) return { path, created: false, appended: [], present: [], blank: [], digests: [] }
   const values = generated(names, options)
   const chunk = Buffer.from(CREATED_HEADER + assignments(values), 'utf8')
+  // The loader refuses a larger file, so it would be created only to fail its read-back.
+  if (chunk.length > DOTENV_MAX_BYTES) {
+    throw new ConfigError(
+      `${path} would be ${String(chunk.length)} bytes when created; a credentials file is at most ${String(DOTENV_MAX_BYTES)}. Nothing was written`,
+    )
+  }
   const appended = readsBack(chunk.toString('utf8'), values, options.accepted, path)
 
   let fd: number
@@ -427,7 +554,7 @@ function create(path: string, options: AppendOptions, uid: number, progress: Pro
   syncDirectory(path)
   sameFile(path, made)
   verify(path, values, options, uid)
-  return { path, created: true, appended, present: [], blank: [] }
+  return { path, created: true, appended, present: [], blank: [], digests: digestsOf(wanted, (name) => values.get(name)) }
 }
 
 /**
@@ -440,31 +567,49 @@ function create(path: string, options: AppendOptions, uid: number, progress: Pro
  * message says so with `fix`, and the error says the file may have changed.
  */
 function removeCreated(path: string, fd: number, why: unknown, fix: string): DotenvWriteError {
-  const reason = why instanceof ConfigError ? why.message : `${path} could not be prepared (${(why as NodeJS.ErrnoException).code ?? 'unknown error'})`
+  // A raw error is named, never kept: see failure.
+  const refusal = why instanceof ConfigError
+  const reason = refusal ? why.message : `${path} could not be prepared (${errorName(why)})`
+  const cause = refusal ? { cause: why } : undefined
   try {
     const held = fstatSync(fd)
     const now = lstatSync(path)
     if (now.dev === held.dev && now.ino === held.ino && held.size === 0) {
       unlinkSync(path)
-      return new DotenvWriteError(`${reason}. Nothing was written, and the empty file this created was removed`, false, { cause: why })
+      return new DotenvWriteError(`${reason}. Nothing was written, and the empty file this created was removed`, false, cause)
     }
   } catch {
     // Reported below: the file may be left, and the message says so.
   }
-  return new DotenvWriteError(`${reason}. Nothing was written to it, but ${path} may be left empty: ${fix}`, true, { cause: why })
+  return new DotenvWriteError(`${reason}. Nothing was written to it, but ${path} may be left empty: ${fix}`, true, cause)
 }
 
 /**
  * Every failure as a DotenvWriteError: a refusal or a failure from below
  * keeps its message; anything else (a generator's own error, an errno no
- * branch above names) is reported by its code, never its text, which may
- * quote what it was given.
+ * branch above names) is reported by its name only (errorName), never its
+ * text, which may quote what it was given, and is not kept as the cause:
+ * util.inspect, and Node's printer for an uncaught error, print a cause's
+ * message.
  */
 function failure(path: string, e: unknown, written: boolean): DotenvWriteError {
   if (e instanceof DotenvWriteError) return e
   if (e instanceof ConfigError) return new DotenvWriteError(e.message, written, { cause: e })
-  const what = (e as NodeJS.ErrnoException).code ?? (e instanceof Error ? e.name : 'an unknown error')
-  return new DotenvWriteError(written ? `${path} may have been changed before ${what}: check it by hand` : `${path} was not written: ${what}`, written, { cause: e })
+  const what = errorName(e)
+  return new DotenvWriteError(written ? `${path} may have been changed before ${what}: check it by hand` : `${path} was not written: ${what}`, written)
+}
+
+/**
+ * What a raw error is called: its errno or Node code (EIO, ERR_OUT_OF_RANGE),
+ * else its class's name (RangeError), else nothing it was given. Each is held
+ * to its shape, since whoever threw it set both.
+ */
+function errorName(e: unknown): string {
+  const code = (e as { code?: unknown } | null | undefined)?.code
+  if (typeof code === 'string' && /^(?:E[A-Z0-9]{1,15}|ERR_[A-Z0-9_]{1,60})$/.test(code)) return code
+  const name = e instanceof Error ? e.name : undefined
+  if (name !== undefined && /^(?:[A-Z][A-Za-z]{0,40})?(?:Error|Exception)$/.test(name)) return name
+  return 'an unknown error'
 }
 
 /** What the loader refuses before reading a byte (dotenv.ts readGuarded), refused here before writing one. */
@@ -485,7 +630,12 @@ function readAll(fd: number, size: number, path: string): Buffer {
   const buf = Buffer.alloc(size)
   let read = 0
   while (read < size) {
-    const got = readSync(fd, buf, read, size - read, read)
+    let got: number
+    try {
+      got = readSync(fd, buf, read, size - read, read)
+    } catch (e) {
+      throw new ConfigError(`cannot read ${path}: ${errorName(e)}`)
+    }
     if (got === 0) break
     read += got
   }

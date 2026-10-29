@@ -505,9 +505,38 @@ function reachedFrom(roots: readonly string[], pool: readonly SourceFile[]): Set
   return seen
 }
 
+// ── The .env write scan ─────────────────────────────────────────────────────
+//
+// CLAUDE.md allows exactly one writer of <repo>/.env. The scan below reads
+// src/ and scripts/ with the compiler and follows each write's path as far as
+// natural code takes it: through consts and lets, parameters and the calls
+// that bind them, a helper's return, object literals and the properties
+// written to them, path.join/resolve, template text, imports by name,
+// default and namespace (re-exports and `export *` included), and fs
+// functions under any name (renamed, aliased, destructured from the module or
+// from import(), called through .call/.apply or handed on as values). Where
+// it cannot follow a path in a file that speaks of .env, the write counts.
+//
+// It is a tripwire for natural code, not a proof against code written to
+// evade it: whoever wants a second writer can write one this cannot see. It
+// deliberately does not follow, and a reviewer reads these by eye:
+//   - .call/.apply through one of the pool's own functions (only fs's);
+//   - a pool function handed on as a value (`[path].forEach(drop)`), where
+//     only fs's own functions count as written-through values;
+//   - a class's static property (`Paths.env`) in a paths module: an
+//     importer that writes it is not taken to speak of .env;
+//   - a helper reached through import() of a pool module;
+//   - a write two modules away: a helper whose path parameter is written by
+//     another helper in a third module.
+// What it does follow across modules: functions, and methods of an exported
+// object literal or class, whose parameter a write in their own module takes
+// as its path; and a function under a second name (`const save = put`).
+
 /** Where each fs call takes a path it writes, creates, moves or deletes. */
 const PATH_ARGS: ReadonlyMap<string, readonly number[]> = new Map<string, readonly number[]>([
   ...['writeFileSync', 'writeFile', 'appendFileSync', 'appendFile', 'createWriteStream', 'truncateSync', 'truncate'].map((c): [string, number[]] => [c, [0]]),
+  // `new fs.WriteStream(path)` creates or truncates it, as createWriteStream does.
+  ['WriteStream', [0]],
   ...['rmSync', 'rm', 'unlinkSync', 'unlink', 'chmodSync', 'chmod', 'chownSync', 'chown', 'utimesSync', 'utimes'].map((c): [string, number[]] => [c, [0]]),
   // macOS changes a link's own mode, owner and times through these.
   ...['lchmodSync', 'lchmod', 'lchownSync', 'lchown', 'lutimesSync', 'lutimes'].map((c): [string, number[]] => [c, [0]]),
@@ -578,11 +607,36 @@ function lexicalDeclaration(id: ts.Identifier): ts.Node | undefined {
           if (d !== undefined) return d
         }
         if (ts.isFunctionDeclaration(st) && named(st.name)) return st
+        if (ts.isClassDeclaration(st) && named(st.name)) return st
       }
     }
     if ((ts.isForStatement(scope) || ts.isForOfStatement(scope) || ts.isForInStatement(scope)) && scope.initializer !== undefined && ts.isVariableDeclarationList(scope.initializer)) {
       const d = scope.initializer.declarations.find((v) => named(v.name))
       if (d !== undefined) return d
+    }
+  }
+  return undefined
+}
+
+/**
+ * A name a `const { property: name } = from` (or `{ name }`) binds, by
+ * lexical scope as lexicalDeclaration finds the rest: the property it takes
+ * and what it takes it from. Top-level elements of an object pattern only;
+ * a rest element is no one property.
+ */
+function destructured(id: ts.Identifier): { readonly property: string; readonly from: ts.Expression } | undefined {
+  for (let scope: ts.Node | undefined = id.parent; scope !== undefined; scope = scope.parent) {
+    if (!(ts.isSourceFile(scope) || ts.isBlock(scope) || ts.isModuleBlock(scope) || ts.isCaseClause(scope) || ts.isDefaultClause(scope))) continue
+    for (const st of scope.statements) {
+      if (!ts.isVariableStatement(st)) continue
+      for (const d of st.declarationList.declarations) {
+        if (!ts.isObjectBindingPattern(d.name) || d.initializer === undefined) continue
+        const el = d.name.elements.find((x) => ts.isIdentifier(x.name) && x.name.text === id.text)
+        if (el === undefined) continue
+        const key = el.propertyName ?? el.name
+        if (el.dotDotDotToken !== undefined || !(ts.isIdentifier(key) || ts.isStringLiteral(key))) return undefined
+        return { property: key.text, from: d.initializer }
+      }
     }
   }
   return undefined
@@ -691,7 +745,7 @@ const traceIn = (pool: ReadonlyMap<string, ts.SourceFile>, assume: Bound = NO_BO
   steps: { left: MAX_STEPS },
 })
 
-type Fn = ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression
+type Fn = ts.FunctionDeclaration | ts.ArrowFunction | ts.FunctionExpression | ts.MethodDeclaration
 
 /** An expression without the parentheses, casts and awaits that leave its value a path. */
 function unwrapped(node: ts.Expression): ts.Expression {
@@ -1004,6 +1058,12 @@ function importOf(id: ts.Identifier): { readonly module: string; readonly name: 
 function moduleBinding(node: ts.Expression, depth = 0): 'fs' | 'path' | undefined {
   const e = unwrapped(node)
   if (depth > 8) return undefined
+  // `await import('node:fs/promises')`: the await is unwrapped above.
+  if (ts.isCallExpression(e) && e.expression.kind === ts.SyntaxKind.ImportKeyword) {
+    const spec = e.arguments[0]
+    if (spec === undefined || !ts.isStringLiteralLike(spec)) return undefined
+    return FS_MODULE.test(spec.text) ? 'fs' : PATH_MODULE.test(spec.text) ? 'path' : undefined
+  }
   if (ts.isPropertyAccessExpression(e)) {
     const of = moduleBinding(e.expression, depth + 1)
     if (of === 'fs' && e.name.text === 'promises') return 'fs'
@@ -1038,7 +1098,12 @@ function fsFunction(node: ts.Expression, pool: ReadonlyMap<string, ts.SourceFile
   if (!ts.isIdentifier(e)) return undefined
   const local = declarationOf(e)
   const from = local === undefined ? importOf(e) : undefined
-  if (local === undefined && from === undefined) return PATH_ARGS.has(e.text) || READ_CALLS.has(e.text) ? e.text : undefined
+  if (local === undefined && from === undefined) {
+    // `const { writeFileSync: put } = fs`, or `= await import('node:fs')`.
+    const element = destructured(e)
+    if (element !== undefined && moduleBinding(element.from, depth + 1) === 'fs') return element.property
+    return PATH_ARGS.has(e.text) || READ_CALLS.has(e.text) ? e.text : undefined
+  }
   if (from !== undefined && FS_MODULE.test(from.module)) return from.name === 'default' || from.name === '*' ? undefined : from.name
   const decl = local ?? bindingOf(e, pool)
   return decl !== undefined && ts.isVariableDeclaration(decl) && ts.isIdentifier(decl.name) && decl.initializer !== undefined
@@ -1067,16 +1132,83 @@ function pathFunction(callee: ts.Expression): string | undefined {
   return PATH_MODULE.test(from.module) ? from.name : undefined
 }
 
-/** The function a callee names, in its own file or through a relative import. */
-function calledFunction(callee: ts.Expression, pool: ReadonlyMap<string, ts.SourceFile>): Fn | undefined {
+/**
+ * The function a callee names, in its own file or through a relative import:
+ * a function by name, under a second name (`const save = put`), a namespace
+ * import's export, or a method: of an object literal a const holds, of a
+ * class (static, `Io.put`), or of an instance (`new Io().put`, or a const
+ * that holds `new Io()`).
+ */
+function calledFunction(callee: ts.Expression, pool: ReadonlyMap<string, ts.SourceFile>, depth = 0): Fn | undefined {
   const e = unwrapped(callee)
-  let decl: ts.Node | undefined
-  if (ts.isIdentifier(e)) decl = bindingOf(e, pool)
-  else if (ts.isPropertyAccessExpression(e) && ts.isIdentifier(e.expression)) {
-    const ns = namespaceOf(e.expression, pool)
-    decl = ns === undefined ? undefined : exportedBinding(ns, e.name.text, pool, 0)
+  if (depth > 8) return undefined
+  if (ts.isIdentifier(e)) {
+    const decl = bindingOf(e, pool)
+    if (decl === undefined) return undefined
+    const alias = constAlias(decl)
+    return functionOf(decl) ?? (alias === undefined ? undefined : calledFunction(alias, pool, depth + 1))
   }
-  return decl === undefined ? undefined : functionOf(decl)
+  if (!ts.isPropertyAccessExpression(e)) return undefined
+  const object = unwrapped(e.expression)
+  const name = e.name.text
+  if (ts.isNewExpression(object)) {
+    const made = ts.isIdentifier(object.expression) ? bindingOf(object.expression, pool) : undefined
+    return made !== undefined && ts.isClassDeclaration(made) ? classMethod(made, name, false) : undefined
+  }
+  if (!ts.isIdentifier(object)) return undefined
+  const ns = namespaceOf(object, pool)
+  if (ns !== undefined) {
+    const decl = exportedBinding(ns, name, pool, 0)
+    return decl === undefined ? undefined : functionOf(decl)
+  }
+  const decl = bindingOf(object, pool)
+  if (decl === undefined) return undefined
+  if (ts.isClassDeclaration(decl)) return classMethod(decl, name, true)
+  if (!ts.isVariableDeclaration(decl) || decl.initializer === undefined || !isConst(decl)) return undefined
+  const value = unwrapped(decl.initializer)
+  if (ts.isObjectLiteralExpression(value)) return literalMethod(value, name)
+  if (ts.isNewExpression(value) && ts.isIdentifier(value.expression)) {
+    const made = bindingOf(value.expression, pool)
+    return made !== undefined && ts.isClassDeclaration(made) ? classMethod(made, name, false) : undefined
+  }
+  return undefined
+}
+
+const isConst = (decl: ts.VariableDeclaration): boolean => ts.isVariableDeclarationList(decl.parent) && (decl.parent.flags & ts.NodeFlags.Const) !== 0
+
+/** The name a const gives a second name to: `const save = put` is `put`. */
+function constAlias(decl: ts.Node): ts.Identifier | undefined {
+  if (!ts.isVariableDeclaration(decl) || decl.initializer === undefined || !isConst(decl)) return undefined
+  const value = unwrapped(decl.initializer)
+  return ts.isIdentifier(value) ? value : undefined
+}
+
+/** An object literal's method `name`: `put(f) {…}`, or `put: (f) => …` / `put: function (f) {…}`. */
+function literalMethod(literal: ts.ObjectLiteralExpression, name: string): Fn | undefined {
+  for (const prop of literal.properties) {
+    if (ts.isSpreadAssignment(prop) || propertyKey(prop.name) !== name) continue
+    if (ts.isMethodDeclaration(prop)) return prop.body === undefined ? undefined : prop
+    if (ts.isPropertyAssignment(prop)) {
+      const fn = unwrapped(prop.initializer)
+      return ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) ? fn : undefined
+    }
+  }
+  return undefined
+}
+
+/** A class's method `name`, static or not: a method, or a field holding an arrow or function. */
+function classMethod(cls: ts.ClassDeclaration, name: string, isStatic: boolean): Fn | undefined {
+  for (const member of cls.members) {
+    if (member.name === undefined || propertyKey(member.name) !== name) continue
+    const staticMember = ((ts.canHaveModifiers(member) ? ts.getModifiers(member) : undefined) ?? []).some((m) => m.kind === ts.SyntaxKind.StaticKeyword)
+    if (staticMember !== isStatic) continue
+    if (ts.isMethodDeclaration(member)) return member.body === undefined ? undefined : member
+    if (ts.isPropertyDeclaration(member) && member.initializer !== undefined) {
+      const fn = unwrapped(member.initializer)
+      return ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) ? fn : undefined
+    }
+  }
+  return undefined
 }
 
 function functionOf(decl: ts.Node): Fn | undefined {
@@ -1185,9 +1317,10 @@ function namespaceOf(id: ts.Identifier, pool: ReadonlyMap<string, ts.SourceFile>
   return undefined
 }
 
-/** A top-level const, let or function named `name` in `st`. */
+/** A top-level const, let, function or class named `name` in `st`. */
 function declaredIn(st: ts.Statement, name: string): ts.Node | undefined {
   if (ts.isVariableStatement(st)) return st.declarationList.declarations.find((d) => ts.isIdentifier(d.name) && d.name.text === name)
+  if (ts.isClassDeclaration(st)) return st.name?.text === name ? st : undefined
   return ts.isFunctionDeclaration(st) && st.name?.text === name && st.body !== undefined ? st : undefined
 }
 
@@ -1254,7 +1387,9 @@ function exportNames(module: ts.SourceFile, pool: ReadonlyMap<string, ts.SourceF
 /** Whether a module-level binding is, holds or returns .env's path: called with arguments the scan cannot see, a function counts by what it returns. */
 function holdsDotenv(decl: ts.Node, pool: ReadonlyMap<string, ts.SourceFile>): boolean {
   const trace = traceIn(pool)
-  const fn = functionOf(decl)
+  // `export const where = envPath`: the function it is a second name for.
+  const alias = constAlias(decl)
+  const fn = functionOf(decl) ?? (alias === undefined ? undefined : calledFunction(alias, pool))
   if (fn !== undefined) return verdictOfAll(returnTails(fn, new Map(fn.parameters.map((p): [ts.ParameterDeclaration, undefined] => [p, undefined])), trace)) === 'dotenv'
   const value = ts.isVariableDeclaration(decl) ? decl.initializer : ts.isExportAssignment(decl) ? decl.expression : undefined
   const init = value === undefined ? undefined : unwrapped(value)
@@ -1343,7 +1478,8 @@ function tailsAt(args: readonly ts.Expression[] | undefined, positions: readonly
   return tails
 }
 
-const WRITE_CALLS = new WeakMap<ts.SourceFile, WriteCall[]>()
+/** By whether calls into other modules count: worked out once per file and rule. */
+const WRITE_CALLS = { across: new WeakMap<ts.SourceFile, WriteCall[]>(), within: new WeakMap<ts.SourceFile, WriteCall[]>() }
 
 /**
  * Every write in a file: an fs write call by whatever name it is made
@@ -1353,7 +1489,8 @@ const WRITE_CALLS = new WeakMap<ts.SourceFile, WriteCall[]>()
  * function that writes the path a parameter gives it (writeParams).
  */
 function writeCallsIn(source: ts.SourceFile, pool: ReadonlyMap<string, ts.SourceFile>, across: boolean): WriteCall[] {
-  const cached = across ? WRITE_CALLS.get(source) : undefined
+  const cache = across ? WRITE_CALLS.across : WRITE_CALLS.within
+  const cached = cache.get(source)
   if (cached !== undefined) return cached
   const out: WriteCall[] = []
   const visit = (node: ts.Node): void => {
@@ -1361,6 +1498,12 @@ function writeCallsIn(source: ts.SourceFile, pool: ReadonlyMap<string, ts.Source
     if (ts.isCallExpression(node)) {
       const write = writeOf(node, source, pool, across)
       if (write !== undefined) out.push(write)
+    } else if (ts.isNewExpression(node)) {
+      // `new fs.WriteStream(path)`: a constructor that opens its path for writing.
+      const name = builtinName(node.expression, pool)
+      const positions = name === undefined ? undefined : PATH_ARGS.get(name)
+      const args = node.arguments ?? []
+      if (name !== undefined && positions !== undefined) out.push({ node, name, tails: (trace) => tailsAt(args, positions, trace) })
     } else if ((ts.isIdentifier(node) && !isPropertyName(node)) || ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
       const name = valueUse(node, pool)
       if (name !== undefined) {
@@ -1371,7 +1514,7 @@ function writeCallsIn(source: ts.SourceFile, pool: ReadonlyMap<string, ts.Source
     ts.forEachChild(node, visit)
   }
   visit(source)
-  if (across) WRITE_CALLS.set(source, out)
+  cache.set(source, out)
   return out
 }
 
@@ -1412,8 +1555,8 @@ function valueUse(node: ts.Expression, pool: ReadonlyMap<string, ts.SourceFile>)
   let at: ts.Node = node
   while (ts.isParenthesizedExpression(at.parent) || ts.isAsExpression(at.parent) || ts.isNonNullExpression(at.parent) || ts.isSatisfiesExpression(at.parent)) at = at.parent
   const parent = at.parent
-  // Called: the call is the write.
-  if (ts.isCallExpression(parent) && parent.expression === at) return undefined
+  // Called, or constructed: the call is the write.
+  if ((ts.isCallExpression(parent) || ts.isNewExpression(parent)) && parent.expression === at) return undefined
   if (ts.isPropertyAccessExpression(parent) && parent.expression === at && (parent.name.text === 'call' || parent.name.text === 'apply')) {
     if (ts.isCallExpression(parent.parent) && parent.parent.expression === parent) return undefined
   }
@@ -1456,11 +1599,38 @@ function writeParams(fn: Fn, pool: ReadonlyMap<string, ts.SourceFile>): readonly
 function readsDotenv(source: ts.SourceFile, pool: ReadonlyMap<string, ts.SourceFile>): boolean {
   const installer = INSTALLER.test(source.fileName)
   return calls(source).some((call) => {
+    if (installer && isLoaderCall(call.expression)) return true
     const callee = builtinName(call.expression, pool)
-    if (callee === undefined) return false
-    if (installer && LOADER_READS.has(callee)) return true
-    return READ_CALLS.has(callee) && verdictOfAll(tailsAt(call.arguments, [0], traceIn(pool))) === 'dotenv'
+    return callee !== undefined && READ_CALLS.has(callee) && verdictOfAll(tailsAt(call.arguments, [0], traceIn(pool))) === 'dotenv'
   })
+}
+
+/**
+ * Whether a callee is one of the loader's reads under any name: by its own
+ * (`loadDotenv`, `d.loadDotenv`, `d['loadDotenv']`), as the import it binds
+ * (`loadDotenv as load`), destructured (`const { loadDotenv: load } = d`,
+ * or from import()), or as a const that names one (`const load = loadDotenv`).
+ */
+function isLoaderCall(callee: ts.Expression, depth = 0): boolean {
+  const e = unwrapped(callee)
+  if (depth > 8) return false
+  const own = ts.isIdentifier(e)
+    ? e.text
+    : ts.isPropertyAccessExpression(e)
+      ? e.name.text
+      : ts.isElementAccessExpression(e) && ts.isStringLiteralLike(e.argumentExpression)
+        ? e.argumentExpression.text
+        : undefined
+  if (own !== undefined && LOADER_READS.has(own)) return true
+  if (!ts.isIdentifier(e)) return false
+  const local = declarationOf(e)
+  if (local !== undefined) {
+    return ts.isVariableDeclaration(local) && local.initializer !== undefined && isLoaderCall(local.initializer, depth + 1)
+  }
+  const from = importOf(e)
+  if (from !== undefined) return LOADER_READS.has(from.name)
+  const element = destructured(e)
+  return element !== undefined && LOADER_READS.has(element.property)
 }
 
 /** Which of the scan's rules apply: following each path (always), and the two that stand in where a path cannot be followed. */
@@ -1723,6 +1893,12 @@ test('the .env write scan passes the installer\'s lock, logs and state file besi
     // path's own join, called on the module as the examples here write it; a numbered or radix-36 suffix.
     "writeFileSync(path.join(root, '.aos', 'install.lock'), String(process.pid))",
     "const lock = join(root, '.aos', 'install.lock')\nwriteFileSync(lock + '.' + 1, 'x')\nwriteFileSync(`${lock}.${Date.now().toString(36)}`, 'x')",
+    // An fs module object's own chmod takes the path, not a handle; a destructured
+    // fs function, from the module or from import(); a WriteStream constructed.
+    "fsp.chmod(join(root, '.aos', 'x'), 0o600)",
+    "import fs from 'node:fs'\nconst { writeFileSync: put } = fs\nput(join(root, '.aos', 'install.lock'), String(process.pid))",
+    "const { writeFile: put } = await import('node:fs/promises')\nawait put(join(root, '.aos', 'install', 'state.json'), '{}')",
+    "import fs from 'node:fs'\nconst log = new fs.WriteStream(join(root, '.aos', 'install', 'run.log'))\nlog.end()",
   ]
   for (const text of locks) assert.deepEqual(scanOne(`${text}${speaking}`), [], text)
   // .envrc and .env.example are other files: naming them is not speaking of .env.
@@ -1734,6 +1910,22 @@ test('the .env write scan passes the installer\'s lock, logs and state file besi
   const io = "import { writeFileSync } from 'node:fs'\nexport function put(file: string, text: string): void { writeFileSync(file, text) }"
   const record = `import { put } from './io.js'\nexport function record(root: string): void {\n  put(join(root, '.aos', 'install', 'active.json'), '{}')${speaking}\n}`
   assert.deepEqual(scanFiles({ 'scripts/install/io.ts': io, 'scripts/install/run.ts': record }), { 'scripts/install/io.ts': [], 'scripts/install/run.ts': [] })
+  // So does a method of its object literal or class, and the helper under a second name.
+  const ioMethods = [
+    io,
+    'export const io = { put(file: string, text: string): void { writeFileSync(file, text) } }',
+    'export class Io { put(file: string, text: string): void { writeFileSync(file, text) } }',
+  ].join('\n')
+  const recordVia = [
+    "import { Io, io, put } from './io.js'",
+    'export function record(root: string): void {',
+    "  io.put(join(root, '.aos', 'install', 'active.json'), '{}')",
+    "  new Io().put(join(root, '.aos', 'install', 'run.log'), 'x')",
+    '  const save = put',
+    `  save(join(root, '.aos', 'install', 'state.json'), '{}')${speaking}`,
+    '}',
+  ].join('\n')
+  assert.deepEqual(scanFiles({ 'scripts/install/io.ts': ioMethods, 'scripts/install/run.ts': recordVia }), { 'scripts/install/io.ts': [], 'scripts/install/run.ts': [] })
   // The installer's own calls into the writer, which writes .env whatever it
   // is handed: they pass no path, so they are not a second writer.
   const writer = WRITE_POOL.get('src/secrets/dotenv-append.ts')?.text ?? ''
@@ -1871,6 +2063,21 @@ test('the .env write scan flags a second writer however its path arrives: a copy
     "writeFileSync(join(root, 'abc') + `/${'v'.replace('v', '.env')}`, 'x')",
     // `..` as the last segment makes the one before it last.
     "export function stage(root: string, x: string): void {\n  writeFileSync(`${x}..`, 'x')\n  console.log(join(root, '.env'))\n}",
+    // A WORD that may be empty, after .env, leaves the last segment .env.
+    "const stamp = new Date().toISOString()\nwriteFileSync(join(root, '.env') + stamp.replace(/.*/, ''), 'x')",
+    // What only looks like a pid or a word: another object's pid (a lock
+    // file's, which may hold '/../.env'), and String() of a parameter.
+    "const lock = join(root, '.aos', 'install.lock')\nconst old = JSON.parse(readFileSync(lock, 'utf8'))\nwriteFileSync(`${lock}.${old.pid}`, 'x')\nconsole.log(join(root, '.env'))",
+    "export function stage(root: string, suffix: string): void {\n  writeFileSync(`${join(root, '.aos', 'install.lock')}.${String(suffix)}`, 'x')\n  console.log(join(root, '.env'))\n}",
+    // An fs function destructured from the module or from import(), and a WriteStream constructed.
+    "import fs from 'node:fs'\nconst { writeFileSync: put } = fs\nput(join(root, '.env'), 'x')",
+    "const { writeFile: put } = await import('node:fs/promises')\nawait put(join(root, '.env'), 'x')",
+    "import fs from 'node:fs'\nnew fs.WriteStream(join(root, '.env'))",
+    "import { WriteStream } from 'node:fs'\nnew WriteStream(join(root, '.env'))",
+    // An argument list it cannot read, in a file that names .env.
+    "import { writeFileSync } from 'node:fs'\nwriteFileSync.apply(null, args)\nconsole.log(join(root, '.env'))",
+    // The fs module's own chmod takes a path, not a handle: followed to .env.
+    "fsp.chmod(join(root, '.e' + 'nv'), 0o644)",
   ]
   for (const text of secondWriters) assert.equal(scanOne(text, at).length, 1, text)
 
@@ -1879,6 +2086,11 @@ test('the .env write scan flags a second writer however its path arrives: a copy
   for (const [path, text] of [
     ['scripts/install/state.ts', "const got = loadDotenv(join(root, DOTENV_FILE), opts)\nwriteFileSync(join(root, '.aos', 'install', 'state.json'), JSON.stringify(got.values))"],
     ['scripts/install.ts', "import { oneCredential } from '../src/secrets/dotenv.js'\nconst token = oneCredential('AOS_PMMCP_TOKEN', path, opts)\nwriteFileSync(join(root, '.aos', 'install', 'digest'), digestOf(token))"],
+    // Under another name: renamed, a const for it, a namespace's, destructured from import().
+    ['scripts/install/env.ts', "import { loadDotenv as load } from '../../src/secrets/dotenv.js'\nconst got = load(path, opts)\nwriteFileSync(join(root, '.aos', 'install', 'state.json'), JSON.stringify(got.values))"],
+    ['scripts/install/env.ts', "import { loadDotenv } from '../../src/secrets/dotenv.js'\nconst load = loadDotenv\nconst got = load(path, opts)\nwriteFileSync(join(root, '.aos', 'install', 'state.json'), JSON.stringify(got.values))"],
+    ['scripts/install/env.ts', "import * as d from '../../src/secrets/dotenv.js'\nconst got = d.loadDotenv(path, opts)\nwriteFileSync(join(root, '.aos', 'install', 'state.json'), JSON.stringify(got.values))"],
+    ['scripts/install/env.ts', "const { oneCredential: one } = await import('../../src/secrets/dotenv.js')\nconst token = one('AOS_PMMCP_TOKEN', path, opts)\nwriteFileSync(join(root, '.aos', 'install', 'digest'), token)"],
   ] as const) {
     assert.equal(scanOne(text, path).length, 1, text)
   }
@@ -1889,8 +2101,12 @@ test('the .env write scan flags a second writer however its path arrives: a copy
     "import { join } from 'node:path'",
     "export const envPath = (root: string): string => join(root, '.env')",
     "export const files = { env: join(process.cwd(), '.env') }",
+    // The helper under a second name.
+    'export const where = envPath',
   ].join('\n')
   const viaImport = [
+    "import { where } from './paths.js'\nexport function restore(root: string, text: string): void { writeFileSync(where(root), text) }",
+    "import { where } from './paths.js'\nexport class Env {\n  file = where(process.cwd())\n  put(text: string): void { writeFileSync(this.file, text) }\n}",
     "import { envPath } from './paths.js'\nexport function restore(root: string, text: string): void { writeFileSync(envPath(root), text) }",
     "import { envPath } from './paths.js'\nexport class Env {\n  private readonly file: string\n  constructor(root: string) { this.file = envPath(root) }\n  put(text: string): void { writeFileSync(this.file, text) }\n}",
     "import { dotenvAt } from './index.js'\nexport function restore(root: string, text: string): void { writeFileSync(dotenvAt(root), text) }",
@@ -1935,6 +2151,39 @@ test('the .env write scan flags a second writer however its path arrives: a copy
     ],
     ["import { writeFileSync } from 'node:fs'\nexport default function (file: string, text: string): void { writeFileSync(file, text) }", "import put from './io.js'\nexport function restore(root: string, t: string): void { put(join(root, '.env'), t) }", 'put'],
     [io, "import { put } from './io.js'\nexport class Env {\n  target = join(process.cwd(), '.env')\n  save(t: string): void { put(this.target, t) }\n}", 'put'],
+    // A method of an object literal or a class the module exports, an
+    // instance it exports, and the helper under a second name.
+    [
+      "import { writeFileSync } from 'node:fs'\nexport const io = { put(file: string, text: string): void { writeFileSync(file, text) } }",
+      "import { io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { io.put(envPath(root), t) }",
+      'io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport const io = { put: (file: string, text: string): void => writeFileSync(file, text) }",
+      "import { io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { io.put(envPath(root), t) }",
+      'io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport class Io { put(file: string, text: string): void { writeFileSync(file, text) } }",
+      "import { Io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { new Io().put(envPath(root), t) }",
+      'new Io().put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport class Io { put(file: string, text: string): void { writeFileSync(file, text) } }",
+      "import { Io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void {\n  const io = new Io()\n  io.put(envPath(root), t)\n}",
+      'io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport class Io { static put(file: string, text: string): void { writeFileSync(file, text) } }",
+      "import { Io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { Io.put(envPath(root), t) }",
+      'Io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nclass Io { put(file: string, text: string): void { writeFileSync(file, text) } }\nexport const io = new Io()",
+      "import { io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { io.put(envPath(root), t) }",
+      'io.put',
+    ],
+    [io, "import { put } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void {\n  const save = put\n  save(envPath(root), t)\n}", 'save'],
     // A spread fills the position the helper writes: what lands there is unseen.
     [
       "import { writeFileSync } from 'node:fs'\nexport function put(text: string, file: string): void { writeFileSync(file, text) }",
@@ -1963,7 +2212,7 @@ test('a test calls appendCredentials and inspectCredentials only through appendI
     ['appendCredentials', 'appendIn'],
     ['inspectCredentials', 'inspectIn'],
   ])
-  const INERT = new Set(['CREATED_HEADER', 'MIN_GENERATED_LENGTH', 'DotenvWriteError'])
+  const INERT = new Set(['CREATED_HEADER', 'MIN_GENERATED_LENGTH', 'GENERATED_LENGTH', 'DotenvWriteError', 'credentialNames'])
   const viaHelper = new Map<string, number>()
   let imports = 0
   for (const file of TEST) {

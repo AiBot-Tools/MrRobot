@@ -25,11 +25,12 @@ import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join, posix, relative } from 'node:path'
 import ts from 'typescript'
 
 import { ENTRY_POINTS } from './helpers/checkout.js'
+import { tmpdir } from './helpers/tmpdir.js'
 
 const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
 
@@ -489,6 +490,80 @@ test('only the entry points, the .env writer, the live helper and three tests im
     'test/dotenv.test.ts',
     'test/helpers/live-env.ts',
   ])
+})
+
+/** Every TypeScript or JavaScript file under `root`/`dir`, whatever its extension: .ts, .mts, .cts, .tsx, .js, .mjs, .cjs, .jsx. */
+function scriptSources(root: string, dir: string, out: SourceFile[] = []): SourceFile[] {
+  for (const entry of readdirSync(join(root, dir))) {
+    const rel = `${dir}/${entry}`
+    if (statSync(join(root, rel)).isDirectory()) scriptSources(root, rel, out)
+    else if (/\.(?:[cm]?[jt]s|[jt]sx)$/.test(rel)) {
+      const text = readFileSync(join(root, rel), 'utf8')
+      out.push({ path: rel, text, lines: text.split('\n') })
+    }
+  }
+  return out
+}
+
+test('in scripts/, node:child_process is imported only by scripts/falsify.ts, scripts/falsify/runner.ts and scripts/install/run.ts', (t) => {
+  // The installer runs pmmcp's stop and start scripts, git and docker, and
+  // scripts/install/run.ts is where the rules for that live: an allowlisted
+  // environment with no DOCKER_*, PMMCP_*, AOS_* or credential name, stdin
+  // that carries a digest or nothing, output to two 0600 files, and the stop
+  // and start scripts detached, never timed out or signalled. A second
+  // importer would be a way to run something with none of that. The mutation
+  // runner and its entry point spawn the test processes they judge. Read
+  // from the syntax tree of every TypeScript and JavaScript file under
+  // scripts/ (.mjs, .cjs and .js included, which node runs as readily), so a
+  // comment is not an import. Any string in code that names the module (or
+  // the spawn bindings beneath it) counts, however it reaches a loader:
+  // import declarations and re-exports, import(), require(), `import x =
+  // require()`, createRequire(import.meta.url)(...), process.getBuiltinModule
+  // and a name held in a variable first.
+  const SPAWNS = /child_process|spawn_sync|process_wrap/
+  const imports = (file: SourceFile): boolean => {
+    const kind = /\.[cm]?js$/.test(file.path) ? ts.ScriptKind.JS : /\.jsx$/.test(file.path) ? ts.ScriptKind.JSX : /\.tsx$/.test(file.path) ? ts.ScriptKind.TSX : ts.ScriptKind.TS
+    const source = ts.createSourceFile(file.path, file.text, ts.ScriptTarget.Latest, true, kind)
+    let found = false
+    const visit = (node: ts.Node): void => {
+      if (found) return
+      if (ts.isStringLiteralLike(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) {
+        found = SPAWNS.test(node.text)
+      }
+      if (!found) ts.forEachChild(node, visit)
+    }
+    visit(source)
+    return found
+  }
+  assert.deepEqual(scriptSources(REPO, 'scripts').filter(imports).map((f) => f.path).sort(), ['scripts/falsify.ts', 'scripts/falsify/runner.ts', 'scripts/install/run.ts'])
+  // The scan sees every form: each of these is an import of the module.
+  for (const text of [
+    "import { spawn } from 'child_process'",
+    "export { spawn } from 'node:child_process'",
+    "const cp = await import('node:child_process')",
+    "const cp = require('child_process')",
+    "import cp = require('node:child_process')",
+    "import { createRequire } from 'node:module'\nconst cp = createRequire(import.meta.url)('node:child_process')",
+    "import { createRequire } from 'node:module'\nconst req = createRequire(import.meta.url)\nconst cp = req('child_process')",
+    "const cp = process.getBuiltinModule('node:child_process')",
+    "const name = 'node:child_process'\nconst cp = await import(name)",
+    'const cp = await import(`node:${"child_process"}`)',
+    "const sync = process.binding('spawn_sync')",
+  ]) {
+    assert.equal(imports({ path: 'scripts/x.ts', text, lines: text.split('\n') }), true, text)
+    assert.equal(imports({ path: 'scripts/x.mjs', text: text.replace(/^import cp = require/, 'const cp = require'), lines: [] }), true, text)
+  }
+  assert.equal(imports({ path: 'scripts/x.ts', text: "// import { spawn } from 'node:child_process'\n/* require('child_process') */\nconst s = 1", lines: [] }), false)
+  // And it walks every extension node runs, not only .ts.
+  const root = tmpdir(t)
+  mkdirSync(join(root, 'scripts', 'deep'), { recursive: true })
+  for (const name of ['a.ts', 'b.mjs', 'c.cjs', 'd.js', 'deep/e.mts', 'deep/f.cts', 'g.sh', 'h.json']) {
+    writeFileSync(join(root, 'scripts', name), "import 'node:child_process'\n")
+  }
+  assert.deepEqual(
+    scriptSources(root, 'scripts').filter(imports).map((f) => f.path).sort(),
+    ['scripts/a.ts', 'scripts/b.mjs', 'scripts/c.cjs', 'scripts/d.js', 'scripts/deep/e.mts', 'scripts/deep/f.cts'],
+  )
 })
 
 /** Files reached from `roots` through relative imports, `roots` included. */

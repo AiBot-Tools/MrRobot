@@ -664,6 +664,28 @@ const dotenvAppend: Suite = {
   },
 }
 
+const INSTALL_GATE = 'src/install/gate.ts'
+
+// The installer's confirmation gate: what stands between the operator's
+// terminal and a live change to pmmcp. Its tests run in-process, against a
+// fake IO and scratch directories.
+const installPlan: Suite = {
+  name: 'installPlan',
+  tests: ['test/install-plan.test.ts'],
+  mutants: [
+    { id: 'IG1', file: INSTALL_GATE, from: '    const second = await this.#second(live)\n    if (second !== undefined) return second\n', to: '', why: 'the live window runs on the first typed confirmation alone: the folder name is never asked' },
+    { id: 'IG2', file: INSTALL_GATE, from: '    const jobs = await this.#jobsGate()\n    if (jobs !== undefined) return jobs\n', to: '', why: "pmmcp is stopped without counting its jobs: a running job meets the stop's timeout, and a count of unknown goes unseen" },
+    { id: 'IG3', file: INSTALL_GATE, from: '    if (!this.#io.interactive) {', to: '    if (false) {', why: 'a stdin that is not a terminal is taken for an operator: `yes | npm run aos-install` stops pmmcp and makes every live change' },
+  ],
+  control: {
+    id: 'C',
+    file: INSTALL_GATE,
+    from: "// The installer's confirmation gate: what the operator answers before",
+    to: "// The installer's confirmation gate: what the operator answers before (control)",
+    why: 'comment only',
+  },
+}
+
 const GITIGNORE = 'src/gitignore.ts'
 
 const gitignore: Suite = {
@@ -736,6 +758,7 @@ export const CATALOG: readonly Suite[] = [
   dotenv,
   dotenvDefault,
   dotenvAppend,
+  installPlan,
   gitignore,
   runner,
 ]

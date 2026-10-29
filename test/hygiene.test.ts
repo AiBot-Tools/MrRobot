@@ -492,6 +492,27 @@ test('only the entry points, the .env writer, the live helper and three tests im
   ])
 })
 
+test('the kernel never imports src/install: only src/install itself, the installer (scripts/install.ts, scripts/install/*) and its tests do', () => {
+  // src/install holds the installer's planner and its confirmation gate:
+  // what may change in pmmcp and .env, and what the operator must type
+  // before anything live does. The kernel, the daemon, the CLI and eval have
+  // no install to plan, and one that reached the gate could be made to walk
+  // it. Resolved imports (static, re-exports and import()), by path, and
+  // followed: nothing the kernel's entry points import reaches src/install
+  // either, however deep.
+  const INSTALL = /^src\/install\//
+  const importers = [...SRC, ...TEST, ...SCRIPTS].filter((f) => relativeImports(f).some((p) => INSTALL.test(p))).map((f) => f.path).sort()
+  assert.ok(importers.includes('scripts/install/discover.ts') && importers.includes('test/install-plan.test.ts'), `the scan sees no importer of src/install: ${importers.join(', ')}`)
+  for (const path of importers) {
+    assert.match(path, /^(?:src\/install\/[^/]+\.ts|scripts\/install\.ts|scripts\/install\/[^/]+\.ts|test\/install-[\w-]+\.test\.ts)$/, `${path} imports src/install`)
+  }
+  for (const root of ['src/kernel.ts', 'src/main.ts', 'src/cli/index.ts', 'scripts/eval.ts']) {
+    const reached = [...reachedFrom([root], [...SRC, ...SCRIPTS])]
+    assert.ok(reached.length > 1, `the import walk from ${root} reaches nothing`)
+    assert.deepEqual(reached.filter((p) => INSTALL.test(p)), [], `${root} reaches src/install`)
+  }
+})
+
 /** Every TypeScript or JavaScript file under `root`/`dir`, whatever its extension: .ts, .mts, .cts, .tsx, .js, .mjs, .cjs, .jsx. */
 function scriptSources(root: string, dir: string, out: SourceFile[] = []): SourceFile[] {
   for (const entry of readdirSync(join(root, dir))) {

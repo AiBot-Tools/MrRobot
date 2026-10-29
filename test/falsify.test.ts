@@ -609,7 +609,7 @@ test('npm run falsify is a program: bad input and unknown options are refused wi
   const bogus = run(['no-such-suite'])
   assert.equal(bogus.status, 2, bogus.stderr)
   assert.match(bogus.stderr, /unknown suite: no-such-suite/)
-  assert.match(bogus.stderr, /suites: delegation, recovery, replay, namespace, goals, anchor, eval, integrity, redaction, schedule, registry, restart, sandbox, dotenv, dotenvDefault, dotenvAppend, gitignore, runner/)
+  assert.match(bogus.stderr, /suites: delegation, recovery, replay, namespace, goals, anchor, eval, integrity, redaction, schedule, registry, restart, sandbox, dotenv, dotenvDefault, dotenvAppend, installPlan, gitignore, runner/)
 
   const badOnly = run(['--only', 'D99'])
   assert.equal(badOnly.status, 2)

@@ -54,9 +54,11 @@
 //
 //   A dry run (--dry-run) stops after the gate printed the plan, every step as
 //   would-do and every question and typed word it would ask. What it writes:
-//   the runner's logs of its read-only probes under .aos/install/<stamp>/
-//   (active.json while a --jobs count runs, removed at its exit) and the lock
-//   while it runs. Nothing else, in the checkout or in HOME.
+//   .aos and .aos/install when missing (0700), the runner's logs of its
+//   read-only probes under .aos/install/<stamp>/ (active.json while a --jobs
+//   count runs, removed at its exit), <stamp>/installer.out only when its own
+//   stdout or stderr went away during the run (Output.keep, at the end), and
+//   the lock while it runs. Nothing else, in the checkout or in HOME.
 //
 //   Signals (scripts/install/signals.ts): SIGINT, SIGHUP and SIGTERM. The
 //   same one again within 100 ms is one delivered twice (npm forwards the

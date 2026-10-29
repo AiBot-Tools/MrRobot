@@ -54,6 +54,7 @@ import { Runner, STOP_SCRIPT, activePath, type ChildOptions, type SpawnFn } from
 import { parseKernelConfig, type KernelConfig } from '../src/config.js'
 import { FEATURE_COMMITS, FEATURE_NAMES, PmmcpDocumentError, featuresOf, keyedLoopbackOnly, missingFeatures, parseFacts, parseQdrantStatus } from '../src/install/facts.js'
 import { parseProviders, type ProvidersFile } from '../src/models/registry.js'
+import { pythonStandIn, shWord } from './helpers/python-stand-in.js'
 import { tmpdir } from './helpers/tmpdir.js'
 
 const REPO = fileURLToPath(new URL('..', import.meta.url))
@@ -431,12 +432,15 @@ function readFileSafe(path: string): string {
   }
 }
 
-/** A FIFO at `path`, made the way the installer runs any program: through the runner (no test but four imports child_process). */
+/**
+ * A FIFO at `path`, made the way the installer runs any program: through the runner (no test but four
+ * imports child_process), by a stand-in python whose body runs mkfifo, which is no program the installer runs.
+ */
 async function mkfifo(t: TestContext, path: string): Promise<void> {
   const root = tmpdir(t)
   writeFileSync(join(root, '.gitignore'), '/.aos/\n')
   const runner = new Runner({ repoRoot: root, env: { HOME: tmpdir(t) }, now: () => NOW })
-  const made = await runner.run({ step: 'mkfifo', command: 'mkfifo', args: [path], cwd: root, timeoutMs: 10_000 })
+  const made = await runner.run({ step: 'mkfifo', ...pythonStandIn(t, `exec mkfifo ${shWord(path)}`), timeoutMs: 10_000 })
   assert.equal(made.code, 0, `mkfifo ${path} failed`)
 }
 
@@ -447,14 +451,10 @@ async function mkfifo(t: TestContext, path: string): Promise<void> {
 function fifoWriter(t: TestContext, fifo: string, seconds: number): { release: () => Promise<void> } {
   const root = tmpdir(t)
   writeFileSync(join(root, '.gitignore'), '/.aos/\n')
+  // A stand-in python whose body writes: the runner runs no shell, nor anything else the installer does not run.
+  const writer = pythonStandIn(t, `sleep ${String(seconds)}\nprintf '[project]\\nname = "late"\\n' > ${shWord(fifo)}`)
   const runner = new Runner({ repoRoot: root, env: { HOME: tmpdir(t) }, now: () => NOW })
-  const started = runner.start({
-    step: 'fifo-writer',
-    command: '/bin/sh',
-    args: ['-c', `sleep ${String(seconds)}; printf '[project]\\nname = "late"\\n' > "$0"`, fifo],
-    cwd: root,
-    timeoutMs: (seconds + 20) * 1000,
-  })
+  const started = runner.start({ step: 'fifo-writer', ...writer, timeoutMs: (seconds + 20) * 1000 })
   return {
     release: async () => {
       const fd = openSync(fifo, constants.O_RDONLY | constants.O_NONBLOCK)
@@ -1387,8 +1387,11 @@ test('an active.json record stops discovery while its pid still runs the recorde
   odd.overrides.set(psActive(4327), { out: 'garbled\n' })
   assert.match(stopWith(await odd.run(t), 'active-step').message, /a process ps does not describe/)
   const undated = new World(t)
+  // A start that is no ISO time fails the runner's record schema: the record is unreadable, shown by its reason alone.
   record(undated, 'stop', 4328, 'yesterday')
-  assert.match(stopWith(await undated.run(t), 'active-step').message, /the record gives no start to tell it by/)
+  const u = stopWith(await undated.run(t), 'active-step').message
+  assert.match(u, /its record cannot be read \(.*is not a record of a running step\)/)
+  assert.equal(u.includes('yesterday'), false)
   assert.equal(undated.calls.length, 0)
 })
 

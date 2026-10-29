@@ -9,8 +9,10 @@
 //
 //   npm run capture:pmmcp [-- OUT] [-- --config PATH]
 //
-// pmmcp takes no bearer (it trusts loopback), so nothing needs to be exported.
-// If kernel.yaml gives the server a `tokenEnv`, that variable must be set.
+// kernel.yaml declares pmmcp's bearer (`tokenEnv: AOS_PMMCP_TOKEN`), and this
+// reads no .env (decision D37 is open), so that variable must be in its
+// environment: README gives the one-command form, which exports nothing. A
+// declared name left unset is refused before anything is dialled.
 //
 // It writes test/fixtures/pmmcp-listtools.json (or OUT, never this checkout's
 // .env, which it refuses however it is spelled) and nothing else. It
@@ -44,8 +46,9 @@ export const CAPTURE_PATH = 'test/fixtures/pmmcp-listtools.json'
 
 async function main(argv: readonly string[]): Promise<number> {
   const repoRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
-  // --config exists so the offline test can point this at a closed port: with no
-  // bearer to withhold, the shipped config would reach the operator's live pmmcp.
+  // --config exists so the offline test can point this at a closed port: pmmcp's
+  // gate runs in warn mode, so with a bearer set the shipped config would reach
+  // the operator's live pmmcp.
   const args = [...argv]
   let configPath = join(repoRoot, 'config', 'kernel.yaml')
   const flag = args.indexOf('--config')

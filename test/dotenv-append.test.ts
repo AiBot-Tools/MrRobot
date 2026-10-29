@@ -1664,3 +1664,70 @@ test('digests: each listed name that holds a value is given as pmmcp\'s sha256 d
     assert.equal(snapshot(join(repo, '.env')), before)
   }
 })
+
+test("the by-hand path .env.example and README give for AOS_PMMCP_TOKEN meets the installer: its placeholder left in is refused by its line, its line deleted is appended with its digest, and a value of your own has its digest staged", (t) => {
+  // `cp .env.example .env`, then the two values the operator knows. The
+  // placeholder the template gives pmmcp's bearer names the installer, which
+  // never changes a line, so the template and README must say what to do
+  // with that line instead, and what they say must be what the writer does.
+  const template = readFileSync(join(REPO_ROOT, '.env.example'), 'utf8')
+  const flat = (text: string): string => text.replace(/^# ?/gm, '').replace(/\s+/g, ' ')
+  assert.match(flat(template), /For AOS_PMMCP_TOKEN, either delete its line, and npm run aos-install then appends it, or put in a value of your own \(openssl rand -hex 32\), whose digest npm run aos-install then stages\./)
+  const readme = readFileSync(join(REPO_ROOT, 'README.md'), 'utf8')
+  const byHand = flat(readme.slice(readme.indexOf('### The `.env` file'), readme.indexOf('**Upgrading from a sourced `.env`.**')))
+  assert.match(byHand, /it refuses a `\.env` that still holds a placeholder, `AOS_PMMCP_TOKEN`'s included, naming the line\. For that name, either delete its line, and the installer then appends it/)
+  assert.match(byHand, /or put in a value of your own \(`openssl rand -hex 32`\), whose digest the installer then stages\./)
+
+  const control = randomBytes(32).toString('hex')
+  const filled = template
+    .replace(/^AOS_CONTROL_TOKEN=.*$/m, `AOS_CONTROL_TOKEN=${control}`)
+    .replace(/^ANTHROPIC_API_KEY=.*$/m, `ANTHROPIC_API_KEY=${KEY}`)
+  const line = filled.split('\n').findIndex((l) => l.startsWith('AOS_PMMCP_TOKEN=')) + 1
+  assert.ok(line > 0, '.env.example no longer holds AOS_PMMCP_TOKEN')
+  const NAMES = ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY']
+  const digests = ['AOS_PMMCP_TOKEN']
+  const digestOf = (value: string): string => `sha256:${createHash('sha256').update(value, 'utf8').digest('hex')}`
+  // What the installer hands the writer: a generator for each token it mints (A5's credentials map).
+  const installer = (): ReturnType<typeof generators> => generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN')
+
+  // Left in: refused by its line, nothing generated, the file as it was.
+  {
+    const repo = repoWith(t, filled)
+    const before = snapshot(join(repo, '.env'))
+    const placeholder = new RegExp(`line ${String(line)}: AOS_PMMCP_TOKEN still holds the \\.env\\.example placeholder`)
+    assert.match(refusal(() => inspectIn(repo, NAMES, { digests })), placeholder)
+    const g = installer()
+    assert.match(untouched(() => appendIn(repo, g.generate, { digests })), placeholder)
+    assert.equal(g.calls(), 0)
+    assert.equal(snapshot(join(repo, '.env')), before)
+  }
+
+  // Its line deleted: missing, then appended, and the digest is of the value made.
+  {
+    const repo = repoWith(t, filled.split('\n').filter((l) => !l.startsWith('AOS_PMMCP_TOKEN=')).join('\n'))
+    const seen = inspectIn(repo, NAMES, { digests })
+    assert.deepEqual(seen.missing, ['AOS_PMMCP_TOKEN'])
+    assert.deepEqual(seen.digests, [])
+    const g = installer()
+    const done = appendIn(repo, g.generate, { digests })
+    assert.deepEqual(done.appended.map((a) => a.name), ['AOS_PMMCP_TOKEN'])
+    assert.deepEqual(done.present.map((p) => p.name), ['AOS_CONTROL_TOKEN'])
+    assert.deepEqual(done.digests, [{ name: 'AOS_PMMCP_TOKEN', digest: digestOf(g.made.get('AOS_PMMCP_TOKEN') ?? '') }])
+  }
+
+  // A value of your own: left alone, nothing generated, and its digest is the one staged.
+  {
+    const own = randomBytes(32).toString('hex')
+    const repo = repoWith(t, filled.replace(/^AOS_PMMCP_TOKEN=.*$/m, `AOS_PMMCP_TOKEN=${own}`))
+    const before = snapshot(join(repo, '.env'))
+    const seen = inspectIn(repo, NAMES, { digests })
+    assert.deepEqual(seen.missing, [])
+    assert.deepEqual(seen.digests, [{ name: 'AOS_PMMCP_TOKEN', digest: digestOf(own) }])
+    const g = installer()
+    const done = appendIn(repo, g.generate, { digests })
+    assert.deepEqual(done.appended, [])
+    assert.equal(g.calls(), 0)
+    assert.deepEqual(done.digests, [{ name: 'AOS_PMMCP_TOKEN', digest: digestOf(own) }])
+    assert.equal(snapshot(join(repo, '.env')), before)
+  }
+})

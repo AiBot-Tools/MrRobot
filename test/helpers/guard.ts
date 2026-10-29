@@ -31,7 +31,7 @@ import { lockHolder } from '../../src/falsify-hold.js'
  * [node, file]; anything else — an -e script, or --test-isolation=none, where
  * one process runs every file listed — is scrubbed.
  */
-export const CREDENTIAL_NAME = /^(ANTHROPIC|OPENAI|OPENROUTER|MOONSHOT)_|_API_KEY$|^AOS_CONTROL_TOKEN$|^PMMCP_TOKEN$/
+export const CREDENTIAL_NAME = /^(ANTHROPIC|OPENAI|OPENROUTER|MOONSHOT)_|_API_KEY$|^AOS_CONTROL_TOKEN$|^AOS_PMMCP_TOKEN$|^PMMCP_TOKEN$/
 
 const LIVE_FILE = /[/\\]test[/\\]live-[^/\\]+\.test\.ts$/
 

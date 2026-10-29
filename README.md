@@ -106,12 +106,13 @@ D33, D35 and D36):
   `~/Github/Persistent-Memory-MCP`, with every fact read from pmmcp's own
   interfaces. With none, it offers to install it there, after one typed
   `install` (what pmmcp's `setup.sh` then writes outside this folder is in
-  "Where things live"). Once `kernel.yaml` declares `AOS_PMMCP_TOKEN`, pmmcp is
+  "Where things live"). `kernel.yaml` declares `AOS_PMMCP_TOKEN`, and pmmcp is
   given only the `sha256:` digest of that `aos-kernel` token, never the token
-  (until then there is none to stage). pmmcp's own keys (the Qdrant key, the
-  dashboard token, the curator secret) are made by pmmcp's CLIs in its 0600
-  files under `~/.persistent-memory-mcp`, and never go into `.env`. Its bearer
-  gate stays in warn mode: switching it to enforce is your later step.
+  (a `kernel.yaml` that declares no pmmcp `tokenEnv` stages none). pmmcp's own
+  keys (the Qdrant key, the dashboard token, the curator secret) are made by
+  pmmcp's CLIs in its 0600 files under `~/.persistent-memory-mcp`, and never go
+  into `.env`. Its bearer gate stays in warn mode: switching it to enforce is
+  your later step.
 - **Live pmmcp changes** (a restart to load the digest, the Qdrant key
   cutover, the dashboard token and curator secret, a fast-forward of its code)
   are each offered with a default of no, and run only after a warning that
@@ -147,9 +148,10 @@ first boots with its hub degraded, because the token it then needs is not set.
 
 The daemon needs `AOS_CONTROL_TOKEN` (at least 32 printable ASCII characters,
 with no whitespace, quote, backtick or `#`, from the shell and `.env` alike;
-`openssl rand -hex 32` makes one) and, to reach a
+`openssl rand -hex 32` makes one), to reach pmmcp, `AOS_PMMCP_TOKEN` (its bearer
+as client `aos-kernel`, which `npm run aos-install` generates), and, to reach a
 model, `ANTHROPIC_API_KEY`: a key created inside a workspace, because an unscoped
-key needs an `anthropic-workspace-id` header the kernel does not send. Both live
+key needs an `anthropic-workspace-id` header the kernel does not send. All three live
 in **your own `.env` in the repository root**: git-ignored, mode 0600, written by you, or appended by `npm run aos-install`. `.env.example` is the
 committed template: placeholders only, never edited to hold a real value, and it
 does not change when your `.env` does. To make it by hand rather than with the
@@ -164,10 +166,19 @@ npm run dev
 
 Line by line: the first creates `.env` from the template at mode 0600 and never
 overwrites one that exists; the second sets 0600 anyway, because `cp` keeps an
-existing file's mode; in the editor, replace both `replace-me-...` values
-(`openssl rand -hex 32` makes a token); `npm run dev` then logs `credentials:
-.env (AOS_CONTROL_TOKEN, ANTHROPIC_API_KEY)`, and `npm run cli -- agents` works
-from a second shell with nothing exported.
+existing file's mode; in the editor, replace every `replace-me-...` value
+(`openssl rand -hex 32` makes a token); `npm run dev` then logs
+`credentials: .env (AOS_CONTROL_TOKEN, AOS_PMMCP_TOKEN, ANTHROPIC_API_KEY)` (the
+names in the order the file holds them), and `npm run cli -- agents` works from
+a second shell with nothing exported.
+
+`npm run aos-install` never changes a line, so it refuses a `.env` that still
+holds a placeholder, `AOS_PMMCP_TOKEN`'s included, naming the line. For that
+name, either delete its line, and the installer then appends it (run it before
+`npm run dev`, which boots with its hub degraded while the name is unset), or
+put in a value of your own (`openssl rand -hex 32`), whose digest the installer
+then stages. Until it has, pmmcp holds no digest of your value, and in warn mode
+logs the token as unknown and serves the request.
 
 Any plain-text editor will do in place of nano, but not TextEdit: its smart
 quotes turn `"` into `“`, which the loader refuses (a key is printable ASCII).
@@ -184,7 +195,8 @@ refuses to start with it even when every credential is exported (the CLI and
 eval open it only when the shell lacks the token). Edit it in place: keep only
 `AOS_CONTROL_TOKEN` and
 `ANTHROPIC_API_KEY`, run `chmod 600 .env`, stop sourcing it, and export
-`AOS_DATA_DIR` or `AOS_LOG_LEVEL` from the shell if you used them.
+`AOS_DATA_DIR` or `AOS_LOG_LEVEL` from the shell if you used them. Then
+`npm run aos-install` appends `AOS_PMMCP_TOKEN`.
 
 How it is read (`src/secrets/dotenv.ts`, decision D31):
 
@@ -201,7 +213,7 @@ How it is read (`src/secrets/dotenv.ts`, decision D31):
   than 64 KB, a `.env` stored on disk under another case (`.Env`: git judges a
   name as stored, and `.env*` does not cover it with `core.ignorecase=false`), a
   `.gitignore` that stops ignoring it (read with git's own rules,
-  so `!*` or a leading space count), any name but the two above, a value still
+  so `!*` or a leading space count), any name but the three above, a value still
   beginning `replace-me`, a character outside printable ASCII, two lines joined
   into one, a name set twice, a second `--dotenv`. It parses with its own strict
   grammar: Node's built-in `.env` parser gives a whitespace-only value the whole
@@ -235,8 +247,8 @@ sentence (`Secret 'x' exists (masked): ****abcd`), by design, so it cannot suppl
 a key; the vault path stays in the code, dormant. Whatever the source (the
 shell, `.env`, the vault, or the D8 fallback to the env), the broker refuses a
 value that cannot be a key: whitespace (pmmcp's masked sentence), a character
-outside printable ASCII, or a joined `NAME=value` line. A pmmcp bearer, if
-`kernel.yaml` ever declares a `tokenEnv`, gets the same checks, and one under 8
+outside printable ASCII, or a joined `NAME=value` line. The pmmcp bearer
+`AOS_PMMCP_TOKEN` gets the same checks, and one under 8
 characters is refused too, because the log's mask will not take a value that
 short. A bearer that fails is refused by name before anything is dialled; one
 that passes is masked before the first request, in the event log, the process
@@ -257,7 +269,7 @@ and outside this rule (decision D36, the last row).
 | `.aos/events.db`, `.aos/events.head` | the event log and its anchor |
 | `.aos/workspaces/{trusted,hostile}` | sandbox mount roots, one per Colima VM |
 | `.aos/docker` | `DOCKER_CONFIG` for the kernel's docker calls and `colima-up.sh`, never `~/.docker` |
-| `.env` | your credentials (`AOS_CONTROL_TOKEN`, `ANTHROPIC_API_KEY`): written by you, or created at 0600 and appended to by `npm run aos-install`, which never changes a line; mode 0600, git-ignored; read, never written, by the other npm entry scripts; deleted by `git clean -fdx` like `.aos/` |
+| `.env` | your credentials (`AOS_CONTROL_TOKEN`, `AOS_PMMCP_TOKEN`, `ANTHROPIC_API_KEY`): written by you, or created at 0600 and appended to by `npm run aos-install`, which generates the two tokens, never writes `ANTHROPIC_API_KEY` and never changes a line; mode 0600, git-ignored; read, never written, by the other npm entry scripts; deleted by `git clean -fdx` like `.aos/` |
 | `.aos/install/`, `.aos/install.lock` | the installer's logs: a 0700 folder per run, `<UTC stamp>/`, holding each program's `<step>.out` and `<step>.err` (0600), `installer.out` (what it said, when its own output went away mid-run), and `active.json` while a step it started in a session of its own runs; its lock, held while it runs and removed at its exit (one left by a killed run is taken over, even after a reboot gave its pid to another process) |
 | `.aos/npm-cache` | npm's cache (`.npmrc`); run npm from the repo root, because npm resolves a relative path against the shell's directory |
 | `~/.colima` | Colima's VMs and sockets; `colima-up.sh` also sets `COLIMA_CACHE_HOME=~/.colima/_cache`, which would otherwise be `~/Library/Caches/colima` |
@@ -313,7 +325,7 @@ of Node, npm, Docker and Colima are yours to keep or remove.
 | `npm run capture:pmmcp` | operator-only: record pmmcp's live tool schemas |
 | `npm run eval` | operator-only: score the orchestration suite (**spends money**) |
 | `npm run falsify` | the mutation catalog: does the suite catch the bugs it claims to? (slow, offline) |
-| `npm run aos-install` | operator-only: find or install pmmcp, append the tokens `.env` lacks, and, once `kernel.yaml` declares `AOS_PMMCP_TOKEN`, stage pmmcp's `aos-kernel` digest; `npm run aos-install -- --dry-run` changes nothing (its flags go after `--`), and live pmmcp changes need two typed confirmations (see Setup) |
+| `npm run aos-install` | operator-only: find or install pmmcp, append the tokens `.env` lacks, and stage pmmcp's `aos-kernel` digest of `AOS_PMMCP_TOKEN`; `npm run aos-install -- --dry-run` changes nothing (its flags go after `--`), and live pmmcp changes need two typed confirmations (see Setup) |
 
 `eval` needs a running daemon (`npm run dev`) and `AOS_CONTROL_TOKEN`. It runs
 the orchestration suite in `src/eval/suite.ts` as real runs against whatever
@@ -334,7 +346,25 @@ adopts a plan and delegates both tasks through `kernel.adopt_plan` and
 the model or the kernel, not a known stub. A suite pruned to what a model already
 does would score 1.00 forever and measure nothing.
 
-`capture:pmmcp` needs a running pmmcp and no token (pmmcp takes no bearer). It calls `tools/list`
+`capture:pmmcp` needs a running pmmcp and `AOS_PMMCP_TOKEN` in its own
+environment: `kernel.yaml` declares it, the capture reads no `.env` (whether it
+should is decision D37, open), and it refuses a declared name left unset before
+dialling. Until D37 is answered, hand it the value for that one command, from
+the repository root:
+
+```bash
+AOS_PMMCP_TOKEN="$(sed -n 's/^AOS_PMMCP_TOKEN=//p' .env)" npm run capture:pmmcp
+```
+
+The value goes into that one command's environment and nowhere else: your
+shell's history keeps the line as typed, never the value, and the shell does
+not export it. Never `export AOS_PMMCP_TOKEN=...`: zsh saves a value typed that
+way to `~/.zsh_history`, and while your shell exports `AOS_PMMCP_TOKEN`,
+`npm run aos-install` stops and asks you to unset it, because the kernel
+started from that shell would send the export, not the value whose digest pmmcp
+is given. The `sed` reads the line as the installer writes it,
+`AOS_PMMCP_TOKEN=` and the value; with no such line it gives nothing, and the
+capture refuses the name as unset. It calls `tools/list`
 and nothing else — no tool is invoked, so no memory and no vault entry is read —
 and writes `test/fixtures/pmmcp-listtools.json`. Everything this repo believes
 about pmmcp's tool surface apart from `get_secret`'s `label` is a guess made on
@@ -628,7 +658,11 @@ and a test must not grow one. Inspect or clear that namespace yourself.
 
 `ANTHROPIC_API_KEY` comes from `.env`, or from a shell export that is not blank,
 which wins. Never type a key on the command line: zsh saves it to
-`~/.zsh_history`. Run one of these, not both.
+`~/.zsh_history`. `PMMCP_URL` goes inline, as below: inline only; never export a
+`PMMCP_` name in a shell that starts pmmcp, whose `load_config` refuses to start
+under one. pmmcp's bearer, `AOS_PMMCP_TOKEN`, is optional while pmmcp's gate is in
+warn mode; the tests send it only when the shell's environment holds it (they
+read no `.env` for it). Run one of these, not both.
 
 The model only, which is cheapest:
 
@@ -800,7 +834,8 @@ AOS_LIVE_TESTS=1 PMMCP_URL=http://127.0.0.1:8766/mcp node --import tsx --test --
 ```
 
 `PMMCP_URL` is required (the test skips without it) and is read only by the
-test, which writes it into its own temporary `kernel.yaml`. The test runs the
+test, which writes it into its own temporary `kernel.yaml`. Give it inline, as
+here, never exported in a shell that starts pmmcp. The test runs the
 shipped CEO against the operator's real pmmcp: a reply that plans could write
 goals under `aos/ceo`, and pmmcp has no tool to delete them. It prints
 `costMicroUsd=<N>` the same way.
@@ -898,16 +933,33 @@ All 30 open decisions were answered on 2026-09-21 and are recorded per row in
 Claude entry is `claude-sonnet-5`, not `claude-opus-5`, for its cost/intelligence
 ratio on orchestration.
 
-Nothing is pending. A decision that reopens belongs in that file with a date,
-not in a commit message.
+Open since 2026-10-29: D37, how `npm run capture:pmmcp` gets pmmcp's bearer,
+and D34's amendment of contract K3's token names. A decision that reopens
+belongs in that file with a date, not in a commit message.
 
 ---
 
-## pmmcp is unauthenticated, and that is accepted for now
+## pmmcp's bearer runs in warn mode
 
-pmmcp trusts loopback and checks no credential. Anything on the Mac can call any
-of its tools, including the vault and `admin`. The operator accepted that for now,
-on two conditions the kernel enforces or will enforce:
+pmmcp has a bearer gate (`src/transport/http_auth.py` in pmmcp;
+`~/.persistent-memory-mcp/http_auth.yaml`, which holds digests only and is read
+once at server start), and it runs in **warn** mode: a request with a missing or
+unknown token is logged and still served. So loopback trust still decides
+access, and anything on the Mac can call any of pmmcp's tools, including the
+vault and `admin`, until the operator switches the gate to enforce, before
+Phase 4 makes Telegram and SMS inputs. The installer does not switch it.
+
+The kernel sends `AOS_PMMCP_TOKEN` as pmmcp's client `aos-kernel`
+(`mcp.servers.pmmcp.tokenEnv` in `kernel.yaml`), and refuses to dial while it is
+unset. In warn mode nothing on the kernel side shows a wrong token, so
+`npm run aos-install` checks the digest offline (`http_auth check --expect`).
+No AOS credential name starts with `PMMCP_` (decision D34): pmmcp's
+`load_config` refuses to start any process launched from a shell that exports
+one (pydantic `extra_forbidden`, checked 2026-10-28), so a `PMMCP_*` value goes
+inline on one command, never `export`.
+
+Until then, access rests on the two conditions the operator set, which the
+kernel enforces or will enforce:
 
 - **Containers stay off it.** Inside a Colima VM the Mac's loopback is
   `192.168.5.2` (`host.lima.internal`). The sandbox probe refuses a domain whose
@@ -915,11 +967,15 @@ on two conditions the kernel enforces or will enforce:
 - **The Phase 2 egress proxy denies it**: `192.168.5.2`, `host.lima.internal`,
   `host.docker.internal`.
 
-Revisit (a bearer in pmmcp) before Phase 4 makes Telegram and SMS inputs. Nothing on the
-client side blocks it. The operator's IDE, Antigravity, sends a configured
-`headers` Authorization over Streamable HTTP: a probe on 2026-10-25 pointed it at a
-listener with `Bearer aos-header-probe`, and the header arrived on its first
-request. The kernel already sends one once `kernel.yaml` declares `tokenEnv`.
+pmmcp's other keys (Qdrant's `service.api_key`, the dashboard token, the curator
+secret) live in 0600 files under `~/.persistent-memory-mcp`, made by pmmcp's own
+CLIs. The kernel never calls 8765, 8767 or 6333, holds none of them, and none
+goes in `<repo>/.env`.
+
+Nothing on the client side blocks enforce. The operator's IDE, Antigravity,
+sends a configured `headers` Authorization over Streamable HTTP: a probe on
+2026-10-25 pointed it at a listener with `Bearer aos-header-probe`, and the
+header arrived on its first request.
 
 ## Sandbox checks on the Mac (2026-10-21)
 
@@ -972,9 +1028,8 @@ Two results the Phase 2 design has to carry:
 
 Facts this repository cannot check from Linux, and how each gets settled. The
 first three of the plan's list are already resolved (Node v26.9.0; pmmcp at
-`http://127.0.0.1:8766/mcp`, loopback with **no** authentication — read from pmmcp's
-source, which trusts loopback and publishes RFC 9728 metadata with no authorization
-servers, so kernel.yaml declares no `tokenEnv`; `get_secret` takes `label`,
+`http://127.0.0.1:8766/mcp`, loopback; since 2026-10-28 a bearer gate in warn mode,
+and kernel.yaml declares `AOS_PMMCP_TOKEN`; `get_secret` takes `label`,
 not `key`). The Colima sandbox rows were settled on 2026-10-21; see "Sandbox
 checks on the Mac" above.
 

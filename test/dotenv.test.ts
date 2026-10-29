@@ -402,17 +402,16 @@ test('an in-repo .env stored under another case is refused by name: git would st
   assert.equal(message.includes(KEY), false)
 })
 
-test('credentialNames on the shipped config is exactly AOS_CONTROL_TOKEN and ANTHROPIC_API_KEY, and grows with a declared tokenEnv or envVar', () => {
+test('credentialNames on the shipped config is exactly AOS_CONTROL_TOKEN, AOS_PMMCP_TOKEN and ANTHROPIC_API_KEY, and loses the bearer with a config that declares no tokenEnv', () => {
   const read = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
   const config = parseKernelConfig(read('config/kernel.yaml'), { repoRoot: REPO_ROOT })
   const providers = parseProviders(read('config/providers.yaml'))
-  assert.deepEqual([...credentialNames(config, providers)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN'])
+  assert.deepEqual([...credentialNames(config, providers)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN'])
 
-  const withToken = {
-    ...config,
-    mcp: { servers: { pmmcp: { ...config.mcp.servers['pmmcp']!, tokenEnv: 'PMMCP_TOKEN' } } },
-  }
-  assert.deepEqual([...credentialNames(withToken, providers)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN', 'PMMCP_TOKEN'])
+  // The name comes from the declaration, not from a list: without it, it is not accepted.
+  const { tokenEnv: _declared, ...pmmcp } = config.mcp.servers['pmmcp']!
+  const tokenless = { ...config, mcp: { servers: { pmmcp } } }
+  assert.deepEqual([...credentialNames(tokenless, providers)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN'])
 })
 
 test('dotenvPathFrom reads --dotenv once, resolves it against the base, and refuses a repeat, a missing value or an option', () => {
@@ -480,13 +479,41 @@ test('daemonEnv without --dotenv never opens a trap .env in the repo root and re
   const plain = daemonEnv(['--config', 'x.yaml'], { repoRoot: repo, config, providers, shell })
   assert.equal(plain.loaded, undefined)
   // Exactly the credential names: nothing else from the shell rides along.
-  assert.deepEqual(plain.env, { AOS_CONTROL_TOKEN: undefined, ANTHROPIC_API_KEY: 'fromTheShell' })
+  assert.deepEqual(plain.env, { AOS_CONTROL_TOKEN: undefined, AOS_PMMCP_TOKEN: undefined, ANTHROPIC_API_KEY: 'fromTheShell' })
 
   // The trap is armed: with the flag, the same file is opened and refused.
   assert.match(
     refusal(() => daemonEnv(['--dotenv', '.env'], { repoRoot: repo, config, providers, shell })),
     /has mode 0644/,
   )
+})
+
+test("CLAUDE.md's Current state says the hub degrades only while AOS_PMMCP_TOKEN is in neither the shell nor .env, which is how daemonEnv hands the kernel its bearer", (t) => {
+  t.after(() => SecretMask.clear())
+  // The sentence a session reads before restarting the daemon. "Before the
+  // installer has filled it" was narrower than the code: a shell export that
+  // is not blank boots the hub too, with or without a .env.
+  const claude = readFileSync(join(REPO_ROOT, 'CLAUDE.md'), 'utf8')
+  const state = claude.slice(claude.indexOf('## Current state'), claude.indexOf('## Commands'))
+  assert.match(state, /a daemon restarted while `AOS_PMMCP_TOKEN` is in neither the shell nor `\.env` boots with its hub degraded \(run `npm run aos-install` first\)/)
+  assert.doesNotMatch(state, /before the installer has filled it/)
+
+  const read = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
+  const config = parseKernelConfig(read('config/kernel.yaml'), { repoRoot: REPO_ROOT })
+  const providers = parseProviders(read('config/providers.yaml'))
+  assert.equal(config.mcp.servers['pmmcp']?.tokenEnv, 'AOS_PMMCP_TOKEN')
+  const repo = tmpdir(t)
+  writeFileSync(join(repo, '.gitignore'), '/.env\n')
+  const bearer = (argv: readonly string[], shell: Record<string, string>): string | undefined =>
+    daemonEnv(argv, { repoRoot: repo, config, providers, shell }).env['AOS_PMMCP_TOKEN']
+  // The shell alone, with no file at all: the kernel gets it.
+  assert.equal(bearer(['--config', 'x.yaml'], { AOS_PMMCP_TOKEN: TOKEN }), TOKEN)
+  // The file alone, with nothing exported: the kernel gets it.
+  const file = write(t, `AOS_PMMCP_TOKEN=${KEY}\n`)
+  assert.equal(bearer(['--dotenv', file], {}), KEY)
+  // Neither, or a blank export and no line: nothing, which kernel.ts refuses to dial without.
+  assert.equal(bearer(['--config', 'x.yaml'], {}), undefined)
+  assert.equal(bearer(['--dotenv', write(t, `AOS_CONTROL_TOKEN=${TOKEN}\n`)], { AOS_PMMCP_TOKEN: '  ' }), undefined)
 })
 
 test('liveCredential refuses unless AOS_LIVE_TESTS=1 in the env it is given, and outside a live process never opens <repo>/.env', (t) => {

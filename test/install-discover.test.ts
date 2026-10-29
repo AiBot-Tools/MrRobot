@@ -505,10 +505,11 @@ function stopWith(d: Discovery, code: Stop['code']): Stop {
   return s
 }
 
-const withTokenEnv = (config: KernelConfig, tokenEnv: string): KernelConfig => {
+const withoutTokenEnv = (config: KernelConfig): KernelConfig => {
   const pmmcp = config.mcp.servers['pmmcp']
   assert.ok(pmmcp)
-  return { ...config, mcp: { ...config.mcp, servers: { ...config.mcp.servers, pmmcp: { ...pmmcp, tokenEnv } } } }
+  const { tokenEnv: _declared, ...rest } = pmmcp
+  return { ...config, mcp: { ...config.mcp, servers: { ...config.mcp.servers, pmmcp: rest } } }
 }
 
 const withUrl = (config: KernelConfig, url: string): KernelConfig => {
@@ -1549,15 +1550,17 @@ test('http_auth check --expect gets the aos-kernel digest from inspectCredential
   }
   const checks = (w: World): Call[] => w.calls.filter((c) => c.args.includes('--expect'))
 
-  // The shipped kernel.yaml declares no pmmcp tokenEnv yet: nothing to check.
-  const shipped = new World(t)
-  withEnv(shipped, `AOS_PMMCP_TOKEN=${TOKEN}\n`)
-  const a = found(await shipped.run(t))
+  // A kernel.yaml that declares no pmmcp tokenEnv: nothing to check, whatever .env holds.
+  const undeclared = new World(t)
+  undeclared.config = withoutTokenEnv(undeclared.config)
+  withEnv(undeclared, `AOS_PMMCP_TOKEN=${TOKEN}\n`)
+  const a = found(await undeclared.run(t))
   assert.equal(a.bearer.state, 'not-checked')
-  assert.equal(checks(shipped).length, 0)
+  assert.equal(checks(undeclared).length, 0)
 
+  // As shipped, kernel.yaml declares it: checked. Every World below keeps the shipped declaration.
   const w = new World(t)
-  w.config = withTokenEnv(w.config, 'AOS_PMMCP_TOKEN')
+  assert.equal(w.config.mcp.servers['pmmcp']?.tokenEnv, 'AOS_PMMCP_TOKEN')
   withEnv(w, `AOS_CONTROL_TOKEN=${randomBytes(32).toString('hex')}\nAOS_PMMCP_TOKEN=${TOKEN}\n`)
   w.check = { out: 'aos-kernel: matches\n', code: 0 }
   const b = found(await w.run(t))
@@ -1578,14 +1581,12 @@ test('http_auth check --expect gets the aos-kernel digest from inspectCredential
   }
 
   const differs = new World(t)
-  differs.config = withTokenEnv(differs.config, 'AOS_PMMCP_TOKEN')
   withEnv(differs, `AOS_PMMCP_TOKEN=${TOKEN}\n`)
   differs.check = { out: 'aos-kernel: differs\n', code: 3 }
   assert.deepEqual(found(await differs.run(t)).bearer, { state: 'differs' })
   // A verdict counts only with its exit: matches with 0, differs or absent with 3.
   for (const answer of [{ out: 'aos-kernel: matches\n', code: 1 }, { out: 'aos-kernel: matches\n', code: 3 }, { out: 'aos-kernel: differs\n', code: 0 }, { out: 'aos-kernel: absent\n', code: 1 }, { out: '', code: 1, err: 'invalid: tokens.x\n' }]) {
     const mismatched = new World(t)
-    mismatched.config = withTokenEnv(mismatched.config, 'AOS_PMMCP_TOKEN')
     withEnv(mismatched, `AOS_PMMCP_TOKEN=${TOKEN}\n`)
     mismatched.check = answer
     assert.equal(found(await mismatched.run(t)).bearer.state, 'failed', JSON.stringify(answer))
@@ -1593,7 +1594,6 @@ test('http_auth check --expect gets the aos-kernel digest from inspectCredential
 
   // No value yet (missing, or blank): not checked.
   const blank = new World(t)
-  blank.config = withTokenEnv(blank.config, 'AOS_PMMCP_TOKEN')
   withEnv(blank, 'AOS_PMMCP_TOKEN=\n')
   const c = found(await blank.run(t))
   assert.deepEqual(c.bearer, { state: 'not-checked', why: 'AOS_PMMCP_TOKEN holds no value in .env yet' })
@@ -1601,7 +1601,6 @@ test('http_auth check --expect gets the aos-kernel digest from inspectCredential
 
   // An older pmmcp without check --expect: not run.
   const older = new World(t)
-  older.config = withTokenEnv(older.config, 'AOS_PMMCP_TOKEN')
   withEnv(older, `AOS_PMMCP_TOKEN=${TOKEN}\n`)
   edit(older.facts, 'features.check_expect', false)
   assert.equal(found(await older.run(t)).bearer.state, 'not-checked')
@@ -1609,7 +1608,6 @@ test('http_auth check --expect gets the aos-kernel digest from inspectCredential
 
   // A .env the writer refuses stops discovery with its reason, which names no value.
   const loose = new World(t)
-  loose.config = withTokenEnv(loose.config, 'AOS_PMMCP_TOKEN')
   withEnv(loose, `AOS_PMMCP_TOKEN=${TOKEN}\n`)
   chmodSync(join(loose.root, '.env'), 0o644)
   const s = stopWith(await loose.run(t), 'dotenv')

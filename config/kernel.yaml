@@ -33,10 +33,16 @@ mcp:
   servers:
     pmmcp:
       # Streamable HTTP on loopback. 8765 is the pmmcp dashboard; 8766 is the
-      # MCP endpoint. No tokenEnv: pmmcp authenticates nobody and trusts
-      # loopback (its RFC 9728 metadata lists no authorization servers), so any
-      # local process can call it. Declare a tokenEnv only if it grows a bearer.
+      # MCP endpoint. The kernel is pmmcp's client aos-kernel and sends the
+      # bearer named here, from the shell or <repo>/.env, where
+      # `npm run aos-install` generates it and gives pmmcp only its sha256
+      # digest (~/.persistent-memory-mcp/http_auth.yaml, read at server start).
+      # pmmcp's gate runs in warn mode, so a missing or unknown token is logged
+      # and still served; the kernel refuses to dial while this name is unset
+      # rather than guess. Never a PMMCP_ name: pmmcp's load_config refuses to
+      # start from a shell that exports one.
       url: http://127.0.0.1:8766/mcp
+      tokenEnv: AOS_PMMCP_TOKEN
       # pmmcp sessions idle-expire, so the hub heartbeats inside that window.
       heartbeatMs: 240000
       requestTimeoutMs: 30000

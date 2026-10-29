@@ -17,7 +17,8 @@
 //
 // The child does not inherit the network guard, so only commands that touch
 // nothing are used: verify-chain and search read a local database, and the
-// daemon binds loopback with no pmmcp token so its hub never dials out.
+// daemon binds loopback with its pmmcp url pointed at a closed loopback port
+// or at a stand-in this process serves on one, so its hub never dials out.
 
 import './helpers/guard.js'
 
@@ -51,11 +52,14 @@ const CHECKOUT = shadowCheckout()
 after(() => CHECKOUT.dispose())
 const ROOT = CHECKOUT.root
 
-// The shipped config names the operator's REAL pmmcp and, since pmmcp takes no
-// bearer, nothing short of the address keeps an offline test from reaching it.
+// The shipped config names the operator's REAL pmmcp and, since pmmcp's gate
+// runs in warn mode (it serves a request with no bearer or an unknown one),
+// nothing short of the address keeps an offline test from reaching it.
 // Port 9 (discard) on loopback: nothing listens, so a connect fails at once.
 const SHIPPED_PMMCP_URL = 'url: http://127.0.0.1:8766/mcp'
 const CLOSED_PMMCP_URL = 'url: http://127.0.0.1:9/mcp'
+/** The shipped pmmcp bearer declaration, the line after the url. */
+const SHIPPED_PMMCP_TOKEN = '\n      tokenEnv: AOS_PMMCP_TOKEN'
 
 /** The shipped kernel.yaml with pmmcp pointed at a closed port, or a throw. */
 function offlinePmmcp(shipped: string): string {
@@ -296,11 +300,11 @@ test('the operator scripts are programs: each refuses with usage rather than doi
   // the suite would notice an entry guard that never fires — the module would
   // load, define main, and exit 0 having run no eval and captured nothing.
   //
-  // eval.ts is driven with its credential ABSENT. capture-pmmcp.ts needs no
-  // credential for pmmcp, so it is driven twice against a CLOSED loopback port:
-  // once as shipped (it must try, fail, and write nothing) and once with a
-  // declared-but-unset tokenEnv (it must refuse before connecting). Neither
-  // touches the operator's pmmcp or any daemon.
+  // eval.ts is driven with its credential ABSENT. capture-pmmcp.ts is driven
+  // against a CLOSED loopback port: as shipped, with its declared bearer unset
+  // (it must refuse before connecting), and with a config that declares no
+  // tokenEnv (it must try, fail, and write nothing). Neither touches the
+  // operator's pmmcp or any daemon.
   const env = { PATH: process.env['PATH'] ?? '/usr/bin:/bin' }
 
   const evalRun = runEntry(CHECKOUT, 'scripts/eval.ts', [], {
@@ -361,33 +365,30 @@ test('the operator scripts are programs: each refuses with usage rather than doi
     return { status: run.status, stderr: run.stderr, printed: `${run.stdout}${run.stderr}`, out }
   }
 
-  // No tokenEnv, as shipped: it must attempt the connection, fail, and write nothing.
-  const tokenless = capture(shipped, 'tokenless')
+  // A config without the declared line: it must attempt the connection, fail, and write nothing.
+  assert.ok(shipped.includes(SHIPPED_PMMCP_TOKEN), 'the shipped pmmcp tokenEnv moved; update SHIPPED_PMMCP_TOKEN')
+  const tokenless = capture(shipped.replace(SHIPPED_PMMCP_TOKEN, ''), 'tokenless')
   assert.equal(tokenless.status, 1, `capture-pmmcp.ts exited ${String(tokenless.status)}: ${tokenless.stderr}`)
   assert.doesNotMatch(tokenless.stderr, /is not set/)
   assert.ok(tokenless.stderr.trim().length > 0, 'a failed capture said nothing')
   assert.equal(existsSync(tokenless.out), false, 'a failed capture wrote a fixture')
 
-  // A declared tokenEnv that is unset refuses before any connection.
-  const declared = capture(
-    shipped.replace(CLOSED_PMMCP_URL, `${CLOSED_PMMCP_URL}\n      tokenEnv: PMMCP_TOKEN`),
-    'declared',
-  )
+  // As shipped, with the declared tokenEnv unset: refused before any connection.
+  const declared = capture(shipped, 'declared')
   assert.equal(declared.status, 1, `capture-pmmcp.ts exited ${String(declared.status)}: ${declared.stderr}`)
-  assert.match(declared.stderr, /PMMCP_TOKEN is not set/)
+  assert.match(declared.stderr, /AOS_PMMCP_TOKEN is not set/)
   assert.equal(existsSync(declared.out), false)
 
   // A declared bearer that cannot be a header (openssl rand -base64 64 wraps
   // mid-token), or that is too short to mask, is refused by name before any
   // connection, and no piece of it is printed.
-  const withToken = shipped.replace(CLOSED_PMMCP_URL, `${CLOSED_PMMCP_URL}\n      tokenEnv: PMMCP_TOKEN`)
   const head = 'qCaptureHeadCanary0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJ'
   const tail = 'qCaptureTailCanaryZYXWVU98765=='
   for (const [token, why, name] of [
-    [`${head}\n${tail}`, /PMMCP_TOKEN contains whitespace, so it is not a bearer/, 'wrapped'],
-    ['Qz7#kd!', /PMMCP_TOKEN is under 8 characters/, 'short'],
+    [`${head}\n${tail}`, /AOS_PMMCP_TOKEN contains whitespace, so it is not a bearer/, 'wrapped'],
+    ['Qz7#kd!', /AOS_PMMCP_TOKEN is under 8 characters/, 'short'],
   ] as const) {
-    const refused = capture(withToken, name, { PMMCP_TOKEN: token })
+    const refused = capture(shipped, name, { AOS_PMMCP_TOKEN: token })
     assert.equal(refused.status, 1, refused.printed)
     assert.match(refused.stderr, why)
     assert.equal(existsSync(refused.out), false)
@@ -426,13 +427,14 @@ test('eval --json and capture-pmmcp OUT refuse a path that is the checkout\'s .e
   assert.match(captured.stderr, refused)
   assert.deepEqual(readFileSync(trap), before)
 
-  // Any other path is the operator's: eval goes on to its token, capture to the (closed) port.
+  // Any other path is the operator's: eval goes on to its token, capture to its declared bearer.
   const report = runEntry(CHECKOUT, 'scripts/eval.ts', ['--json', join(dir, 'report.out.json')], { env, timeout: 60_000 })
   assert.equal(report.status, 2, report.stderr)
   assert.match(report.stderr, /AOS_CONTROL_TOKEN is not set/)
   const elsewhere = runEntry(CHECKOUT, 'scripts/capture-pmmcp.ts', [join(dir, 'capture.json'), '--config', configPath], { env, timeout: 60_000 })
   assert.equal(elsewhere.status, 1, elsewhere.stderr)
   assert.doesNotMatch(elsewhere.stderr, refused)
+  assert.match(elsewhere.stderr, /AOS_PMMCP_TOKEN is not set/)
   assert.equal(existsSync(join(dir, 'capture.json')), false)
 })
 
@@ -452,11 +454,11 @@ test('capture-pmmcp masks its bearer: a server that echoes it into a refusal pri
   const out = join(dir, 'echo.json')
   writeFileSync(
     configPath,
-    offlinePmmcp(readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8')).replace(CLOSED_PMMCP_URL, `${url}\n      tokenEnv: PMMCP_TOKEN`),
+    offlinePmmcp(readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8')).replace(CLOSED_PMMCP_URL, url),
   )
   // Async: the echoing server lives in this process and must keep answering.
   const child = spawnEntry(CHECKOUT, 'scripts/capture-pmmcp.ts', [out, '--config', configPath], {
-    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', PMMCP_TOKEN: bearer },
+    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', AOS_PMMCP_TOKEN: bearer },
   })
   let printed = ''
   child.stdout.on('data', (c: Buffer) => (printed += c.toString('utf8')))
@@ -470,13 +472,14 @@ test('capture-pmmcp masks its bearer: a server that echoes it into a refusal pri
   assert.equal(existsSync(out), false)
 })
 
-/** A kernel.yaml for a spawned daemon: its own data dir and port, pmmcp offline. */
-function daemonConfig(dataDir: string, port: number): string {
+/** A kernel.yaml for a spawned daemon: its own data dir and port, pmmcp offline or at `pmmcpUrl` (a loopback stand-in). */
+function daemonConfig(dataDir: string, port: number, pmmcpUrl?: string): string {
   const path = join(dataDir, 'kernel.yaml')
   const shipped = readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8')
+  const offline = offlinePmmcp(shipped)
   writeFileSync(
     path,
-    offlinePmmcp(shipped)
+    (pmmcpUrl === undefined ? offline : offline.replace(CLOSED_PMMCP_URL, `url: ${pmmcpUrl}`))
       .replace(/^dataDir: .*$/m, `dataDir: ${dataDir}`)
       .replace(/^  port: \d+$/m, `  port: ${String(port)}`)
       .replace(/mountRoot: [^\n}]*/g, `mountRoot: ${dataDir}/work `),
@@ -500,12 +503,33 @@ function credsFile(dir: string, text: string, mode = 0o600): string {
 // dotenv.test.ts ("every returned value is registered with SecretMask…").
 const FILE_TOKEN = 'qFileOnlyControlToken0123456789abcdefgh'
 const FILE_KEY = 'qFileOnlyProviderKeyZYXWVUTSRQ987654321'
+const FILE_BEARER = 'qFileOnlyPmmcpBearerKJIHGFEDCBA13579ace'
 
-test('the daemon and the CLI read AOS_CONTROL_TOKEN and a provider key that exist only in a --dotenv file, and neither reaches the log or the output', async (t) => {
+test("the daemon and the CLI read AOS_CONTROL_TOKEN, pmmcp's bearer and a provider key that exist only in a --dotenv file, the bearer reaches pmmcp as sent, and none reaches the log or the output", async (t) => {
+  // A stand-in for pmmcp on a loopback port: it records each request's
+  // Authorization header and refuses, echoing the bearer back, as a server
+  // that quotes a refused token would. The SDK puts that body in its error,
+  // and the hub's degraded reason carries the error, so only the mask can
+  // keep the bearer out of the log and the event log.
+  const seen: (string | undefined)[] = []
+  const pmmcp = createServer((req, res) => {
+    req.resume()
+    seen.push(req.headers.authorization)
+    res.writeHead(401, { 'content-type': 'text/plain' }).end(`unauthorized: ${String(req.headers.authorization).replace(/^Bearer /, '')}`)
+  })
+  await new Promise<void>((resolve) => pmmcp.listen(0, '127.0.0.1', resolve))
+  t.after(() => {
+    pmmcp.closeAllConnections()
+    return new Promise<void>((resolve) => pmmcp.close(() => resolve()))
+  })
   const dataDir = join(tmpdir(t), 'daemon-dotenv')
   mkdirSync(dataDir, { recursive: true })
-  const configPath = daemonConfig(dataDir, 7792)
-  const creds = credsFile(tmpdir(t), `# test credentials\nAOS_CONTROL_TOKEN=${FILE_TOKEN}\nANTHROPIC_API_KEY=${FILE_KEY}\n`)
+  const configPath = daemonConfig(dataDir, 7792, `http://127.0.0.1:${String((pmmcp.address() as AddressInfo).port)}/mcp`)
+  // In .env.example's order, as `cp .env.example .env` leaves them: the log line lists the file's names in its order.
+  const creds = credsFile(
+    tmpdir(t),
+    `# test credentials\nAOS_CONTROL_TOKEN=${FILE_TOKEN}\nAOS_PMMCP_TOKEN=${FILE_BEARER}\nANTHROPIC_API_KEY=${FILE_KEY}\n`,
+  )
 
   // No credential in the environment at all: only the file can supply them.
   const env = { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '', AOS_DATA_DIR: dataDir }
@@ -537,13 +561,17 @@ test('the daemon and the CLI read AOS_CONTROL_TOKEN and a provider key that exis
   // Booting at all proves the token came from the file: without one the
   // control plane refuses to start.
   assert.ok(listening, `the daemon never listened:\n${log}`)
-  assert.match(log, /credentials: \.env \(AOS_CONTROL_TOKEN, ANTHROPIC_API_KEY\)/)
+  // README's line for a .env made from the template (plan A10's on the Mac).
+  assert.match(log, /credentials: \.env \(AOS_CONTROL_TOKEN, AOS_PMMCP_TOKEN, ANTHROPIC_API_KEY\)/)
+  // The bearer pmmcp was dialled with is the file's, under the name kernel.yaml declares, on the first request.
+  assert.ok(seen.length >= 1, `the daemon never dialled pmmcp:\n${log}`)
+  assert.equal(seen[0], `Bearer ${FILE_BEARER}`)
 
   // The other shell, as `npm run cli` runs it: the token only in the file.
   const agents = cli(['agents', '--config', configPath, '--dotenv', creds], { AOS_DATA_DIR: dataDir })
   assert.equal(agents.status, 0, agents.stderr)
   assert.match(agents.stdout, /^ceo\t/m)
-  for (const secret of [FILE_TOKEN, FILE_KEY]) {
+  for (const secret of [FILE_TOKEN, FILE_BEARER, FILE_KEY]) {
     assert.equal(`${agents.stdout}${agents.stderr}`.includes(secret), false, 'the CLI printed a credential')
   }
 
@@ -568,7 +596,9 @@ test('the daemon and the CLI read AOS_CONTROL_TOKEN and a provider key that exis
       'the file-sourced key was not resolved through the env source',
     )
     const everything = JSON.stringify(rows)
-    for (const secret of [FILE_TOKEN, FILE_KEY]) {
+    // The echo arrived and was recorded, masked: otherwise the bearer's absence below proves nothing.
+    assert.match(everything, /unauthorized: \[REDACTED\]/, 'the refusal pmmcp echoed is not in the log, so this proves nothing')
+    for (const secret of [FILE_TOKEN, FILE_BEARER, FILE_KEY]) {
       assert.equal(everything.includes(secret), false, 'a file-sourced value reached the event log')
       assert.equal(log.includes(secret), false, 'a file-sourced value reached the daemon output')
     }
@@ -841,14 +871,17 @@ test('aos-install --dry-run with an empty HOME finds no pmmcp, prints the plan a
   // S1, by name only, then discovery's finding: no pmmcp anywhere it looked.
   assert.match(run.stdout, /exports {5}DOCKER_CONFIG and PMMCP_DEBUG: pmmcp's commands run without them/)
   assert.match(run.stdout, /pmmcp {6}not found \(looked at .*com\.aibot\.pmmcp\.plist.*the listener on 127\.0\.0\.1:8766.*Github\/Persistent-Memory-MCP\)/)
-  assert.match(run.stdout, /^kernel {5}kernel\.yaml url matches; no pmmcp tokenEnv declared; AOS daemon listening on \d+$/m)
+  assert.match(run.stdout, /^kernel {5}kernel\.yaml url matches; pmmcp tokenEnv AOS_PMMCP_TOKEN; AOS daemon listening on \d+$/m)
   assert.match(run.stdout, /^ {2}- the AOS daemon listens on \d+: restart it after this run$/m)
   // The plan: .env by name, the fresh install it would make, every step as would-do, and the typed word it would ask.
   assert.match(run.stdout, /^\.env {2}.*\.env {2}absent \(created at 0600 when something is appended\)$/m)
   assert.match(run.stdout, /^ {2}AOS_CONTROL_TOKEN +missing {2}-> will be generated \(64 hex\)$/m)
+  assert.match(run.stdout, /^ {2}AOS_PMMCP_TOKEN +missing {2}-> will be generated \(64 hex\)$/m)
   assert.match(run.stdout, /^ {2}ANTHROPIC_API_KEY +missing {2}-> add it yourself; the installer never writes it$/m)
   assert.match(run.stdout, /pmmcp {2}not installed: a fresh install at .*\/Github\/Persistent-Memory-MCP/)
-  assert.match(run.stdout, /^would 1\. \[AOS file\] create .*\.env at 0600 with AOS_CONTROL_TOKEN/m)
+  assert.match(run.stdout, /^would 1\. \[AOS file\] create .*\.env at 0600 with AOS_CONTROL_TOKEN and AOS_PMMCP_TOKEN \(/m)
+  // The declared bearer reaches pmmcp as its digest alone, staged by the fresh install.
+  assert.match(run.stdout, /^would \d+\. \[fresh install\] stage the aos-kernel digest of AOS_PMMCP_TOKEN in /m)
   assert.match(run.stdout, /^would \d+\. \[fresh install\] clone pmmcp to /m)
   assert.match(run.stdout, /would ask you to type `install` before anything is installed/)
   assert.match(run.stdout, /dry run: nothing was changed, nothing was stopped or started \(probe output in .*\.aos\/install\/\d{8}T\d{6}Z\)/)
@@ -1077,7 +1110,8 @@ test('aos-install --dry-run in an empty HOME hands discovery and the planner wha
   assert.match(variant.stdout, /\(the default place\) is stored as "persistent-memory-mcp", not Persistent-Memory-MCP/)
   assert.doesNotMatch(variant.stdout, /^plan:|fresh install at/m)
 
-  // AOS_CONTROL_TOKEN exported by the shell: S2 names it among the exports and nothing is generated for it.
+  // AOS_CONTROL_TOKEN exported by the shell: S2 names it among the exports and nothing is generated for it;
+  // only the declared pmmcp bearer, which the shell does not export, would be.
   const shell = await installerMachine(t, { trap: false })
   const value = createHash('sha256').update(`export ${String(Date.now())}`).digest('hex')
   const exported = await installerAsync(shell, ['--dry-run'], { AOS_CONTROL_TOKEN: value })
@@ -1085,20 +1119,21 @@ test('aos-install --dry-run in an empty HOME hands discovery and the planner wha
   assert.equal(exported.status, 2, printed)
   assert.match(exported.stdout, /^ {2}shell exports {8}AOS_CONTROL_TOKEN$/m)
   assert.match(exported.stdout, /^ {2}AOS_CONTROL_TOKEN +missing, and exported by this shell -> not appended; unset it and re-run$/m)
-  assert.doesNotMatch(exported.stdout, /will be generated|create .*\.env at 0600/)
+  assert.doesNotMatch(exported.stdout, /AOS_CONTROL_TOKEN +missing {2}-> will be generated|\.env at 0600 with AOS_CONTROL_TOKEN|append AOS_CONTROL_TOKEN/)
+  assert.match(exported.stdout, /^ {2}1\. \[AOS file\] create .*\.env at 0600 with AOS_PMMCP_TOKEN \(/m)
   assert.equal(printed.includes(value), false, 'the exported value was printed')
   assert.equal(existsSync(join(shell.checkout.root, '.env')), false)
 })
 
 test('aos-install --aos-only --dry-run asks whether only the tokens it generates fit in .env, never the names you add yourself', async (t) => {
   // `fits` counts every missing name it is given: asked over the screen's
-  // names, a .env with room for the control token but not for every provider
-  // key beside it would be refused as over 64 KiB, though the installer never
-  // writes those keys.
+  // names, a .env with room for the two tokens it generates but not for every
+  // provider key beside them would be refused as over 64 KiB, though the
+  // installer never writes those keys.
   const m = await installerMachine(t, { trap: false })
   const path = join(m.checkout.root, '.env')
   const line = `# ${'x'.repeat(96)}\n`
-  const room = 65_536 - `AOS_CONTROL_TOKEN=${'0'.repeat(64)}\n`.length - 20
+  const room = 65_536 - `AOS_CONTROL_TOKEN=${'0'.repeat(64)}\n`.length - `AOS_PMMCP_TOKEN=${'0'.repeat(64)}\n`.length - 20
   const body = line.repeat(Math.floor(room / line.length)) + '#'.repeat(room % line.length - 1) + '\n'
   assert.equal(Buffer.byteLength(body), room)
   writeFileSync(path, body, { mode: 0o600 })
@@ -1106,7 +1141,7 @@ test('aos-install --aos-only --dry-run asks whether only the tokens it generates
   handOver(path)
   const run = installer(m, ['--aos-only', '--dry-run'])
   assert.equal(run.status, 0, `${run.stdout}${run.stderr}`)
-  assert.match(run.stdout, /^would 1\. \[AOS file\] append AOS_CONTROL_TOKEN to /m)
+  assert.match(run.stdout, /^would 1\. \[AOS file\] append AOS_CONTROL_TOKEN and AOS_PMMCP_TOKEN to /m)
   assert.doesNotMatch(run.stdout, /over 64 KiB/)
   assert.equal(readFileSync(path, 'utf8'), body, 'a dry run changed .env')
 })

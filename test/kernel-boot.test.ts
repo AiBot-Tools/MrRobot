@@ -1066,10 +1066,13 @@ test('envFallback:true shows secrets degraded in status.get', async (t) => {
   assert.equal(clean.kernel.status().envFallback, false)
 })
 
-test('pmmcp is dialled with no bearer unless kernel.yaml declares a tokenEnv, and a declared one left unset is never dialled', async (t) => {
-  // pmmcp authenticates nobody (it trusts loopback), so the shipped config names
-  // no tokenEnv. A loopback recorder stands in for it: the claim is what the
+test('pmmcp is dialled with the declared bearer, with none when a config declares no tokenEnv, and never when the declared one is unset', async (t) => {
+  // The shipped config declares pmmcp's bearer (the kernel is its client
+  // aos-kernel). A loopback recorder stands in for pmmcp: the claim is what the
   // kernel SENDS, which a mock client factory would never see.
+  const shipped = parseKernelConfig(parseYaml(readFileSync(join(REPO_ROOT, 'config', 'kernel.yaml'), 'utf8')), { repoRoot: REPO_ROOT })
+  const tokenEnv = shipped.mcp.servers['pmmcp']?.tokenEnv
+  assert.equal(tokenEnv, 'AOS_PMMCP_TOKEN')
   const seen: IncomingHttpHeaders[] = []
   const server = createServer((req, res) => {
     seen.push(req.headers)
@@ -1081,31 +1084,31 @@ test('pmmcp is dialled with no bearer unless kernel.yaml declares a tokenEnv, an
   const url = `url: http://127.0.0.1:${String((server.address() as AddressInfo).port)}/mcp`
   const pointAt = (extra: string) => (base: string): string =>
     base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `${url}${extra}`)
+  const declared = `\n      tokenEnv: ${tokenEnv}`
 
-  // As shipped: dialled, and nothing that looks like a credential goes with it.
-  const tokenless = await withKernel(t, { kernelYaml: pointAt('') })
-  assert.ok(seen.length > 0, 'the kernel never dialled pmmcp')
-  assert.ok(seen.every((h) => h.authorization === undefined), 'a bearer went to a server that takes none')
-  const reason = tokenless.kernel.status().subsystems.hub.reason ?? ''
-  assert.doesNotMatch(reason, /is not set/)
-  await tokenless.kernel.shutdown()
-
-  // Declared and unset: refused with the variable named, before any request.
-  seen.length = 0
-  const declared = await withKernel(t, { kernelYaml: pointAt('\n      tokenEnv: PMMCP_TOKEN') })
-  assert.equal(seen.length, 0, 'a declared tokenEnv left unset still dialled')
-  assert.match(declared.kernel.status().subsystems.hub.reason ?? '', /PMMCP_TOKEN is not set/)
-  await declared.kernel.shutdown()
-
-  // Declared and set: the bearer goes in the Authorization header.
+  // Declared and set, as shipped: the bearer goes in the Authorization header.
   const bearer = 'pmmcp-bearer-for-this-test-only'
-  const withToken = await withKernel(t, {
-    kernelYaml: pointAt('\n      tokenEnv: PMMCP_TOKEN'),
-    env: { PMMCP_TOKEN: bearer },
-  })
+  const withToken = await withKernel(t, { kernelYaml: pointAt(declared), env: { [tokenEnv]: bearer } })
   assert.ok(seen.length > 0, 'a set tokenEnv was never dialled')
   assert.ok(seen.every((h) => h.authorization === `Bearer ${bearer}`), 'the declared bearer was not sent')
   await withToken.kernel.shutdown()
+
+  // Declared and unset: refused with the variable named, before any request.
+  seen.length = 0
+  const unset = await withKernel(t, { kernelYaml: pointAt(declared) })
+  assert.equal(seen.length, 0, 'a declared tokenEnv left unset still dialled')
+  assert.match(unset.kernel.status().subsystems.hub.reason ?? '', /AOS_PMMCP_TOKEN is not set/)
+  await unset.kernel.shutdown()
+
+  // A config without the line (the fixture's own): dialled, and nothing that
+  // looks like a credential goes with it, even with the shipped name set.
+  seen.length = 0
+  const tokenless = await withKernel(t, { kernelYaml: pointAt(''), env: { [tokenEnv]: bearer } })
+  assert.equal(tokenless.fx.config.mcp.servers['pmmcp']?.tokenEnv, undefined)
+  assert.ok(seen.length > 0, 'the kernel never dialled pmmcp')
+  assert.ok(seen.every((h) => h.authorization === undefined), 'a bearer went to a server whose config declares none')
+  assert.doesNotMatch(tokenless.kernel.status().subsystems.hub.reason ?? '', /is not set/)
+  await tokenless.kernel.shutdown()
 })
 
 test('a declared pmmcp bearer that cannot be a header is refused by name, never dialled, and no part of it reaches the log', async (t) => {

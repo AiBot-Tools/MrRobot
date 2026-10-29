@@ -872,9 +872,10 @@ async function connectHub(
 
   let clientFactory = factory
   if (clientFactory === undefined) {
-    // No tokenEnv means the server takes no bearer (pmmcp trusts loopback). A
-    // DECLARED tokenEnv that is unset still refuses: the operator said this
-    // server wants a credential, and connecting without one would be a guess.
+    // No tokenEnv means no bearer is sent. A DECLARED tokenEnv that is unset
+    // refuses (the shipped AOS_PMMCP_TOKEN included, though pmmcp's gate runs
+    // in warn mode): the operator said this server wants a credential, and
+    // connecting without one would be a guess.
     const tokenEnv = server.tokenEnv
     const token = tokenEnv === undefined ? undefined : env[tokenEnv]
     if (tokenEnv !== undefined && (token === undefined || token.trim() === '')) {

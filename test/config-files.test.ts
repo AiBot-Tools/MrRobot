@@ -41,6 +41,7 @@ import { DENY_KEYS, TOKEN_PATTERNS } from '../src/events/redact.js'
 import { DOCKER_NAMES } from '../scripts/install/preflight.js'
 import { credentialNames, gitignoresDotenv, parseDotenv, PLACEHOLDER_PREFIX } from '../src/secrets/dotenv.js'
 import { ConfigError } from '../src/errors.js'
+import { CREDENTIAL_NAME } from './helpers/guard.js'
 import { withStore } from './helpers/store.js'
 
 const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
@@ -64,9 +65,9 @@ test('config/kernel.yaml parses and its four D30 budget defaults are present and
 
   // pmmcp: the MCP endpoint on 8766, not the dashboard on 8765.
   assert.equal(config.mcp.servers['pmmcp']?.url, 'http://127.0.0.1:8766/mcp')
-  // No bearer: pmmcp authenticates nobody (loopback trust). Declaring one would
-  // make boot wait on a variable the server ignores.
-  assert.equal(config.mcp.servers['pmmcp']?.tokenEnv, undefined)
+  // The kernel is pmmcp's client aos-kernel. Never a PMMCP_ name: pmmcp's
+  // load_config refuses to start from a shell that exports one.
+  assert.equal(config.mcp.servers['pmmcp']?.tokenEnv, 'AOS_PMMCP_TOKEN')
   assert.equal(config.secrets.keyArg, 'label')
   assert.equal(config.secrets.envFallback, false)
 
@@ -483,6 +484,30 @@ test('.env.example is the placeholder-only template: exactly the accepted names,
   }
 })
 
+test('every credential name the shipped config declares is one test/helpers/guard.ts scrubs', () => {
+  // A declared name the guard misses survives into every offline test process,
+  // so a token the operator exported in the shell that runs npm test could be
+  // read, logged or sent by any test. The falsify runner's copy of the pattern
+  // is held equal to the guard's (falsify.test.ts), so this covers it too.
+  const names = [
+    ...credentialNames(
+      parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO }),
+      parseProviders(readYaml('config/providers.yaml')),
+    ),
+  ].sort()
+  // The declared bearer is among them, so this is not a check over a list that lost it.
+  assert.ok(names.includes('AOS_PMMCP_TOKEN'), names.join(', '))
+  for (const name of names) {
+    assert.match(name, CREDENTIAL_NAME, `${name} is declared, and test/helpers/guard.ts does not scrub it`)
+    // This file is no live test, so the guard has already removed each from
+    // its environment. Checked by presence, never by value: node:test prints
+    // what a failed assertion compared, and a value found here is a token the
+    // operator exported (env.test.ts runs this check with a guard that
+    // deletes nothing, and holds its output to the name).
+    assert.ok(!Object.hasOwn(process.env, name), `${name} is still in an offline test's environment`)
+  }
+})
+
 test('package.json passes --dotenv .env to dev, cli and eval and to nothing else; no script or .npmrc uses Node --env-file', () => {
   const scripts = (JSON.parse(read('package.json')) as { scripts: Record<string, string> }).scripts
   for (const name of ['dev', 'cli', 'eval']) {
@@ -516,7 +541,7 @@ test('package.json names the installer aos-install, never install/preinstall/pos
   assert.deepEqual(runners.map(([name]) => name), ['aos-install'], 'another script runs the installer')
 })
 
-test("README's installer section and D35 say what the installer does: the exports it names, the dry run's writes, the digest only once declared, flags after --, and the fresh install's one typed word", () => {
+test("README's installer section and D35 say what the installer does: the exports it names, the dry run's writes, the declared bearer's digest alone, flags after --, and the fresh install's one typed word", () => {
   const readme = read('README.md')
   const start = readme.indexOf('### Install with npm run aos-install')
   assert.notEqual(start, -1, 'README has no installer section')
@@ -526,15 +551,57 @@ test("README's installer section and D35 say what the installer does: the export
   assert.match(section, /`DOCKER_CONTEXT` or `PMMCP_\*` your shell exports/)
   assert.doesNotMatch(section, /any `DOCKER_\*` or `PMMCP_\*` your shell exports/)
   assert.match(section, /`active\.json` too, while a `--jobs` count runs/)
-  assert.match(section, /Once `kernel\.yaml` declares `AOS_PMMCP_TOKEN`, pmmcp is given only the `sha256:` digest/)
+  assert.match(section, /`kernel\.yaml` declares `AOS_PMMCP_TOKEN`, and pmmcp is given only the `sha256:` digest of that `aos-kernel` token, never the token/)
   assert.match(section, /The flags go after `--`: npm takes `npm run aos-install --dry-run` as its own `--dry-run`/)
   const row = readme.split('\n').find((l) => l.startsWith('| `npm run aos-install` |')) ?? ''
-  assert.match(row, /once `kernel\.yaml` declares `AOS_PMMCP_TOKEN`, stage pmmcp's `aos-kernel` digest; `npm run aos-install -- --dry-run` changes nothing/)
+  assert.match(row, /stage pmmcp's `aos-kernel` digest of `AOS_PMMCP_TOKEN`; `npm run aos-install -- --dry-run` changes nothing/)
   // CLAUDE.md's Commands line names the dry run as npm must be given it.
   assert.match(read('CLAUDE.md'), /^npm run aos-install +# .*npm run aos-install -- --dry-run changes nothing/m)
   // D35's two typed confirmations, and the one exception the plan's Q24 makes.
   const d35 = read('docs/DECISIONS.md').split('\n').find((l) => l.startsWith('| D35 |')) ?? ''
   assert.match(d35, /a second typed `Persistent-Memory-MCP` \(one exception, the plan's Q24: on a fresh install the one typed `install` also covers the first stop and start/)
+})
+
+/** README's one-command capture: pmmcp's bearer from .env into that command's environment alone. */
+const CAPTURE_COMMAND = `AOS_PMMCP_TOKEN="$(sed -n 's/^AOS_PMMCP_TOKEN=//p' .env)" npm run capture:pmmcp`
+
+test('DECISIONS.md records D34 for the bearer kernel.yaml declares and keeps D37 open while capture:pmmcp reads no .env, README gives that capture a command that exports nothing, and the totals count the rows', () => {
+  const decisions = read('docs/DECISIONS.md')
+  const rows = decisions.split('\n')
+  const row = (id: string): string => rows.find((l) => l.startsWith(`| ${id} |`)) ?? ''
+  const tokenEnv = parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO }).mcp.servers['pmmcp']?.tokenEnv
+  assert.equal(tokenEnv, 'AOS_PMMCP_TOKEN')
+
+  // D34: the name kernel.yaml declares, and why no PMMCP_ name, with what is still to come.
+  const d34 = row('D34')
+  assert.notEqual(d34, '', 'kernel.yaml declares pmmcp\'s bearer and DECISIONS.md has no D34 row for it')
+  for (const fact of [`\`${String(tokenEnv)}\``, '`aos-kernel`', 'warn mode', '`load_config`', 'installer task A9', 'Q19']) {
+    assert.ok(d34.includes(fact), `D34 does not say ${fact}`)
+  }
+  assert.doesNotMatch(decisions, /is recorded when/, 'DECISIONS.md still names a row it has not written')
+  // The rule README states, with the row behind it.
+  const readme = read('README.md')
+  assert.match(readme, /No AOS credential name starts with `PMMCP_` \(decision D34\)/)
+
+  // D37: open for as long as the capture takes no --dotenv, and meanwhile
+  // README and the row give the same one-command form, which exports nothing.
+  const scripts = (JSON.parse(read('package.json')) as { scripts: Record<string, string> }).scripts
+  assert.doesNotMatch(scripts['capture:pmmcp'] ?? '', /--dotenv/, 'capture:pmmcp reads .env now: answer D37 and drop CAPTURE_COMMAND')
+  const d37 = row('D37')
+  assert.match(d37, /\| open \|$/, 'D37 is no longer open while capture:pmmcp still reads no .env')
+  assert.ok(d37.includes(`\`${CAPTURE_COMMAND}\``), 'D37 does not give README\'s command')
+  const blocks = [...readme.matchAll(/^```(?:bash|sh|zsh|shell)\n([\s\S]*?)^```/gm)].map((m) => (m[1] ?? '').trim())
+  assert.ok(blocks.includes(CAPTURE_COMMAND), 'README has no shell block that is exactly the one-command capture')
+  for (const body of blocks) assert.doesNotMatch(body, /\bexport\b[^\n]*AOS_PMMCP_TOKEN/, `README exports pmmcp's bearer: ${body}`)
+
+  // The totals are the rows this file holds.
+  const totals = /\*\*Totals\.\*\* (\d+) Phase 0 decisions \(30 from the plan, D31 to D(\d+) added later\), (\d+) fleet\s+design decisions, (\d+) of them blocking\./.exec(decisions)
+  assert.ok(totals, 'DECISIONS.md states its totals in another form')
+  const ds = rows.filter((l) => /^\| D\d+ /.test(l)).length
+  assert.equal(Number(totals[1]), ds, 'the Phase 0 total is not the number of D rows')
+  assert.equal(Number(totals[2]), ds, 'the last D row added is not the total')
+  assert.equal(Number(totals[3]), rows.filter((l) => /^\| Q\d+ /.test(l)).length, 'the fleet total is not the number of Q rows')
+  assert.equal(Number(totals[4]), rows.filter((l) => /^\| \*\*[DQ]\d+\*\* /.test(l)).length, 'the blocking total is not the number of blocking rows')
 })
 
 test('every README shell block pastes cleanly into stock macOS zsh: no # comments', () => {

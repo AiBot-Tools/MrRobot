@@ -490,6 +490,7 @@ test('test processes get no live-test flag and no credential from the runner, an
       ANTHROPIC_API_KEY: 'k',
       OPENROUTER_API_KEY: 'k',
       AOS_CONTROL_TOKEN: 't',
+      AOS_PMMCP_TOKEN: 't',
       PMMCP_TOKEN: 't',
       NODE_OPTIONS: '--inspect',
       NODE_TEST_CONTEXT: 'child',

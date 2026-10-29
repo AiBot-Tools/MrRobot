@@ -164,7 +164,7 @@ export const RESTORING_SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as c
 const SIGNAL_NUMBERS: Partial<Record<NodeJS.Signals, number>> = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGTERM: 15 }
 
 /** Credential names, as test/helpers/guard.ts scrubs them (falsify.test.ts keeps the two equal). */
-export const CHILD_CREDENTIAL_NAME = /^(ANTHROPIC|OPENAI|OPENROUTER|MOONSHOT)_|_API_KEY$|^AOS_CONTROL_TOKEN$|^PMMCP_TOKEN$/
+export const CHILD_CREDENTIAL_NAME = /^(ANTHROPIC|OPENAI|OPENROUTER|MOONSHOT)_|_API_KEY$|^AOS_CONTROL_TOKEN$|^AOS_PMMCP_TOKEN$|^PMMCP_TOKEN$/
 
 /**
  * The environment a test process gets: the runner's, minus what must never

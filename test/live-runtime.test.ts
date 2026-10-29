@@ -62,8 +62,22 @@ const KEY = LIVE ? liveCredential('ANTHROPIC_API_KEY') : undefined
 const WRITES = process.env['AOS_LIVE_PMMCP_WRITES'] === '1'
 const ANTHROPIC_HOST = 'api.anthropic.com'
 
-// PMMCP_TOKEN is optional: pmmcp takes no bearer. Set it only for a server that does.
+// AOS_PMMCP_TOKEN is optional: pmmcp's bearer gate runs in warn mode and serves a
+// request without one. Give PMMCP_URL inline on the one command, never exported:
+// pmmcp's load_config refuses to start from a shell that exports a PMMCP_ name.
 const hasPmmcp = (): boolean => process.env['PMMCP_URL'] !== undefined
+
+/**
+ * The fixture's kernel.yaml pointed at the live pmmcp, declaring the shipped
+ * bearer name when AOS_PMMCP_TOKEN is set, so the kernel sends it as the
+ * shipped config makes it. Unset, nothing is declared and nothing is sent:
+ * pmmcp's gate runs in warn mode and serves a request without one.
+ */
+const livePmmcp = (url: string) => (base: string): string =>
+  base.replace(
+    /url: http:\/\/127\.0\.0\.1:\d+\/mcp/,
+    `url: ${url}${(process.env['AOS_PMMCP_TOKEN'] ?? '').trim() === '' ? '' : '\n      tokenEnv: AOS_PMMCP_TOKEN'}`,
+  )
 
 /**
  * Every micro-dollar the log records, probe included. That is the bill: the
@@ -112,7 +126,7 @@ test(
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
       : !hasPmmcp()
-        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer)'
+        ? 'set PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer)'
         : !WRITES
           ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
           : false,
@@ -130,7 +144,7 @@ test(
     const state = await hub.connect('pmmcp', async () => {
       const client = new Client({ name: 'aos-live-runtime', version: '0.0.1' })
       await client.connect(
-        streamableHttpTransport(process.env['PMMCP_URL'] ?? '', process.env['PMMCP_TOKEN']),
+        streamableHttpTransport(process.env['PMMCP_URL'] ?? '', process.env['AOS_PMMCP_TOKEN']),
       )
       return client
     })
@@ -155,7 +169,7 @@ test(
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
       : !hasPmmcp() || KEY === undefined
-        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer), and put ANTHROPIC_API_KEY in the shell or .env'
+        ? 'set PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer), and put ANTHROPIC_API_KEY in the shell or .env'
         : !WRITES
           ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
           : false,
@@ -170,11 +184,11 @@ test(
     // get_secret masks by design, so pmmcp is the goal store here, not the vault.
     const { kernel, fx } = await withKernel(t, {
       env: {
-        PMMCP_TOKEN: process.env['PMMCP_TOKEN'],
+        AOS_PMMCP_TOKEN: process.env['AOS_PMMCP_TOKEN'],
         ANTHROPIC_API_KEY: KEY,
       },
       sandboxDriver: fakeSandbox(),
-      kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `url: ${pmmcpUrl}`),
+      kernelYaml: livePmmcp(pmmcpUrl),
       agentsDir: liveFleet(tmpdir(t), ref),
     })
     assert.equal(kernel.status().subsystems.hub.state, 'ok', kernel.status().subsystems.hub.reason ?? '')
@@ -236,7 +250,7 @@ test(
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
       : !hasPmmcp() || KEY === undefined
-        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer), and put ANTHROPIC_API_KEY in the shell or .env'
+        ? 'set PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer), and put ANTHROPIC_API_KEY in the shell or .env'
         : !WRITES
           ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
           : false,
@@ -250,11 +264,11 @@ test(
     // The shipped CEO, delegating, but remembering in the test namespace.
     const { kernel, fx } = await withKernel(t, {
       env: {
-        PMMCP_TOKEN: process.env['PMMCP_TOKEN'],
+        AOS_PMMCP_TOKEN: process.env['AOS_PMMCP_TOKEN'],
         ANTHROPIC_API_KEY: KEY,
       },
       sandboxDriver: fakeSandbox(),
-      kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `url: ${pmmcpUrl}`),
+      kernelYaml: livePmmcp(pmmcpUrl),
       agentsDir: liveFleet(tmpdir(t), ref, { delegation: true }),
     })
     assert.equal(kernel.status().subsystems.hub.state, 'ok', kernel.status().subsystems.hub.reason ?? '')
@@ -279,7 +293,7 @@ test(
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
       : !hasPmmcp() || KEY === undefined
-        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer), and put ANTHROPIC_API_KEY in the shell or .env'
+        ? 'set PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer), and put ANTHROPIC_API_KEY in the shell or .env'
         : !WRITES
           ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
           : false,
@@ -290,10 +304,10 @@ test(
     const ref = realRef()
     const pmmcpUrl = process.env['PMMCP_URL'] ?? ''
     const fx = fixture(t, {
-      kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `url: ${pmmcpUrl}`),
+      kernelYaml: livePmmcp(pmmcpUrl),
     })
     const agentsDir = liveFleet(tmpdir(t), ref, { delegation: true })
-    const env = { PMMCP_TOKEN: process.env['PMMCP_TOKEN'], ANTHROPIC_API_KEY: KEY }
+    const env = { AOS_PMMCP_TOKEN: process.env['AOS_PMMCP_TOKEN'], ANTHROPIC_API_KEY: KEY }
 
     // A dead process reads no reply. After the crash the old kernel gets headers
     // and a body that never ends, as the offline script's hang does: a promise

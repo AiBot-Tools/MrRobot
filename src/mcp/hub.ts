@@ -75,10 +75,11 @@ function isSessionGone(e: unknown): boolean {
 /**
  * Streamable HTTP to a loopback MCP server, with a bearer only when one is given.
  *
- * pmmcp authenticates nobody: it trusts loopback and publishes RFC 9728 metadata
- * with no authorization servers. A server that does want a bearer names its
- * `tokenEnv` in kernel.yaml, and then an unset token refuses the connection
- * upstream of here rather than sending an empty `Bearer `.
+ * kernel.yaml names a server's bearer by its `tokenEnv` (pmmcp's is
+ * AOS_PMMCP_TOKEN, sent as its client aos-kernel; pmmcp's gate runs in warn
+ * mode, so loopback trust still decides access). A declared token that is
+ * unset refuses the connection upstream of here rather than sending an empty
+ * `Bearer `; a server with no tokenEnv gets no header at all.
  */
 export function streamableHttpTransport(url: string, token?: string): Transport {
   const transport = new StreamableHTTPClientTransport(

@@ -80,20 +80,24 @@ const STARTED_BEFORE = new Date('2026-10-29T08:50:00.000Z')
 const OPERATOR_UID = 501
 
 const raw = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
-/** kernel.yaml as shipped: no pmmcp tokenEnv yet, so the credentials map holds the control token alone. */
+/** kernel.yaml as shipped, which declares pmmcp's bearer as AOS_PMMCP_TOKEN. */
 const SHIPPED: KernelConfig = parseKernelConfig(raw('config/kernel.yaml'), { repoRoot: REPO_ROOT })
 const PROVIDERS: ProvidersFile = parseProviders(raw('config/providers.yaml'))
 
-/** kernel.yaml with pmmcp's bearer declared as `tokenEnv` (A8 ships AOS_PMMCP_TOKEN). */
-function declaring(tokenEnv: string, extra: Record<string, unknown> = {}): KernelConfig {
+/** kernel.yaml with pmmcp's bearer declared as `tokenEnv`, or with no tokenEnv line at all (undefined). */
+function declaring(tokenEnv: string | undefined, extra: Record<string, unknown> = {}): KernelConfig {
   const doc = structuredClone(raw('config/kernel.yaml')) as { mcp: { servers: Record<string, Record<string, unknown>> } }
   const pmmcp = doc.mcp.servers['pmmcp']
   assert.ok(pmmcp !== undefined)
-  pmmcp['tokenEnv'] = tokenEnv
+  if (tokenEnv === undefined) delete pmmcp['tokenEnv']
+  else pmmcp['tokenEnv'] = tokenEnv
   Object.assign(doc.mcp.servers, extra)
   return parseKernelConfig(doc, { repoRoot: REPO_ROOT })
 }
+/** The bearer declared, as shipped (the credentials map test holds the two equal). */
 const DECLARED = declaring('AOS_PMMCP_TOKEN')
+/** A config that declares no pmmcp tokenEnv, as kernel.yaml did before A8: the credentials map holds the control token alone. */
+const UNDECLARED = declaring(undefined)
 
 type Doc = Record<string, unknown>
 
@@ -237,12 +241,12 @@ function dotenv(names: Readonly<Record<string, number | 'missing' | { blank: num
   return { path: '/Users/op/MrRobot/.env', found, present, blank, missing }
 }
 
-/** A .env that holds every name of the shipped config and of A8's. */
+/** A .env that holds every name of the shipped config. */
 const FULL = dotenv({ AOS_CONTROL_TOKEN: 3, AOS_PMMCP_TOKEN: 4, ANTHROPIC_API_KEY: 5 })
 
 function input(over: Partial<PlanInput> = {}): PlanInput {
   return {
-    config: SHIPPED,
+    config: UNDECLARED,
     providers: PROVIDERS,
     dotenv: dotenv({ AOS_CONTROL_TOKEN: 3, ANTHROPIC_API_KEY: 5 }),
     room: { writable: true, fits: true },
@@ -420,21 +424,21 @@ test("discovery's result and the writer's inspection are what the planner takes,
 })
 
 test('nothing to do on a configured system: an empty plan and no prompt', async () => {
-  // As shipped (no pmmcp tokenEnv): the control token in .env, Qdrant
+  // With no pmmcp tokenEnv declared: the control token in .env, Qdrant
   // enforced, the dashboard token and curator secret present, no update.
-  const shipped = planInstall(input())
-  assert.deepEqual(shipped.stops, [])
-  assert.deepEqual(shipped.steps, [])
-  assert.deepEqual(shipped.offers, [])
-  assert.deepEqual(shipped.generate, [])
-  assert.equal(nothingToDo(shipped), true)
+  const undeclared = planInstall(input())
+  assert.deepEqual(undeclared.stops, [])
+  assert.deepEqual(undeclared.steps, [])
+  assert.deepEqual(undeclared.offers, [])
+  assert.deepEqual(undeclared.generate, [])
+  assert.equal(nothingToDo(undeclared), true)
 
-  // Once kernel.yaml declares the bearer: on file in pmmcp, and loaded by a server that started after.
+  // As shipped, with the bearer declared: on file in pmmcp, and loaded by a server that started after.
   const declared = planInstall(input({ config: DECLARED, dotenv: FULL, pmmcp: found({ bearer: { state: 'matches' } }) }))
   assert.deepEqual([declared.stops, declared.steps, declared.offers, declared.generate], [[], [], [], []])
   assert.equal(declared.staged, undefined)
 
-  for (const plan of [shipped, declared]) {
+  for (const plan of [undeclared, declared]) {
     for (const interactive of [true, false]) {
       const io = new FakeIO({ interactive })
       const outcome = await gate(plan, io)
@@ -1002,7 +1006,14 @@ test('the curator secret is offered only when facts show curator_proof; without 
 })
 
 test('generate holds only the names the config maps to installer-made tokens: ANTHROPIC_API_KEY is never generated, whatever is missing', (t) => {
-  assert.deepEqual([...credentialsMap(SHIPPED).values()], [{ name: 'AOS_CONTROL_TOKEN', from: 'control.tokenEnv', client: undefined }])
+  // As shipped: the control token, and pmmcp's bearer as its client aos-kernel.
+  assert.deepEqual(SHIPPED, DECLARED)
+  assert.deepEqual([...credentialsMap(SHIPPED).values()], [
+    { name: 'AOS_CONTROL_TOKEN', from: 'control.tokenEnv', client: undefined },
+    { name: 'AOS_PMMCP_TOKEN', from: 'mcp.servers.pmmcp.tokenEnv', client: 'aos-kernel' },
+  ])
+  // A config that declares no pmmcp tokenEnv: the control token alone.
+  assert.deepEqual([...credentialsMap(UNDECLARED).values()], [{ name: 'AOS_CONTROL_TOKEN', from: 'control.tokenEnv', client: undefined }])
   // Another MCP server's bearer is a credential its service issues: never in the map.
   const withGithub = declaring('AOS_PMMCP_TOKEN', { github: { url: 'http://127.0.0.1:9999/mcp', tokenEnv: 'GITHUB_TOKEN' } })
   assert.deepEqual([...credentialsMap(withGithub).values()], [

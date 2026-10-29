@@ -12,7 +12,7 @@ import net from 'node:net'
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 
 import { allowHost, clearAllowedHosts, NetworkBlocked } from './helpers/guard.js'
@@ -234,7 +234,7 @@ test('the test guard removes credential names from every test process except a l
   const guard = fileURLToPath(new URL('./helpers/guard.ts', import.meta.url))
   const body =
     `await import(${JSON.stringify(guard)})\n` +
-    "console.log(JSON.stringify({ key: process.env.ANTHROPIC_API_KEY ?? null, token: process.env.AOS_CONTROL_TOKEN ?? null, other: process.env.OPENROUTER_API_KEY ?? null, path: process.env.PATH === undefined ? null : 'kept' }))\n"
+    "console.log(JSON.stringify({ key: process.env.ANTHROPIC_API_KEY ?? null, token: process.env.AOS_CONTROL_TOKEN ?? null, bearer: process.env.AOS_PMMCP_TOKEN ?? null, other: process.env.OPENROUTER_API_KEY ?? null, path: process.env.PATH === undefined ? null : 'kept' }))\n"
   const probe = (file: string, live: boolean, extra: readonly string[] = []): Record<string, unknown> => {
     const path = join(dir, file)
     writeFileSync(path, body)
@@ -248,6 +248,8 @@ test('the test guard removes credential names from every test process except a l
         ...(process.env['AOS_FALSIFY_RUN'] === undefined ? {} : { AOS_FALSIFY_RUN: process.env['AOS_FALSIFY_RUN'] }),
         ANTHROPIC_API_KEY: 'qGuardCanaryKey',
         AOS_CONTROL_TOKEN: 'qGuardCanaryToken',
+        // pmmcp's bearer, which kernel.yaml declares: matched by no provider pattern, only by its own name.
+        AOS_PMMCP_TOKEN: 'qGuardCanaryBearer',
         OPENROUTER_API_KEY: 'qGuardCanaryOther',
         ...(live ? { AOS_LIVE_TESTS: '1' } : {}),
       },
@@ -255,7 +257,7 @@ test('the test guard removes credential names from every test process except a l
     assert.equal(result.status, 0, result.stderr)
     return JSON.parse(result.stdout.trim().split('\n').pop() ?? '{}') as Record<string, unknown>
   }
-  const scrubbed = { key: null, token: null, other: null, path: 'kept' }
+  const scrubbed = { key: null, token: null, bearer: null, other: null, path: 'kept' }
   assert.deepEqual(probe('cli.test.ts', false), scrubbed)
   assert.deepEqual(probe('live-probe.test.ts', false), scrubbed)
   assert.deepEqual(probe('cli.test.ts', true), scrubbed, 'an offline file kept credentials on the live run')
@@ -266,9 +268,67 @@ test('the test guard removes credential names from every test process except a l
   assert.deepEqual(probe('live-probe.test.ts', true), {
     key: 'qGuardCanaryKey',
     token: 'qGuardCanaryToken',
+    bearer: 'qGuardCanaryBearer',
     other: 'qGuardCanaryOther',
     path: 'kept',
   })
+})
+
+/** config-files.test.ts's check that the guard removed every declared credential, run here as its own process. */
+const SCRUB_CHECK = 'every credential name the shipped config declares is one test/helpers/guard.ts scrubs'
+
+test("the check that the guard scrubbed every declared credential passes with them exported, and with a guard that deletes nothing fails by name, printing no value", (t) => {
+  // That check is what notices the guard's delete loop breaking while its
+  // pattern still matches. On that day the operator's shell may well export
+  // a real token, and node:test prints what a failed assertion compared: a
+  // check that compares the value prints the token it found. So run the real
+  // check twice in its own process, with a canary for each declared name
+  // exported: once as it runs in npm test, where it must pass, and once with
+  // process.env behind a Proxy that ignores delete, which is that broken loop.
+  const root = tmpdir(t)
+  const preload = join(root, 'deletes-nothing.mjs')
+  writeFileSync(preload, 'process.env = new Proxy(process.env, { deleteProperty: () => true })\n')
+  const canaries = {
+    // Letters only, so no window of one can turn up in a duration or a line number.
+    AOS_CONTROL_TOKEN: 'qScrubCanaryControlZYXWVUTSRQPONMLKJ',
+    AOS_PMMCP_TOKEN: 'qScrubCanaryBearerZYXWVUTSRQPONMLKJI',
+    ANTHROPIC_API_KEY: 'qScrubCanaryProviderZYXWVUTSRQPONMLK',
+  }
+  const file = fileURLToPath(new URL('./config-files.test.ts', import.meta.url))
+  const pattern = `^${SCRUB_CHECK.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}$`
+  const run = (extra: readonly string[]): { status: number | null; printed: string } => {
+    const result = spawnSync(
+      process.execPath,
+      ['--import', 'tsx', ...extra, '--test-reporter=tap', `--test-name-pattern=${pattern}`, file],
+      {
+        encoding: 'utf8',
+        timeout: 60_000,
+        env: {
+          PATH: process.env['PATH'] ?? '/usr/bin:/bin',
+          // Under a falsify run this process was admitted by its run id; a child it spawns belongs to the same run.
+          ...(process.env['AOS_FALSIFY_RUN'] === undefined ? {} : { AOS_FALSIFY_RUN: process.env['AOS_FALSIFY_RUN'] }),
+          ...canaries,
+        },
+      },
+    )
+    return { status: result.status, printed: `${result.stdout}${result.stderr}` }
+  }
+  // As npm test runs it: the guard removes all three, and the one check passes.
+  const scrubbed = run([])
+  assert.equal(scrubbed.status, 0, scrubbed.printed)
+  assert.match(scrubbed.printed, /^# tests 1$/m, `the pattern no longer finds the check:\n${scrubbed.printed}`)
+  assert.match(scrubbed.printed, /^# pass 1$/m, scrubbed.printed)
+
+  // The broken loop: the check fails, by name, at the first name it finds.
+  const leaked = run(['--import', pathToFileURL(preload).href])
+  assert.equal(leaked.status, 1, leaked.printed)
+  assert.match(leaked.printed, /^# fail 1$/m, leaked.printed)
+  assert.match(leaked.printed, /(?:ANTHROPIC_API_KEY|AOS_CONTROL_TOKEN|AOS_PMMCP_TOKEN) is still in an offline test's environment/, leaked.printed)
+  for (const value of Object.values(canaries)) {
+    for (let i = 0; i + 8 <= value.length; i += 1) {
+      assert.equal(leaked.printed.includes(value.slice(i, i + 8)), false, `the check printed part of a credential it found:\n${leaked.printed}`)
+    }
+  }
 })
 
 test('the test guard admits a mutated tree only for the falsify run that mutated it', (t) => {
@@ -326,4 +386,37 @@ test('the test guard admits a mutated tree only for the falsify run that mutated
   const gone = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' })
   lock(Number(gone.stdout))
   assert.equal(load().status, 0, 'a dead run\'s lock refused a clean tree')
+})
+
+test("README's one-command capture hands that command pmmcp's bearer from the line the installer writes, nothing for a missing line, and leaves the shell without it", (t) => {
+  // Until D37 is answered capture:pmmcp reads no .env, and the README form is
+  // how the operator gets the token into its environment without typing it
+  // (zsh history) or exporting it (aos-install stops for an exported bearer).
+  // Run as a shell runs it, against a scratch .env, with a stand-in for npm
+  // that prints what the command was given.
+  const readme = readFileSync(join(REPO_DIR, 'README.md'), 'utf8')
+  const blocks = [...readme.matchAll(/^```bash\n([\s\S]*?)^```/gm)].map((m) => (m[1] ?? '').trim())
+  const command = blocks.find((b) => b.endsWith(' npm run capture:pmmcp'))
+  assert.ok(command !== undefined, 'README has no shell block that runs the capture')
+  assert.match(command, /^AOS_PMMCP_TOKEN="\$\([^\n]*\)" npm run capture:pmmcp$/, 'the capture is no longer one command with the bearer set inline')
+  const probe = `${command.replace(/ npm run capture:pmmcp$/, ' /usr/bin/env')}; printf 'after=%s\\n' "\${AOS_PMMCP_TOKEN-unset}"`
+  const shell = (dotenv: string): { given: string | undefined; after: string | undefined } => {
+    const dir = tmpdir(t)
+    writeFileSync(join(dir, '.env'), dotenv, { mode: 0o600 })
+    const run = spawnSync('/bin/sh', ['-c', probe], { cwd: dir, encoding: 'utf8', timeout: 10_000, env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin' } })
+    assert.equal(run.status, 0, run.stderr)
+    const lines = run.stdout.split('\n')
+    return {
+      given: lines.find((l) => l.startsWith('AOS_PMMCP_TOKEN='))?.slice('AOS_PMMCP_TOKEN='.length),
+      after: lines.find((l) => l.startsWith('after='))?.slice('after='.length),
+    }
+  }
+  const value = 'qCaptureLineBearerZYXWVUTSRQPONMLKJ'
+  // The line as the installer appends it, among the others: exactly its value, and the shell never holds it.
+  assert.deepEqual(
+    shell(`AOS_CONTROL_TOKEN=qCaptureOtherControlZYXWVUTSRQPONM\nANTHROPIC_API_KEY=qCaptureOtherKeyZYXWVUTSRQPONMLK\nAOS_PMMCP_TOKEN=${value}\n`),
+    { given: value, after: 'unset' },
+  )
+  // No such line: the command is given a blank value, which the capture refuses as unset.
+  assert.deepEqual(shell('AOS_CONTROL_TOKEN=qCaptureOtherControlZYXWVUTSRQPONM\n'), { given: '', after: 'unset' })
 })

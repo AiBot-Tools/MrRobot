@@ -56,6 +56,18 @@ const LIVE = process.env['AOS_LIVE_TESTS'] === '1'
 const KEY = LIVE ? liveCredential('ANTHROPIC_API_KEY') : undefined
 const ANTHROPIC_HOST = 'api.anthropic.com'
 
+/**
+ * The fixture's kernel.yaml pointed at the live pmmcp, declaring the shipped
+ * bearer name when AOS_PMMCP_TOKEN is set, so the kernel sends it as the
+ * shipped config makes it. Unset, nothing is declared and nothing is sent:
+ * pmmcp's gate runs in warn mode and serves a request without one.
+ */
+const livePmmcp = (url: string) => (base: string): string =>
+  base.replace(
+    /url: http:\/\/127\.0\.0\.1:\d+\/mcp/,
+    `url: ${url}${(process.env['AOS_PMMCP_TOKEN'] ?? '').trim() === '' ? '' : '\n      tokenEnv: AOS_PMMCP_TOKEN'}`,
+  )
+
 interface Row {
   readonly seq: number
   readonly type: string
@@ -214,7 +226,7 @@ test(
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
       : process.env['PMMCP_URL'] === undefined || KEY === undefined
-        ? 'set PMMCP_URL (PMMCP_TOKEN only if the server wants a bearer), and put ANTHROPIC_API_KEY in the shell or .env'
+        ? 'set PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer), and put ANTHROPIC_API_KEY in the shell or .env'
         : false,
   },
   async (t) => {
@@ -230,11 +242,11 @@ test(
     // the memory and goal store. The criterion is both at once: pmmcp really
     // connected, and a real run that really spent money.
     const booted = await withKernel(t, {
-      env: { PMMCP_TOKEN: process.env['PMMCP_TOKEN'], ANTHROPIC_API_KEY: key },
+      env: { AOS_PMMCP_TOKEN: process.env['AOS_PMMCP_TOKEN'], ANTHROPIC_API_KEY: key },
       sandboxDriver: fakeSandbox(),
       // No clientFactory: the hub opens a real Streamable HTTP session to the
       // operator's pmmcp. The guard already admits loopback.
-      kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `url: ${pmmcpUrl}`),
+      kernelYaml: livePmmcp(pmmcpUrl),
     })
 
     const status = booted.kernel.status()

@@ -1118,7 +1118,8 @@ function bearerCheck(): Step {
   return {
     id: 'bearer-check',
     tag: 'live',
-    title: `one MCP initialize with the ${PMMCP_CLIENT} bearer, then "first request with token" for ${PMMCP_CLIENT} in ~/.persistent-memory-mcp/logs/server.log (not found: inconclusive, not a failure)`,
+    // No MCP initialize: the installer holds no token's value (A2) to send one; the kernel's own next request makes the line (plan S7 L6, §9 option (a)).
+    title: `"first request with token" for ${PMMCP_CLIENT} in ~/.persistent-memory-mcp/logs/server.log since the start (not found: inconclusive, not a failure; restart npm run dev to make the line)`,
     short: `the ${PMMCP_CLIENT} bearer check`,
     commands: [],
     rollback: undefined,

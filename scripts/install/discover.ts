@@ -177,8 +177,8 @@ export const PMMCP_OLLAMA_PORTS: readonly number[] = [11434, 11435, 11436, 11437
 /** The docker context pmmcp's Qdrant lives in. */
 export const DOCKER_CONTEXT = 'desktop-linux'
 
-/** The hosts a pmmcp service may be configured on. */
-const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', '::1'])
+/** The hosts a pmmcp service may be configured on (a fresh install's new checkout is held to the same set). */
+export const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['127.0.0.1', 'localhost', '::1'])
 
 /** How long each kind of probe may take. */
 const QUICK_MS = 15_000

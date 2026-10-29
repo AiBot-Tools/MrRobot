@@ -73,7 +73,10 @@
 //   in the result (activeError), never thrown from the exit.
 //
 //   What it reads and shows: machine output from the .out file only
-//   (readOut, readJobs); the .err file is shown, never parsed. Either is shown
+//   (readOut, readJobs); the .err file is shown, never parsed (one caller's
+//   exception, stated in its contract: A6 reads an `invalid:` line from
+//   `http_auth check`'s stderr, where pmmcp's interface puts its refusal and
+//   prints nothing on stdout; nothing here parses it). Either is shown
 //   through tail(), which strips terminal control sequences and then applies
 //   redactString. A caller that has read a probe whose output may hold
 //   another process's command line or environment (ps, launchctl print) has

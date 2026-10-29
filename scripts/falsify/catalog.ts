@@ -602,7 +602,11 @@ const DOTENV_APPEND = 'src/secrets/dotenv-append.ts'
 // write, and what a failure says it changed, from the second re-review;
 // WA20-WA35 the guards the third re-review found untested (the create's
 // read-back, size check and directory sync, a raw error's name and cause),
-// the dry run's size and directory checks, and the digests.
+// the dry run's size and directory checks, and the digests; WA36-WA41 the
+// fourth's: what the writer may generate (only a token the AOS mints, never a
+// provider's key) and the created file's size at exactly 64 KiB; WA42-WA43
+// the fifth's: the key the created header names refused by name, and the
+// refusal's pronoun for two keys.
 const dotenvAppend: Suite = {
   name: 'dotenvAppend',
   tests: ['test/dotenv-append.test.ts', 'test/dotenv.test.ts'],
@@ -642,6 +646,14 @@ const dotenvAppend: Suite = {
     { id: 'WA33', file: DOTENV_APPEND, from: 'values.get(name) ?? inFile(name)', to: 'inFile(name)', why: 'a token appended by this call gets no digest, so the installer stages nothing for it' },
     { id: 'WA34', file: DOTENV_APPEND, from: 'preflight(options, [...options.generate.keys(), ...wanted], path)', to: 'preflight(options, options.generate.keys(), path)', why: 'a digest is asked for a name the config does not declare, and the call goes ahead instead of refusing it' },
     { id: 'WA35', file: DOTENV_APPEND, from: '  const cause = refusal ? { cause: why } : undefined', to: '  const cause = { cause: why }', why: 'a raw error while a created .env is prepared is kept as the cause, and util.inspect prints whatever its thrower put in its message' },
+    { id: 'WA36', file: DOTENV_APPEND, from: '  if (providerKeys.length > 0) {', to: '  if (false) {', why: 'a provider key the caller lists as generatable is generated: junk the kernel sends to the provider, and "present" for good, so nobody is told to add the real one' },
+    { id: 'WA37', file: DOTENV_APPEND, from: '  if (unminted.length > 0) {', to: '  if (false) {', why: 'a name the AOS does not mint (pmmcp\'s bearer before the config declares it, another service\'s token) is generated because a caller handed a generator for it' },
+    { id: 'WA38', file: DOTENV_APPEND, from: '  const pmmcp = config.mcp.servers[PMMCP_SERVER]\n  if (pmmcp?.tokenEnv !== undefined) names.add(pmmcp.tokenEnv)', to: '  for (const server of Object.values(config.mcp.servers)) if (server.tokenEnv !== undefined) names.add(server.tokenEnv)', why: 'another MCP server\'s bearer, a credential its service issues, is listed as minted, and the installer generates junk for it' },
+    { id: 'WA39', file: DOTENV_APPEND, from: 'const size = Buffer.byteLength(CREATED_HEADER) + assignedBytes(names, length)', to: 'const size = assignedBytes(names, length)', why: 'the dry run leaves out the created header and says a file up to 112 bytes over 64 KiB fits, which the real run refuses' },
+    { id: 'WA40', file: DOTENV_APPEND, from: '  if (chunk.length > DOTENV_MAX_BYTES) {', to: '  if (chunk.length >= DOTENV_MAX_BYTES) {', why: 'a created file of exactly 64 KiB, which the loader reads, is refused' },
+    { id: 'WA41', file: DOTENV_APPEND, from: 'fits: size <= DOTENV_MAX_BYTES, digests: [] }', to: 'fits: size < DOTENV_MAX_BYTES, digests: [] }', why: 'the dry run says a created file of exactly 64 KiB does not fit, though the real run creates it' },
+    { id: 'WA42', file: DOTENV_APPEND, from: '  const keys = new Set<string>([OPERATORS_KEY])', to: '  const keys = new Set<string>()', why: 'a caller that hands over no providers and lists ANTHROPIC_API_KEY as generatable gets junk written under the header that tells the operator to add the real one' },
+    { id: 'WA43', file: DOTENV_APPEND, from: "add ${one ? 'it' : 'them'} to .env yourself", to: 'add it to .env yourself', why: 'two provider keys refused together tell the operator to add "it"' },
   ],
   control: {
     id: 'C',

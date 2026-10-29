@@ -8,22 +8,32 @@
 //   src/ or scripts/ opens .env for writing (hygiene.test.ts holds all three).
 //   The installer imports this module and never the loader, src/secrets/
 //   dotenv.ts (hygiene.test.ts's list of the loader's importers holds it): it
-//   builds `accepted` with credentialNames, re-exported here; it needs no
-//   confirming read, since appendCredentials reads every name it writes back
-//   through loadDotenv before it returns; and what pmmcp is given for a token
-//   is its digest, from `digests` here, so the installer never holds a value.
+//   builds `accepted` with credentialNames, re-exported here, and
+//   `generatable` with mintedCredentialNames, and hands over the providers
+//   file it loaded as `providers`; it needs no confirming read, since
+//   appendCredentials reads every name it writes back through loadDotenv
+//   before it returns; and what pmmcp is given for a token is its digest,
+//   from `digests` here, so the installer never holds a value.
 //
 //   What it writes: only <repoRoot>/.env, and only names the config declares
-//   (`accepted`) that hold no line in the file yet. A missing file is created at
-//   0600 with O_EXCL, so a file that appears meanwhile is never written over,
-//   and starts with two comment lines that hold no value. An existing file is
-//   appended to, never rewritten: no line is changed, removed or reordered; a
-//   name the operator left blank keeps its blank line and is never appended a
-//   second time; no backup copy is made anywhere. An existing file is read
-//   through a descriptor that cannot write, and opened for writing only once
-//   something is missing, so a 0400 file the loader accepts is accepted here
-//   while nothing is missing. Nothing to append means nothing is opened for
-//   writing, and a missing file stays missing.
+//   (`accepted`) that hold no line in the file yet. And only a token the AOS
+//   mints itself: each name in `generate` must be in `generatable`, which the
+//   caller builds with mintedCredentialNames (control.tokenEnv, and pmmcp's
+//   tokenEnv once declared), and no provider's auth.envVar is ever generated,
+//   whatever `generatable` says, nor ANTHROPIC_API_KEY, the key the created
+//   header tells the operator to add, whatever `providers` says. A provider
+//   key is the operator's to add: a generated one would read as present for
+//   good, so the installer would never again say "add it yourself", and the
+//   kernel would send it to the provider. A missing file is created at 0600
+//   with O_EXCL, so a file that appears meanwhile is never written over, and
+//   starts with two comment lines that hold no value. An existing file is
+//   appended to, never rewritten: no line is changed, removed or reordered;
+//   a name the operator left blank keeps its blank line and is never
+//   appended a second time; no backup copy is made anywhere. An existing
+//   file is read through a descriptor that cannot write, and opened for
+//   writing only once something is missing, so a 0400 file the loader
+//   accepts is accepted here while nothing is missing. Nothing to append
+//   means nothing is opened for writing, and a missing file stays missing.
 //
 //   What it reports: each name it was asked for, by line number, as appended,
 //   present (set to a value) or blank (on a line with no value, which the
@@ -31,7 +41,10 @@
 //   delete, since appending it again would make the file a duplicate the
 //   loader refuses). inspectCredentials reports the same, and what is missing,
 //   before anything is written: it is the installer's plan and its dry run,
-//   read through the same refusals and never opened for writing. It also says
+//   read through the same refusals about the user, the file and the names,
+//   and never opened for writing. The refusals about what may be generated
+//   are appendCredentials' alone, since inspect is not told what will be: a
+//   provider key it reports missing is one the append refuses. It also says
 //   what the write would meet: whether the missing names, at the length the
 //   installer generates, keep the file within 64 KiB, and whether the file's
 //   owner may write it (by its mode bits), or, with no file, whether the
@@ -52,14 +65,16 @@
 //   (after the append, or as created, too), invalid UTF-8, a NUL byte, any
 //   line parseDotenv refuses (a placeholder, an undeclared name, a
 //   duplicate); a name to generate, or asked for in `digests`, that the
-//   config does not declare; an fstat or read of the file that fails (named
-//   by its errno); a file it must append to whose mode bits deny its owner
-//   writing; a file it created whose filesystem does not keep mode 0600; a
-//   file that changed between the read and the write; and a generated value
-//   shorter than the control token's floor or one the loader would not read
-//   back exactly as written. Every
-//   refusal happens before a byte is written. A file this call created and
-//   then refused, before its first byte, is removed again.
+//   config does not declare; a name to generate that is a provider's
+//   auth.envVar or ANTHROPIC_API_KEY, or that is not in `generatable` (both
+//   before the file is opened or a value made); an fstat or read of the file
+//   that fails (named by its errno); a file it must append to whose mode
+//   bits deny its owner writing; a file it created whose filesystem does not
+//   keep mode 0600; a file that changed between the read and the write; and
+//   a generated value shorter than the control token's floor or one the
+//   loader would not read back exactly as written. Every refusal happens
+//   before a byte is written. A file this call created and then refused,
+//   before its first byte, is removed again.
 //
 //   How a failure says what it changed: every error appendCredentials throws
 //   is a DotenvWriteError, whose `written` is false for a refusal (the file is
@@ -103,16 +118,44 @@ import {
 import { dirname, join, resolve } from 'node:path'
 
 import { entryProblem } from '../agents/protected.js'
+import type { KernelConfig } from '../config.js'
 import { MIN_TOKEN_LENGTH } from '../control/auth.js'
 import { ConfigError } from '../errors.js'
 import { SecretMask } from '../events/redact.js'
+import type { ProvidersFile } from '../models/registry.js'
 import { DOTENV_FILE, DOTENV_MAX_BYTES, gitignoresDotenv, loadDotenv, occupiedLines, parseDotenv } from './dotenv.js'
 
 /** What the installer builds `accepted` from, here so that it never imports the loader. */
 export { credentialNames } from './dotenv.js'
 
+/** The MCP server whose bearer the installer mints: the kernel dials this one (kernel.ts) and stages its digest in pmmcp. */
+const PMMCP_SERVER = 'pmmcp'
+
+/**
+ * The credential names whose values the AOS itself mints, and so the only
+ * ones appendCredentials may generate (`generatable`): the control plane's
+ * bearer, control.tokenEnv, and pmmcp's, its server's tokenEnv once the
+ * config declares one. Never another MCP server's tokenEnv: that is a
+ * credential its service issues, which the operator adds by hand. It reads
+ * the config alone, so a pmmcp tokenEnv that names a provider's key is
+ * listed, and appendCredentials refuses that one by the providers file.
+ */
+export function mintedCredentialNames(config: Pick<KernelConfig, 'control' | 'mcp'>): ReadonlySet<string> {
+  const names = new Set<string>([config.control.tokenEnv])
+  const pmmcp = config.mcp.servers[PMMCP_SERVER]
+  if (pmmcp?.tokenEnv !== undefined) names.add(pmmcp.tokenEnv)
+  return names
+}
+
+/**
+ * The provider key the created file tells the operator to add (D33): never
+ * generated, by name, whatever the caller's `providers` holds, so a header
+ * that says "add it yourself" is never written above a junk one.
+ */
+const OPERATORS_KEY = 'ANTHROPIC_API_KEY'
+
 /** The two lines a created file starts with: comments, no value, no placeholder. */
-export const CREATED_HEADER = '# Created by npm run aos-install, which only ever appends the names it lacks.\n# Add ANTHROPIC_API_KEY yourself.\n'
+export const CREATED_HEADER = `# Created by npm run aos-install, which only ever appends the names it lacks.\n# Add ${OPERATORS_KEY} yourself.\n`
 
 /**
  * The shortest value this writes. The control token's floor
@@ -151,6 +194,19 @@ interface Where {
 export interface AppendOptions extends Where {
   /** The names to add when the file holds no line for them, in order, each with what makes its value. */
   readonly generate: ReadonlyMap<string, () => string>
+  /**
+   * The names this call may generate: mintedCredentialNames(config). A name
+   * in `generate` outside it is refused, nothing generated, so a map built
+   * from inspectCredentials' `missing` cannot write a provider key.
+   */
+  readonly generatable: ReadonlySet<string>
+  /**
+   * The providers the config's keys are for: no entry's auth.envVar is ever
+   * generated, even when `generatable` holds it, and neither is
+   * ANTHROPIC_API_KEY, which CREATED_HEADER names, whatever this holds. The
+   * operator adds those.
+   */
+  readonly providers: Pick<ProvidersFile, 'entries'>
 }
 
 export interface InspectOptions extends Where {
@@ -237,11 +293,16 @@ export class DotenvWriteError extends ConfigError {
 
 /**
  * What <repoRoot>/.env holds of `names`, by line, through every refusal
- * appendCredentials makes before it generates a value. Opens nothing for
- * writing and creates nothing: a missing file is reported missing.
+ * appendCredentials makes about the user, the file and the names before it
+ * generates a value. Not the ones about what may be generated (a provider's
+ * key, a name outside `generatable`): inspect is not told what will be, so
+ * those are appendCredentials' alone, and a name listed here as missing may
+ * be one the append refuses. Opens nothing for writing and creates nothing:
+ * a missing file is reported missing.
  *
  * @throws {ConfigError} naming the path, names and line numbers only, for any
- *   refusal in the contract above that comes before a value is made.
+ *   refusal in the contract above that comes before a value is made, but
+ *   the two about what may be generated.
  */
 export function inspectCredentials(options: InspectOptions): InspectResult {
   const names = [...new Set(options.names)]
@@ -298,6 +359,7 @@ interface Progress {
 function append(path: string, options: AppendOptions, progress: Progress): AppendResult {
   const wanted = [...new Set(options.digests ?? [])]
   const uid = preflight(options, [...options.generate.keys(), ...wanted], path)
+  refuseUnminted(options)
   const fd = openToRead(path)
   if (fd === undefined) return create(path, options, uid, progress, wanted)
 
@@ -410,6 +472,35 @@ function preflight(where: Where, names: Iterable<string>, path: string): number 
     if (!where.accepted.has(name)) throw new ConfigError(`${name} is not a credential name the config declares, so it is not written to .env`)
   }
   return uid
+}
+
+/**
+ * The names in `generate` this module must not make a value for, refused
+ * before the file is opened or a generator runs: a provider's key (each
+ * entry's auth.envVar, and OPERATORS_KEY by name), whatever `generatable`
+ * says, then anything else `generatable` does not hold.
+ */
+function refuseUnminted(options: AppendOptions): void {
+  const names = [...options.generate.keys()]
+  const keys = new Set<string>([OPERATORS_KEY])
+  for (const entry of Object.values(options.providers.entries)) {
+    if (entry.auth.envVar !== undefined) keys.add(entry.auth.envVar)
+  }
+  const providerKeys = names.filter((name) => keys.has(name))
+  if (providerKeys.length > 0) {
+    const one = providerKeys.length === 1
+    throw new ConfigError(
+      `${providerKeys.join(', ')} ${one ? "is a provider's key" : "are providers' keys"} (auth.envVar in providers.yaml): ` +
+        `the installer never generates one; add ${one ? 'it' : 'them'} to .env yourself. Nothing was written`,
+    )
+  }
+  const unminted = names.filter((name) => !options.generatable.has(name))
+  if (unminted.length > 0) {
+    throw new ConfigError(
+      `${unminted.join(', ')} ${unminted.length === 1 ? 'is not a token' : 'are not tokens'} the AOS mints (control.tokenEnv, or pmmcp's tokenEnv), ` +
+        `so the installer does not generate ${unminted.length === 1 ? 'it' : 'them'}. Nothing was written`,
+    )
+  }
 }
 
 /**

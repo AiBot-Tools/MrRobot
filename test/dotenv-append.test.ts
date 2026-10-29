@@ -49,6 +49,7 @@ import {
   appendCredentials,
   credentialNames,
   inspectCredentials,
+  mintedCredentialNames,
   type AppendOptions,
   type AppendResult,
   type InspectOptions,
@@ -59,6 +60,11 @@ import { REPO_ROOT } from './helpers/kernel.js'
 import { tmpdir } from './helpers/tmpdir.js'
 
 const ACCEPTED = new Set(['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY'])
+/** The tokens the AOS mints once kernel.yaml declares pmmcp's bearer: what mintedCredentialNames gives the installer then. */
+const GENERATABLE: ReadonlySet<string> = new Set(['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN'])
+const readConfig = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
+/** The shipped providers: ANTHROPIC_API_KEY is the Claude entry's auth.envVar. */
+const PROVIDERS = parseProviders(readConfig('config/providers.yaml'))
 /** The operator's uid on the Mac: the writer refuses root, and CI may be root. */
 const OPERATOR_UID = 501
 const KEY = 'qKeyVa1ueFor7estsOnlyZYXWVUTSRQPONM'
@@ -68,6 +74,10 @@ interface Who {
   /** 'process': leave euid to the writer's own default, process.geteuid(). */
   readonly euid?: number | 'process'
   readonly accepted?: ReadonlySet<string>
+  /** appendIn only: GENERATABLE unless said. */
+  readonly generatable?: ReadonlySet<string>
+  /** appendIn only: the shipped providers unless said. */
+  readonly providers?: AppendOptions['providers']
   readonly digests?: readonly string[]
   /** inspectIn only. */
   readonly valueLength?: number
@@ -87,6 +97,8 @@ function appendIn(repo: string, generate: ReadonlyMap<string, () => string>, who
     repoRoot: repo,
     accepted: who.accepted ?? ACCEPTED,
     generate,
+    generatable: who.generatable ?? GENERATABLE,
+    providers: who.providers ?? PROVIDERS,
     ...(who.uid === undefined ? {} : { uid: who.uid }),
     ...(euid === 'process' ? {} : { euid }),
     ...(who.digests === undefined ? {} : { digests: who.digests }),
@@ -378,25 +390,27 @@ test('appends only absent names, after a newline when the file lacks a final one
   t.after(() => SecretMask.clear())
   // Each file, and the lines the loader will number the new names: after the
   // last line, and after the newline the writer adds where the file lacks one.
+  // The operator's own key, where there is one, is left alone and not asked for.
   const fixtures: [string, Record<string, number>][] = [
-    [`# mine\nANTHROPIC_API_KEY=${KEY}`, { AOS_CONTROL_TOKEN: 3 }],
-    [`# mine\nANTHROPIC_API_KEY=${KEY}\n`, { AOS_CONTROL_TOKEN: 3 }],
-    [`# mine\r\nANTHROPIC_API_KEY=${KEY}\r\n`, { AOS_CONTROL_TOKEN: 3 }],
-    [`# only a comment, no final newline`, { AOS_CONTROL_TOKEN: 2, ANTHROPIC_API_KEY: 3 }],
-    ['', { AOS_CONTROL_TOKEN: 1, ANTHROPIC_API_KEY: 2 }],
+    [`# mine\nAOS_PMMCP_TOKEN=${KEY}`, { AOS_CONTROL_TOKEN: 3 }],
+    [`# mine\nAOS_PMMCP_TOKEN=${KEY}\n`, { AOS_CONTROL_TOKEN: 3 }],
+    [`# mine\r\nAOS_PMMCP_TOKEN=${KEY}\r\n`, { AOS_CONTROL_TOKEN: 3 }],
+    [`# mine\nANTHROPIC_API_KEY=${KEY}`, { AOS_CONTROL_TOKEN: 3, AOS_PMMCP_TOKEN: 4 }],
+    [`# only a comment, no final newline`, { AOS_CONTROL_TOKEN: 2, AOS_PMMCP_TOKEN: 3 }],
+    ['', { AOS_CONTROL_TOKEN: 1, AOS_PMMCP_TOKEN: 2 }],
   ]
   for (const [original, at] of fixtures) {
     const repo = repoWith(t, original)
     const path = join(repo, '.env')
     const ino = lstatSync(path).ino
-    const g = generators('AOS_CONTROL_TOKEN', 'ANTHROPIC_API_KEY')
+    const g = generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN')
     const result = appendIn(repo, g.generate)
-    const hadKey = original.includes('ANTHROPIC_API_KEY')
+    const hadToken = original.includes('AOS_PMMCP_TOKEN')
     assert.deepEqual(result, {
       path,
       created: false,
       appended: Object.entries(at).map(([name, line]) => ({ name, line })),
-      present: hadKey ? [{ name: 'ANTHROPIC_API_KEY', line: 2 }] : [],
+      present: hadToken ? [{ name: 'AOS_PMMCP_TOKEN', line: 2 }] : [],
       blank: [],
       digests: [],
     }, JSON.stringify(original))
@@ -413,14 +427,14 @@ test('appends only absent names, after a newline when the file lacks a final one
 
     // A second run finds every name where the first put it and changes nothing.
     const after = snapshot(path)
-    const again = generators('AOS_CONTROL_TOKEN', 'ANTHROPIC_API_KEY')
+    const again = generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN')
     assert.deepEqual(appendIn(repo, again.generate), {
       path,
       created: false,
       appended: [],
       present: [
         { name: 'AOS_CONTROL_TOKEN', line: at['AOS_CONTROL_TOKEN'] },
-        { name: 'ANTHROPIC_API_KEY', line: at['ANTHROPIC_API_KEY'] ?? 2 },
+        { name: 'AOS_PMMCP_TOKEN', line: at['AOS_PMMCP_TOKEN'] ?? 2 },
       ],
       blank: [],
       digests: [],
@@ -469,13 +483,13 @@ test('a blank line is reported apart from a set one, by line number: the loader 
   const original = `ANTHROPIC_API_KEY=${KEY}\n# the control plane's bearer\nAOS_CONTROL_TOKEN=\n`
   const repo = repoWith(t, original)
   const path = join(repo, '.env')
-  const g = generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY')
+  const g = generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN')
   const result = appendIn(repo, g.generate)
   assert.deepEqual(result, {
     path,
     created: false,
     appended: [{ name: 'AOS_PMMCP_TOKEN', line: 4 }],
-    present: [{ name: 'ANTHROPIC_API_KEY', line: 1 }],
+    present: [],
     blank: [{ name: 'AOS_CONTROL_TOKEN', line: 3 }],
     digests: [],
   })
@@ -485,8 +499,18 @@ test('a blank line is reported apart from a set one, by line number: the loader 
   // Why blank is not present: the daemon would boot without that name.
   const loaded = loadDotenv(path, { repoRoot: repo, accepted: ACCEPTED, wanted: [...ACCEPTED], shell: {} })
   assert.deepEqual(Object.keys(loaded.values).sort(), ['ANTHROPIC_API_KEY', 'AOS_PMMCP_TOKEN'])
-  // And a re-run says so again, by the same line, rather than "nothing to do".
-  assert.deepEqual(appendIn(repo, generators('AOS_CONTROL_TOKEN').generate).blank, [{ name: 'AOS_CONTROL_TOKEN', line: 3 }])
+  // And a re-run says so again, by the same line, apart from the set one,
+  // rather than "nothing to do".
+  const again = generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN')
+  assert.deepEqual(appendIn(repo, again.generate), {
+    path,
+    created: false,
+    appended: [],
+    present: [{ name: 'AOS_PMMCP_TOKEN', line: 4 }],
+    blank: [{ name: 'AOS_CONTROL_TOKEN', line: 3 }],
+    digests: [],
+  })
+  assert.equal(again.calls(), 0)
 })
 
 test('a .env its owner cannot write: with nothing missing it is nothing to do, and a missing name is refused by its mode bits with the fix', (t) => {
@@ -496,28 +520,31 @@ test('a .env its owner cannot write: with nothing missing it is nothing to do, a
   // file for writing, the operator cannot open this one.
   const token = randomBytes(32).toString('hex')
   for (const mode of [0o400, 0o500]) {
-    const repo = repoWith(t, `AOS_CONTROL_TOKEN=${token}\nANTHROPIC_API_KEY=\n`, mode)
+    const repo = repoWith(t, `AOS_CONTROL_TOKEN=${token}\nAOS_PMMCP_TOKEN=\n`, mode)
     const path = join(repo, '.env')
     const before = snapshot(path)
     assert.deepEqual(loadDotenv(path, { repoRoot: repo, accepted: ACCEPTED, wanted: ['AOS_CONTROL_TOKEN'], shell: {} }).values, { AOS_CONTROL_TOKEN: token })
 
-    const done = generators('AOS_CONTROL_TOKEN', 'ANTHROPIC_API_KEY')
+    const done = generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN')
     assert.deepEqual(appendIn(repo, done.generate), {
       path,
       created: false,
       appended: [],
       present: [{ name: 'AOS_CONTROL_TOKEN', line: 1 }],
-      blank: [{ name: 'ANTHROPIC_API_KEY', line: 2 }],
+      blank: [{ name: 'AOS_PMMCP_TOKEN', line: 2 }],
       digests: [],
     })
     assert.equal(snapshot(path), before)
 
+    // With pmmcp's line gone, AOS_PMMCP_TOKEN is missing, not blank.
+    const fewer = repoWith(t, `AOS_CONTROL_TOKEN=${token}\n`, mode)
+    const fewerBefore = snapshot(join(fewer, '.env'))
     const more = generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN')
     assert.match(
-      untouched(() => appendIn(repo, more.generate)),
+      untouched(() => appendIn(fewer, more.generate)),
       new RegExp(`has mode 0${mode.toString(8)}: its owner cannot write it, so AOS_PMMCP_TOKEN cannot be added\\. Run: chmod 600 .*\\.env, then re-run`),
     )
-    assert.equal(snapshot(path), before)
+    assert.equal(snapshot(join(fewer, '.env')), fewerBefore)
     assert.equal(more.calls(), 0, 'a value was made for a file that cannot take it')
   }
 })
@@ -853,16 +880,17 @@ test('after an append, loadDotenv with the shipped credentialNames returns every
   const read = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
   const config = parseKernelConfig(read('config/kernel.yaml'), { repoRoot: REPO_ROOT })
   const providers = parseProviders(read('config/providers.yaml'))
-  // As the installer builds it: through the writer's re-export, never the loader.
+  // As the installer builds them: through the writer's exports, never the loader.
   const names = credentialNames(config, providers)
+  const generatable = mintedCredentialNames(config)
   const control = config.control.tokenEnv
-  assert.ok(names.has(control))
+  assert.ok(names.has(control) && generatable.has(control))
 
   // Created, then the operator's provider key added by hand, then a re-run.
   for (const original of [undefined, `ANTHROPIC_API_KEY=${KEY}`]) {
     const repo = repoWith(t, original)
     const g = generators(control)
-    const result = appendIn(repo, g.generate, { accepted: names })
+    const result = appendIn(repo, g.generate, { accepted: names, generatable, providers })
     // On the line after the header, or after the operator's key and the newline its file lacked.
     assert.deepEqual(result.appended, [{ name: control, line: original === undefined ? 3 : 2 }])
     const loaded = loadDotenv(join(repo, '.env'), { repoRoot: repo, accepted: names, wanted: [...names], shell: {} })
@@ -873,6 +901,123 @@ test('after an append, loadDotenv with the shipped credentialNames returns every
     // The control plane would boot on it.
     assert.equal(assertTokenUsable(loaded.values[control]), value)
   }
+})
+
+/** The shipped kernel.yaml, parsed as the installer will, after `edit` changes the raw document. */
+function shippedConfig(edit: (raw: { mcp: { servers: Record<string, Record<string, unknown>> } }) => void = () => undefined): ReturnType<typeof parseKernelConfig> {
+  const raw = readConfig('config/kernel.yaml') as { mcp: { servers: Record<string, Record<string, unknown>> } }
+  edit(raw)
+  return parseKernelConfig(raw, { repoRoot: REPO_ROOT })
+}
+
+test('mintedCredentialNames gives exactly the tokens the AOS mints: AOS_CONTROL_TOKEN, and pmmcp\'s tokenEnv once declared; never a provider\'s key or another server\'s bearer', () => {
+  // The shipped config: the control token, and pmmcp's bearer only if kernel.yaml declares one (A8).
+  const config = shippedConfig()
+  const declared = config.mcp.servers['pmmcp']?.tokenEnv
+  assert.deepEqual([...mintedCredentialNames(config)], ['AOS_CONTROL_TOKEN', ...(declared === undefined ? [] : [declared])])
+  // Every one is a name the config declares, and none is a provider's key.
+  const accepted = credentialNames(config, PROVIDERS)
+  const keys = Object.values(PROVIDERS.entries).flatMap((e) => (e.auth.envVar === undefined ? [] : [e.auth.envVar]))
+  assert.deepEqual(keys, ['ANTHROPIC_API_KEY'])
+  for (const name of mintedCredentialNames(config)) {
+    assert.ok(accepted.has(name), name)
+    assert.equal(keys.includes(name), false, name)
+  }
+
+  // pmmcp's bearer declared, and a second MCP server with its own: only
+  // pmmcp's is minted. The other is a credential its service issues.
+  const both = shippedConfig((raw) => {
+    const pmmcp = raw.mcp.servers['pmmcp']
+    assert.ok(pmmcp !== undefined)
+    pmmcp['tokenEnv'] = 'AOS_PMMCP_TOKEN'
+    raw.mcp.servers['github'] = { url: 'http://127.0.0.1:9911/mcp', tokenEnv: 'GITHUB_MCP_TOKEN' }
+  })
+  assert.deepEqual([...mintedCredentialNames(both)], ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN'])
+  assert.deepEqual([...credentialNames(both, PROVIDERS)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'GITHUB_MCP_TOKEN'])
+})
+
+test('a generator for a provider\'s key is refused even when the caller lists it as generatable, and one for a name the AOS does not mint is refused: nothing generated, nothing written', (t) => {
+  t.after(() => SecretMask.clear())
+  const provider = /^ANTHROPIC_API_KEY is a provider's key \(auth\.envVar in providers\.yaml\): the installer never generates one; add it to \.env yourself\. Nothing was written$/
+  const withKey = new Set([...GENERATABLE, 'ANTHROPIC_API_KEY'])
+  // No file, a file without the key, and one where the operator set it:
+  // refused alike, before anything is opened or made, as a refusal.
+  for (const original of [undefined, `AOS_CONTROL_TOKEN=${'a'.repeat(64)}\n`, `ANTHROPIC_API_KEY=${KEY}\n`]) {
+    for (const generatable of [withKey, GENERATABLE]) {
+      const repo = repoWith(t, original)
+      const listing = readdirSync(repo).sort()
+      const before = snapshot(join(repo, '.env'))
+      const g = generators('AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY')
+      assert.match(untouched(() => appendIn(repo, g.generate, { generatable })), provider, String(original))
+      assert.equal(g.calls(), 0)
+      assert.equal(snapshot(join(repo, '.env')), before)
+      assert.deepEqual(readdirSync(repo).sort(), listing)
+    }
+  }
+
+  // The slip the installer could make: `generate` built from the dry run's
+  // `missing`, which lists the provider key the operator has not added yet.
+  const fresh = repoWith(t)
+  const missing = inspectIn(fresh, ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY']).missing
+  assert.deepEqual(missing, ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY'])
+  const fromMissing = generators(...missing)
+  assert.match(untouched(() => appendIn(fresh, fromMissing.generate, { generatable: new Set(missing) })), provider)
+  assert.equal(fromMissing.calls(), 0)
+  assert.deepEqual(readdirSync(fresh).sort(), ['.gitignore'])
+
+  // A config that names a provider's key as pmmcp's bearer: the helper lists
+  // it, and the writer still refuses it. Built from the parsed config rather
+  // than parsed, since a rule on tokenEnv names may refuse it at parse.
+  const shipped = shippedConfig()
+  const pmmcp = shipped.mcp.servers['pmmcp']
+  assert.ok(pmmcp !== undefined)
+  const misnamed = mintedCredentialNames({ control: shipped.control, mcp: { servers: { ...shipped.mcp.servers, pmmcp: { ...pmmcp, tokenEnv: 'ANTHROPIC_API_KEY' } } } })
+  assert.ok(misnamed.has('ANTHROPIC_API_KEY'))
+  const g = generators('ANTHROPIC_API_KEY')
+  assert.match(untouched(() => appendIn(fresh, g.generate, { generatable: misnamed })), provider)
+  assert.equal(g.calls(), 0)
+
+  // By name, whatever `providers` holds: the key the created header tells
+  // the operator to add is never generated, even when the caller hands over
+  // no providers and lists it as generatable, with no file and with one.
+  assert.ok(CREATED_HEADER.includes('# Add ANTHROPIC_API_KEY yourself.\n'))
+  for (const original of [undefined, `AOS_CONTROL_TOKEN=${'a'.repeat(64)}\n`]) {
+    const repo = repoWith(t, original)
+    const before = snapshot(join(repo, '.env'))
+    const named = generators('AOS_CONTROL_TOKEN', 'ANTHROPIC_API_KEY')
+    assert.match(untouched(() => appendIn(repo, named.generate, { generatable: withKey, providers: { entries: {} } })), provider, String(original))
+    assert.equal(named.calls(), 0)
+    assert.equal(snapshot(join(repo, '.env')), before)
+  }
+
+  // Two providers' keys: named together, and the operator told to add them.
+  const claude = Object.values(PROVIDERS.entries)[0]
+  assert.ok(claude !== undefined)
+  const two = { entries: { ...PROVIDERS.entries, other: { ...claude, auth: { ...claude.auth, envVar: 'OPENAI_API_KEY' } } } }
+  const both = generators('ANTHROPIC_API_KEY', 'OPENAI_API_KEY')
+  assert.match(
+    untouched(() => appendIn(fresh, both.generate, { accepted: new Set([...ACCEPTED, 'OPENAI_API_KEY']), generatable: new Set(['ANTHROPIC_API_KEY', 'OPENAI_API_KEY']), providers: two })),
+    /^ANTHROPIC_API_KEY, OPENAI_API_KEY are providers' keys \(auth\.envVar in providers\.yaml\): the installer never generates one; add them to \.env yourself\. Nothing was written$/,
+  )
+  assert.equal(both.calls(), 0)
+
+  // Not minted: pmmcp's bearer before kernel.yaml declares it, and another
+  // server's, each a name the config declares. Refused the same way.
+  const accepted = new Set([...ACCEPTED, 'GITHUB_MCP_TOKEN'])
+  const before = generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN')
+  assert.match(
+    untouched(() => appendIn(fresh, before.generate, { generatable: new Set(['AOS_CONTROL_TOKEN']) })),
+    /^AOS_PMMCP_TOKEN is not a token the AOS mints \(control\.tokenEnv, or pmmcp's tokenEnv\), so the installer does not generate it\. Nothing was written$/,
+  )
+  const other = generators('AOS_PMMCP_TOKEN', 'GITHUB_MCP_TOKEN')
+  assert.match(
+    untouched(() => appendIn(fresh, other.generate, { accepted, generatable: new Set(['AOS_CONTROL_TOKEN']) })),
+    /^AOS_PMMCP_TOKEN, GITHUB_MCP_TOKEN are not tokens the AOS mints .*, so the installer does not generate them\. Nothing was written$/,
+  )
+  assert.equal(before.calls() + other.calls(), 0)
+  assert.deepEqual(readdirSync(fresh).sort(), ['.gitignore'])
+  // And with each listed, the same calls write.
+  assert.deepEqual(appendIn(fresh, generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN').generate).appended.map((a) => a.name), ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN'])
 })
 
 test('refuses to run as root', (t) => {
@@ -941,11 +1086,13 @@ test('inspectCredentials reports each name present, blank or missing by line, th
     assert.equal(snapshot(path), before)
     assert.equal(JSON.stringify(result).includes(token.slice(0, 8)), false)
     if (mode === 0o600) {
-      // What it says is missing is exactly what an append then adds, where it said.
-      const g = generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY')
+      // What it says is missing is exactly what an append of the minted
+      // names then adds, where it said; the operator's blank key is theirs.
+      const g = generators(...NAMES.filter((name) => GENERATABLE.has(name)))
       const appended = appendIn(repo, g.generate)
+      const minted = (lines: readonly { name: string }[]): unknown[] => lines.filter((l) => GENERATABLE.has(l.name))
       assert.deepEqual(appended.appended.map((a) => a.name), result.missing)
-      assert.deepEqual([appended.present, appended.blank], [result.present, result.blank])
+      assert.deepEqual([appended.present, appended.blank], [minted(result.present), minted(result.blank)])
     } else {
       // A 0400 file it calls unwritable is one the writer refuses to add a missing name to.
       assert.match(untouched(() => appendIn(repo, generators('AOS_PMMCP_TOKEN').generate)), /its owner cannot write it/)
@@ -993,7 +1140,8 @@ test('inspectCredentials reports each name present, blank or missing by line, th
     const listing = readdirSync(repo).sort()
     const before = snapshot(join(repo, '.env'))
     const inspected = refusal(() => inspectIn(repo, names, who))
-    const g = generators(...names)
+    // The writer is handed no provider key: that refusal comes before these.
+    const g = generators(...names.filter((name) => name !== 'ANTHROPIC_API_KEY'))
     assert.equal(untouched(() => appendIn(repo, g.generate, who)), inspected, why)
     assert.equal(g.calls(), 0, why)
     assert.equal(snapshot(join(repo, '.env')), before, why)
@@ -1333,6 +1481,39 @@ test('inspectCredentials says whether the missing names fit within 64 KiB at the
   const huge = new Map([['AOS_PMMCP_TOKEN', () => 'h'.repeat(DOTENV_MAX_BYTES)]])
   assert.match(untouched(() => appendIn(none, huge)), /would be \d+ bytes when created; a credentials file is at most 65536\. Nothing was written$/)
   assert.deepEqual(readdirSync(none).sort(), ['.gitignore'])
+
+  // No file, at the boundary: the two header lines and the new ones come to
+  // exactly 64 KiB, which fits and is created; one byte more does not fit,
+  // and is refused before anything is created. The header counts in both.
+  const header = Buffer.byteLength(CREATED_HEADER)
+  assert.equal(header, 112)
+  const tooBig = new RegExp(`would be ${String(DOTENV_MAX_BYTES + 1)} bytes when created; a credentials file is at most ${String(DOTENV_MAX_BYTES)}\\. Nothing was written$`)
+  const created = (repo: string, lengths: readonly [string, number][]): AppendResult =>
+    appendIn(repo, new Map(lengths.map(([name, length]): [string, () => string] => [name, () => 'c'.repeat(length)])))
+  const one = DOTENV_MAX_BYTES - header - Buffer.byteLength('AOS_PMMCP_TOKEN=\n')
+  for (const [extra, fits] of [[0, true], [1, false]] as const) {
+    const repo = repoWith(t)
+    assert.equal(inspectIn(repo, ['AOS_PMMCP_TOKEN'], { valueLength: one + extra }).fits, fits, `one name + ${String(extra)}`)
+    if (fits) {
+      const made = created(repo, [['AOS_PMMCP_TOKEN', one]])
+      assert.deepEqual([made.created, made.appended], [true, [{ name: 'AOS_PMMCP_TOKEN', line: 3 }]])
+      assert.equal(lstatSync(join(repo, '.env')).size, DOTENV_MAX_BYTES)
+    } else {
+      assert.match(untouched(() => created(repo, [['AOS_PMMCP_TOKEN', one + 1]])), tooBig)
+      assert.deepEqual(readdirSync(repo).sort(), ['.gitignore'])
+    }
+  }
+  // Two names: every line counts. At exactly 64 KiB both fit and are
+  // created; a byte more in either is refused.
+  const each = (DOTENV_MAX_BYTES - header - Buffer.byteLength('AOS_CONTROL_TOKEN=\nAOS_PMMCP_TOKEN=\n')) / 2
+  assert.ok(Number.isInteger(each))
+  const pair = repoWith(t)
+  assert.equal(inspectIn(pair, ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN'], { valueLength: each }).fits, true)
+  assert.equal(inspectIn(pair, ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN'], { valueLength: each + 1 }).fits, false)
+  assert.match(untouched(() => created(pair, [['AOS_CONTROL_TOKEN', each], ['AOS_PMMCP_TOKEN', each + 1]])), tooBig)
+  assert.deepEqual(readdirSync(pair).sort(), ['.gitignore'])
+  assert.deepEqual(created(pair, [['AOS_CONTROL_TOKEN', each], ['AOS_PMMCP_TOKEN', each]]).appended.map((a) => a.line), [3, 4])
+  assert.equal(lstatSync(join(pair, '.env')).size, DOTENV_MAX_BYTES)
 })
 
 test('inspectCredentials with no file says whether the operator may create one in the repository, by the directory\'s mode bits', (t) => {

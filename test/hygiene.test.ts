@@ -527,10 +527,25 @@ function reachedFrom(roots: readonly string[], pool: readonly SourceFile[]): Set
 //     importer that writes it is not taken to speak of .env;
 //   - a helper reached through import() of a pool module;
 //   - a write two modules away: a helper whose path parameter is written by
-//     another helper in a third module.
-// What it does follow across modules: functions, and methods of an exported
-// object literal or class, whose parameter a write in their own module takes
-// as its path; and a function under a second name (`const save = put`).
+//     another helper in a third module;
+//   - a nested destructuring pattern (`const { promises: { writeFile } } = fs`);
+//   - an object or instance a `let` holds (`let io = new Io()`), and a
+//     method a class inherits (`new Sub().put`, where Sub extends Io);
+//   - a method's callers in its own module other than its siblings'
+//     `this.m(…)`: a write through its parameter there is unseen; and a
+//     `this.m(…)` in an object literal's arrow property, whose `this` is
+//     the enclosing one, not the object's.
+// What it does follow across modules: functions, and methods of an object
+// literal or class a module exports (by name, as its default, or through a
+// namespace import: `m.io.put`, `new m.Io().put`), whose parameter a write in
+// their own module takes as its path, directly or through a sibling called on
+// `this` (`this.raw(f, t)`), that sibling a method or a property holding a
+// function (`raw = (f, t) => …`, `raw: function (f, t) {…}`), called from a
+// method, an accessor, a class's constructor or field, or an object
+// literal's function property (`put: function (f, t) {…}`); an object
+// literal's property that names such a function (`{ put }`, `{ put: put }`),
+// on the write side and the paths side alike; and a function under a second
+// name (`const save = put`).
 
 /** Where each fs call takes a path it writes, creates, moves or deletes. */
 const PATH_ARGS: ReadonlyMap<string, readonly number[]> = new Map<string, readonly number[]>([
@@ -840,15 +855,78 @@ function parameterTails(p: ts.ParameterDeclaration, trace: Trace): readonly Tail
   // Outside a call being followed: the default and what every caller in this
   // file passes, and unseen when a caller may be where the scan cannot look.
   const out = p.initializer === undefined ? [] : [...tailsOf(p.initializer, trace)]
-  const sites = callSites(p.parent)
-  if (sites === undefined || rest || !ts.isIdentifier(p.name)) return [...out, UNSEEN]
   const index = p.parent.parameters.indexOf(p)
-  for (const call of sites) {
-    const args = argumentTails(call.arguments, { ...trace, bound: NO_BOUND })
-    if (args === undefined) out.push(UNSEEN)
-    else out.push(...(args[index] ?? []))
+  const passed = (calls: readonly ts.CallExpression[]): void => {
+    for (const call of calls) {
+      const args = argumentTails(call.arguments, { ...trace, bound: NO_BOUND })
+      if (args === undefined) out.push(UNSEEN)
+      else out.push(...(args[index] ?? []))
+    }
   }
+  const sites = callSites(p.parent)
+  if (sites === undefined || rest || !ts.isIdentifier(p.name)) {
+    // A method may be called from wherever its object reaches, so it stays
+    // unseen; what a sibling passes it through `this` is followed as well.
+    if (!rest && ts.isIdentifier(p.name)) passed(thisCallSites(p.parent))
+    return [...out, UNSEEN]
+  }
+  passed(sites)
   return out
+}
+
+/**
+ * The calls of a method through `this` from its siblings in the same class
+ * (of the same staticness) or object literal: `this.raw(f, t)` from `put`.
+ * The method may be a property holding a function (`raw = (f) => …`,
+ * `raw: function (f) {…}`). The callers are its siblings' bodies: methods,
+ * accessors, a class's constructor and fields, and a property holding a
+ * function expression, whose `this` is the object it is called on; not an
+ * object literal's arrow property, whose `this` is the enclosing one, nor
+ * inside a function or class of their own, which bind another `this`. An
+ * arrow inside a body keeps it.
+ */
+function thisCallSites(fn: ts.SignatureDeclaration): ts.CallExpression[] {
+  const self = memberOf(fn)
+  if (self === undefined) return []
+  const name = propertyKey(self.name)
+  const owner = self.parent
+  if (name === undefined || !(ts.isClassLike(owner) || ts.isObjectLiteralExpression(owner))) return []
+  const isStatic = (member: ts.Node): boolean =>
+    ts.isClassStaticBlockDeclaration(member) || ((ts.canHaveModifiers(member) ? ts.getModifiers(member) : undefined) ?? []).some((m) => m.kind === ts.SyntaxKind.StaticKeyword)
+  const out: ts.CallExpression[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isClassLike(node)) return
+    if (ts.isCallExpression(node)) {
+      const callee = unwrapped(node.expression)
+      if (ts.isPropertyAccessExpression(callee) && callee.expression.kind === ts.SyntaxKind.ThisKeyword && callee.name.text === name) out.push(node)
+    }
+    ts.forEachChild(node, visit)
+  }
+  // A property holding a function expression is read from inside it: the
+  // visit stops at a function's edge, and this one's `this` is the object's.
+  const functionHeld = (member: ts.Node): ts.FunctionExpression | undefined => {
+    if (!(ts.isPropertyDeclaration(member) || ts.isPropertyAssignment(member)) || member.initializer === undefined) return undefined
+    const value = unwrapped(member.initializer)
+    return ts.isFunctionExpression(value) ? value : undefined
+  }
+  const siblings: readonly ts.Node[] = ts.isObjectLiteralExpression(owner)
+    ? owner.properties.filter((m) => ts.isMethodDeclaration(m) || ts.isAccessor(m) || functionHeld(m) !== undefined)
+    : owner.members.filter((m) => isStatic(m) === isStatic(self))
+  for (const member of siblings) ts.forEachChild(functionHeld(member) ?? member, visit)
+  return out
+}
+
+/** The class member or object literal property a function is: a method, or the property whose value it is (`raw = (f) => …`, `raw: function (f) {…}`). */
+function memberOf(fn: ts.SignatureDeclaration): ts.MethodDeclaration | ts.PropertyDeclaration | ts.PropertyAssignment | undefined {
+  if (ts.isMethodDeclaration(fn)) return fn
+  if (!ts.isArrowFunction(fn) && !ts.isFunctionExpression(fn)) return undefined
+  // Out through what unwrapped() sees through, as classMethod and literalMethod read the value.
+  let at: ts.Node = fn
+  while (ts.isParenthesizedExpression(at.parent) || ts.isAsExpression(at.parent) || ts.isNonNullExpression(at.parent) || ts.isSatisfiesExpression(at.parent) || ts.isTypeAssertionExpression(at.parent)) {
+    at = at.parent
+  }
+  const prop = at.parent
+  return (ts.isPropertyDeclaration(prop) || ts.isPropertyAssignment(prop)) && prop.initializer === at ? prop : undefined
 }
 
 /** Every call of a function by name, when those are all there are: none for an export, a method, a callback or a function used as a value. */
@@ -1135,9 +1213,12 @@ function pathFunction(callee: ts.Expression): string | undefined {
 /**
  * The function a callee names, in its own file or through a relative import:
  * a function by name, under a second name (`const save = put`), a namespace
- * import's export, or a method: of an object literal a const holds, of a
- * class (static, `Io.put`), or of an instance (`new Io().put`, or a const
- * that holds `new Io()`).
+ * import's export, or a method: of an object literal a const holds or a
+ * module exports as its default, of a class, by name or a module's default
+ * (static, `Io.put`), or of an instance (`new Io().put`, or a const or
+ * default export that holds
+ * `new Io()`), each also through a namespace import (`m.io.put`). An object
+ * literal's property may name the function (`{ put }`, `{ put: put }`).
  */
 function calledFunction(callee: ts.Expression, pool: ReadonlyMap<string, ts.SourceFile>, depth = 0): Fn | undefined {
   const e = unwrapped(callee)
@@ -1152,23 +1233,37 @@ function calledFunction(callee: ts.Expression, pool: ReadonlyMap<string, ts.Sour
   const object = unwrapped(e.expression)
   const name = e.name.text
   if (ts.isNewExpression(object)) {
-    const made = ts.isIdentifier(object.expression) ? bindingOf(object.expression, pool) : undefined
+    const made = namedBinding(object.expression, pool)
     return made !== undefined && ts.isClassDeclaration(made) ? classMethod(made, name, false) : undefined
   }
-  if (!ts.isIdentifier(object)) return undefined
-  const ns = namespaceOf(object, pool)
+  const ns = ts.isIdentifier(object) ? namespaceOf(object, pool) : undefined
   if (ns !== undefined) {
     const decl = exportedBinding(ns, name, pool, 0)
     return decl === undefined ? undefined : functionOf(decl)
   }
-  const decl = bindingOf(object, pool)
-  if (decl === undefined) return undefined
+  const decl = namedBinding(object, pool)
+  return decl === undefined ? undefined : methodOf(decl, name, pool, depth)
+}
+
+/** The declaration a name, or a namespace import's member (`m.io`), binds. */
+function namedBinding(node: ts.Expression, pool: ReadonlyMap<string, ts.SourceFile>): ts.Node | undefined {
+  const e = unwrapped(node)
+  if (ts.isIdentifier(e)) return bindingOf(e, pool)
+  if (!ts.isPropertyAccessExpression(e)) return undefined
+  const object = unwrapped(e.expression)
+  const ns = ts.isIdentifier(object) ? namespaceOf(object, pool) : undefined
+  return ns === undefined ? undefined : exportedBinding(ns, e.name.text, pool, 0)
+}
+
+/** Method `name` of what a declaration holds: a class (its statics), or the object literal or instance a const or a default export is. */
+function methodOf(decl: ts.Node, name: string, pool: ReadonlyMap<string, ts.SourceFile>, depth: number): Fn | undefined {
   if (ts.isClassDeclaration(decl)) return classMethod(decl, name, true)
-  if (!ts.isVariableDeclaration(decl) || decl.initializer === undefined || !isConst(decl)) return undefined
-  const value = unwrapped(decl.initializer)
-  if (ts.isObjectLiteralExpression(value)) return literalMethod(value, name)
-  if (ts.isNewExpression(value) && ts.isIdentifier(value.expression)) {
-    const made = bindingOf(value.expression, pool)
+  const held = ts.isVariableDeclaration(decl) && isConst(decl) ? decl.initializer : ts.isExportAssignment(decl) && !decl.isExportEquals ? decl.expression : undefined
+  const value = held === undefined ? undefined : unwrapped(held)
+  if (value === undefined) return undefined
+  if (ts.isObjectLiteralExpression(value)) return literalMethod(value, name, pool, depth)
+  if (ts.isNewExpression(value)) {
+    const made = namedBinding(value.expression, pool)
     return made !== undefined && ts.isClassDeclaration(made) ? classMethod(made, name, false) : undefined
   }
   return undefined
@@ -1183,14 +1278,20 @@ function constAlias(decl: ts.Node): ts.Identifier | undefined {
   return ts.isIdentifier(value) ? value : undefined
 }
 
-/** An object literal's method `name`: `put(f) {…}`, or `put: (f) => …` / `put: function (f) {…}`. */
-function literalMethod(literal: ts.ObjectLiteralExpression, name: string): Fn | undefined {
+/**
+ * An object literal's method `name`: `put(f) {…}`, `put: (f) => …` /
+ * `put: function (f) {…}`, or a property that names a function, the
+ * shorthand `{ put }` or `{ put: put }`, followed as a callee by that name.
+ */
+function literalMethod(literal: ts.ObjectLiteralExpression, name: string, pool: ReadonlyMap<string, ts.SourceFile>, depth: number): Fn | undefined {
   for (const prop of literal.properties) {
     if (ts.isSpreadAssignment(prop) || propertyKey(prop.name) !== name) continue
     if (ts.isMethodDeclaration(prop)) return prop.body === undefined ? undefined : prop
+    if (ts.isShorthandPropertyAssignment(prop)) return calledFunction(prop.name, pool, depth + 1)
     if (ts.isPropertyAssignment(prop)) {
       const fn = unwrapped(prop.initializer)
-      return ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) ? fn : undefined
+      if (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn)) return fn
+      return ts.isIdentifier(fn) ? calledFunction(fn, pool, depth + 1) : undefined
     }
   }
   return undefined
@@ -1339,6 +1440,7 @@ function exportedBinding(module: ts.SourceFile, name: string, pool: ReadonlyMap<
   for (const st of module.statements) {
     if (name === 'default') {
       if (ts.isFunctionDeclaration(st) && isExported(st) && isDefault(st)) return st.body === undefined ? undefined : st
+      if (ts.isClassDeclaration(st) && isExported(st) && isDefault(st)) return st
       if (ts.isExportAssignment(st) && !st.isExportEquals) {
         const value = unwrapped(st.expression)
         return ts.isIdentifier(value) ? moduleLevel(module, value.text, pool, hops) : st
@@ -1847,6 +1949,19 @@ test('the .env write scan passes the installer\'s lock, logs and state file besi
     '}',
   ].join('\n')
   assert.deepEqual(scanFiles({ 'scripts/install/paths.ts': paths, 'scripts/install.ts': asNamespace })['scripts/install.ts'], [])
+  // The same helpers as an object's properties, shorthand or named: in a
+  // file that speaks of .env the lock's open must be followed to pass.
+  const pathsObject2 = `${paths}\nexport const at = { lockPath, envPath: envPath, dir: installDir }`
+  const viaObject = [
+    "import { openSync } from 'node:fs'",
+    "import { at } from './install/paths.js'",
+    'export function main(root: string): string {',
+    "  openSync(at.lockPath(root), 'wx')",
+    "  openSync(join(at.dir(root), 'active.json'), 'wx')",
+    "  return `${at.envPath(root)} (${join(root, '.env')}): names appended`",
+    '}',
+  ].join('\n')
+  assert.deepEqual(scanFiles({ 'scripts/install/paths.ts': pathsObject2, 'scripts/install.ts': viaObject }), { 'scripts/install/paths.ts': [], 'scripts/install.ts': [] })
 
   // A write helper of its own, followed to each call: the paths it is given
   // are what it writes. `process.stdout.write` is a property, not a call of it.
@@ -1915,26 +2030,50 @@ test('the .env write scan passes the installer\'s lock, logs and state file besi
     io,
     'export const io = { put(file: string, text: string): void { writeFileSync(file, text) } }',
     'export class Io { put(file: string, text: string): void { writeFileSync(file, text) } }',
+    // A property naming the helper, shorthand or not, and a sibling through `this`.
+    'export const short = { put, again: put }',
+    'export class Raw {\n  save(file: string, text: string): void { this.raw(file, text) }\n  private raw(f: string, t: string): void { writeFileSync(f, t) }\n}',
+    // A sibling through `this` that is a property holding a function, and a caller that is one.
+    'export class Field {\n  save(file: string, text: string): void { this.raw(file, text) }\n  private raw = (f: string, t: string): void => writeFileSync(f, t)\n}',
+    'export const lit = {\n  save: function (file: string, text: string): void { this.raw(file, text) },\n  raw: (f: string, t: string): void => writeFileSync(f, t),\n}',
   ].join('\n')
   const recordVia = [
-    "import { Io, io, put } from './io.js'",
+    "import { Field, Io, Raw, io, lit, put, short } from './io.js'",
+    "import * as m from './io.js'",
+    "import dio from './dio.js'",
+    "import Dcls from './dcls.js'",
     'export function record(root: string): void {',
     "  io.put(join(root, '.aos', 'install', 'active.json'), '{}')",
     "  new Io().put(join(root, '.aos', 'install', 'run.log'), 'x')",
     '  const save = put',
-    `  save(join(root, '.aos', 'install', 'state.json'), '{}')${speaking}`,
+    "  save(join(root, '.aos', 'install', 'state.json'), '{}')",
+    "  short.put(join(root, '.aos', 'install', 'a.json'), '{}')",
+    "  short.again(join(root, '.aos', 'install', 'b.json'), '{}')",
+    "  new Raw().save(join(root, '.aos', 'install', 'c.json'), '{}')",
+    "  m.io.put(join(root, '.aos', 'install', 'd.json'), '{}')",
+    "  new m.Io().put(join(root, '.aos', 'install', 'e.json'), '{}')",
+    "  dio.put(join(root, '.aos', 'install', 'f.json'), '{}')",
+    "  new Field().save(join(root, '.aos', 'install', 'g.json'), '{}')",
+    "  lit.save(join(root, '.aos', 'install', 'h.json'), '{}')",
+    `  new Dcls().put(join(root, '.aos', 'install', 'i.json'), '{}')${speaking}`,
     '}',
   ].join('\n')
-  assert.deepEqual(scanFiles({ 'scripts/install/io.ts': ioMethods, 'scripts/install/run.ts': recordVia }), { 'scripts/install/io.ts': [], 'scripts/install/run.ts': [] })
+  const dio = "import { writeFileSync } from 'node:fs'\nexport default { put(file: string, text: string): void { writeFileSync(file, text) } }"
+  const dcls = "import { writeFileSync } from 'node:fs'\nexport default class { put(file: string, text: string): void { writeFileSync(file, text) } }"
+  assert.deepEqual(
+    scanFiles({ 'scripts/install/io.ts': ioMethods, 'scripts/install/dio.ts': dio, 'scripts/install/dcls.ts': dcls, 'scripts/install/run.ts': recordVia }),
+    { 'scripts/install/io.ts': [], 'scripts/install/dio.ts': [], 'scripts/install/dcls.ts': [], 'scripts/install/run.ts': [] },
+  )
   // The installer's own calls into the writer, which writes .env whatever it
   // is handed: they pass no path, so they are not a second writer.
   const writer = WRITE_POOL.get('src/secrets/dotenv-append.ts')?.text ?? ''
   assert.ok(writer.includes('export function appendCredentials('), 'the writer moved')
   const installer = [
-    "import { appendCredentials, inspectCredentials } from '../src/secrets/dotenv-append.js'",
-    'export function credentials(root: string, accepted: ReadonlySet<string>): void {',
+    "import { appendCredentials, credentialNames, inspectCredentials, mintedCredentialNames } from '../src/secrets/dotenv-append.js'",
+    'export function credentials(root: string, config: KernelConfig, providers: ProvidersFile): void {',
+    '  const accepted = credentialNames(config, providers)',
     "  const seen = inspectCredentials({ repoRoot: root, accepted, names: ['AOS_CONTROL_TOKEN'] })",
-    "  if (seen.missing.length > 0) appendCredentials({ repoRoot: root, accepted, generate: new Map([['AOS_CONTROL_TOKEN', () => 'x']]) })",
+    "  if (seen.missing.length > 0) appendCredentials({ repoRoot: root, accepted, generatable: mintedCredentialNames(config), providers, generate: new Map([['AOS_CONTROL_TOKEN', () => 'x']]) })",
     "  console.log(`${join(root, '.env')}: ${seen.missing.join(', ')}`)",
     '}',
   ].join('\n')
@@ -2130,6 +2269,9 @@ test('the .env write scan flags a second writer however its path arrives: a copy
     [{ 'scripts/install/paths.ts': "import { join } from 'node:path'\nconst envPath = (root: string): string => join(root, '.env')\nexport default envPath" }, `import envAt from './paths.js'\n${envClass('envAt(process.cwd())')}`],
     [{ 'scripts/install/paths.ts': paths, 'scripts/install/index.ts': "export { envPath } from './paths.js'" }, `import * as where from './index.js'\n${envClass('where.envPath(process.cwd())')}`],
     [{ 'scripts/install/paths.ts': paths, 'scripts/install/index.ts': "export * from './paths.js'" }, `import * as where from './index.js'\n${envClass('where.envPath(process.cwd())')}`],
+    // The helper as an object's property, shorthand or named.
+    [{ 'scripts/install/paths.ts': `${paths}\nexport const at = { envPath }` }, "import { at } from './paths.js'\nexport function restore(root: string, t: string): void { writeFileSync(at.envPath(root), t) }"],
+    [{ 'scripts/install/paths.ts': `${paths}\nexport const at = { env: envPath }` }, "import { at } from './paths.js'\nexport function restore(root: string, t: string): void { writeFileSync(at.env(root), t) }"],
   ]
   for (const [modules, text] of viaModules) {
     const found = scanFiles({ ...modules, [at]: text })
@@ -2184,6 +2326,94 @@ test('the .env write scan flags a second writer however its path arrives: a copy
       'io.put',
     ],
     [io, "import { put } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void {\n  const save = put\n  save(envPath(root), t)\n}", 'save'],
+    // A property that names the helper, shorthand or not; an object a module
+    // exports as its default; a sibling a method reaches through `this`; an
+    // object or class reached through a namespace import.
+    [
+      "import { writeFileSync } from 'node:fs'\nfunction put(file: string, text: string): void { writeFileSync(file, text) }\nexport const io = { put }",
+      "import { io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { io.put(envPath(root), t) }",
+      'io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nfunction put(file: string, text: string): void { writeFileSync(file, text) }\nexport const io = { put: put }",
+      "import { io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { io.put(envPath(root), t) }",
+      'io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport default { put(file: string, t: string): void { writeFileSync(file, t) } }",
+      "import io from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { io.put(envPath(root), t) }",
+      'io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport class Io {\n  put(f: string, t: string): void { this.raw(f, t) }\n  private raw(f: string, t: string): void { writeFileSync(f, t) }\n}",
+      "import { Io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { new Io().put(envPath(root), t) }",
+      'new Io().put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport class Io {\n  static put(f: string, t: string): void { this.raw(f, t) }\n  static raw(f: string, t: string): void { writeFileSync(f, t) }\n}",
+      "import { Io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { Io.put(envPath(root), t) }",
+      'Io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport const io = {\n  put(f: string, t: string): void { this.raw(f, t) },\n  raw(f: string, t: string): void { writeFileSync(f, t) },\n}",
+      "import { io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { io.put(envPath(root), t) }",
+      'io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport const io = { put(file: string, text: string): void { writeFileSync(file, text) } }",
+      "import * as m from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { m.io.put(envPath(root), t) }",
+      'm.io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport class Io { put(file: string, text: string): void { writeFileSync(file, text) } }",
+      "import * as m from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { new m.Io().put(envPath(root), t) }",
+      'new m.Io().put',
+    ],
+    // A class the module exports as its default, an instance's or a static method.
+    [
+      "import { writeFileSync } from 'node:fs'\nexport default class Io { put(f: string, t: string): void { writeFileSync(f, t) } }",
+      "import Io from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { new Io().put(envPath(root), t) }",
+      'new Io().put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport default class { static put(f: string, t: string): void { writeFileSync(f, t) } }",
+      "import Io from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { Io.put(envPath(root), t) }",
+      'Io.put',
+    ],
+    // A sibling reached through `this` that is a property holding a function:
+    // a class's arrow or function field, an object literal's arrow or
+    // function property; and a caller that is an object literal's function
+    // property, whose `this` is the object.
+    [
+      "import { writeFileSync } from 'node:fs'\nexport class Io {\n  put(f: string, t: string): void { this.raw(f, t) }\n  private raw = (f: string, t: string): void => writeFileSync(f, t)\n}",
+      "import { Io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { new Io().put(envPath(root), t) }",
+      'new Io().put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport class Io {\n  put(f: string, t: string): void { this.raw(f, t) }\n  private raw = function (f: string, t: string): void { writeFileSync(f, t) }\n}",
+      "import { Io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void {\n  const io = new Io()\n  io.put(envPath(root), t)\n}",
+      'io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport class Io {\n  static put(f: string, t: string): void { this.raw(f, t) }\n  static raw = (f: string, t: string): void => writeFileSync(f, t)\n}",
+      "import { Io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { Io.put(envPath(root), t) }",
+      'Io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport const io = {\n  put(f: string, t: string): void { this.raw(f, t) },\n  raw: function (f: string, t: string): void { writeFileSync(f, t) },\n}",
+      "import { io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { io.put(envPath(root), t) }",
+      'io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport const io = {\n  put(f: string, t: string): void { this.raw(f, t) },\n  raw: (f: string, t: string): void => writeFileSync(f, t),\n}",
+      "import { io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { io.put(envPath(root), t) }",
+      'io.put',
+    ],
+    [
+      "import { writeFileSync } from 'node:fs'\nexport const io = {\n  put: function (f: string, t: string): void { this.raw(f, t) },\n  raw(f: string, t: string): void { writeFileSync(f, t) },\n}",
+      "import { io } from './io.js'\nimport { envPath } from './paths.js'\nexport function restore(root: string, t: string): void { io.put(envPath(root), t) }",
+      'io.put',
+    ],
     // A spread fills the position the helper writes: what lands there is unseen.
     [
       "import { writeFileSync } from 'node:fs'\nexport function put(text: string, file: string): void { writeFileSync(file, text) }",
@@ -2212,7 +2442,7 @@ test('a test calls appendCredentials and inspectCredentials only through appendI
     ['appendCredentials', 'appendIn'],
     ['inspectCredentials', 'inspectIn'],
   ])
-  const INERT = new Set(['CREATED_HEADER', 'MIN_GENERATED_LENGTH', 'GENERATED_LENGTH', 'DotenvWriteError', 'credentialNames'])
+  const INERT = new Set(['CREATED_HEADER', 'MIN_GENERATED_LENGTH', 'GENERATED_LENGTH', 'DotenvWriteError', 'credentialNames', 'mintedCredentialNames'])
   const viaHelper = new Map<string, number>()
   let imports = 0
   for (const file of TEST) {

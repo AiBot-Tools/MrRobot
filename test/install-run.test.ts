@@ -979,3 +979,43 @@ test('machine output is read whole, as valid UTF-8 and within its cap, over as m
     closeSync(fd)
   }
 })
+
+test("a step's two files can be emptied once read, and only a step this runner ran", async (t) => {
+  // A probe's output may hold another process's command line (ps) or launchd's
+  // copy of a service's environment: once read, the logs need not keep it.
+  const root = repo(t)
+  const home = tmpdir(t)
+  const fake = recorder((c) => {
+    write(c.options.stdio[1], '  501 /usr/bin/ssh -N -L 8766:127.0.0.1:8766 -o IdentityFile=/Users/op/.ssh/vm vm\n')
+    write(c.options.stdio[2], 'a warning\n')
+    setImmediate(() => c.child.emit('exit', 0, null))
+  })
+  const runner = new Runner({ repoRoot: root, env: installerEnv(home), spawn: fake.spawn, now: () => NOW })
+  const result = await runner.run({ step: 'ps-812', command: 'ps', args: ['-ww', '-o', 'uid=,args=', '-p', '812'], cwd: root, timeoutMs: 5000 })
+  assert.match(readOut(result), /ssh -N -L/)
+  assert.equal(runner.discard(result), undefined)
+  assert.equal(readFileSync(result.out, 'utf8'), '')
+  assert.equal(readFileSync(result.err, 'utf8'), '')
+  // Still this run's 0600 files, now empty.
+  assert.equal(mode(result.out), 0o600)
+  assert.equal(mode(result.err), 0o600)
+  // A file already gone is no error.
+  unlinkSync(result.err)
+  assert.equal(runner.discard(result), undefined)
+
+  // Nothing but a step this runner ran, by the names it gave its files.
+  const keep = join(dirname(result.out), 'notes.txt')
+  writeFileSync(keep, 'kept\n', { mode: 0o600 })
+  const outside = join(root, 'kept.txt')
+  writeFileSync(outside, 'kept\n', { mode: 0o600 })
+  assert.throws(() => runner.discard({ step: 'ps-812', out: keep, err: result.err }), refusedCode)
+  assert.throws(() => runner.discard({ step: 'ps-812', out: result.out, err: outside }), refusedCode)
+  assert.throws(() => runner.discard({ step: 'never', out: join(dirname(result.out), 'never.out'), err: join(dirname(result.out), 'never.err') }), refusedCode)
+  const other = new Runner({ repoRoot: root, env: installerEnv(home), spawn: fake.spawn, now: () => new Date(NOW.getTime() + 1000) })
+  assert.throws(() => other.discard(result), refusedCode)
+  const theirs = await other.run({ step: 'ps-812', command: 'ps', args: ['-ww', '-o', 'uid=,args=', '-p', '812'], cwd: root, timeoutMs: 5000 })
+  assert.throws(() => runner.discard(theirs), refusedCode)
+  assert.match(readFileSync(theirs.out, 'utf8'), /ssh -N -L/)
+  assert.equal(readFileSync(keep, 'utf8'), 'kept\n')
+  assert.equal(readFileSync(outside, 'utf8'), 'kept\n')
+})

@@ -75,7 +75,10 @@
 //   What it reads and shows: machine output from the .out file only
 //   (readOut, readJobs); the .err file is shown, never parsed. Either is shown
 //   through tail(), which strips terminal control sequences and then applies
-//   redactString.
+//   redactString. A caller that has read a probe whose output may hold
+//   another process's command line or environment (ps, launchctl print) has
+//   the runner empty that step's two files (discard): the leak scan knows
+//   only the values registered with SecretMask, never someone else's.
 //
 //   After a child exits, both files are scanned for every value registered
 //   with SecretMask. A hit empties that file, fails the step with a defect
@@ -704,6 +707,33 @@ export class Runner {
   /** Why nothing more is run, once a child's output held a registered value. */
   get halted(): string | undefined {
     return this.#halted
+  }
+
+  /**
+   * Empty a step's two files once the caller has read what it needs from
+   * them: for a probe whose output may hold another process's command line
+   * (ps) or launchd's copy of a service's environment (launchctl print),
+   * which the logs need not keep and the leak scan cannot judge. Only a step
+   * this runner ran, in this run's folder, by the names it gave them. A file
+   * already gone is no error; one that cannot be emptied is returned, never
+   * thrown, so the caller can report it.
+   */
+  discard(result: Pick<RunResult, 'step' | 'out' | 'err'>): string | undefined {
+    const dir = this.#dir
+    const out = dir === undefined ? undefined : join(dir, `${result.step}.out`)
+    const err = dir === undefined ? undefined : join(dir, `${result.step}.err`)
+    if (out === undefined || err === undefined || !this.#steps.has(result.step) || result.out !== out || result.err !== err) {
+      throw refused(`${result.step}: not a step of this run, so its files are not this runner's to empty`, result.step)
+    }
+    const failed: string[] = []
+    for (const path of [out, err]) {
+      try {
+        empty(path)
+      } catch (e) {
+        if (errnoOf(e) !== 'ENOENT') failed.push(`${path} (${errnoOf(e)})`)
+      }
+    }
+    return failed.length === 0 ? undefined : `could not empty ${failed.join(', ')}: delete ${failed.length > 1 ? 'them' : 'it'}`
   }
 
   /** Run a child to its exit. */

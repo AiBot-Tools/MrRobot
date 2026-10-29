@@ -63,9 +63,10 @@ const WRITES = process.env['AOS_LIVE_PMMCP_WRITES'] === '1'
 const ANTHROPIC_HOST = 'api.anthropic.com'
 
 // AOS_PMMCP_TOKEN is optional: pmmcp's bearer gate runs in warn mode and serves a
-// request without one. Give PMMCP_URL inline on the one command, never exported:
-// pmmcp's load_config refuses to start from a shell that exports a PMMCP_ name.
-const hasPmmcp = (): boolean => process.env['PMMCP_URL'] !== undefined
+// request without one. AOS_LIVE_PMMCP_URL goes inline on the one command. Like
+// every name the AOS reads, it does not start with PMMCP_ (D34), the prefix
+// pmmcp's load_config reads as its own settings.
+const hasPmmcp = (): boolean => process.env['AOS_LIVE_PMMCP_URL'] !== undefined
 
 /**
  * The fixture's kernel.yaml pointed at the live pmmcp, declaring the shipped
@@ -126,7 +127,7 @@ test(
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
       : !hasPmmcp()
-        ? 'set PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer)'
+        ? 'set AOS_LIVE_PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer)'
         : !WRITES
           ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
           : false,
@@ -144,7 +145,7 @@ test(
     const state = await hub.connect('pmmcp', async () => {
       const client = new Client({ name: 'aos-live-runtime', version: '0.0.1' })
       await client.connect(
-        streamableHttpTransport(process.env['PMMCP_URL'] ?? '', process.env['AOS_PMMCP_TOKEN']),
+        streamableHttpTransport(process.env['AOS_LIVE_PMMCP_URL'] ?? '', process.env['AOS_PMMCP_TOKEN']),
       )
       return client
     })
@@ -169,7 +170,7 @@ test(
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
       : !hasPmmcp() || KEY === undefined
-        ? 'set PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer), and put ANTHROPIC_API_KEY in the shell or .env'
+        ? 'set AOS_LIVE_PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer), and put ANTHROPIC_API_KEY in the shell or .env'
         : !WRITES
           ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
           : false,
@@ -178,7 +179,7 @@ test(
     const revoke = allowHost(ANTHROPIC_HOST)
     t.after(revoke)
     const ref = realRef()
-    const pmmcpUrl = process.env['PMMCP_URL'] ?? ''
+    const pmmcpUrl = process.env['AOS_LIVE_PMMCP_URL'] ?? ''
 
     // The key from the environment, as in the Phase 0 exit criterion: pmmcp's
     // get_secret masks by design, so pmmcp is the goal store here, not the vault.
@@ -250,7 +251,7 @@ test(
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
       : !hasPmmcp() || KEY === undefined
-        ? 'set PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer), and put ANTHROPIC_API_KEY in the shell or .env'
+        ? 'set AOS_LIVE_PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer), and put ANTHROPIC_API_KEY in the shell or .env'
         : !WRITES
           ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
           : false,
@@ -259,7 +260,7 @@ test(
     const revoke = allowHost(ANTHROPIC_HOST)
     t.after(revoke)
     const ref = realRef()
-    const pmmcpUrl = process.env['PMMCP_URL'] ?? ''
+    const pmmcpUrl = process.env['AOS_LIVE_PMMCP_URL'] ?? ''
 
     // The shipped CEO, delegating, but remembering in the test namespace.
     const { kernel, fx } = await withKernel(t, {
@@ -293,7 +294,7 @@ test(
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
       : !hasPmmcp() || KEY === undefined
-        ? 'set PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer), and put ANTHROPIC_API_KEY in the shell or .env'
+        ? 'set AOS_LIVE_PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer), and put ANTHROPIC_API_KEY in the shell or .env'
         : !WRITES
           ? 'set AOS_LIVE_PMMCP_WRITES=1 as well: this writes goals into pmmcp under aos/agent/aos-live-test, and they are not deleted afterwards'
           : false,
@@ -302,7 +303,7 @@ test(
     const revoke = allowHost(ANTHROPIC_HOST)
     t.after(revoke)
     const ref = realRef()
-    const pmmcpUrl = process.env['PMMCP_URL'] ?? ''
+    const pmmcpUrl = process.env['AOS_LIVE_PMMCP_URL'] ?? ''
     const fx = fixture(t, {
       kernelYaml: livePmmcp(pmmcpUrl),
     })

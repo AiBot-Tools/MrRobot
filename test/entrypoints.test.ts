@@ -863,7 +863,7 @@ test('aos-install --dry-run with an empty HOME finds no pmmcp, prints the plan a
   const root = m.checkout.root
   const checkoutBefore = snapshot(root)
   const homeBefore = snapshot(m.home)
-  // Names the installer's children must never see: a Colima DOCKER_CONFIG and a PMMCP_ name pmmcp would refuse to start under.
+  // Names the installer's children must never see: a Colima DOCKER_CONFIG and a name in pmmcp's PMMCP_ prefix (a checkout up to 53ea308 refuses to start under it).
   const run = await installerAsync(m, ['--dry-run'], { DOCKER_CONFIG: '/nonexistent/colima-docker', PMMCP_DEBUG: '1' })
   const printed = `${run.stdout}${run.stderr}`
   assert.equal(run.status, 0, printed)

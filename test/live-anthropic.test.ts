@@ -225,8 +225,8 @@ test(
   {
     skip: !LIVE
       ? 'set AOS_LIVE_TESTS=1 to run the live tests (D29)'
-      : process.env['PMMCP_URL'] === undefined || KEY === undefined
-        ? 'set PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer), and put ANTHROPIC_API_KEY in the shell or .env'
+      : process.env['AOS_LIVE_PMMCP_URL'] === undefined || KEY === undefined
+        ? 'set AOS_LIVE_PMMCP_URL (AOS_PMMCP_TOKEN only once pmmcp enforces its bearer), and put ANTHROPIC_API_KEY in the shell or .env'
         : false,
   },
   async (t) => {
@@ -234,7 +234,7 @@ test(
     t.after(revoke)
 
     const ref = realRef()
-    const pmmcpUrl = process.env['PMMCP_URL'] ?? ''
+    const pmmcpUrl = process.env['AOS_LIVE_PMMCP_URL'] ?? ''
     const key = KEY ?? ''
 
     // pmmcp's get_secret returns only a masked sentence, by design, so the key

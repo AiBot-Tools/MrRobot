@@ -39,8 +39,10 @@ mcp:
       # digest (~/.persistent-memory-mcp/http_auth.yaml, read at server start).
       # pmmcp's gate runs in warn mode, so a missing or unknown token is logged
       # and still served; the kernel refuses to dial while this name is unset
-      # rather than guess. Never a PMMCP_ name: pmmcp's load_config refuses to
-      # start from a shell that exports one.
+      # rather than guess. Never a PMMCP_ name (config refuses one, D34): that
+      # prefix is pmmcp's own, which its load_config reads as settings from a
+      # shell that exports one, and a checkout up to 53ea308 refuses to start
+      # under one that is no setting.
       url: http://127.0.0.1:8766/mcp
       tokenEnv: AOS_PMMCP_TOKEN
       # pmmcp sessions idle-expire, so the hub heartbeats inside that window.

@@ -1129,11 +1129,11 @@ test('a declared pmmcp bearer that cannot be a header is refused by name, never 
   const tail = 'qBearerTailCanaryZYXWVU98765=='
   for (const token of [`${head}\n${tail}`, `${head} ${tail}`, `\u201C${head}${tail}\u201D`]) {
     const booted = await withKernel(t, {
-      kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `${url}\n      tokenEnv: PMMCP_TOKEN`),
-      env: { PMMCP_TOKEN: token },
+      kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `${url}\n      tokenEnv: AOS_PMMCP_TOKEN`),
+      env: { AOS_PMMCP_TOKEN: token },
     })
     const reason = booted.kernel.status().subsystems.hub.reason ?? ''
-    assert.match(reason, /PMMCP_TOKEN (contains whitespace|contains a character outside printable ASCII)/, JSON.stringify(token))
+    assert.match(reason, /AOS_PMMCP_TOKEN (contains whitespace|contains a character outside printable ASCII)/, JSON.stringify(token))
     await booted.kernel.shutdown()
     const logged = allRows(booted.fx.dbPath).map((r) => r.payload).join('\n')
     for (const secret of [head, tail]) {
@@ -1161,11 +1161,11 @@ test('a declared pmmcp bearer too short for the mask is refused by name and neve
   const url = `url: http://127.0.0.1:${String((server.address() as AddressInfo).port)}/mcp`
   const short = 'Qz7#kd!'
   const booted = await withKernel(t, {
-    kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `${url}\n      tokenEnv: PMMCP_TOKEN`),
-    env: { PMMCP_TOKEN: short },
+    kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `${url}\n      tokenEnv: AOS_PMMCP_TOKEN`),
+    env: { AOS_PMMCP_TOKEN: short },
   })
   const reason = booted.kernel.status().subsystems.hub.reason ?? ''
-  assert.match(reason, new RegExp(`PMMCP_TOKEN is under ${String(MIN_MASK_LENGTH)} characters, so it cannot be masked`))
+  assert.match(reason, new RegExp(`AOS_PMMCP_TOKEN is under ${String(MIN_MASK_LENGTH)} characters, so it cannot be masked`))
   await booted.kernel.shutdown()
   assert.equal(allRows(booted.fx.dbPath).map((r) => r.payload).join('\n').includes(short), false, 'the short bearer reached the event log')
   assert.equal(dialled, 0, 'a bearer the log cannot mask was sent anyway')
@@ -1187,8 +1187,8 @@ test('a valid pmmcp bearer is masked before connecting, so a server that echoes 
   t.after(() => new Promise<void>((resolve) => server.close(() => resolve())))
   const url = `url: http://127.0.0.1:${String((server.address() as AddressInfo).port)}/mcp`
   const booted = await withKernel(t, {
-    kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `${url}\n      tokenEnv: PMMCP_TOKEN`),
-    env: { PMMCP_TOKEN: bearer },
+    kernelYaml: (base) => base.replace(/url: http:\/\/127\.0\.0\.1:\d+\/mcp/, `${url}\n      tokenEnv: AOS_PMMCP_TOKEN`),
+    env: { AOS_PMMCP_TOKEN: bearer },
   })
   await booted.kernel.shutdown()
   const logged = allRows(booted.fx.dbPath).map((r) => r.payload).join('\n')

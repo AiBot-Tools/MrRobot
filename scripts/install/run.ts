@@ -17,7 +17,9 @@
 //       nothing before them has the program), and SSH_AUTH_SOCK for git
 //       alone. So no DOCKER_* (a DOCKER_CONFIG export points docker at a
 //       Colima VM, which holds no pmmcp-qdrant), no PMMCP_* (pmmcp's
-//       load_config refuses to start under a name it does not know,
+//       load_config reads PMMCP_<SECTION>__<KEY> as a setting and
+//       PMMCP_CONFIG_PATH as its config's path, and a checkout up to 53ea308
+//       refuses to start under any PMMCP_ name that is no setting,
 //       PMMCP_CONFIG_PATH included), no AOS_* and no credential name ever
 //       reaches a child.
 //     - stdin from /dev/null, or one `sha256:<64 lowercase hex>` line: a

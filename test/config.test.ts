@@ -40,6 +40,7 @@ test('parses a valid fixture', () => {
   assert.equal(config.control.port, 7777)
   assert.equal(config.dataDir, '/var/lib/aos')
   assert.equal(config.mcp.servers['pmmcp']?.url, 'http://127.0.0.1:8766/mcp')
+  assert.equal(config.mcp.servers['pmmcp']?.tokenEnv, 'AOS_PMMCP_TOKEN')
   assert.equal(config.secrets.keyArg, 'label')
   assert.equal(config.sandbox.domains.hostile.network, 'aos-hostile')
   assert.equal(config.budgets.maxRetries, 2)
@@ -99,7 +100,7 @@ test('rejects a secret-looking key anywhere and names the path', () => {
 
   // Referencing a secret by environment variable NAME is the supported way,
   // and must keep working.
-  assert.doesNotThrow(() => assertNoSecretKeys({ tokenEnv: 'PMMCP_TOKEN', vaultId: 'anthropic-api-key' }))
+  assert.doesNotThrow(() => assertNoSecretKeys({ tokenEnv: 'AOS_PMMCP_TOKEN', vaultId: 'anthropic-api-key' }))
 })
 
 test('rejects a non-loopback pmmcp url', () => {
@@ -120,6 +121,100 @@ test('rejects a non-loopback pmmcp url', () => {
   const noPmmcp = fixture('valid.yaml') as { mcp: { servers: Record<string, unknown> } }
   delete noPmmcp.mcp.servers['pmmcp']
   assert.throws(() => parse(noPmmcp), /must include pmmcp/)
+})
+
+/** valid.yaml with `tokenEnv` set on pmmcp, or on a second server beside it. */
+function declaringTokenEnv(tokenEnv: unknown, server = 'pmmcp'): unknown {
+  const doc = fixture('valid.yaml') as { mcp: { servers: Record<string, Record<string, unknown>> } }
+  doc.mcp.servers[server] = { url: 'http://127.0.0.1:9911/mcp', ...doc.mcp.servers[server], tokenEnv }
+  return doc
+}
+
+test("a tokenEnv beginning PMMCP_ is refused, naming pmmcp's load_config", () => {
+  // PMMCP_ is pmmcp's own prefix (D34): its load_config reads an exported
+  // PMMCP_<SECTION>__<KEY> as a setting, and a pmmcp checkout up to 53ea308
+  // will not start under any PMMCP_ name that is no setting. A kernel bearer
+  // the operator exports must never be the reason pmmcp does not start, or a
+  // setting it silently takes. The rule is the server entry's, so it holds for
+  // every MCP server, not only pmmcp.
+  for (const name of ['PMMCP_TOKEN', 'PMMCP_TOKEN_CEO', 'PMMCP_TOKEN_GOALS_LIVE', 'PMMCP_SERVER__TOKEN', 'PMMCP_SERVER', 'PMMCP_']) {
+    for (const server of ['pmmcp', 'github']) {
+      assert.throws(
+        () => parse(declaringTokenEnv(name, server)),
+        (e: unknown) =>
+          e instanceof Error &&
+          /kernel\.yaml is invalid/.test(e.message) &&
+          /tokenEnv must not start with PMMCP_/.test(e.message) &&
+          /pmmcp's load_config/.test(e.message) &&
+          // Placed on the server that declared it.
+          e.message.includes(`"${server}"`) &&
+          // The way out is named, not only the refusal, and it is the server's
+          // own: AOS_PMMCP_TOKEN is pmmcp's bearer, so another server told to
+          // take it would declare pmmcp's name and be sent pmmcp's bearer.
+          (server === 'pmmcp'
+            ? /Name it AOS_PMMCP_TOKEN/.test(e.message)
+            : /Give github an AOS_ name of its own, not AOS_PMMCP_TOKEN: that is pmmcp's bearer/.test(e.message) &&
+              !/Name it AOS_PMMCP_TOKEN/.test(e.message)),
+        `${server}.tokenEnv: ${name} must be refused, naming load_config and ${server}'s way out`,
+      )
+    }
+  }
+
+  // A prefix, not a substring: the shipped name and names that merely hold
+  // PMMCP_ further in still parse, and keep their spelling.
+  for (const name of ['AOS_PMMCP_TOKEN', 'AOS_PMMCP_TOKEN_CEO', 'XPMMCP_TOKEN']) {
+    assert.equal(parse(declaringTokenEnv(name)).mcp.servers['pmmcp']?.tokenEnv, name)
+    assert.equal(parse(declaringTokenEnv(name, 'github')).mcp.servers['github']?.tokenEnv, name)
+  }
+})
+
+test('a tokenEnv that is not an upper-case .env name is refused', () => {
+  // The name is looked up in the shell and in <repo>/.env. One neither can
+  // spell the way the operator typed it is a bearer that is never found: the
+  // hub would degrade over a "missing" value the operator believes is set.
+  for (const name of [
+    '',
+    'aos_pmmcp_token',
+    'Aos_Pmmcp_Token',
+    // Lower case is refused before any prefix rule: pmmcp reads its settings
+    // without regard to case, so each of these would set or stop pmmcp from a
+    // shell that exports it, past a prefix check that reads PMMCP_ by spelling.
+    // Lower case in the first letter alone counts as much as anywhere after it.
+    'pmmcp_token',
+    'pMMCP_SERVER__PORT',
+    'Pmmcp_SERVER__PORT',
+    'aOS_PMMCP_TOKEN',
+    'AOS-PMMCP-TOKEN',
+    'AOS.PMMCP.TOKEN',
+    'AOS PMMCP TOKEN',
+    ' AOS_PMMCP_TOKEN',
+    'AOS_PMMCP_TOKEN ',
+    'AOS_PMMCP_TOKEN\n',
+    '1AOS_TOKEN',
+    '_AOS_TOKEN',
+    'AOS_PMMCP_TOKEN=qJoinedValue0123',
+    '\u00C4OS_TOKEN',
+    '\uFF21OS_TOKEN',
+  ]) {
+    assert.throws(
+      () => parse(declaringTokenEnv(name)),
+      (e: unknown) => e instanceof Error && /tokenEnv must be an upper-case \.env name/.test(e.message),
+      `tokenEnv: ${JSON.stringify(name)} must be refused`,
+    )
+  }
+  // Not a string at all, as YAML reads `tokenEnv: 42` or `tokenEnv: true`.
+  for (const value of [42, true, null, ['AOS_PMMCP_TOKEN']]) {
+    assert.throws(() => parse(declaringTokenEnv(value)), /kernel\.yaml is invalid/, `tokenEnv: ${JSON.stringify(value)} must be refused`)
+  }
+
+  // What a shell export and a .env line share: these parse unchanged.
+  for (const name of ['AOS_PMMCP_TOKEN', 'GITHUB_TOKEN', 'A', 'X1', 'A_1__B']) {
+    assert.equal(parse(declaringTokenEnv(name)).mcp.servers['pmmcp']?.tokenEnv, name)
+  }
+  // No tokenEnv at all is still a server that sends no bearer.
+  const none = fixture('valid.yaml') as { mcp: { servers: Record<string, Record<string, unknown>> } }
+  delete none.mcp.servers['pmmcp']?.['tokenEnv']
+  assert.equal(parse(none).mcp.servers['pmmcp']?.tokenEnv, undefined)
 })
 
 test('inside the repo, the data dir and mount roots live only under .aos/', () => {

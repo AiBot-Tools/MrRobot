@@ -14,7 +14,7 @@ mcp:
   servers:
     pmmcp:
       url: http://127.0.0.1:8766/mcp
-      tokenEnv: PMMCP_TOKEN
+      tokenEnv: AOS_PMMCP_TOKEN
       heartbeatMs: 240000
 secrets:
   keyArg: label

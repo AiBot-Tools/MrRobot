@@ -65,8 +65,8 @@ test('config/kernel.yaml parses and its four D30 budget defaults are present and
 
   // pmmcp: the MCP endpoint on 8766, not the dashboard on 8765.
   assert.equal(config.mcp.servers['pmmcp']?.url, 'http://127.0.0.1:8766/mcp')
-  // The kernel is pmmcp's client aos-kernel. Never a PMMCP_ name: pmmcp's
-  // load_config refuses to start from a shell that exports one.
+  // The kernel is pmmcp's client aos-kernel. Never a PMMCP_ name, which config
+  // refuses (D34): that prefix is pmmcp's own, which its load_config reads.
   assert.equal(config.mcp.servers['pmmcp']?.tokenEnv, 'AOS_PMMCP_TOKEN')
   assert.equal(config.secrets.keyArg, 'label')
   assert.equal(config.secrets.envFallback, false)
@@ -578,6 +578,10 @@ test('DECISIONS.md records D34 for the bearer kernel.yaml declares and keeps D37
   for (const fact of [`\`${String(tokenEnv)}\``, '`aos-kernel`', 'warn mode', '`load_config`', 'installer task A9', 'Q19']) {
     assert.ok(d34.includes(fact), `D34 does not say ${fact}`)
   }
+  // A9's refusal is in src/config.ts (config.test.ts holds it), so D34 says it
+  // is built, and leaves only the K3 amendment to come.
+  assert.ok(d34.includes("A9's refusal built"), 'D34 still says A9\'s refusal is to come')
+  assert.doesNotMatch(d34, /not built yet/)
   assert.doesNotMatch(decisions, /is recorded when/, 'DECISIONS.md still names a row it has not written')
   // The rule README states, with the row behind it.
   const readme = read('README.md')
@@ -602,6 +606,52 @@ test('DECISIONS.md records D34 for the bearer kernel.yaml declares and keeps D37
   assert.equal(Number(totals[2]), ds, 'the last D row added is not the total')
   assert.equal(Number(totals[3]), rows.filter((l) => /^\| Q\d+ /.test(l)).length, 'the fleet total is not the number of Q rows')
   assert.equal(Number(totals[4]), rows.filter((l) => /^\| \*\*[DQ]\d+\*\* /.test(l)).length, 'the blocking total is not the number of blocking rows')
+})
+
+test("no credential name the shipped config declares is in pmmcp's PMMCP_ prefix, and D34 claims config's refusal for a tokenEnv alone", () => {
+  // src/config.ts refuses the prefix only as an MCP server's tokenEnv
+  // (config.test.ts). A provider's auth.envVar is read from a shell export at
+  // boot as well, and one in pmmcp's prefix would set a pmmcp setting, or stop
+  // pmmcp, in any shell that starts it. The provider schema does not refuse
+  // one (that change awaits the operator), so the shipped files are held here,
+  // in any case, as pmmcp reads them.
+  const names = [
+    ...credentialNames(
+      parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO }),
+      parseProviders(readYaml('config/providers.yaml')),
+    ),
+  ].sort()
+  // A provider's key among them, so this is not a check over a list that lost them.
+  assert.ok(names.includes('AOS_PMMCP_TOKEN') && names.some((n) => n.endsWith('_API_KEY')), names.join(', '))
+  for (const name of names) assert.doesNotMatch(name, /^pmmcp_/i, `${name} is declared in pmmcp's PMMCP_ prefix (D34)`)
+
+  // And D34 does not claim more than the code enforces.
+  const d34 = read('docs/DECISIONS.md').split('\n').find((l) => l.startsWith('| D34 |')) ?? ''
+  assert.doesNotMatch(d34, /no AOS credential name may start/, 'D34 claims a refusal for every credential name')
+  assert.match(d34, /so no kernel `tokenEnv` may start with `PMMCP_`/)
+  assert.match(d34, /A provider's `auth\.envVar` is not held to the prefix by `src\/models\/registry\.ts`/)
+})
+
+/** `text` in paragraphs, a list item or a table row each counted as one. */
+function paragraphs(text: string): string[] {
+  return text
+    .split(/\n[ \t]*\n/)
+    .flatMap((block) => block.split(/\n(?=[ \t]*(?:[-*] |\| ))/))
+    .filter((p) => p.trim() !== '')
+}
+
+test("every place that says pmmcp's load_config refuses a PMMCP_ name says it is a checkout up to 53ea308 that refuses every one (D34)", () => {
+  // pmmcp's 235992d narrowed the refusal: it reads PMMCP_<SECTION>__<KEY> as a
+  // setting, stops on a bare section name or one that does not exist, and
+  // leaves PMMCP_TOKEN alone. A sentence that says it refuses every PMMCP_
+  // name is true only of a checkout up to 53ea308, and must say so.
+  for (const rel of ['README.md', 'CLAUDE.md', 'config/kernel.yaml', 'scripts/install/run.ts', 'src/config.ts', 'docs/DECISIONS.md']) {
+    const saying = paragraphs(read(rel)).filter((p) => p.includes('load_config') && p.includes('PMMCP_') && /refus/.test(p))
+    assert.ok(saying.length > 0, `${rel} no longer says what pmmcp's load_config refuses: drop it from this list`)
+    for (const p of saying) {
+      assert.ok(p.includes('53ea308'), `${rel} says pmmcp's load_config refuses a PMMCP_ name and not which pmmcp: ${p.trim().slice(0, 160)}`)
+    }
+  }
 })
 
 test('every README shell block pastes cleanly into stock macOS zsh: no # comments', () => {

@@ -83,10 +83,61 @@ const Control = z
 
 const Events = z.object({ anchorEvery: posInt().default(100) }).strict()
 
+/**
+ * The name a tokenEnv may take: upper case, digits and `_`, starting with a
+ * letter, as `.env.example` and every credential name here are. A shell cannot
+ * export a name holding `-`, `.` or a space and the `.env` loader reads no line
+ * that holds one, so such a bearer is never found and the hub degrades over a
+ * value the operator believes is set. Upper case also closes the way round the
+ * prefix rule below: pmmcp reads its settings without regard to case
+ * (pydantic-settings, case_sensitive=False), so an exported
+ * `pmmcp_server__port` sets its port as `PMMCP_SERVER__PORT` would (checked
+ * against pmmcp's e646096, 2026-10-29).
+ */
+const TOKEN_ENV_NAME = /^[A-Z][A-Z0-9_]*$/
+
+/**
+ * `PMMCP_` is pmmcp's own prefix (decision D34). Its load_config reads an
+ * exported `PMMCP_<SECTION>__<KEY>` as a setting, in any case, and refuses to
+ * start under a misspelt section or a bare section name (`PMMCP_SERVER`); a
+ * pmmcp checkout up to 53ea308 refuses to start under any `PMMCP_` name that
+ * is no setting (pydantic extra_forbidden, checked 2026-10-28; the narrower
+ * reading is pmmcp's 235992d, checked 2026-10-29). A kernel bearer may be
+ * exported from the operator's shell (a non-blank export wins at boot), and
+ * that shell may be the one that starts pmmcp, so no kernel credential name
+ * enters that namespace, whichever pmmcp is installed.
+ */
+const PMMCP_PREFIX = 'PMMCP_'
+
+/** The server whose bearer is AOS_PMMCP_TOKEN, as pmmcp's client aos-kernel. */
+const PMMCP_SERVER = 'pmmcp'
+
+const TokenEnv = z.string().regex(TOKEN_ENV_NAME, {
+  message: 'mcp server tokenEnv must be an upper-case .env name: A-Z, 0-9 and _, starting with a letter',
+})
+
+/**
+ * The prefix refusal, its way out worded by server. Only pmmcp's bearer is
+ * AOS_PMMCP_TOKEN: a second server told the same would declare pmmcp's name,
+ * and the hub would send pmmcp's bearer to that service.
+ */
+function prefixRefusal(server: string): string {
+  const wayOut =
+    server === PMMCP_SERVER
+      ? 'Name it AOS_PMMCP_TOKEN, or another name that does not start with PMMCP_'
+      : `Give ${server} an AOS_ name of its own, not AOS_PMMCP_TOKEN: that is pmmcp's bearer, and ${server} would be sent it`
+  return (
+    "mcp server tokenEnv must not start with PMMCP_, pmmcp's own prefix: pmmcp's load_config reads an exported " +
+    'PMMCP_<SECTION>__<KEY> as a setting, in any case, and refuses to start under a bare section name such as ' +
+    'PMMCP_SERVER, and a pmmcp checkout up to 53ea308 refuses to start under any PMMCP_ name that is no setting ' +
+    `(decision D34). ${wayOut}`
+  )
+}
+
 const McpServer = z
   .object({
     url: z.string().refine(isLoopbackUrl, { message: 'mcp server url must have a loopback hostname' }),
-    tokenEnv: z.string().min(1).optional(),
+    tokenEnv: TokenEnv.optional(),
     heartbeatMs: posInt().default(240_000),
     requestTimeoutMs: posInt().default(30_000),
     pingTimeoutMs: posInt().default(10_000),
@@ -95,9 +146,17 @@ const McpServer = z
   .strict()
 
 const Mcp = z
-  .object({ servers: z.record(z.string().min(1), McpServer) })
+  .object({
+    servers: z.record(z.string().min(1), McpServer).superRefine((servers, ctx) => {
+      for (const [server, entry] of Object.entries(servers)) {
+        if (typeof entry.tokenEnv === 'string' && entry.tokenEnv.startsWith(PMMCP_PREFIX)) {
+          ctx.addIssue({ code: 'custom', path: [server, 'tokenEnv'], message: prefixRefusal(server) })
+        }
+      }
+    }),
+  })
   .strict()
-  .refine((m) => 'pmmcp' in m.servers, { message: 'mcp.servers must include pmmcp' })
+  .refine((m) => PMMCP_SERVER in m.servers, { message: 'mcp.servers must include pmmcp' })
 
 /**
  * Where provider credentials come from.

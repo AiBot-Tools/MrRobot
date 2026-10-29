@@ -658,9 +658,10 @@ and a test must not grow one. Inspect or clear that namespace yourself.
 
 `ANTHROPIC_API_KEY` comes from `.env`, or from a shell export that is not blank,
 which wins. Never type a key on the command line: zsh saves it to
-`~/.zsh_history`. `PMMCP_URL` goes inline, as below: inline only; never export a
-`PMMCP_` name in a shell that starts pmmcp, whose `load_config` refuses to start
-under one. pmmcp's bearer, `AOS_PMMCP_TOKEN`, is optional while pmmcp's gate is in
+`~/.zsh_history`. `AOS_LIVE_PMMCP_URL` goes inline, as below: inline only; never
+export a `PMMCP_` name in a shell that starts pmmcp, whose `load_config` reads that
+prefix as its own settings (a checkout up to 53ea308 refuses to start under one it
+does not know). pmmcp's bearer, `AOS_PMMCP_TOKEN`, is optional while pmmcp's gate is in
 warn mode; the tests send it only when the shell's environment holds it (they
 read no `.env` for it). Run one of these, not both.
 
@@ -674,7 +675,7 @@ Everything, including pmmcp writes to `aos/agent/aos-live-test`:
 
 ```bash
 AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_WRITES=1 \
-  PMMCP_URL=http://127.0.0.1:8766/mcp npm test
+  AOS_LIVE_PMMCP_URL=http://127.0.0.1:8766/mcp npm test
 ```
 
 Run `npm run capture:pmmcp` first if you can: the goal-tools test will name any
@@ -817,7 +818,7 @@ terminal's spec output, `#` in TAP); that is the number recorded below.
 `AOS_LIVE_TESTS=1 npm test` runs the same test plus every other live test, at
 roughly twice the cost.
 
-- Result: pass. 2 passed, 1 skipped by design: the exit-criterion test needs `PMMCP_URL`, and line 2 runs it. The rejected-tool-call replay passed against the real Messages API.
+- Result: pass. 2 passed, 1 skipped by design: the exit-criterion test needs `PMMCP_URL` (since renamed `AOS_LIVE_PMMCP_URL`), and line 2 runs it. The rejected-tool-call replay passed against the real Messages API.
 - Date: 2026-10-19
 - Commit: c80f7be
 - `costMicroUsd`: 2770 (llmCalls 1)
@@ -830,12 +831,13 @@ memory and goal store here, not the key store: its `get_secret` masks by design.
 The key comes from the same place.
 
 ```bash
-AOS_LIVE_TESTS=1 PMMCP_URL=http://127.0.0.1:8766/mcp node --import tsx --test --test-name-pattern="Phase 0 exit criterion" test/live-anthropic.test.ts
+AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_URL=http://127.0.0.1:8766/mcp node --import tsx --test --test-name-pattern="Phase 0 exit criterion" test/live-anthropic.test.ts
 ```
 
-`PMMCP_URL` is required (the test skips without it) and is read only by the
-test, which writes it into its own temporary `kernel.yaml`. Give it inline, as
-here, never exported in a shell that starts pmmcp. The test runs the
+`AOS_LIVE_PMMCP_URL` is required (the test skips without it) and is read only by
+the test, which writes it into its own temporary `kernel.yaml`. Give it inline, as
+here. It was `PMMCP_URL` until the rename that keeps every AOS name out of pmmcp's
+`PMMCP_` prefix (decision D34). The test runs the
 shipped CEO against the operator's real pmmcp: a reply that plans could write
 goals under `aos/ceo`, and pmmcp has no tool to delete them. It prints
 `costMicroUsd=<N>` the same way.
@@ -884,7 +886,7 @@ both opt-ins (`ANTHROPIC_API_KEY` from `.env`, or a shell export that is not
 blank):
 
 ```bash
-AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_WRITES=1 PMMCP_URL=http://127.0.0.1:8766/mcp node --import tsx --test test/live-runtime.test.ts
+AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_WRITES=1 AOS_LIVE_PMMCP_URL=http://127.0.0.1:8766/mcp node --import tsx --test test/live-runtime.test.ts
 ```
 
 Lines 1 and 2 print `runId=…` / `ceoRunId=…` and `costMicroUsd=…` as test
@@ -953,10 +955,14 @@ The kernel sends `AOS_PMMCP_TOKEN` as pmmcp's client `aos-kernel`
 (`mcp.servers.pmmcp.tokenEnv` in `kernel.yaml`), and refuses to dial while it is
 unset. In warn mode nothing on the kernel side shows a wrong token, so
 `npm run aos-install` checks the digest offline (`http_auth check --expect`).
-No AOS credential name starts with `PMMCP_` (decision D34): pmmcp's
-`load_config` refuses to start any process launched from a shell that exports
-one (pydantic `extra_forbidden`, checked 2026-10-28), so a `PMMCP_*` value goes
-inline on one command, never `export`.
+No AOS credential name starts with `PMMCP_` (decision D34), and `kernel.yaml`
+refuses one as a `tokenEnv`: that prefix is pmmcp's own. pmmcp's `load_config`
+reads an exported `PMMCP_<SECTION>__<KEY>` as a setting, in any case
+(`pmmcp_server__port` sets the port), and refuses to start under a bare section
+name such as `PMMCP_SERVER` or a section that does not exist
+(`PMMCP_DASHBORD__PORT`); a pmmcp checkout up to 53ea308 refuses to start under
+any `PMMCP_` name that is no setting (pydantic `extra_forbidden`, checked
+2026-10-28). So a `PMMCP_*` value goes inline on one command, never `export`.
 
 Until then, access rests on the two conditions the operator set, which the
 kernel enforces or will enforce:

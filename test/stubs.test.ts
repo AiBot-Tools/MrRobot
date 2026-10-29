@@ -172,10 +172,84 @@ test("every STUBS entry is named in README's stub section", () => {
   // The key comes from .env or an export, never typed into a command line,
   // where zsh writes it to ~/.zsh_history.
   assert.equal(/ANTHROPIC_API_KEY=\S*\s+npm\b/.test(README), false, 'README puts a key on a command line')
-  assert.ok(README.includes('PMMCP_URL='))
+  assert.ok(README.includes('AOS_LIVE_PMMCP_URL='))
+  // And no command README gives sets a PMMCP_ name (D34): that prefix is pmmcp's
+  // own, which its load_config reads as settings.
+  assert.doesNotMatch(README, /(?<![A-Z0-9_])PMMCP_[A-Z0-9_]*=/, 'README gives a command that sets a PMMCP_ name')
   assert.ok(README.includes('npm run cli -- run ceo'))
   // The Node warning that does not look like a version problem.
   assert.ok(README.includes('--disable-warning= is not allowed in NODE_OPTIONS'))
+})
+
+/**
+ * Every name `source` reads from process.env by spelling: `process.env['X']`
+ * (any quote, optional chaining), `process.env.X`, and `{ X } = process.env`.
+ */
+function envReads(source: string): string[] {
+  const names: string[] = []
+  for (const m of source.matchAll(/process\.env\s*(?:(?:\?\.)?\s*\[\s*(['"`])([^'"`]*)\1\s*\]|(?:\?\.|\.)\s*([A-Za-z_$][\w$]*))/g)) {
+    names.push(m[2] ?? m[3] ?? '')
+  }
+  for (const m of source.matchAll(/\{([^{}]*)\}\s*=\s*process\.env\b/g)) {
+    for (const part of (m[1] ?? '').split(',')) {
+      const name = (part.split(':')[0] ?? '').trim()
+      if (name !== '') names.push(name)
+    }
+  }
+  return names
+}
+
+test("the live tests read pmmcp's URL as AOS_LIVE_PMMCP_URL, the name README's commands set, and no file reads a PMMCP_ name from its environment (D34)", () => {
+  // A gated run's skips read as "by design". A live file that went back to the
+  // old name would skip every pmmcp-connected test on the Mac, where README's
+  // commands set only the new one, with a skip reason naming a variable that is
+  // set, and the README checklist could record a pass that never ran.
+  const LIVE_FILES = ['live-anthropic.test.ts', 'live-runtime.test.ts']
+  const gated = readdirSync(`${REPO}/test`).filter((f) => /^live-.*\.test\.ts$/.test(f)).sort()
+  assert.deepEqual(gated, LIVE_FILES, 'a live file was added or renamed: say here which pmmcp URL it reads')
+  const blocks = [...README.matchAll(/^```(?:bash|sh|zsh|shell)\n([\s\S]*?)^```/gm)].map((m) => m[1] ?? '')
+  const liveCommands = blocks.filter((b) => /(?:^|\s)AOS_LIVE_TESTS=1\s/.test(b))
+  assert.ok(liveCommands.length >= 3, `README gives ${String(liveCommands.length)} live-test commands`)
+  const set = (block: string): string[] => [...block.matchAll(/(?:^|\s)([A-Z][A-Z0-9_]*)=/g)].map((m) => m[1] ?? '')
+
+  const readByLive = new Set<string>()
+  for (const file of LIVE_FILES) {
+    const source = readFileSync(`${REPO}/test/${file}`, 'utf8')
+    const reads = envReads(source)
+    for (const name of reads) readByLive.add(name)
+    // The URL it dials is read under one name, the new one, at every read.
+    const urls = [...new Set(reads.filter((n) => /pmmcp/i.test(n) && /url/i.test(n)))].sort()
+    assert.deepEqual(urls, ['AOS_LIVE_PMMCP_URL'], `${file} reads pmmcp's URL as ${urls.join(', ')}`)
+    // Each variable a skip reason tells the operator to set is one the file reads.
+    for (const m of source.matchAll(/'set ([A-Z][A-Z0-9_]*)/g)) {
+      assert.ok(reads.includes(m[1] ?? ''), `${file} says "set ${m[1] ?? ''}" and never reads it`)
+    }
+    // README runs the file, with the URL set on the same command.
+    const runs = liveCommands.filter((b) => b.includes(`test/${file}`) || /\bnpm test\b/.test(b))
+    assert.ok(
+      runs.some((b) => set(b).includes('AOS_LIVE_PMMCP_URL')),
+      `no README command runs ${file} with AOS_LIVE_PMMCP_URL set`,
+    )
+  }
+  // And every name a README live command sets is one a live file reads: a
+  // name README sets that nothing reads is a rename done on one side only.
+  for (const block of liveCommands) {
+    for (const name of set(block)) assert.ok(readByLive.has(name), `README sets ${name} for a live run and no live file reads it`)
+  }
+
+  // No AOS file reads a PMMCP_ name, in any case (pmmcp reads its prefix
+  // without regard to case): that prefix is pmmcp's own (D34).
+  const sources = ['src', 'scripts', 'test'].flatMap((dir) =>
+    readdirSync(`${REPO}/${dir}`, { recursive: true, encoding: 'utf8' })
+      .filter((f) => f.endsWith('.ts'))
+      .map((f) => `${dir}/${f}`),
+  )
+  assert.ok(sources.length > 100, `only ${String(sources.length)} sources found`)
+  for (const file of sources) {
+    for (const name of envReads(readFileSync(`${REPO}/${file}`, 'utf8'))) {
+      assert.doesNotMatch(name, /^pmmcp_/i, `${file} reads ${name} from its environment`)
+    }
+  }
 })
 
 test('CLAUDE.md Current state names every STUBS entry', () => {

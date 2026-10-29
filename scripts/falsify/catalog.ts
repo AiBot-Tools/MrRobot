@@ -490,6 +490,9 @@ const sandbox: Suite = {
     { id: 'Z21', file: 'src/sandbox/docker.ts', from: '  const home = input.home ?? homeDirectory()', to: "  const home = input.home ?? process.env['HOME'] ?? ''", why: 'with HOME empty, the run-args audit skips its home check, so a command may name files under it' },
     { id: 'Z22', file: 'src/agents/protected.ts', from: "  return s.normalize('NFKC').toUpperCase().toLowerCase().normalize('NFKC')", to: '  return s.toLowerCase()', why: 'a .aos stored as .aoſ, which APFS opens as .aos and git ignores under neither setting, passes as spelled right' },
     { id: 'Z23', file: 'src/config.ts', from: '  assertAosEntry(options.repoRoot)\n', to: '', why: 'a linked .aos is admitted whenever no configured path is spelled through it, and git commits the link anyway' },
+    { id: 'Z24', file: 'src/config.ts', from: "        if (typeof entry.tokenEnv === 'string' && entry.tokenEnv.startsWith(PMMCP_PREFIX)) {", to: '        if (false) {', why: "a tokenEnv in pmmcp's PMMCP_ prefix is admitted, and exporting it sets a pmmcp setting or stops pmmcp (D34)" },
+    { id: 'Z25', file: 'src/config.ts', from: 'const TOKEN_ENV_NAME = /^[A-Z][A-Z0-9_]*$/', to: 'const TOKEN_ENV_NAME = /^[A-Za-z][A-Z0-9_]*$/', why: 'a tokenEnv lower case in its first letter (pMMCP_SERVER__PORT) passes the prefix rule, and pmmcp reads it without regard to case' },
+    { id: 'Z26', file: 'src/config.ts', from: '    server === PMMCP_SERVER\n', to: '    true\n', why: "every server refused for the PMMCP_ prefix is told to take AOS_PMMCP_TOKEN, and would then be sent pmmcp's bearer" },
   ],
   control: { id: 'C', file: DOCKER, from: '    // Invariant 9, one flag at a time.', to: '    // Invariant 9, one flag at a time. (control)', why: 'comment only' },
 }

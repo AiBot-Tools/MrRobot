@@ -525,16 +525,16 @@ test('bearerRefusal: a bearer that cannot be a header or cannot be masked is ref
   t.after(() => SecretMask.clear())
   const good = 'qOpaqueBearerCanary0123456789abcdefghij'
   for (const [token, why] of [
-    [`${good}\n${good}`, /^PMMCP_TOKEN contains whitespace, so it is not a bearer$/],
-    [`\u201C${good}\u201D`, /^PMMCP_TOKEN contains a character outside printable ASCII/],
-    ['Qz7#kd!', /^PMMCP_TOKEN is under 8 characters, so it cannot be masked$/],
+    [`${good}\n${good}`, /^AOS_PMMCP_TOKEN contains whitespace, so it is not a bearer$/],
+    [`\u201C${good}\u201D`, /^AOS_PMMCP_TOKEN contains a character outside printable ASCII/],
+    ['Qz7#kd!', /^AOS_PMMCP_TOKEN is under 8 characters, so it cannot be masked$/],
   ] as const) {
-    const refusal = bearerRefusal('PMMCP_TOKEN', token)
+    const refusal = bearerRefusal('AOS_PMMCP_TOKEN', token)
     assert.match(refusal ?? '', why)
     assert.equal((refusal ?? '').includes(token.slice(0, 7)), false, 'the refusal quotes the bearer')
   }
   assert.equal(SecretMask.size, 0, 'a refused bearer was registered')
-  assert.equal(bearerRefusal('PMMCP_TOKEN', good), undefined)
+  assert.equal(bearerRefusal('AOS_PMMCP_TOKEN', good), undefined)
   assert.equal(redactString(`unauthorized: ${good}`), `unauthorized: ${CENSOR}`)
 })
 
@@ -543,7 +543,7 @@ test('a padded base32 credential is minted, not refused as a joined line; a real
   const B32 = 'HW37QR4WXHMPU2R7Y3KSNGPCLXTK3LNHIAVQ74H3B527O53Z4NWQ===='
   assert.equal(notACredential(B32), undefined)
   assert.equal(notACredential('MZXW6YTBOI======'), undefined)
-  assert.equal(bearerRefusal('PMMCP_TOKEN', B32), undefined)
+  assert.equal(bearerRefusal('AOS_PMMCP_TOKEN', B32), undefined)
   assert.equal(notACredential('OPENROUTER_API_KEY=qJoinedCanary0123'), 'holds a whole NAME=value line')
   assert.equal(notACredential('ABC==x'), 'holds a whole NAME=value line')
 })

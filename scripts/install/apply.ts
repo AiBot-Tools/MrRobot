@@ -97,7 +97,9 @@
 //        says what L4 left.
 //     L5 the start, then its checks: /health 200; an MCP server on 8766 of
 //        this account whose pid is not the one discovery found and that
-//        started (ps etime, a lower bound) after http_auth.yaml last changed;
+//        started (ps etime, a lower bound) after http_auth.yaml last changed
+//        (an lsof that fails is a check that could not be made, never "no
+//        server listens", and leaves whether the digest loaded not known);
 //        pmmcp-qdrant running; the worker and scraper PID files naming live
 //        processes; after L3, `status --json` verdict `enforced` (any other
 //        names the rollback); after L4 left a usable dashboard token,
@@ -118,9 +120,12 @@
 //        and only what came after the mark when it was not): found, or
 //        inconclusive (never a failure). No MCP initialize is sent: that
 //        would need the token's value, which no installer module holds (A2),
-//        so the line comes from the kernel's own next request (restarting
-//        npm run dev). Plan S7 L6 reads so since A6 fix round 3 (plan §9,
-//        option (a)), and so does the planner's title for the step.
+//        so the line comes from the kernel's own next request: from a
+//        restarted npm run dev when the next steps ask that restart
+//        (something it reads changed), else from the running daemon, whose
+//        hub reconnects to the restarted pmmcp within its 240 s heartbeat.
+//        Plan S7 L6 reads so since A6 fix round 3 (plan §9, option (a)), and
+//        so does the planner's title for the step.
 //   A fresh install runs its whole sequence the same way: the .env append,
 //   the clone, setup.sh --non-interactive in its own session (stdin
 //   /dev/null), the facts of the new checkout (its features, and each
@@ -141,9 +146,20 @@
 //   skipped as it went, a step a phase was handed but did not reach
 //   skipped with why ("not reached: the stop did not stop pmmcp"), and a
 //   step no phase was handed skipped. Then .env (what was appended, its
-//   mode, and an ACL when ls -le shows one or cannot tell), the bearer, the
-//   Qdrant verdict, the dashboard, the backups, a leak, what is left to do
-//   by hand, and the next steps.
+//   mode, and an ACL when ls -le shows one or cannot tell; after a write
+//   that failed part way, never "not written": that it may have changed, the
+//   names this run was appending, and `ls -l .env` and `git check-ignore -v
+//   .env` to run before npm run dev restarts), the bearer, the Qdrant verdict
+//   (after the kept prekey's cleanup, no longer "kept"), the dashboard, the
+//   backups, a leak, what is left to do by hand, and the next steps: the
+//   restart of npm run dev only when something it reads changed (.env gained
+//   a line, or the restarted pmmcp loaded an aos-kernel digest the server
+//   before it had not: staged this run, or on file but loaded by no server
+//   that discovery could show started after http_auth.yaml last changed; a
+//   cutover, a dashboard token or an update on a system whose server had
+//   the digest loaded asks none), and the
+//   steps about pmmcp only for a pmmcp this run touched (not with --aos-only,
+//   nor with --no-install and none installed).
 //
 //   Exit codes (Applied): 0 done; 1 a step failed and the state is as
 //   reported (a non-live step; a live item that changed nothing, or a leak
@@ -486,6 +502,8 @@ export class Applier {
   /** The handed steps whose turn came: a phase that ends early reports the rest skipped, with why. */
   readonly #reached = new Set<Step>()
   #env: AppendResult | undefined
+  /** The writer's failure, when the append failed: `written` true means .env may have been changed all the same (never "not written"). */
+  #envFailed: { readonly written: boolean; readonly message: string } | undefined
   /** .env's mode and ACL as the end report shows them, once looked at (whenever the file exists). */
   #dotenvMode: { readonly path: string; readonly mode: number; readonly acl: boolean | undefined } | undefined
   #dotenvChecked = false
@@ -497,6 +515,13 @@ export class Applier {
   #digest: string | undefined
   #digestOnFile: boolean | undefined
   #loaded: boolean | undefined
+  /**
+   * Whether the server discovery found had loaded http_auth.yaml as it was then (it started after the file last changed); undefined
+   * when that cannot be told. A digest not on file then can only be loaded now by being staged this run, which #digestStaged says.
+   */
+  readonly #loadedBefore: boolean | undefined
+  /** Set once this run put the digest on file (check --expect matches after the rotate). */
+  #digestStaged = false
   readonly #backups: string[] = []
   #facts: Facts | undefined
   /** The facts L2 re-read from the updated tree. */
@@ -538,6 +563,8 @@ export class Applier {
       const server = d.server
       if (server?.startedAfter !== undefined && d.httpAuthModified !== undefined) this.#loaded = server.startedAfter.getTime() > d.httpAuthModified.getTime()
     }
+    // Before anything runs: a restart this run makes changes what the daemon reads only if the digest was not loaded already.
+    this.#loadedBefore = this.#loaded
   }
 
   /** What has been done, skipped, failed or left inconclusive, in order. */
@@ -699,9 +726,14 @@ export class Applier {
       })
     } catch (e) {
       if (e instanceof DotenvWriteError) {
+        this.#envFailed = { written: e.written, message: e.message }
         this.#item(step.short, 'failed', e.message)
         this.#print(`failed: ${e.message}`)
-        if (e.written) this.#written = true
+        if (e.written) {
+          // The writer stopped after it began writing: the file may hold the new names, or be left empty, and may no longer be one the loader reads.
+          this.#written = true
+          this.#print(`  ${this.#dotenvCheck()}`)
+        }
         throw new End(e.written || this.#written ? 1 : 2, '.env was not written as planned')
       }
       throw e
@@ -721,6 +753,20 @@ export class Applier {
     // Looked at again here: this run may have created it.
     this.#dotenvChecked = false
     await this.#checkDotenv(result.path)
+  }
+
+  /**
+   * What to check once the writer failed after it began writing: the names
+   * this run was appending (never a value), and the two commands that show
+   * whether the loader will still read the file.
+   */
+  #dotenvCheck(): string {
+    const names = this.#o.plan.generate
+    return (
+      `.env may now hold ${names.length === 0 ? 'what this run was appending' : list([...names])} (the names this run was appending), or be left empty if this run created it: ` +
+      `check it in ${this.#o.repoRoot} with ls -l .env (-rw------- and yours) and git check-ignore -v .env (it must name the .gitignore line that ignores .env), ` +
+      'and fix what they show before you restart npm run dev'
+    )
   }
 
   /** .env's mode, and whether ls shows an ACL on it, for the end report: once, whenever the file exists, written by this run or not. */
@@ -822,6 +868,7 @@ export class Applier {
     this.#digestOnFile = on
     if (on) {
       this.#written = true
+      this.#digestStaged = true
       this.#loaded = false
       this.#item(
         step.short,
@@ -877,6 +924,8 @@ export class Applier {
     const ran = await this.#exec({ step: 'qdrant-cleanup', command: this.#python(dir), args: ['scripts/qdrant_api_key.py', 'cleanup'], cwd: dir }, 'qdrant_api_key.py cleanup')
     if (ran.ok && ran.result.code === 0) {
       this.#written = true
+      // Discovery's status said the prekey was kept: its exit 0 says it is gone, so the report no longer says "kept" beside "removed".
+      if (this.#qdrant !== undefined) this.#qdrant = { ...this.#qdrant, prekey_kept: false }
       this.#item(step.short, 'done', 'pmmcp-qdrant-prekey removed (its volumes stay)')
       return
     }
@@ -1308,7 +1357,10 @@ export class Applier {
 
     const mcp = await this.#mcpProcess(ports.server)
     const modified = this.#httpAuthModified()
-    if (mcp === undefined) {
+    if (mcp.state === 'unknown') {
+      // lsof could not say: neither that a server runs nor that none does, so whether one loaded the digest stays not known.
+      failed.push(`whether an MCP server of this account listens on ${String(ports.server)} could not be checked (lsof failed: ${mcp.why})`)
+    } else if (mcp.state === 'none') {
       // No server runs to have loaded it.
       this.#loaded = false
       failed.push(`no MCP server of this account listens on ${String(ports.server)}`)
@@ -1411,16 +1463,23 @@ export class Applier {
     return status
   }
 
-  /** The MCP server this account runs on the port, and the earliest it can have started. */
-  async #mcpProcess(port: number): Promise<{ readonly pid: number; readonly startedAfter: Date | undefined } | undefined> {
+  /**
+   * The MCP server this account runs on the port, and the earliest it can
+   * have started; none when nothing of this account listens there, unknown
+   * when lsof could not say.
+   */
+  async #mcpProcess(
+    port: number,
+  ): Promise<{ readonly state: 'found'; readonly pid: number; readonly startedAfter: Date | undefined } | { readonly state: 'none' } | { readonly state: 'unknown'; readonly why: string }> {
     const l = await this.#listening(port)
-    if (l.state !== 'listening') return undefined
+    if (l.state === 'unknown') return { state: 'unknown', why: l.why }
+    if (l.state === 'none') return { state: 'none' }
     const mine = l.pids.find((p) => p.uid !== undefined && p.uid === this.#uid)
-    if (mine === undefined) return undefined
+    if (mine === undefined) return { state: 'none' }
     const before = this.#now()
     const ran = await this.#exec({ step: `ps-etime-${String(mine.pid)}`, command: 'ps', args: ['-o', 'etime=', '-p', String(mine.pid)], cwd: this.#o.repoRoot, timeoutMs: QUICK_MS })
     const elapsed = ran.ok && ran.result.code === 0 ? parseEtime((this.#out(ran.result) ?? '').split('\n')[0] ?? '') : undefined
-    return { pid: mine.pid, startedAfter: elapsed === undefined ? undefined : startedAfter(before, elapsed) }
+    return { state: 'found', pid: mine.pid, startedAfter: elapsed === undefined ? undefined : startedAfter(before, elapsed) }
   }
 
   #httpAuthModified(): Date | undefined {
@@ -1505,12 +1564,30 @@ export class Applier {
       this.#item(step.short, 'done', `server.log has "first request with token" for ${PMMCP_CLIENT} since the start`)
       return
     }
+    // A restart only when the next steps ask one (the running daemon does not hold what changed); else its hub reconnects by itself.
+    const then = this.#daemonRestartNeeded()
+      ? 'restart npm run dev, as the next steps say'
+      : "the AOS daemon's next request makes the line (its hub reconnects to the restarted pmmcp within its 240 s heartbeat; if npm run dev is not running, start it)"
     this.#item(
       step.short,
       'inconclusive',
-      `no "first request with token" for ${PMMCP_CLIENT} in server.log since the start (the installer holds no token to send one): restart npm run dev, then ` +
+      `no "first request with token" for ${PMMCP_CLIENT} in server.log since the start (the installer holds no token to send one): ${then}, then ` +
         `grep "first request with token" ~/.persistent-memory-mcp/logs/server.log`,
     )
+  }
+
+  /**
+   * Whether something the daemon reads changed in this run: .env gained a
+   * line, or the restarted pmmcp loaded an aos-kernel digest that the server
+   * before it had not (staged this run, or on file but not loaded, or not
+   * known to be loaded). A cutover, a dashboard token or an update on a
+   * system whose server had the digest already changes nothing it reads.
+   */
+  #daemonRestartNeeded(): boolean {
+    const env = this.#env
+    const envChanged = env !== undefined && (env.created || env.appended.length > 0)
+    const loadedNow = this.#started && this.#digestOnFile === true && this.#loaded === true
+    return envChanged || (loadedNow && (this.#digestStaged || this.#loadedBefore !== true))
   }
 
   // ── a fresh install ──
@@ -1906,11 +1983,16 @@ export class Applier {
     for (const step of plan.steps) if (!this.#handed.has(step)) out.push(`  ${'skipped'.padEnd(12)} ${shownLine(step.short)}`)
 
     const env = this.#env
+    const failed = this.#envFailed
     const mode = this.#dotenvMode
     const modeText = mode === undefined ? '' : `; mode ${mode.mode.toString(8).padStart(4, '0')}`
     if (env !== undefined) {
       const appended = env.appended.map((n) => `${n.name} (line ${String(n.line)})`)
       out.push(`.env  ${env.path}: ${appended.length === 0 ? 'nothing appended' : `${env.created ? 'created with' : 'appended'} ${list(appended)}`}${modeText}`)
+    } else if (failed?.written === true) {
+      // Never "not written": the writer said it may have changed the file before it failed.
+      out.push(`.env  ${mode?.path ?? plan.dotenv.path}: may have been changed by this run before the writer failed (${shownLine(failed.message)})${modeText}`)
+      out.push(`  ${shownLine(this.#dotenvCheck())}`)
     } else out.push(`.env  ${mode?.path ?? plan.dotenv.path}: not written by this run${modeText}`)
     if (mode?.acl === true) out.push('  it carries an ACL, which the loader does not read: run chmod -N .env in the repository root')
     else if (mode !== undefined && mode.acl === undefined) {
@@ -1960,13 +2042,16 @@ export class Applier {
     }
 
     out.push('next steps:')
-    if (this.#written || this.#started) out.push('  restart npm run dev (it reads .env when it starts), and check that its credentials line names the tokens and that the hub is ok')
+    // Only when something the daemon reads changed (#daemonRestartNeeded).
+    if (failed?.written === true) out.push('  check .env as above before you restart npm run dev: the loader refuses a .env that git does not ignore or that others can read')
+    else if (this.#daemonRestartNeeded()) out.push('  restart npm run dev (it reads .env when it starts), and check that its credentials line names the tokens and that the hub is ok')
     if (plan.dotenv.lines.some((l) => l.name === 'ANTHROPIC_API_KEY' && l.state !== 'present')) out.push('  add ANTHROPIC_API_KEY to .env yourself: the installer never writes it')
     // The virtualenv's own module, not `uv run`, which may sync (and prune) the virtualenv on the way.
     if (plan.kind === 'fresh-install') out.push(`  for scraping pages that need JavaScript: ${within(dir ?? `~/Github/${PMMCP_FOLDER}`, '.venv/bin/python -m playwright install chromium')}`)
     const shared = this.#o.discovery?.kind === 'found' || this.#o.discovery?.kind === 'absent' ? this.#o.discovery.kernel.ollamaShared : []
     if (shared.length > 0) out.push(`  ${list(shared.map((s) => `${s.ref} (${String(s.port)})`))} shares one of pmmcp's Ollama ports 11434-11437, which pmmcp's stop stops: move it to a port of its own`)
-    if (plan.kind !== 'aos-only') {
+    // Of a pmmcp this run touched: none with --aos-only, and none is installed with --no-install.
+    if (plan.kind !== 'aos-only' && plan.kind !== 'not-installed') {
       out.push("  pmmcp's bearer gate stays in warn mode: switching it to enforce is your later step")
       out.push('  re-running setup.sh or deploy-multi-session-config.sh rewrites ~/.persistent-memory-mcp/config.yaml')
     }

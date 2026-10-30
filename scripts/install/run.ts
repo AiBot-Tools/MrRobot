@@ -166,7 +166,11 @@
 //   no timeout, and never signalled by this module, whatever happens. A stop
 //   killed part way leaves services half stopped and the drain lock behind.
 //   While one runs, <repo>/.aos/install/active.json records {step, pid,
-//   started, out, err}; it is created with O_EXCL before the spawn and
+//   started, out, err}, and readOnly for the one such step that changes
+//   nothing (`stop-pmmcp-server.sh --jobs`, the jobs count, which an
+//   installer that ends on a Ctrl-C or a signal leaves running: a re-run
+//   waits for it or, once its pid has ended, clears it, and never reads it
+//   as an open window); it is created with O_EXCL before the spawn and
 //   removed when the child exits, so a re-run after the installer died finds
 //   the window still open. A second one is refused while the record exists:
 //   only the caller, having seen the recorded child gone, clears it
@@ -1072,6 +1076,14 @@ const ActiveRecord = z.object({
   started: z.iso.datetime(),
   out: recordedLog('.out'),
   err: recordedLog('.err'),
+  /**
+   * Set by the runner, from the command it checked, for the one step in its
+   * own session that changes nothing (`stop-pmmcp-server.sh --jobs`): a
+   * re-run waits for such a record's child or clears it once its pid has
+   * ended, and never reads it as a window that may be open. Absent: any
+   * other step, read as one that may be stopping, starting or changing pmmcp.
+   */
+  readOnly: z.literal(true).optional(),
 })
 export type ActiveRecord = z.infer<typeof ActiveRecord>
 
@@ -1311,7 +1323,9 @@ export class Runner {
       throw new InstallRunError('AOS_INSTALL_RUN_HALTED', `${spec.step}: not run: ${this.#halted}`, spec.step)
     }
     const env = childEnv(this.#env, spec.command)
-    const { ownSession, installs } = checkSpec(spec, env, this.#installs)
+    const { script, ownSession, installs } = checkSpec(spec, env, this.#installs)
+    // The jobs count is pmmcp's one read-only use of the stop script (its interface: no drain lock, no launchctl, no signal); its record says so.
+    const readOnly = script === STOP_SCRIPT && spec.args.length === 1 && spec.args[0] === '--jobs'
     for (const dir of installs) this.#installs.add(dir)
     if (ownSession) {
       const active = readActive(this.repoRoot)
@@ -1355,7 +1369,7 @@ export class Runner {
     let activeError: string | undefined
     if (claim !== undefined) {
       // No pid: the spawn failed, and its 'error' comes next, so nothing here may throw past the listeners below.
-      activeError = pid === undefined ? this.#release(claim) : this.#record(claim, { step, pid, started: started.toISOString(), out, err })
+      activeError = pid === undefined ? this.#release(claim) : this.#record(claim, { step, pid, started: started.toISOString(), out, err, ...(readOnly ? { readOnly: true as const } : {}) })
     }
 
     let stdinError: string | undefined
@@ -1452,10 +1466,14 @@ export class Runner {
         : active.state === 'unreadable'
           ? `a step whose record cannot be read (${active.reason})`
           : 'a step whose record was there a moment ago'
+    // A read-only count holds the record too, and is no window: said as what it is.
+    const kind =
+      active.state === 'recorded' && active.record.readOnly === true
+        ? "an earlier read-only count of pmmcp's jobs (stop-pmmcp-server.sh --jobs, which changes nothing) may still be running"
+        : 'an earlier step in its own session (a stop, a start, or a step inside the stopped window) may still be running'
     return new InstallRunError(
       'AOS_INSTALL_RUN_BUSY',
-      `${step}: not run: ${activePath(this.repoRoot)} says an earlier step in its own session (a stop, a start, or a step inside the stopped window) may still be running: ${what}. ` +
-        'Wait for it to end; nothing is stopped or started meanwhile.',
+      `${step}: not run: ${activePath(this.repoRoot)} says ${kind}: ${what}. Wait for it to end; nothing is stopped or started meanwhile.`,
       step,
     )
   }

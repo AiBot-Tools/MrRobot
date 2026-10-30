@@ -59,7 +59,9 @@
 //   What is offered (Plan.offers, asked by the gate, default no), each only
 //   from what the facts show: the Qdrant cutover, for an existing container
 //   that asks for no key and with no pmmcp-qdrant-prekey kept; the kept
-//   prekey's cleanup once Qdrant enforces the key (not live); the dashboard
+//   prekey's cleanup once Qdrant enforces the key (not live), and only in a
+//   run that asks or does something else anyway: on its own it is a note
+//   that gives its command, and the run has nothing to do; the dashboard
 //   token and the curator secret, each only where pmmcp's code takes it
 //   safely (the token with dashboard_auth and stop_listener_check, the
 //   secret with curator_secret and curator_proof as well, and the curator on
@@ -69,9 +71,13 @@
 //   run's update (L4 then re-reads the facts); the fast-forward to the local
 //   origin/main, only on a clean tree whose uv.lock and pyproject.toml it
 //   leaves alone, and only when something else needs pmmcp changed or the
-//   checkout lacks a feature; and one restart when a digest is staged now, or
+//   checkout lacks a feature; one restart when a digest is staged now, or
 //   is on file but the running MCP server cannot be shown to have started
-//   after http_auth.yaml last changed. Every live item opens the same window:
+//   after http_auth.yaml last changed; and the start, when pmmcp is stopped
+//   with launchd's service unloaded and discovery found that the last
+//   installer run that stopped it ran no start after it (killed or crashed
+//   inside the window, or a stop that did not stop and no start after it:
+//   Found.leftStopped). Every live item opens the same window:
 //   one graceful stop, the chosen changes, one start and its checks, so two
 //   items still make one restart; when pmmcp's MCP server is not running,
 //   the window still runs the stop (for whatever else of pmmcp runs) and
@@ -104,6 +110,14 @@ export const PMMCP_CLIENT = 'aos-kernel'
 
 /** The folder an install has on disk, which the second confirmation types. */
 export const PMMCP_FOLDER = 'Persistent-Memory-MCP'
+
+/** The start offered for a pmmcp left stopped: said as the run folders show it, never what was done by hand since. */
+export const START_QUESTION = 'Start pmmcp (stopped now; the last installer run that stopped it ran no start after it)? [y/N]'
+
+/** What the gate says, in place of asking, for an offer the window of the changes accepted above already carries out. */
+export function impliedAnswer(offer: Pick<Offer, 'id'>): string {
+  return offer.id === 'start' ? 'yes, the window the changes above open ends by starting pmmcp' : 'yes, by the changes above, which restart pmmcp once'
+}
 
 /** The MCP server whose tokenEnv the credentials map gives a pmmcp client. */
 const PMMCP_SERVER = 'pmmcp'
@@ -241,6 +255,8 @@ export interface PmmcpFound {
     readonly untracked: number | undefined
   }
   readonly server: { readonly pid: number; readonly startedAfter: Date | undefined } | undefined
+  /** pmmcp is stopped with launchd's service unloaded, and the last installer run that stopped it ran no start after it (its run folder): the start is offered. */
+  readonly leftStopped: { readonly folder: string } | undefined
   readonly httpAuthModified: Date | undefined
   readonly qdrant: QdrantStatus | undefined
   readonly jobs: FoundJobs
@@ -317,7 +333,7 @@ export type StepId =
   | 'start'
   | 'bearer-check'
 
-export type OfferId = 'qdrant' | 'qdrant-cleanup' | 'auth' | 'update' | 'auth-after-update' | 'restart'
+export type OfferId = 'qdrant' | 'qdrant-cleanup' | 'auth' | 'update' | 'auth-after-update' | 'restart' | 'start'
 
 /** A file pmmcp's auth CLI makes. */
 export type AuthFile = 'dashboard_token' | 'curator_secret'
@@ -487,7 +503,11 @@ class Planner {
       if (this.#staged === undefined) this.#notes.push('--aos-only: pmmcp is not touched')
       else {
         this.#block(
-          `--aos-only: pmmcp is not touched, so the ${this.#staged.client} digest of ${this.#staged.name} is not staged: run the installer without --aos-only to stage it`,
+          this.#staged.from === 'append'
+            ? `--aos-only: pmmcp is not touched, so the ${this.#staged.client} digest of the ${this.#staged.name} this run appends is not staged: run the installer without --aos-only to stage it`
+            : // .env holds the token already: pmmcp may well hold its digest, which is neither checked nor staged here.
+              `--aos-only: pmmcp is not touched, so whether it holds the ${this.#staged.client} digest of ${this.#staged.name} is not checked, nor is the digest staged: ` +
+              'run the installer without --aos-only to check it, and to stage it if pmmcp lacks it',
         )
       }
       this.#staged = undefined
@@ -681,12 +701,8 @@ class Planner {
     const restart = token.onFile && running && !loaded
     if (restart && !token.now && server !== undefined) this.#notes.push(notLoaded(server, found.httpAuthModified))
 
-    // Not live: offered whatever the jobs check can do.
+    // Not live: offered whatever the jobs check can do, but only beside something else (below).
     const cleanup = this.#cleanup(found)
-    if (cleanup !== undefined) {
-      this.#offers.push(cleanup.offer)
-      this.#steps.push(cleanup.step)
-    }
 
     const qdrant = this.#qdrant(found)
     const auth = this.#auth(found)
@@ -703,6 +719,29 @@ class Planner {
         offer: { id: 'restart', question: `Restart pmmcp to load the staged ${PMMCP_CLIENT} token? [y/N]`, impliedByWindow: true, requires: undefined, live: true },
         step: undefined,
       })
+    }
+    // The last installer run that stopped pmmcp ran no start after it (killed or crashed inside the window, or a stop that did not stop and no
+    // start after it), and pmmcp is stopped now: the start, behind the same window and confirmations as any live item; beside another, that
+    // window's own start is it. Said as the folders show it: what was run by hand since is not known here.
+    if (!running && found.leftStopped !== undefined) {
+      this.#notes.push(
+        `the last installer run that stopped pmmcp (its logs: ${found.leftStopped.folder}) ran no start after it, and pmmcp is stopped now: no MCP server listens on ` +
+          `its port, and launchd has its service unloaded until a start (${within(dir, './start-pmmcp-server.sh')})`,
+      )
+      offered.push({ offer: { id: 'start', question: START_QUESTION, impliedByWindow: true, requires: undefined, live: true }, step: undefined })
+    }
+    // The kept prekey's cleanup is asked only in a run that asks or does something else anyway: on its own it is a note with its
+    // command, and a re-run after a cutover has nothing to do (plan A10). The cutover can be rolled back only while the prekey is kept.
+    if (cleanup !== undefined) {
+      if (this.#steps.length > 0 || (offered.length > 0 && this.#jobsGate.available)) {
+        this.#offers.push(cleanup.offer)
+        this.#steps.push(cleanup.step)
+      } else {
+        this.#notes.push(
+          'pmmcp-qdrant-prekey, the keyless Qdrant the cutover kept stopped, is still there: once you no longer want to roll the cutover back, ' +
+            `remove it with ${within(dir, '.venv/bin/python scripts/qdrant_api_key.py cleanup')} (its volumes stay)`,
+        )
+      }
     }
     if (offered.length === 0) return
 
@@ -1120,7 +1159,7 @@ function bearerCheck(): Step {
     id: 'bearer-check',
     tag: 'live',
     // No MCP initialize: the installer holds no token's value (A2) to send one; the kernel's own next request makes the line (plan S7 L6, §9 option (a)).
-    title: `"first request with token" for ${PMMCP_CLIENT} in ~/.persistent-memory-mcp/logs/server.log since the start (not found: inconclusive, not a failure; restart npm run dev to make the line)`,
+    title: `"first request with token" for ${PMMCP_CLIENT} in ~/.persistent-memory-mcp/logs/server.log since the start (not found: inconclusive, not a failure; the AOS daemon's next request makes the line)`,
     short: `the ${PMMCP_CLIENT} bearer check`,
     commands: [],
     rollback: undefined,

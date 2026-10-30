@@ -68,10 +68,14 @@
 //   start to L5's end) it is trapped: the installer says the window is
 //   finishing and goes on, and says so again at the end; the steps there run
 //   in sessions of their own (A3), so neither a Ctrl-C nor a closed terminal
-//   reaches them. While pmmcp's jobs are counted it ends the count (the gate
-//   then ends the run, 130). Anywhere else it ends the run at once, with 130,
-//   129 or 143 (outside the window nothing is half done that a re-run does
-//   not pick up from the state on disk).
+//   reaches them. Once the window has opened, and until the end report is
+//   printed, it is held outside the window too: the run's last checks and
+//   its report (what was done, whether pmmcp is left stopped, what is left
+//   to do) come first, and the run ends with the gate's code. While pmmcp's
+//   jobs are counted it ends the count (the gate then ends the run, 130).
+//   Anywhere else, before the window ever opened, it ends the run at once,
+//   with 130, 129 or 143 (nothing is half done then that a re-run does not
+//   pick up from the state on disk).
 //
 //   Output (scripts/install/output.ts): a write error on stdout or stderr
 //   (EPIPE from a `| tee` the same Ctrl-C ended, EIO from a closed terminal)
@@ -82,12 +86,25 @@
 //   manual start with it. A line typed ahead of a question is not its answer
 //   (scripts/install/terminal.ts).
 //
-//   Exit codes (plan §5): 0 done, or nothing to do, or a dry run; 1 a step
+//   The last line, once the flags were taken: `aos-install: exit N: <how
+//   this run ended>`, the installer's own code and what it was for this run
+//   (scripts/install/ending.ts: the gate's outcome, a refusal, a stop, a
+//   signal or a defect, and "the end report above" only when one was
+//   printed). npm 10 re-raises a SIGINT it forwarded, so `npm run
+//   aos-install` may end with 130 after a Ctrl-C inside the window although
+//   the installer finished; this line is the run's word, and `node --import
+//   tsx scripts/install.ts` (from the root) exits with the installer's own
+//   code.
+//
+//   Exit codes (plan §5): 0 done, nothing to do, a dry run, or declined; 1 a step
 //   failed and the state is as reported (also a leak, or an installer defect,
 //   before the window opened); 2 refused before any change; 3 changes are
 //   needed but stdin is not a terminal; 4 a live step failed and pmmcp is not
 //   in its intended state (also a defect once the window had opened); 130
-//   interrupted outside the window (129 and 143 for SIGHUP and SIGTERM).
+//   interrupted before the window opened (129 and 143 for SIGHUP and
+//   SIGTERM), and the input ending or any of those signals at a prompt,
+//   which answers it, or during the jobs count, which it ends (130 whichever
+//   it was: the last line says "interrupted", not which).
 
 import { readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
@@ -102,11 +119,12 @@ import { parseProviders, type ProvidersFile } from '../src/models/registry.js'
 import { DotenvWriteError, credentialNames, inspectCredentials, type InspectResult } from '../src/secrets/dotenv-append.js'
 import { Applier, tuiPids } from './install/apply.js'
 import { DiscoverError, PLIST_LABEL, discover, type Absent, type Found } from './install/discover.js'
+import { defectEnding, exitLine, outcomeEnding, refusedEnding, signalEnding, stoppedEnding, type Ending } from './install/ending.js'
 import { startWithPs, takeLock } from './install/lock.js'
 import { Output } from './install/output.js'
 import { npmTookFlags, preflight } from './install/preflight.js'
 import { InstallRunError, Runner, shownLine } from './install/run.js'
-import { HANDLED_SIGNALS, defectExit, handleSignal, signalWords, type HandledSignal } from './install/signals.js'
+import { HANDLED_SIGNALS, defectExit, handleSignal, signalWords, windowChanged, type HandledSignal } from './install/signals.js'
 import { Terminal } from './install/terminal.js'
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
@@ -127,7 +145,9 @@ const USAGE = [
   'The flags go after --, as in npm run aos-install -- --dry-run: npm takes one given before -- as its own.',
   'There is no --yes and no --force. Exit codes: 0 done or nothing to do; 1 a step failed; 2 refused',
   'before any change; 3 changes are needed but stdin is not a terminal; 4 a live step failed and pmmcp',
-  'is not in its intended state; 130 interrupted outside the stopped window (129, 143 by SIGHUP, SIGTERM).',
+  'is not in its intended state; 130 interrupted before the stopped window (129, 143 by SIGHUP, SIGTERM; 130 for',
+  'any of them at a question or during the jobs count). Once the window opened, a signal waits for the end report.',
+  'Its last line, aos-install: exit N, is its own code: after a Ctrl-C npm may report 130 for a run it finished.',
 ].join('\n')
 
 interface Flags {
@@ -194,8 +214,8 @@ function kernelLine(kernel: Found['kernel'], config: KernelConfig): string {
   return `kernel     kernel.yaml url ${url}; ${token}; ${daemon}`
 }
 
-/** S3 for an install that is there: names, states, commits and paths, never a value. */
-function foundScreen(f: Found, config: KernelConfig): string[] {
+/** S3 for an install that is there: names, states, commits and paths, never a value. Exported for its test. */
+export function foundScreen(f: Found, config: KernelConfig): string[] {
   const out: string[] = []
   const facts = f.facts
   out.push(`pmmcp      ${f.install.dir} (${SOURCE_LABEL[f.install.source]}), origin AiBot-Tools/persistent-memory-mcp`)
@@ -211,9 +231,15 @@ function foundScreen(f: Found, config: KernelConfig): string[] {
       : ''
   out.push(`code       ${g.head === undefined ? 'HEAD not read' : g.head.slice(0, 7)}${branch} ${tree}${missing}${update}`)
   const s = f.service
-  const service = s.loaded ? `${PLIST_LABEL} loaded${s.state === undefined ? '' : `, ${s.state}`}${s.pid === undefined ? '' : `, pid ${String(s.pid)}`}` : `${PLIST_LABEL} not loaded`
+  const service =
+    s.loaded === undefined
+      ? `${PLIST_LABEL}: whether launchd has it loaded is not known`
+      : s.loaded
+        ? `${PLIST_LABEL} loaded${s.state === undefined ? '' : `, ${s.state}`}${s.pid === undefined ? '' : `, pid ${String(s.pid)}`}`
+        : `${PLIST_LABEL} not loaded`
   const server = f.server === undefined ? 'no MCP server on its port' : `MCP server pid ${String(f.server.pid)}${f.server.startedAfter === undefined ? '' : `, started after ${f.server.startedAfter.toISOString()}`}`
-  out.push(`service    ${service}; ${server}`)
+  const left = f.leftStopped === undefined ? '' : `; the last installer run that stopped it ran no start after it (${f.leftStopped.folder})`
+  out.push(`service    ${service}; ${server}${left}`)
   const e = f.endpoints
   const at = facts?.config
   const health = e.health === 0 ? 'no answer' : String(e.health)
@@ -255,15 +281,30 @@ function readYaml(path: string): unknown {
   return parseYaml(readFileSync(path, 'utf8'))
 }
 
-/** Whether the outcome followed a phase that ran (or failed): the end report is printed then. */
-const ranAPhase = (outcome: GateOutcome): boolean =>
+/** Whether the outcome followed a phase that ran (or failed): the end report is printed then, and only then. Exported for its test. */
+export const ranAPhase = (outcome: GateOutcome): boolean =>
   outcome.kind === 'failed' || outcome.kind === 'done' || ((outcome.kind === 'declined' || outcome.kind === 'aborted') && outcome.applied.length > 0)
+
+/**
+ * What a throw from discovery or the TUI check ends the run with: a leak
+ * or a halted runner (a registered value reached a child's output), or
+ * discovery's own defect, stops it before any change, exit 1 (a defect,
+ * never 2: nothing was refused); anything else is undefined here, and
+ * main throws it on (a defect of its own). Exported for its test.
+ */
+export function stoppedBy(e: unknown): { readonly line: string; readonly ending: Ending } | undefined {
+  if (e instanceof InstallRunError && (e.code === 'AOS_INSTALL_RUN_LEAK' || e.code === 'AOS_INSTALL_RUN_HALTED')) return { line: `stopped: ${e.message}`, ending: stoppedEnding() }
+  if (e instanceof DiscoverError) return { line: `discovery failed (a defect, report it): ${e.message}`, ending: stoppedEnding() }
+  return undefined
+}
 
 /** What main shares with the signal handlers and the end of the run. */
 interface RunState {
   terminal: Terminal | undefined
   windowOpen: boolean
   windowOpened: boolean
+  /** From the window's first opening until the end report is printed (signals.ts windowChanged). */
+  reporting: boolean
   counting: boolean
   readonly interrupt: AbortController
   pmmcpDir: string | undefined
@@ -271,11 +312,18 @@ interface RunState {
   last: { readonly signal: HandledSignal; readonly at: number } | undefined
   /** The signals the window trapped. */
   readonly trapped: Set<HandledSignal>
+  /** The signals held after the window until the end report. */
+  readonly held: Set<HandledSignal>
   /** The run's log folder, once a child made it. */
   logs: () => string | undefined
+  /** Once the flags were taken (not --help, not a usage error): the run ends with its exit line. */
+  exitLine: boolean
 }
 
-async function main(argv: readonly string[], state: RunState, out: Output): Promise<number> {
+/** A usage error or --help: no run, so no exit line. */
+const noRun = (code: 0 | 2): Ending => ({ code, why: '' })
+
+async function main(argv: readonly string[], state: RunState, out: Output): Promise<Ending> {
   const root = REPO_ROOT
   const say = (line: string): void => out.say(line)
   // A flag npm took before `--` never reached argv: whatever is left would run without it.
@@ -286,17 +334,18 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
       `${shownLine(`npm took ${list(taken)} as its own option${taken.length > 1 ? 's' : ''}, so the installer was not given ${taken.length > 1 ? 'them' : 'it'}: ` +
         "put the installer's flags after --, as in npm run aos-install -- --dry-run")}\n\n${USAGE}\n`,
     )
-    return 2
+    return noRun(2)
   }
   const flags = parseFlags(argv, process.cwd())
   if ('error' in flags) {
     out.raw('stderr', `${shownLine(flags.error)}\n\n${USAGE}\n`)
-    return 2
+    return noRun(2)
   }
   if (flags.help) {
     out.raw('stdout', `${USAGE}\n`)
-    return 0
+    return noRun(0)
   }
+  state.exitLine = true
 
   // S1
   const home = process.env['HOME']
@@ -305,7 +354,7 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
   if (pre.refusals.length > 0 || home === undefined) {
     say('refused before any change:')
     for (const r of pre.refusals) say(`  - ${r}`)
-    return 2
+    return refusedEnding()
   }
 
   const runner = new Runner({ repoRoot: root })
@@ -313,7 +362,7 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
   const lock = await takeLock({ root, print: say, startOf: startWithPs(runner, root) })
   if (typeof lock === 'string') {
     say(`refused before any change: ${lock}`)
-    return 2
+    return refusedEnding()
   }
   process.once('exit', () => lock.release())
 
@@ -324,7 +373,7 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
     providers = parseProviders(readYaml(join(root, 'config', 'providers.yaml')))
   } catch (e) {
     say(`refused before any change: the config cannot be read: ${e instanceof Error ? e.message : String(e)}`)
-    return 2
+    return refusedEnding()
   }
 
   // S2: names, lines and states only; the writer's inspection reads .env without opening it for writing.
@@ -339,7 +388,7 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
   } catch (e) {
     if (!(e instanceof DotenvWriteError) && !(e instanceof ConfigError)) throw e
     say(`refused before any change: ${e.message}`)
-    return 2
+    return refusedEnding()
   }
   const exported = exportedNames(process.env, accepted)
 
@@ -351,23 +400,18 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
     // S3
     let found: Awaited<ReturnType<typeof discover>>
     try {
-      found = await discover({ repoRoot: root, home, runner, config, providers, ...(flags.pmmcpDir === undefined ? {} : { pmmcpDir: flags.pmmcpDir }) })
+      found = await discover({ repoRoot: root, home, runner, config, providers, print: say, ...(flags.pmmcpDir === undefined ? {} : { pmmcpDir: flags.pmmcpDir }) })
     } catch (e) {
-      if (e instanceof InstallRunError && (e.code === 'AOS_INSTALL_RUN_LEAK' || e.code === 'AOS_INSTALL_RUN_HALTED')) {
-        say(`stopped: ${e.message}`)
-        return 1
-      }
-      if (e instanceof DiscoverError) {
-        say(`discovery failed (a defect, report it): ${e.message}`)
-        return 1
-      }
-      throw e
+      const stopped = stoppedBy(e)
+      if (stopped === undefined) throw e
+      say(stopped.line)
+      return stopped.ending
     }
     if (found.kind === 'stopped') {
       if (found.install !== undefined) say(`pmmcp      ${found.install.dir} (${SOURCE_LABEL[found.install.source]})`)
       say('refused before any change:')
       for (const stop of found.stops) say(`  - ${stop.message}`)
-      return 2
+      return refusedEnding()
     }
     discovery = found
     const notes = [...found.notes]
@@ -377,11 +421,11 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
       try {
         pids = await tuiPids(runner, found.install.dir)
       } catch (e) {
-        if (e instanceof InstallRunError) {
-          say(`stopped: ${e.message}`)
-          return 1
-        }
-        throw e
+        // tuiPids throws a leak or a halt only: any other failure of pgrep is no answer.
+        const stopped = stoppedBy(e)
+        if (stopped === undefined) throw e
+        say(stopped.line)
+        return stopped.ending
       }
       if (pids === undefined) notes.push('whether a scripts/monitor_tui.py runs cannot be told (pgrep gave no answer): the installer checks again before it makes a curator secret')
       tui = pids ?? []
@@ -422,10 +466,7 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
     discovery,
     print: say,
     ask: (question) => terminal.ask(question),
-    window: (open) => {
-      state.windowOpen = open
-      if (open) state.windowOpened = true
-    },
+    window: (open) => windowChanged(state, open),
     interrupt: state.interrupt.signal,
   })
   const io: GateIO = {
@@ -444,8 +485,11 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
     apply: (phase, steps) => applier.apply(phase, steps),
   }
   const outcome = await runGate(plan, io, { dryRun: flags.dryRun, discovery: s3, ...(runner.dir === undefined ? {} : { logs: runner.dir }) })
-  if (ranAPhase(outcome)) for (const line of applier.report()) say(line)
-  return outcome.exitCode
+  const reported = ranAPhase(outcome)
+  if (reported) for (const line of applier.report()) say(line)
+  // The report is out: what a held signal waited for is said.
+  state.reporting = false
+  return outcomeEnding(outcome, reported)
 }
 
 /**
@@ -454,12 +498,17 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
  * once what is queued on stdout and stderr is handed on (process.exit alone
  * can cut a pipe's last lines on macOS).
  */
-function finish(out: Output, state: RunState, code: number): void {
+function finish(out: Output, state: RunState, ending: Ending): void {
   if (finishing) return
   finishing = true
+  const code = ending.code
   if (state.trapped.size > 0) {
     out.say(`${list([...state.trapped].map(signalWords))} came while pmmcp was stopped; the installer went on to the start and its checks, as reported above`)
   }
+  if (state.held.size > 0) {
+    out.say(`${list([...state.held].map(signalWords))} came after the stopped window; the installer finished its checks and printed the end report above first`)
+  }
+  if (state.exitLine) out.say(exitLine(ending))
   const kept = out.keep(state.logs(), code)
   if (kept !== undefined) out.warn(`the installer's output went away (${out.lost?.code ?? 'unknown'}) during the run; what it said is in ${kept}`)
   out.flush(() => process.exit(code))
@@ -476,36 +525,43 @@ if (entry !== undefined && fileURLToPath(import.meta.url) === resolve(entry)) {
     terminal: undefined,
     windowOpen: false,
     windowOpened: false,
+    reporting: false,
     counting: false,
     interrupt: new AbortController(),
     pmmcpDir: undefined,
     last: undefined,
     trapped: new Set(),
+    held: new Set(),
     logs: () => undefined,
+    exitLine: false,
   }
   // A read error on stdin (EIO once the terminal is gone) ends the question it was read for (the terminal's), never the run.
   process.stdin.on('error', () => undefined)
   for (const signal of HANDLED_SIGNALS) {
     process.on(signal, () => {
+      // The last line is printed (or being handed on): nothing is said after it.
+      if (finishing) return
       handleSignal(state, signal, Date.now(), {
         promptOpen: () => state.terminal?.promptOpen === true,
         answer: () => state.terminal?.interrupt(),
         trapped: (s) => out.say(`${signalWords(s)} does not interrupt the stopped window: its steps run in sessions of their own. It is finishing; wait for the start and its checks.`),
+        held: (s) =>
+          out.say(`${signalWords(s)} does not end the run yet: the stopped window opened in this run, so the installer finishes its last checks and prints the end report (what was done, and what is left to do) first.`),
         abortCount: () => state.interrupt.abort(),
         exit: (code, s) => {
           out.say(s === 'SIGINT' ? 'interrupted: nothing more is done' : `ended by ${s}: nothing more is done`)
-          finish(out, state, code)
+          finish(out, state, signalEnding(code, s))
         },
       })
     })
   }
   main(process.argv.slice(2), state, out)
-    .then((code) => finish(out, state, code))
+    .then((ending) => finish(out, state, ending))
     .catch((e: unknown) => {
       out.warn(`npm run aos-install failed (a defect, report it): ${e instanceof Error ? e.message : String(e)}`)
       if (state.windowOpened && state.pmmcpDir !== undefined) {
         out.warn(`pmmcp may be stopped: start it with cd ${shellWord(state.pmmcpDir)} && ./start-pmmcp-server.sh`)
       }
-      finish(out, state, defectExit(state.windowOpened))
+      finish(out, state, defectEnding(defectExit(state.windowOpened)))
     })
 }

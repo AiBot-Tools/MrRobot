@@ -262,7 +262,7 @@ export function parseDotenv(text: string, accepted: ReadonlySet<string>, label =
       continue
     }
     if (value.toLowerCase().startsWith(PLACEHOLDER_PREFIX)) {
-      problems.push(`line ${String(n)}: ${name} still holds the .env.example placeholder: put the real value there`)
+      problems.push(`line ${String(n)}: ${name} still holds the .env.example placeholder: delete that line, or put the real value there, then re-run`)
       continue
     }
 

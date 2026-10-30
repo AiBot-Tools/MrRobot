@@ -63,15 +63,62 @@ export function runEntry(
   return spawnSync(process.execPath, ['--import', 'tsx', entry, ...args], { ...opts, cwd: checkout.root, encoding: 'utf8' })
 }
 
-/** Start an entry point from the copy, stdin closed, stdout and stderr piped. */
+/**
+ * Gives a child a terminal: python3's pty module (no Node dependency has
+ * one). It forks the command on a new pseudo-terminal, its stdin, stdout and
+ * stderr; copies what the command writes there to its own stdout; types
+ * Ctrl-D (the end of the input) once that output holds the cue, and never
+ * anything else; and exits with the command's status.
+ */
+const PTY_WRAPPER = [
+  'import os, pty, sys',
+  'cue = sys.argv[1].encode()',
+  'pid, fd = pty.fork()',
+  'if pid == 0:',
+  '    os.execv(sys.argv[2], sys.argv[2:])',
+  "out = b''",
+  'sent = False',
+  'while True:',
+  '    try:',
+  '        chunk = os.read(fd, 4096)',
+  '    except OSError:',
+  '        break',
+  '    if not chunk:',
+  '        break',
+  '    out += chunk',
+  '    if not sent and cue in out:',
+  "        os.write(fd, b'\\x04')",
+  '        sent = True',
+  '_, status = os.waitpid(pid, 0)',
+  'sys.stdout.buffer.write(out)',
+  'sys.stdout.flush()',
+  'sys.exit(os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))',
+  '',
+].join('\n')
+
+/** Whether a terminal can be given to an entry point here (spawnEntry's `eofAfter`): python3 with its pty module. */
+export function terminalAvailable(): boolean {
+  return spawnSync('python3', ['-I', '-c', 'import os, pty'], { encoding: 'utf8' }).status === 0
+}
+
+/**
+ * Start an entry point from the copy, stdin closed, stdout and stderr piped.
+ * With `eofAfter`, it runs at a terminal instead (PTY_WRAPPER): its stdin and
+ * stdout are one, the end of the input is typed once its output holds that
+ * text, and what it wrote there (stderr included, lines ending \r\n) comes on
+ * stdout when it has exited.
+ */
 export function spawnEntry(
   checkout: ShadowCheckout,
   entry: EntryPoint,
   args: readonly string[],
-  opts: Omit<SpawnOptions, 'cwd' | 'stdio'> = {},
+  opts: Omit<SpawnOptions, 'cwd' | 'stdio'> & { readonly eofAfter?: string } = {},
 ): ChildProcessByStdio<null, Readable, Readable> {
   noCwd(opts)
-  return spawn(process.execPath, ['--import', 'tsx', entry, ...args], { ...opts, cwd: checkout.root, stdio: ['ignore', 'pipe', 'pipe'] })
+  const { eofAfter, ...options } = opts
+  const node = [process.execPath, '--import', 'tsx', entry, ...args]
+  if (eofAfter !== undefined) return spawn('python3', ['-I', '-c', PTY_WRAPPER, eofAfter, ...node], { ...options, cwd: checkout.root, stdio: ['ignore', 'pipe', 'pipe'] })
+  return spawn(process.execPath, node.slice(1), { ...options, cwd: checkout.root, stdio: ['ignore', 'pipe', 'pipe'] })
 }
 
 export function shadowCheckout(): ShadowCheckout {

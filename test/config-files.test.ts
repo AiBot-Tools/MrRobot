@@ -553,6 +553,10 @@ test("README's installer section and D35 say what the installer does: the export
   assert.match(section, /`active\.json` too, while a `--jobs` count runs/)
   assert.match(section, /`kernel\.yaml` declares `AOS_PMMCP_TOKEN`, and pmmcp is given only the `sha256:` digest of that `aos-kernel` token, never the token/)
   assert.match(section, /The flags go after `--`: npm takes `npm run aos-install --dry-run` as its own `--dry-run`/)
+  // 130 for any handled signal at a question or during the jobs count (the gate aborts the count), and 129 or 143 only before the window.
+  assert.match(section, /130 interrupted before the stopped window opened \(129 and 143 for SIGHUP and SIGTERM; 130 for the input ending, or for any of those signals, at a question, which it answers, or during the jobs count, which it ends\)/)
+  // After the window opened, a signal waits for the end report.
+  assert.match(section, /From the window's first opening until the end report is printed, a signal outside the window \(at no question\) is held as well/)
   const row = readme.split('\n').find((l) => l.startsWith('| `npm run aos-install` |')) ?? ''
   assert.match(row, /stage pmmcp's `aos-kernel` digest of `AOS_PMMCP_TOKEN`; `npm run aos-install -- --dry-run` changes nothing/)
   // CLAUDE.md's Commands line names the dry run as npm must be given it.

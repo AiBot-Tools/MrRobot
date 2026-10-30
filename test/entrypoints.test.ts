@@ -37,12 +37,16 @@ import { PassThrough, Writable } from 'node:stream'
 import { closeVerified, withStore } from './helpers/store.js'
 import { EventStore } from '../src/events/store.js'
 import { tmpdir } from './helpers/tmpdir.js'
-import { runEntry, shadowCheckout, spawnEntry, TRAP_DOTENV, type ShadowCheckout } from './helpers/checkout.js'
+import { runEntry, shadowCheckout, spawnEntry, terminalAvailable, TRAP_DOTENV, type ShadowCheckout } from './helpers/checkout.js'
 import { CEO_SUITE } from '../src/eval/suite.js'
 import { BOOT_SLACK_MS, lockPath, takeLock, type LockOptions } from '../scripts/install/lock.js'
+import { defectEnding, exitLine, outcomeEnding, refusedEnding, signalEnding, stoppedEnding } from '../scripts/install/ending.js'
 import { Output, TRANSCRIPT_FILE } from '../scripts/install/output.js'
 import { npmTookFlags, preflight, productVersion, stubRefusals } from '../scripts/install/preflight.js'
-import { HANDLED_SIGNALS, REPEAT_MS, SIGNAL_EXIT, defectExit, handleSignal, onSignal, type HandledSignal, type SignalState, type SignalView } from '../scripts/install/signals.js'
+import { HANDLED_SIGNALS, REPEAT_MS, SIGNAL_EXIT, defectExit, handleSignal, onSignal, windowChanged, type HandledSignal, type SignalState, type SignalView, type WindowMarks } from '../scripts/install/signals.js'
+import { ranAPhase, stoppedBy } from '../scripts/install.js'
+import { DiscoverError } from '../scripts/install/discover.js'
+import { InstallRunError } from '../scripts/install/run.js'
 import { TYPE_AHEAD_MS, Terminal } from '../scripts/install/terminal.js'
 
 // Every program here runs from a copy of the checkout holding a trap .env,
@@ -872,7 +876,9 @@ test('aos-install --dry-run with an empty HOME finds no pmmcp, prints the plan a
   assert.match(run.stdout, /exports {5}DOCKER_CONFIG and PMMCP_DEBUG: pmmcp's commands run without them/)
   assert.match(run.stdout, /pmmcp {6}not found \(looked at .*com\.aibot\.pmmcp\.plist.*the listener on 127\.0\.0\.1:8766.*Github\/Persistent-Memory-MCP\)/)
   assert.match(run.stdout, /^kernel {5}kernel\.yaml url matches; pmmcp tokenEnv AOS_PMMCP_TOKEN; AOS daemon listening on \d+$/m)
-  assert.match(run.stdout, /^ {2}- the AOS daemon listens on \d+: restart it after this run$/m)
+  // That it listens, and no restart: nothing it reads changes in a dry run (the end report asks one only when something did).
+  assert.match(run.stdout, /^ {2}- the AOS daemon listens on \d+: it reads \.env when it starts, and the end report's next steps say whether this run needs it restarted$/m)
+  assert.doesNotMatch(run.stdout, /restart it after this run|^ {2}restart npm run dev \(it reads \.env when it starts\)/m)
   // The plan: .env by name, the fresh install it would make, every step as would-do, and the typed word it would ask.
   assert.match(run.stdout, /^\.env {2}.*\.env {2}absent \(created at 0600 when something is appended\)$/m)
   assert.match(run.stdout, /^ {2}AOS_CONTROL_TOKEN +missing {2}-> will be generated \(64 hex\)$/m)
@@ -885,6 +891,8 @@ test('aos-install --dry-run with an empty HOME finds no pmmcp, prints the plan a
   assert.match(run.stdout, /^would \d+\. \[fresh install\] clone pmmcp to /m)
   assert.match(run.stdout, /would ask you to type `install` before anything is installed/)
   assert.match(run.stdout, /dry run: nothing was changed, nothing was stopped or started \(probe output in .*\.aos\/install\/\d{8}T\d{6}Z\)/)
+  // Its last line is its own exit code, the run's word whatever npm's own status says after a Ctrl-C it forwarded.
+  assert.equal(run.stdout.trimEnd().split('\n').at(-1), 'aos-install: exit 0: a dry run: nothing was changed, stopped or started')
   // In plan §5's order: S1, S2 (.env), S3 (what discovery found), then the plan.
   const lines = run.stdout.split('\n')
   const order = [/^preflight:$/, /^\.env {2}/, /^pmmcp {6}not found/, /^discovery notes:$/, /^plan:$/].map((re) => lines.findIndex((l) => re.test(l)))
@@ -927,6 +935,7 @@ test('aos-install with stdin not a terminal prints the plan and exits 3', async 
   // Its hint names the dry run as npm must be given it: after --.
   assert.match(run.stdout, /\(or npm run aos-install -- --dry-run /)
   assert.doesNotMatch(run.stdout, /\[y\/N\]|Type `install`/, 'a question was asked of a pipe')
+  assert.equal(run.stdout.trimEnd().split('\n').at(-1), 'aos-install: exit 3: changes are needed, but stdin is not a terminal: nothing was changed')
   assert.equal(existsSync(join(m.checkout.root, '.env')), false, '.env was written')
   assert.deepEqual(m.calls().filter((l) => !l.startsWith('env ')), ['lsof -nP -iTCP:8766 -sTCP:LISTEN -Fpu', 'docker context show', 'docker info --format {{.ServerVersion}}'])
 
@@ -940,6 +949,34 @@ test('aos-install with stdin not a terminal prints the plan and exits 3', async 
   assert.equal(existsSync(join(aos.checkout.root, '.env')), false)
   assert.deepEqual(aos.calls(), [])
   assert.deepEqual(runFolders(aos.checkout.root), [], 'a program ran for --aos-only')
+})
+
+test('aos-install at a terminal: the input ending at its question aborts with exit 130, nothing changed, and its last line says the input ended', async (t) => {
+  // The one prompt an empty HOME gets is the fresh install's typed word. The
+  // end of the input there is no "no" to a question the installer can go on
+  // past: the run ends, and its last line, the run's word, says how.
+  if (!terminalAvailable()) {
+    t.diagnostic('no python3 with its pty module here, so no terminal can be given to the installer: the exit line is held in process only')
+    return
+  }
+  const m = await installerMachine(t, { trap: false })
+  const child = spawnEntry(m.checkout, 'scripts/install.ts', [], { env: installerEnv(m), eofAfter: 'Type `install` to begin', ...INSTALLER_AS })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')))
+  child.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')))
+  const timer = setTimeout(() => child.kill('SIGKILL'), 90_000)
+  const status = await new Promise<number | null>((resolve) => child.on('close', (code) => resolve(code)))
+  clearTimeout(timer)
+  const text = stdout.replace(/\r\n/g, '\n')
+  assert.equal(status, 130, `${text}${stderr}`)
+  assert.match(text, /^ {2}\d+\. \[fresh install\] clone pmmcp to /m)
+  assert.match(text, /^aborted \(the input ended\): nothing live was done, nothing was installed, and nothing was changed$/m)
+  assert.equal(text.trimEnd().split('\n').at(-1), 'aos-install: exit 130: aborted, the input ended at a question: nothing was changed')
+  assert.doesNotMatch(text, /Ctrl-C/)
+  assert.equal(existsSync(join(m.checkout.root, '.env')), false, '.env was written')
+  assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false, 'the lock was left behind')
+  assert.deepEqual(m.calls().filter((l) => !l.startsWith('env ')), ['lsof -nP -iTCP:8766 -sTCP:LISTEN -Fpu', 'docker context show', 'docker info --format {{.ServerVersion}}'])
 })
 
 test('aos-install rejects an unknown flag with usage and exit 2', async (t) => {
@@ -963,6 +1000,7 @@ test('aos-install rejects an unknown flag with usage and exit 2', async (t) => {
     assert.equal(run.status, 2, `${JSON.stringify(args)}: ${run.stdout}${run.stderr}`)
     assert.match(run.stderr, /usage: npm run aos-install/, JSON.stringify(args))
     assert.match(run.stderr, /There is no --yes and no --force/)
+    assert.match(run.stderr, /130 for\nany of them at a question or during the jobs count\)\. Once the window opened, a signal waits for the end report\./)
     assert.equal(run.stdout, '', `${JSON.stringify(args)}: printed more than usage`)
   }
   // Refused before anything was looked at: not even the lock's folder was made.
@@ -975,6 +1013,8 @@ test('aos-install rejects an unknown flag with usage and exit 2', async (t) => {
     assert.equal(help.status, 0, `${flag}: ${help.stderr}`)
     assert.match(help.stdout, /--dry-run {10}discover and plan only/, flag)
     assert.match(help.stdout, /The flags go after --, as in npm run aos-install -- --dry-run/, flag)
+    // Usage is no run: it has no exit line.
+    assert.doesNotMatch(help.stdout, /^aos-install: exit/m, flag)
   }
   assert.deepEqual(changed(before, snapshot(m.checkout.root)), [])
 })
@@ -1257,10 +1297,10 @@ test('aos-install ends at once on Ctrl-C, a hangup or SIGTERM outside the stoppe
   // status its default would give, and the lock is released (a default
   // SIGHUP or SIGTERM would leave it behind). Here it comes while discovery
   // waits on docker.
-  for (const [signal, code, said] of [
-    ['SIGINT', 130, /interrupted: nothing more is done/],
-    ['SIGHUP', 129, /ended by SIGHUP: nothing more is done/],
-    ['SIGTERM', 143, /ended by SIGTERM: nothing more is done/],
+  for (const [signal, code, said, last] of [
+    ['SIGINT', 130, /interrupted: nothing more is done/, 'SIGINT (Ctrl-C)'],
+    ['SIGHUP', 129, /ended by SIGHUP: nothing more is done/, 'SIGHUP (the terminal closed)'],
+    ['SIGTERM', 143, /ended by SIGTERM: nothing more is done/, 'SIGTERM'],
   ] as const) {
     const m = await installerMachine(t, { trap: false })
     m.hold()
@@ -1280,6 +1320,7 @@ test('aos-install ends at once on Ctrl-C, a hangup or SIGTERM outside the stoppe
     m.release()
     assert.deepEqual(ended, { code, signal: null }, `${signal}: ${stdout}`)
     assert.match(stdout, said)
+    assert.equal(stdout.trimEnd().split('\n').at(-1), `aos-install: exit ${String(code)}: ended by ${last} outside the stopped window: nothing more was done`, signal)
     assert.doesNotMatch(stdout, /^plan:/m, `${signal}: it went on to plan`)
     assert.equal(existsSync(join(m.checkout.root, '.env')), false)
     assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false, `${signal}: the lock was left behind`)
@@ -1318,14 +1359,66 @@ test('aos-install goes on when its stdout reader is gone: no EPIPE crash, its li
 // found install or a real signal: each piece is a module of its own
 // (scripts/install/*.ts) that install.ts only wires.
 
+test("the installer's last line says how this run ended: the input ending or an interrupt (never named Ctrl-C), a decline that changed nothing, and the end report only when one was printed", () => {
+  const line = (...a: Parameters<typeof outcomeEnding>): string => exitLine(outcomeEnding(...a))
+  // EOF and an interrupt at a question, before anything was applied: no end report is printed then.
+  assert.equal(line({ kind: 'aborted', at: 'offer', by: 'eof', applied: [], exitCode: 130 }, false), 'aos-install: exit 130: aborted, the input ended at a question: nothing was changed')
+  assert.equal(
+    line({ kind: 'aborted', at: 'second-confirmation', by: 'interrupt', applied: [], exitCode: 130 }, false),
+    'aos-install: exit 130: aborted, interrupted at a question: nothing was changed',
+  )
+  assert.equal(line({ kind: 'aborted', at: 'jobs', by: 'interrupt', applied: [], exitCode: 130 }, false), 'aos-install: exit 130: aborted, interrupted at the jobs check: nothing was changed')
+  // The input ending during the jobs wait (or at its question) is the check's, not "a question".
+  assert.equal(line({ kind: 'aborted', at: 'jobs', by: 'eof', applied: [], exitCode: 130 }, false), 'aos-install: exit 130: aborted, the input ended at the jobs check: nothing was changed')
+  // After the non-live steps: their end report was printed.
+  assert.equal(
+    line({ kind: 'aborted', at: 'first-confirmation', by: 'eof', applied: ['non-live'], exitCode: 130 }, true),
+    'aos-install: exit 130: aborted, the input ended at a question: nothing live was done (the non-live steps were applied: see the end report above)',
+  )
+  // A jobs count that is unknown, with nothing applied: exit 1, and no end report to point at.
+  assert.equal(line({ kind: 'aborted', at: 'jobs', by: 'jobs', applied: [], exitCode: 1 }, false), "aos-install: exit 1: pmmcp's jobs could not be counted, so nothing was stopped: see above")
+  assert.equal(line({ kind: 'aborted', at: 'jobs', by: 'jobs', applied: ['non-live'], exitCode: 1 }, true), "aos-install: exit 1: pmmcp's jobs could not be counted, so nothing was stopped: see the end report above")
+  assert.equal(line({ kind: 'aborted', at: 'jobs', by: 'quit', applied: [], exitCode: 0 }, false), 'aos-install: exit 0: aborted at the jobs wait (q): nothing was changed')
+  // Declined: exit 0, and never "done".
+  assert.equal(line({ kind: 'declined', at: 'offer', applied: [], exitCode: 0 }, false), 'aos-install: exit 0: declined: nothing was changed')
+  assert.equal(
+    line({ kind: 'declined', at: 'second-confirmation', applied: ['non-live'], exitCode: 0 }, true),
+    'aos-install: exit 0: declined: nothing live was done (the non-live steps were applied: see the end report above)',
+  )
+  // A failed phase always has its end report.
+  assert.equal(line({ kind: 'failed', phase: 'non-live', applied: [], exitCode: 1 }, true), 'aos-install: exit 1: a step failed, and the state is as the end report above says')
+  assert.equal(line({ kind: 'failed', phase: 'non-live', applied: [], exitCode: 2 }, true), 'aos-install: exit 2: refused before any change: see the end report above')
+  assert.equal(line({ kind: 'failed', phase: 'live', applied: ['non-live'], exitCode: 4 }, true), 'aos-install: exit 4: a live step failed, and pmmcp is not in its intended state: see the end report above')
+  assert.equal(line({ kind: 'done', applied: ['non-live'], exitCode: 0 }, true), 'aos-install: exit 0: done: see the end report above')
+  assert.equal(line({ kind: 'dry-run', exitCode: 0 }, false), 'aos-install: exit 0: a dry run: nothing was changed, stopped or started')
+  assert.equal(line({ kind: 'refused', exitCode: 2 }, false), 'aos-install: exit 2: refused before any change: see above')
+  // Before the gate: a refusal, a stop by a defect (a leak, a halt, discovery's own), a defect anywhere, a signal: none has an end report.
+  assert.equal(exitLine(refusedEnding()), 'aos-install: exit 2: refused before any change: see above')
+  assert.equal(exitLine(stoppedEnding()), 'aos-install: exit 1: stopped before any change: see above')
+  assert.equal(exitLine(defectEnding(1)), 'aos-install: exit 1: a defect (report it) before the stopped window: see above')
+  assert.equal(exitLine(defectEnding(4)), 'aos-install: exit 4: a defect (report it) once the stopped window had opened: pmmcp may be stopped, see above')
+  assert.equal(exitLine(signalEnding(143, 'SIGTERM')), 'aos-install: exit 143: ended by SIGTERM outside the stopped window: nothing more was done')
+  // No line points at an end report that was not printed, and none names Ctrl-C for an interrupt at a prompt.
+  for (const reported of [false, true]) {
+    for (const by of ['eof', 'interrupt', 'quit', 'jobs'] as const) {
+      const text = line({ kind: 'aborted', at: 'offer', by, applied: [], exitCode: by === 'quit' ? 0 : by === 'jobs' ? 1 : 130 }, reported)
+      assert.doesNotMatch(text, /Ctrl-C/, text)
+      if (!reported) assert.doesNotMatch(text, /end report/, text)
+    }
+  }
+})
+
 test('a signal answers an open prompt, is trapped inside the window, ends a jobs count, or ends the run with 128 + its number; the same one again within REPEAT_MS is one delivery; a defect exits 4 once the window opened', () => {
-  const view = (o: Partial<SignalView> = {}): SignalView => ({ promptOpen: false, windowOpen: false, counting: false, last: undefined, ...o })
+  const view = (o: Partial<SignalView> = {}): SignalView => ({ promptOpen: false, windowOpen: false, reporting: false, counting: false, last: undefined, ...o })
   assert.deepEqual(HANDLED_SIGNALS, ['SIGINT', 'SIGHUP', 'SIGTERM'])
   assert.deepEqual(SIGNAL_EXIT, { SIGINT: 130, SIGHUP: 129, SIGTERM: 143 })
   for (const signal of HANDLED_SIGNALS) {
     // In this order: a prompt's answer first, then the window, then the count.
     assert.deepEqual(onSignal(view({ promptOpen: true, windowOpen: true, counting: true }), signal, 1000), { kind: 'answered' }, signal)
-    assert.deepEqual(onSignal(view({ windowOpen: true, counting: true }), signal, 1000), { kind: 'trapped' }, signal)
+    assert.deepEqual(onSignal(view({ windowOpen: true, reporting: true, counting: true }), signal, 1000), { kind: 'trapped' }, signal)
+    // After the window, once it had opened, until the end report: held, whatever the signal, so the run ends with its report and its own code.
+    assert.deepEqual(onSignal(view({ reporting: true, counting: true }), signal, 1000), { kind: 'held' }, signal)
+    assert.deepEqual(onSignal(view({ promptOpen: true, reporting: true }), signal, 1000), { kind: 'answered' }, `${signal}: "start pmmcp again?" after the window takes it as its answer`)
     assert.deepEqual(onSignal(view({ counting: true }), signal, 1000), { kind: 'count-aborted' }, signal)
     assert.deepEqual(onSignal(view(), signal, 1000), { kind: 'exit', code: SIGNAL_EXIT[signal] }, signal)
   }
@@ -1350,10 +1443,19 @@ test('handleSignal carries out the decision: a Ctrl-C delivered twice at "start 
       prompt = false
     },
     trapped: (s: HandledSignal): void => void done.push(`trapped ${s}`),
+    held: (s: HandledSignal): void => void done.push(`held ${s}`),
     abortCount: (): void => void done.push('abort'),
     exit: (code: number, s: HandledSignal): void => void done.push(`exit ${String(code)} ${s}`),
   }
-  const state: SignalState & { windowOpen: boolean; counting: boolean } = { windowOpen: false, counting: false, last: undefined, trapped: new Set() }
+  const state: SignalState & WindowMarks & { counting: boolean } = {
+    windowOpen: false,
+    windowOpened: false,
+    reporting: false,
+    counting: false,
+    last: undefined,
+    trapped: new Set(),
+    held: new Set(),
+  }
   // The window is closed while the question is asked (A6); the second delivery finds it answered.
   assert.equal(handleSignal(state, 'SIGINT', 5000, effects).kind, 'answered')
   assert.equal(handleSignal(state, 'SIGINT', 5001, effects).kind, 'repeat')
@@ -1363,16 +1465,73 @@ test('handleSignal carries out the decision: a Ctrl-C delivered twice at "start 
   assert.equal(handleSignal(state, 'SIGINT', 5000 + REPEAT_MS + 1, effects).kind, 'exit')
   assert.deepEqual(done, ['answer', 'exit 130 SIGINT'])
 
-  done.length = 0
-  state.windowOpen = true
-  for (const [signal, at] of [['SIGHUP', 9000], ['SIGTERM', 9001], ['SIGINT', 9002], ['SIGINT', 9003]] as const) handleSignal(state, signal, at, effects)
-  assert.deepEqual(done, ['trapped SIGHUP', 'trapped SIGTERM', 'trapped SIGINT'])
-  assert.deepEqual([...state.trapped].sort(), ['SIGHUP', 'SIGINT', 'SIGTERM'])
-  state.windowOpen = false
+  // While pmmcp's jobs are counted, before any window: the count ends.
   state.counting = true
   done.length = 0
   handleSignal(state, 'SIGTERM', 20_000, effects)
   assert.deepEqual(done, ['abort'])
+  state.counting = false
+
+  done.length = 0
+  windowChanged(state, true)
+  assert.deepEqual([state.windowOpen, state.windowOpened, state.reporting], [true, true, true], 'the first opening marks the run')
+  for (const [signal, at] of [['SIGHUP', 9000], ['SIGTERM', 9001], ['SIGINT', 9002], ['SIGINT', 9003]] as const) handleSignal(state, signal, at, effects)
+  assert.deepEqual(done, ['trapped SIGHUP', 'trapped SIGTERM', 'trapped SIGINT'])
+  assert.deepEqual([...state.trapped].sort(), ['SIGHUP', 'SIGINT', 'SIGTERM'])
+
+  // The window closed (L5 ended, or "start the old revision?" was answered n), and the run's last checks and its report are still to
+  // come: a Ctrl-C or SIGTERM there is held, never the end of a run that stopped pmmcp with no report and 130 for its 4.
+  done.length = 0
+  windowChanged(state, false)
+  assert.deepEqual([state.windowOpen, state.windowOpened, state.reporting], [false, true, true], 'a close keeps the run owing its report')
+  assert.equal(handleSignal(state, 'SIGINT', 30_000, effects).kind, 'held')
+  assert.equal(handleSignal(state, 'SIGTERM', 30_001, effects).kind, 'held')
+  assert.deepEqual(done, ['held SIGINT', 'held SIGTERM'])
+  assert.deepEqual([...state.held].sort(), ['SIGINT', 'SIGTERM'])
+  // Opened again for a start, the window traps as before; closed, it holds.
+  windowChanged(state, true)
+  assert.equal(handleSignal(state, 'SIGHUP', 31_000, effects).kind, 'trapped')
+  windowChanged(state, false)
+  assert.equal(handleSignal(state, 'SIGHUP', 32_000, effects).kind, 'held')
+  // Once the report is printed (main clears the mark), a signal ends the run as before the window.
+  state.reporting = false
+  done.length = 0
+  assert.equal(handleSignal(state, 'SIGINT', 40_000, effects).kind, 'exit')
+  assert.deepEqual(done, ['exit 130 SIGINT'])
+})
+
+test("main's ends that are not the gate's: the end report only after a phase ran, and discovery's or the TUI check's defect is exit 1, never a refusal", () => {
+  // The end report is printed after a phase ran or failed, and not for a jobs count that failed (or anything else) with nothing applied.
+  for (const [outcome, reported] of [
+    [{ kind: 'aborted', at: 'jobs', by: 'jobs', applied: [], exitCode: 1 }, false],
+    [{ kind: 'aborted', at: 'jobs', by: 'jobs', applied: ['non-live'], exitCode: 1 }, true],
+    [{ kind: 'aborted', at: 'first-confirmation', by: 'eof', applied: [], exitCode: 130 }, false],
+    [{ kind: 'declined', at: 'offer', applied: [], exitCode: 0 }, false],
+    [{ kind: 'declined', at: 'second-confirmation', applied: ['non-live'], exitCode: 0 }, true],
+    [{ kind: 'failed', phase: 'non-live', applied: [], exitCode: 2 }, true],
+    [{ kind: 'done', applied: ['live'], exitCode: 0 }, true],
+    [{ kind: 'nothing-to-do', exitCode: 0 }, false],
+    [{ kind: 'dry-run', exitCode: 0 }, false],
+    [{ kind: 'refused', exitCode: 2 }, false],
+    [{ kind: 'not-a-terminal', exitCode: 3 }, false],
+  ] as const) {
+    assert.equal(ranAPhase(outcome), reported, JSON.stringify(outcome))
+  }
+  // A leak or a halted runner, or discovery's own defect: stopped before any change, exit 1 (nothing was refused), with the line that says why.
+  for (const [e, said] of [
+    [new InstallRunError('AOS_INSTALL_RUN_LEAK', 'lsof-8766: a registered secret value reached its output', 'lsof-8766'), 'stopped: lsof-8766: a registered secret value reached its output'],
+    [new InstallRunError('AOS_INSTALL_RUN_HALTED', 'facts: not run: a defect', 'facts'), 'stopped: facts: not run: a defect'],
+    [new DiscoverError('no candidate'), 'discovery failed (a defect, report it): no candidate'],
+  ] as const) {
+    const stopped = stoppedBy(e)
+    assert.ok(stopped !== undefined, said)
+    assert.equal(stopped.line, said)
+    assert.equal(stopped.ending.code, 1, said)
+    assert.equal(exitLine(stopped.ending), 'aos-install: exit 1: stopped before any change: see above')
+  }
+  // Anything else is main's own defect, thrown on: a probe that merely failed, or an error of no kind it knows.
+  assert.equal(stoppedBy(new InstallRunError('AOS_INSTALL_RUN_REFUSED', 'refused')), undefined)
+  assert.equal(stoppedBy(new Error('boom')), undefined)
 })
 
 /** A stream whose every write fails as a pipe with no reader does. */
@@ -1564,6 +1723,19 @@ test("the preflight refuses root and a current directory that is not the checkou
     "the installer does not run as root: run it as your own account, without sudo (the .env it writes and pmmcp's files must be yours)",
   ])
   assert.deepEqual(preflight({ ...input, cwd: home }).refusals, [`the current directory is not this checkout's root (${root}): run it from there, cd '${root}' && npm run aos-install`])
+  // npm run typed in a subfolder hands the installer the root as its cwd, but npm keeps its cache and logs under the folder it was typed in: refused, with the cd.
+  assert.deepEqual(preflight({ ...input, env: { INIT_CWD: root } }).refusals, [])
+  const sub = join(root, 'src')
+  mkdirSync(sub)
+  const typedIn = `npm run was typed in ${sub}, not in this checkout's root (${root}), and npm keeps its cache and logs under the folder it was typed in (.npmrc's cache=.aos/npm-cache): run it from the root, cd '${root}' && npm run aos-install`
+  assert.deepEqual(preflight({ ...input, env: { INIT_CWD: sub } }).refusals, [typedIn])
+  // What npm already wrote there is named for removal, never removed.
+  mkdirSync(join(sub, '.aos', 'npm-cache', '_logs'), { recursive: true })
+  assert.deepEqual(preflight({ ...input, env: { INIT_CWD: sub } }).refusals, [
+    `${typedIn}; ${join(sub, '.aos')} holds what npm wrote there, which git does not ignore: remove it once you have checked it holds only npm's cache and logs`,
+  ])
+  assert.ok(existsSync(join(sub, '.aos', 'npm-cache', '_logs')))
+  assert.equal(preflight({ ...input, env: { INIT_CWD: 'relative/dir' } }).refusals.length, 1, 'an INIT_CWD that is no folder of this checkout is refused too')
   assert.match(preflight({ ...input, platform: 'linux' }).lines[1] ?? '', /^ {2}system {6}Linux \S+ \S+, user op \(uid 501\)$/)
 
   assert.equal(productVersion('<plist><dict>\n\t<key>ProductName</key>\n\t<string>macOS</string>\n\t<key>ProductVersion</key>\n\t<string>15.6.1</string>\n</dict></plist>'), '15.6.1')

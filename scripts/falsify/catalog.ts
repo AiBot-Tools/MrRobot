@@ -679,6 +679,13 @@ const installPlan: Suite = {
     { id: 'IG1', file: INSTALL_GATE, from: '    const second = await this.#second(live)\n    if (second !== undefined) return second\n', to: '', why: 'the live window runs on the first typed confirmation alone: the folder name is never asked' },
     { id: 'IG2', file: INSTALL_GATE, from: '    const jobs = await this.#jobsGate()\n    if (jobs !== undefined) return jobs\n', to: '', why: "pmmcp is stopped without counting its jobs: a running job meets the stop's timeout, and a count of unknown goes unseen" },
     { id: 'IG3', file: INSTALL_GATE, from: '    if (!this.#io.interactive) {', to: '    if (false) {', why: 'a stdin that is not a terminal is taken for an operator: `yes | npm run aos-install` stops pmmcp and makes every live change' },
+    {
+      id: 'IG4',
+      file: INSTALL_GATE,
+      from: "      const failed = await this.#apply('non-live', nonLive)\n      if (failed !== undefined) return failed\n",
+      to: "      await this.#apply('non-live', nonLive)\n",
+      why: 'a failed non-live step (the .env append, the digest staging) goes on to the warning, both confirmations and the stop: pmmcp is stopped after a failure that should have ended the run',
+    },
   ],
   control: {
     id: 'C',

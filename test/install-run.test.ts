@@ -482,7 +482,17 @@ test('stop and start run detached, stdin /dev/null, stdout and stderr to separat
     assert.ok(c && c.command === spec.command, JSON.stringify(spec))
     assert.equal(c.options.detached, true, JSON.stringify(spec))
     assert.equal(c.options.stdio[0], 'ignore', JSON.stringify(spec))
-    assert.equal(readActive(root).state, 'recorded', JSON.stringify(spec))
+    const recorded = readActive(root)
+    assert.equal(recorded.state, 'recorded', JSON.stringify(spec))
+    // Only the jobs count, which changes nothing, is recorded as read-only: a re-run may clear it once its pid has ended, and never reads it as a window.
+    const jobsCount = spec.command === STOP && spec.args.length === 1 && spec.args[0] === '--jobs'
+    assert.equal(recorded.state === 'recorded' && recorded.record.readOnly === true, jobsCount, JSON.stringify(spec))
+    if (jobsCount) {
+      assert.throws(
+        () => runner.start({ step: 'stop', command: STOP, args: [], cwd: pmmcp }),
+        (e: unknown) => e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_BUSY' && /an earlier read-only count of pmmcp's jobs/.test(e.message) && !/inside the stopped window/.test(e.message),
+      )
+    }
     c.child.emit('exit', 0, null)
     await running.done
   }

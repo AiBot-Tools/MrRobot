@@ -196,6 +196,10 @@ class Machine {
   /** Discovery's aos-kernel check; undefined: worked out from .env. */
   bearer: Found['bearer'] | undefined
   staleActive: ActiveRecord | undefined
+  /** Discovery's leftStopped: the last installer run that stopped pmmcp ran no start after it. */
+  leftStopped: Found['leftStopped']
+  /** Discovery found the MCP server running on 8766 (false: pmmcp is stopped). */
+  discoveredServer = true
   /** pmmcp is installed (false: a fresh install's machine). */
   installed = true
 
@@ -523,7 +527,8 @@ class Machine {
   /** Discovery's result for this machine, as discover() would hand it on. */
   found(): Found {
     const facts = parseFacts(JSON.stringify(this.facts))
-    const dotenvHasToken = existsSync(join(this.root, '.env')) && inspectIn(this, ['AOS_PMMCP_TOKEN'], ['AOS_PMMCP_TOKEN']).digests.length > 0
+    // Read only when the test names no bearer state: a config that declares no AOS_PMMCP_TOKEN cannot ask the writer for it.
+    const dotenvHasToken = (): boolean => existsSync(join(this.root, '.env')) && inspectIn(this, ['AOS_PMMCP_TOKEN'], ['AOS_PMMCP_TOKEN']).digests.length > 0
     return {
       kind: 'found',
       install: { dir: this.dir, source: 'plist' },
@@ -533,12 +538,13 @@ class Machine {
       missing: missingFeatures(facts),
       git: { head: HEAD, originMain: this.originMain, fastForward: this.originMain !== HEAD, lockUnchanged: this.originMain !== HEAD ? true : undefined, trackedChanges: 0, untracked: 0 },
       service: { loaded: true, state: 'running', pid: OLD_PID },
-      server: { pid: OLD_PID, startedAfter: OLD_STARTED_AFTER },
+      server: this.discoveredServer ? { pid: OLD_PID, startedAfter: OLD_STARTED_AFTER } : undefined,
+      leftStopped: this.leftStopped,
       httpAuthModified: statSync(this.authFile).mtime,
       endpoints: { health: 200, bearer: 'off-or-warn', dashboard: { status: 200, authRequired: false, source: 'none' }, qdrant: { status: 200, version: '1.13.4' } },
       qdrant: parseQdrantStatus(JSON.stringify(this.qdrantBefore)),
       jobs: { state: 'counted', jobs: { running: 0, display: [] } },
-      bearer: this.bearer ?? (dotenvHasToken ? { state: 'matches' } : { state: 'not-checked', why: 'AOS_PMMCP_TOKEN holds no value in .env yet' }),
+      bearer: this.bearer ?? (dotenvHasToken() ? { state: 'matches' } : { state: 'not-checked', why: 'AOS_PMMCP_TOKEN holds no value in .env yet' }),
       kernel: { url: 'http://127.0.0.1:8766/mcp', urlMatches: true, tokenEnv: 'AOS_PMMCP_TOKEN', ollamaShared: [], daemonListening: false },
       notes: [],
     }
@@ -720,6 +726,19 @@ function cutoverOnly(m: Machine): Plan {
   return plan
 }
 
+/** The cutover alone, with whatever bearer state the machine already names: no restart is asked beside it. */
+function cutoverOnlyWith(m: Machine): Plan {
+  m.preEnv()
+  m.qdrantBefore = keyless()
+  m.auth.dashboard_token = 'present'
+  m.auth.curator_secret = 'present'
+  edit(m.facts, 'dashboard_token', { state: 'present' })
+  edit(m.facts, 'curator_secret', { state: 'present' })
+  const plan = m.plan()
+  assert.deepEqual(plan.offers.map((o) => o.id), ['qdrant'], JSON.stringify(plan.notes))
+  return plan
+}
+
 const THIRD = 'f00dfac'.padEnd(40, '0')
 
 // ── S5: the non-live steps ───────────────────────────────────────────────
@@ -817,6 +836,10 @@ test("the jobs count reads stdout's first line alone, after clearing the stale r
   const pending = m.applier(plan, { interrupt: interrupt.signal }).countJobs()
   interrupt.abort()
   assert.deepEqual(await pending, { state: 'interrupt' } satisfies JobsAnswer)
+  // The count runs on in its own session: an installer that leaves now leaves its record, marked read-only, which a re-run clears once its pid has ended.
+  const left = readActive(m.root)
+  assert.equal(left.state, 'recorded')
+  assert.ok(left.state === 'recorded' && left.record.readOnly === true && /^stop-jobs/.test(left.record.step), JSON.stringify(left))
   release()
 })
 
@@ -1958,7 +1981,8 @@ test('the bearer check is done only on an aos-kernel line written since the star
   const shownPlan = restartOnly(new Machine(t))
   const title = shownPlan.steps.find((s) => s.id === 'bearer-check')?.title ?? ''
   assert.equal(/initialize/i.test(title), false, title)
-  assert.match(title, /"first request with token" for aos-kernel in ~\/\.persistent-memory-mcp\/logs\/server\.log since the start .*restart npm run dev/)
+  assert.match(title, /"first request with token" for aos-kernel in ~\/\.persistent-memory-mcp\/logs\/server\.log since the start \(not found: inconclusive, not a failure; the AOS daemon's next request makes the line\)$/)
+  assert.equal(/restart npm run dev/.test(title), false, title)
   for (const c of cases) {
     const m = new Machine(t)
     const plan = restartOnly(m)
@@ -1968,7 +1992,8 @@ test('the bearer check is done only on an aos-kernel line written since the star
     assert.deepEqual(await applier.apply('live', chosen(plan, ['restart']).live), { ok: true }, c.name)
     const item = itemNamed(applier.items, /bearer check/)
     assert.equal(item.state, c.state, c.name)
-    if (c.state === 'inconclusive') assert.match(item.detail, /since the start .*restart npm run dev/, c.name)
+    // This restart loaded the digest, so the next steps ask the daemon restarted, and the line comes from the restarted daemon.
+    if (c.state === 'inconclusive') assert.match(item.detail, /since the start .*: restart npm run dev, as the next steps say, then grep "first request with token" /, c.name)
     assert.ok(applier.report().some((l) => l.startsWith(`  ${c.state.padEnd(12)} the aos-kernel bearer check`)), c.name)
   }
 })
@@ -2023,17 +2048,55 @@ test('a .env the writer may have changed before it failed ends the run with exit
   const m = new Machine(t)
   const plan = m.plan()
   // The .gitignore stops ignoring .env while the writer works: its read-back through the loader refuses the file it wrote.
-  let minted = 0
+  // Every value it minted is kept here, so that none can be found in what was shown.
+  const minted: string[] = []
   const applier = m.applier(plan, {
     mint: () => {
-      minted += 1
-      if (minted === 1) writeFileSync(join(m.root, '.gitignore'), '/.aos/\n')
-      return randomBytes(32).toString('hex')
+      if (minted.length === 0) writeFileSync(join(m.root, '.gitignore'), '/.aos/\n')
+      const v = randomBytes(32).toString('hex')
+      minted.push(v)
+      return v
     },
   })
   assert.deepEqual(await applier.apply('non-live', chosen(plan, []).nonLive), { ok: false, exitCode: 1 })
   assert.equal(itemNamed(applier.items, /appended to \.env/).state, 'failed')
   assert.equal(m.ran(/rotate_http_auth_token/).length, 0)
+
+  // The report never says "not written": .env may hold the tokens now, and may no longer be git-ignored. It names what may have
+  // changed (the names, never a value), the two checks to run, and holds back the restart of npm run dev until they pass.
+  const report = applier.report()
+  const text = report.join('\n')
+  assert.equal(/not written by this run/.test(text), false, text)
+  const envLine = report.find((l) => l.startsWith('.env  '))
+  assert.match(envLine ?? '', /: may have been changed by this run before the writer failed \(.+\); mode 0600$/, text)
+  assert.ok(
+    report.includes(
+      `  .env may now hold AOS_CONTROL_TOKEN and AOS_PMMCP_TOKEN (the names this run was appending), or be left empty if this run created it: ` +
+        `check it in ${m.root} with ls -l .env (-rw------- and yours) and git check-ignore -v .env (it must name the .gitignore line that ignores .env), ` +
+        'and fix what they show before you restart npm run dev',
+    ),
+    text,
+  )
+  assert.equal(/^ {2}restart npm run dev/m.test(text), false, text)
+  assert.match(text, /^ {2}check \.env as above before you restart npm run dev/m)
+  assert.ok(m.printed.some((l) => /^ {2}\.env may now hold AOS_CONTROL_TOKEN and AOS_PMMCP_TOKEN/.test(l)), m.text())
+  // Both tokens were minted, and the file holds them (the writer wrote before its read-back refused): neither was shown.
+  assert.equal(minted.length, 2)
+  const written = readFileSync(join(m.root, '.env'), 'utf8')
+  for (const v of minted) {
+    assert.ok(written.includes(v), 'the writer did not write what was minted: this check would prove nothing')
+    assert.equal(text.includes(v) || m.text().includes(v), false, 'a minted token was shown')
+  }
+
+  // A refusal (written false) changed nothing: "not written", and no check to run.
+  const m2 = new Machine(t)
+  const plan2 = m2.plan()
+  writeFileSync(join(m2.root, '.env'), '# mine\n', { mode: 0o644 })
+  const refused = m2.applier(plan2)
+  assert.deepEqual(await refused.apply('non-live', chosen(plan2, []).nonLive), { ok: false, exitCode: 2 })
+  const text2 = refused.report().join('\n')
+  assert.match(text2, /: not written by this run; mode 0644/)
+  assert.equal(/may have been changed|git check-ignore|restart npm run dev/.test(text2), false, text2)
 })
 
 test("the kept prekey's cleanup failing stops the run before anything live (exit 1)", async (t) => {
@@ -2243,6 +2306,221 @@ test('the end report shows an ACL on .env when ls -le lists one or prints +, say
   assert.match(text, new RegExp(`\\.env {2}${join(m.root, '.env').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: not written by this run; mode 0600`))
   assert.match(text, /run chmod -N \.env/)
   assert.equal(m.ran(/^ls -lde /).length, 1)
+})
+
+/** The gate's IO over this machine and an applier: a yes to every y/N question and the word each typed confirmation asks for. */
+function gateIO(m: Machine, applier: Applier): GateIO {
+  return {
+    interactive: true,
+    print: (line) => m.printed.push(line),
+    ask: (q) => {
+      m.asked.push(q)
+      const text = q.includes('`stop pmmcp`') ? 'stop pmmcp' : q.includes('`Persistent-Memory-MCP`') ? 'Persistent-Memory-MCP' : q.includes('`install`') ? 'install' : 'y'
+      return Promise.resolve({ kind: 'line', text })
+    },
+    countJobs: () => applier.countJobs(),
+    pause: () => Promise.resolve('elapsed'),
+    apply: (phase, steps) => applier.apply(phase, steps),
+  }
+}
+
+test('a non-live phase that fails ends the run there, through the gate: no warning, no typed confirmation, no jobs count, no stop, no window (exit 1)', async (t) => {
+  const m = new Machine(t)
+  m.qdrantBefore = keyless()
+  const plan = m.plan()
+  assert.ok(plan.offers.some((o) => o.live), JSON.stringify(plan.offers))
+  // The rotate refuses its arguments: nothing was written in http_auth.yaml, and the digest is not on file.
+  m.over.set(`${m.py} scripts/rotate_http_auth_token.py aos-kernel --create --digest-stdin`, { err: 'usage: rotate_http_auth_token.py\n', code: 2 })
+  const applier = m.applier(plan)
+  const outcome = await runGate(plan, gateIO(m, applier), { dryRun: false })
+  assert.deepEqual(outcome, { kind: 'failed', phase: 'non-live', applied: [], exitCode: 1 })
+  assert.equal(itemNamed(applier.items, /digest staged/).state, 'failed')
+  assert.deepEqual(m.windows, [], 'the window opened after a failed non-live step')
+  assert.deepEqual(m.ran(/stop-pmmcp-server\.sh|start-pmmcp-server\.sh/), [], 'the jobs count, the stop or the start ran')
+  assert.equal(m.asked.some((q) => /`stop pmmcp`|`Persistent-Memory-MCP`/.test(q)), false, m.asked.join('\n'))
+  assert.equal(m.printed.some((l) => l.startsWith('WARNING: ')), false)
+  // The window's steps were never handed on: skipped, as the gate never reached them.
+  assert.ok(applier.report().some((l) => /^ {2}skipped +the graceful stop/.test(l) && !l.includes('not reached')), applier.report().join('\n'))
+})
+
+test("after the kept prekey's cleanup the report says it was removed and never also kept; a cleanup alone asks for no npm run dev restart", async (t) => {
+  const m = new Machine(t)
+  m.preEnv()
+  m.bearer = { state: 'matches' }
+  m.auth.dashboard_token = 'present'
+  m.auth.curator_secret = 'present'
+  edit(m.facts, 'dashboard_token', { state: 'present' })
+  edit(m.facts, 'curator_secret', { state: 'present' })
+  m.qdrantBefore = edit(enforced(), 'prekey_kept', true)
+  const plan = m.plan()
+  // Beside the restart the run asks anyway, the cleanup is asked too; on its own it would be a note (install-plan.test.ts).
+  assert.deepEqual(plan.offers.map((o) => o.id), ['qdrant-cleanup', 'restart'])
+  const KEPT = /pmmcp-qdrant-prekey kept; remove it later with cd .* && \.venv\/bin\/python scripts\/qdrant_api_key\.py cleanup/
+  assert.match(m.applier(plan).report().join('\n'), KEPT, 'before the cleanup the report says it is kept')
+  const applier = m.applier(plan)
+  assert.deepEqual(await applier.apply('non-live', chosen(plan, ['qdrant-cleanup']).nonLive), { ok: true })
+  const text = applier.report().join('\n')
+  assert.match(text, /^ {2}done {9}the kept pmmcp-qdrant-prekey removed: pmmcp-qdrant-prekey removed \(its volumes stay\)$/m)
+  assert.match(text, /^qdrant: verdict enforced$/m)
+  assert.equal(KEPT.test(text), false, text)
+  // Nothing the daemon reads changed: .env and pmmcp's bearer are as they were.
+  assert.equal(/restart npm run dev/.test(text), false, text)
+})
+
+test('npm run dev is asked to restart only when something it reads changed: .env gained a line, or a new pmmcp loaded the aos-kernel digest', async (t) => {
+  const says = (report: readonly string[]): boolean => report.some((l) => l.startsWith('  restart npm run dev (it reads .env when it starts)'))
+  // A stop that did not stop, and the start asked for after it: pmmcp is back as it was, and the daemon has nothing new to read.
+  const noop = new Machine(t)
+  const plan = restartOnly(noop)
+  noop.stopLeaves = [8767]
+  noop.answer = { kind: 'line', text: '' }
+  const noopApplier = noop.applier(plan)
+  assert.deepEqual(await noopApplier.apply('live', chosen(plan, ['restart']).live), { ok: false, exitCode: 4 })
+  assert.equal(itemNamed(noopApplier.items, /start pmmcp again/).state, 'done')
+  assert.equal(says(noopApplier.report()), false, noopApplier.report().join('\n'))
+  // The restart that loaded the digest: the daemon's next request is the one that shows it.
+  const restart = new Machine(t)
+  const restartPlan = restartOnly(restart)
+  const restarted = restart.applier(restartPlan)
+  assert.deepEqual(await restarted.apply('live', chosen(restartPlan, ['restart']).live), { ok: true }, JSON.stringify(restarted.items))
+  assert.ok(restarted.report().some((l) => /loaded by the running server: yes/.test(l)))
+  assert.equal(says(restarted.report()), true, restarted.report().join('\n'))
+  // .env appended: always.
+  const appended = new Machine(t)
+  const appendPlan = appended.plan()
+  const writer = appended.applier(appendPlan)
+  assert.deepEqual(await writer.apply('non-live', chosen(appendPlan, []).nonLive), { ok: true })
+  assert.equal(says(writer.report()), true)
+  // A configured system: .env holds both tokens, the digest matches, and the server discovery found started after http_auth.yaml
+  // last changed, so it had loaded the digest already. A cutover restarts pmmcp, and the daemon has nothing new to read.
+  const configured = new Machine(t)
+  utimesSync(configured.authFile, new Date(OLD_STARTED_AFTER.getTime() - 60_000), new Date(OLD_STARTED_AFTER.getTime() - 60_000))
+  const cutPlan = cutoverOnly(configured)
+  assert.equal(cutPlan.offers.some((o) => o.id === 'restart'), false, 'the digest is loaded: no restart is offered')
+  configured.qdrantAfter = enforced()
+  const cut = configured.applier(cutPlan)
+  assert.deepEqual(await cut.apply('live', chosen(cutPlan, ['qdrant']).live), { ok: true }, JSON.stringify(cut.items))
+  assert.ok(cut.report().some((l) => /digest matches \.env: yes; loaded by the running server: yes/.test(l)), cut.report().join('\n'))
+  assert.equal(says(cut.report()), false, cut.report().join('\n'))
+  // Nor does the bearer check ask one: the running daemon's hub reconnects to the restarted pmmcp by itself and sends the bearer.
+  const bearer = itemNamed(cut.items, /bearer check/)
+  assert.equal(bearer.state, 'inconclusive')
+  assert.match(
+    bearer.detail,
+    /: the AOS daemon's next request makes the line \(its hub reconnects to the restarted pmmcp within its 240 s heartbeat; if npm run dev is not running, start it\), then grep "first request with token" ~\/\.persistent-memory-mcp\/logs\/server\.log$/,
+  )
+  assert.equal(/restart npm run dev/.test(cut.report().join('\n')), false, cut.report().join('\n'))
+  // The same cutover where the server before it had not loaded the digest: the restart loaded it, and the daemon's bearer now counts.
+  const unloaded = new Machine(t)
+  const unloadedPlan = cutoverOnly(unloaded)
+  const loading = unloaded.applier(unloadedPlan)
+  assert.deepEqual(await loading.apply('live', chosen(unloadedPlan, ['qdrant']).live), { ok: true }, JSON.stringify(loading.items))
+  assert.equal(says(loading.report()), true, loading.report().join('\n'))
+  // A server that had loaded http_auth.yaml, but without the digest: this run stages it, and the restart that loads it is new to
+  // the daemon although .env gained nothing.
+  const staging = new Machine(t)
+  staging.preEnv()
+  staging.bearer = { state: 'absent' }
+  utimesSync(staging.authFile, new Date(OLD_STARTED_AFTER.getTime() - 60_000), new Date(OLD_STARTED_AFTER.getTime() - 60_000))
+  const stagePlan = staging.plan()
+  assert.deepEqual(chosen(stagePlan, ['restart']).nonLive.map((s) => s.id), ['stage-digest'])
+  const stager = staging.applier(stagePlan)
+  assert.deepEqual(await stager.apply('non-live', chosen(stagePlan, ['restart']).nonLive), { ok: true })
+  assert.deepEqual(await stager.apply('live', chosen(stagePlan, ['restart']).live), { ok: true }, JSON.stringify(stager.items))
+  assert.match(stager.report().join('\n'), /^\.env  .*: not written by this run/m)
+  assert.equal(says(stager.report()), true, stager.report().join('\n'))
+  // No aos-kernel token at all (kernel.yaml declares no tokenEnv for pmmcp): a cutover's new server loads http_auth.yaml, but no
+  // digest of the daemon's is in it, so nothing the daemon reads changed.
+  const bare = new Machine(t)
+  const doc = structuredClone(raw('config/kernel.yaml')) as { mcp: { servers: Record<string, Record<string, unknown>> } }
+  const pmmcp = doc.mcp.servers['pmmcp']
+  assert.ok(pmmcp !== undefined)
+  delete pmmcp['tokenEnv']
+  bare.config = parseKernelConfig(doc, { repoRoot: REPO_ROOT })
+  bare.bearer = { state: 'not-checked', why: 'kernel.yaml declares no tokenEnv for pmmcp' }
+  const barePlan = cutoverOnlyWith(bare)
+  assert.equal(barePlan.staged, undefined)
+  const bareApplier = bare.applier(barePlan)
+  assert.deepEqual(await bareApplier.apply('live', chosen(barePlan, ['qdrant']).live), { ok: true }, JSON.stringify(bareApplier.items))
+  assert.equal(says(bareApplier.report()), false, bareApplier.report().join('\n'))
+})
+
+test('an lsof that fails after the start is reported as a check not made, never as "no MCP server listens", and leaves "loaded" not known', async (t) => {
+  for (const failure of [{ code: 2, err: 'lsof: status error on /dev\n' }, { signal: 'SIGKILL' as const }]) {
+    const m = new Machine(t)
+    const plan = restartOnly(m)
+    const started = (): boolean => m.calls.some((c) => c.key === join(m.dir, START_SCRIPT))
+    m.over.set('lsof -nP -iTCP:8766 -sTCP:LISTEN -Fpu', () => (started() ? failure : undefined))
+    const applier = m.applier(plan)
+    assert.deepEqual(await applier.apply('live', chosen(plan, ['restart']).live), { ok: false, exitCode: 4 }, JSON.stringify(failure))
+    const start = itemNamed(applier.items, /the start/)
+    assert.equal(start.state, 'failed')
+    assert.match(start.detail, /whether an MCP server of this account listens on 8766 could not be checked \(lsof failed: (?:lsof exited 2|lsof-8766: lsof ended by SIGKILL)\)/, start.detail)
+    assert.equal(/no MCP server of this account listens/.test(start.detail), false, start.detail)
+    const text = applier.report().join('\n')
+    assert.match(text, /aos-kernel digest matches \.env: yes; loaded by the running server: not known/, text)
+  }
+  // lsof that answers, with nothing of this account there: that is a finding, and the server loaded nothing.
+  const none = new Machine(t)
+  const plan = restartOnly(none)
+  none.startServer = false
+  const applier = none.applier(plan)
+  assert.deepEqual(await applier.apply('live', chosen(plan, ['restart']).live), { ok: false, exitCode: 4 })
+  assert.match(itemNamed(applier.items, /the start/).detail, /no MCP server of this account listens on 8766/)
+  assert.match(applier.report().join('\n'), /loaded by the running server: no/)
+})
+
+test('with --no-install, the report gives no next step about a pmmcp that is not installed', async (t) => {
+  const m = new Machine(t, { installed: false })
+  m.discovery = m.absent()
+  const map = [...credentialsMap(m.config).keys()]
+  const plan = planInstall({
+    config: m.config,
+    providers: PROVIDERS,
+    dotenv: inspectIn(m, [...map, 'ANTHROPIC_API_KEY']),
+    room: inspectIn(m, map),
+    exported: new Set(),
+    pmmcp: m.discovery,
+    tuiPids: [],
+    options: { aosOnly: false, noInstall: true },
+  })
+  assert.equal(plan.kind, 'not-installed')
+  const applier = m.applier(plan)
+  assert.deepEqual(await applier.apply('non-live', chosen(plan, []).nonLive), { ok: true })
+  const text = applier.report().join('\n')
+  assert.match(text, /^ {2}restart npm run dev/m, 'the .env it wrote is something the daemon reads')
+  assert.equal(/warn mode|setup\.sh|config\.yaml|pmmcp bearer|qdrant:/.test(text), false, text)
+})
+
+test('pmmcp stopped after the last installer run that stopped it ran no start is started by a window of its own: the stop (for whatever else runs), then the start and its checks', async (t) => {
+  const m = new Machine(t)
+  m.preEnv()
+  m.bearer = { state: 'matches' }
+  m.auth.dashboard_token = 'present'
+  m.auth.curator_secret = 'present'
+  edit(m.facts, 'dashboard_token', { state: 'present' })
+  edit(m.facts, 'curator_secret', { state: 'present' })
+  // As a run killed after L1 left it: nothing listens, no PID file names a live process, Qdrant stopped, launchd unloaded.
+  m.listeners.clear()
+  m.alive.clear()
+  m.running = false
+  m.qdrant = 'exited'
+  for (const name of ['mcp.pid', 'worker.pid', 'scraper_worker.pid']) rmSync(join(m.pmmcpHome, 'pids', name), { force: true })
+  m.discoveredServer = false
+  m.leftStopped = { folder: join(m.root, '.aos', 'install', '20261029T090000Z') }
+  const plan = m.plan()
+  assert.deepEqual(plan.offers.map((o) => o.id), ['start'])
+  const { nonLive, live } = chosen(plan, ['start'])
+  assert.deepEqual([nonLive, live.map((s) => s.id)], [[], ['stop', 'start', 'bearer-check']])
+  const applier = m.applier(plan)
+  const outcome = await runGate(plan, gateIO(m, applier), { dryRun: false })
+  assert.deepEqual(outcome, { kind: 'done', applied: ['live'], exitCode: 0 }, JSON.stringify(applier.items))
+  assert.ok(m.asked.includes('Start pmmcp (stopped now; the last installer run that stopped it ran no start after it)? [y/N]'), m.asked.join('\n'))
+  assert.ok(m.asked.some((q) => q.includes('`stop pmmcp`')) && m.asked.some((q) => q.includes('`Persistent-Memory-MCP`')), 'the start ran without both typed confirmations')
+  assert.equal(itemNamed(applier.items, /graceful stop/).state, 'done')
+  assert.match(itemNamed(applier.items, /the start/).detail, /^\/health 200; a new MCP server \(pid 913\), started after http_auth\.yaml last changed; pmmcp-qdrant running/)
+  assert.deepEqual(m.windows, [true, false])
+  assert.match(applier.report().join('\n'), /loaded by the running server: yes/)
 })
 
 test('logTail reads a regular file from its end, never through a link, and nothing else', (t) => {

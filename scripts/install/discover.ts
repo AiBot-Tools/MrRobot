@@ -8,7 +8,11 @@
 //   starts goes through the A3 runner (scripts/install/run.ts), so a child
 //   gets the runner's allowlisted environment (no DOCKER_*, PMMCP_*, AOS_*
 //   or credential name), stdin from /dev/null or one digest, and output in
-//   0600 files under .aos/install/<stamp>/, the one thing it writes. It
+//   0600 files under .aos/install/<stamp>/, the one thing it writes, but for
+//   the one record it removes: active.json's record of an earlier run's
+//   read-only jobs count (the runner marks it readOnly) once its pid has
+//   ended, waited for up to 15 s (READ_ONLY_POLLS) while it still runs,
+//   which it says at once (DiscoverOptions.print) before the first pause. It
 //   writes no file itself, holds no credential value and never opens .env
 //   itself: the one digest it hands a child comes from inspectCredentials
 //   (src/secrets/dotenv-append.ts), which reads .env without opening it for
@@ -50,7 +54,10 @@
 //   message that names the field, the path or the fix, never a value): a
 //   step an earlier run started in its own session that active.json still
 //   records while its pid still runs that step (ps; a record that cannot be
-//   read, or a pid ps cannot be asked about, counts as running); a legacy
+//   read, or a pid ps cannot be asked about, counts as running; a read-only
+//   jobs count that still runs after the wait above is said to change
+//   nothing, and one whose record active.json no longer holds once it ended
+//   is no one's to remove here); a legacy
 //   com.aibot-tools.pmmcp* plist; a com.aibot.pmmcp plist whose
 //   WorkingDirectory is gone; two candidate installs; a folder that is not an
 //   install; something other than this account's pmmcp MCP server on 8766;
@@ -75,6 +82,13 @@
 //   --jobs is not run meanwhile, which the runner would refuse); the launchd
 //   service and the MCP server's pid and the earliest it can have started
 //   (ps etime, which no locale changes, so `ps -o lstart=` is never parsed);
+//   whether an earlier run of this installer left pmmcp stopped
+//   (leftStopped: no MCP server, launchd answered that the service is not
+//   loaded, which only launchctl print's exit 113, "Could not find
+//   service", says (any other failure leaves it not known, and noted), and
+//   the latest run folder under .aos/install that holds the stop's or a
+//   start's log, newest stamp first, holds the stop's alone, read by name,
+//   never opened);
 //   /health, the RFC 9728 document (enforce shows as
 //   bearer_methods_supported ["header"]), the dashboard's /api/auth/status
 //   (its 503 body included) and Qdrant's version, all on loopback through
@@ -127,6 +141,8 @@ import { credentialNames, inspectCredentials, type InspectOptions } from '../../
 import {
   InstallRunError,
   STOP_SCRIPT,
+  clearActive,
+  installDir,
   readActive,
   readAt,
   readJobs,
@@ -188,6 +204,53 @@ const HTTP_MS = 3_000
 
 /** How long after its active.json record a recorded child may have started: the record is made just before the spawn. */
 const SPAWN_SLACK_MS = 10_000
+
+/** How often, and how many times, an earlier run's read-only jobs count that still runs is looked at again before discovery stops on it. */
+export const READ_ONLY_POLL_MS = 1_000
+export const READ_ONLY_POLLS = 15
+
+/** A run's folder under .aos/install: its UTC stamp, and -2, -3, ... for a second run in the same second (run.ts stampOf). */
+const RUN_FOLDER = /^(\d{8}T\d{6}Z)(?:-(\d{1,3}))?$/
+
+/** The step logs that say a run started pmmcp (L5, or the start offered after a stop that did not stop), and the one that says it ran the stop. */
+const START_LOG = /^start(?:-again)?(?:-\d+)?\.out$/
+const STOP_LOG = /^stop(?:-\d+)?\.out$/
+
+/**
+ * The run folder of the last earlier run of this installer that ran the
+ * stop or a start, when what it ran last of the two was the stop: its
+ * folder holds stop.out and no start.out or start-again.out. Read-only:
+ * folder names and entries, never a file's content; links and anything but
+ * a folder are passed over. `own` (this run's folder) is left out.
+ */
+export function earlierStop(repoRoot: string, own: string | undefined): { readonly folder: string } | undefined {
+  const dir = installDir(repoRoot)
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return undefined
+  }
+  const runs = names
+    .map((name) => ({ name, m: RUN_FOLDER.exec(name) }))
+    .filter((r): r is { name: string; m: RegExpExecArray } => r.m !== null)
+    // Latest first: by stamp, then by the -n a second run in the same second gets.
+    .sort((a, b) => ((a.m[1] ?? '') === (b.m[1] ?? '') ? Number(b.m[2] ?? '1') - Number(a.m[2] ?? '1') : (a.m[1] ?? '') < (b.m[1] ?? '') ? 1 : -1))
+  for (const { name } of runs) {
+    const folder = join(dir, name)
+    if (folder === own) continue
+    let files: string[]
+    try {
+      if (!lstatSync(folder).isDirectory()) continue
+      files = readdirSync(folder)
+    } catch {
+      continue
+    }
+    if (files.some((f) => START_LOG.test(f))) return undefined
+    if (files.some((f) => STOP_LOG.test(f))) return { folder }
+  }
+  return undefined
+}
 
 export type StopCode =
   | 'active-step'
@@ -347,11 +410,30 @@ export interface DiscoverOptions {
   readonly http?: HttpGet
   /** The clock a process's start is reckoned from (ps etime) and a recorded step is checked against (default the system's). */
   readonly now?: () => Date
+  /** The pause between looks at an earlier run's read-only jobs count that still runs (default a timer). */
+  readonly sleep?: (ms: number) => Promise<void>
+  /** A line said at once, while discovery runs: before that wait, which is otherwise silent (default none; the notes come after). */
+  readonly print?: (line: string) => void
 }
 
+/**
+ * launchctl print's exit for a service that is not in the domain ("Could not
+ * find service"): the one answer that says it is not loaded. Not yet seen on
+ * macOS 15.6.1: A10's Mac checks hold it (with pmmcp stopped, `launchctl
+ * print gui/$(id -u)/com.aibot.pmmcp; echo $?` prints 113); until then a
+ * different code there leaves `loaded` not known, noted on every run, and
+ * the start a left-stopped pmmcp is offered is never offered.
+ */
+export const LAUNCHCTL_NOT_FOUND = 113
+
 export interface ServiceState {
-  /** launchctl print found the service in gui/<uid>. */
-  readonly loaded: boolean
+  /**
+   * true: launchctl print found the service in gui/<uid>; false: it answered
+   * that there is no such service there (exit 113); undefined: it could not
+   * be asked, or it failed some other way (an unusable domain, say), so
+   * whether launchd has it loaded is not known.
+   */
+  readonly loaded: boolean | undefined
   readonly state: string | undefined
   readonly pid: number | undefined
 }
@@ -426,6 +508,16 @@ export interface Found {
   readonly git: GitState
   readonly service: ServiceState
   readonly server: ServerProcess | undefined
+  /**
+   * pmmcp is stopped (no MCP server listens, and launchd answered that the
+   * service is not loaded: a stop boots it out and disables it until the
+   * start script runs), and the last earlier run of this installer that ran
+   * the stop did not run a start after it (its run folder, under
+   * .aos/install, holds stop.out and no start.out or start-again.out): a run
+   * that was killed or crashed inside the window, or one whose stop did not
+   * stop and was not started again. The planner offers the start.
+   */
+  readonly leftStopped: { readonly folder: string } | undefined
   /** ~/.persistent-memory-mcp/http_auth.yaml's mtime, when there is one: the server loads it only at its start. */
   readonly httpAuthModified: Date | undefined
   readonly endpoints: Endpoints
@@ -514,10 +606,28 @@ export function projectName(text: string): string | undefined {
   return undefined
 }
 
-/** The pmmcp folder a server's command line runs: an argument <dir>/.venv/bin/pmmcp. */
-export function serverDirOf(args: string): string | undefined {
-  for (const arg of args.split(' ')) {
-    if (isAbsolute(arg) && arg.endsWith('/.venv/bin/pmmcp')) return dirname(dirname(dirname(arg)))
+/** The server's program, as the plist's ProgramArguments[1] and the start script name it under the checkout. */
+const SERVER_SUFFIX = '/.venv/bin/pmmcp'
+
+/**
+ * The pmmcp folder a server's command line runs: an argument
+ * <dir>/.venv/bin/pmmcp. ps joins the arguments with spaces, so a folder
+ * whose name holds a space (~/My Projects/...) cannot be split on them: the
+ * argument is read back from the known suffix, ending at a space or the end
+ * of the line, to a `/` at the start of the line or after a space. Of those
+ * starts, the first (from the suffix back) whose folder `isInstall` accepts
+ * is taken, else the one nearest the suffix (the shortest path), which
+ * discovery then validates like any other.
+ */
+export function serverDirOf(args: string, isInstall: (dir: string) => boolean = () => false): string | undefined {
+  for (let end = args.indexOf(SERVER_SUFFIX); end >= 0; end = args.indexOf(SERVER_SUFFIX, end + 1)) {
+    const stop = end + SERVER_SUFFIX.length
+    if (stop !== args.length && args[stop] !== ' ') continue
+    const starts: number[] = []
+    for (let i = end; i >= 0; i -= 1) if (args[i] === '/' && (i === 0 || args[i - 1] === ' ')) starts.push(i)
+    const dirs = starts.map((i) => args.slice(i, end)).filter((d) => d !== '' && isAbsolute(d))
+    const dir = dirs.find(isInstall) ?? dirs[0]
+    if (dir !== undefined) return dir
   }
   return undefined
 }
@@ -902,6 +1012,7 @@ class Discoverer {
   readonly #http: HttpGet
   readonly #uid: number | undefined
   readonly #now: () => Date
+  readonly #sleep: (ms: number) => Promise<void>
   readonly #notes: string[] = []
   #install: Install | undefined
   #facts: Facts | undefined
@@ -915,6 +1026,7 @@ class Discoverer {
     this.#http = options.http ?? loopbackGet
     this.#uid = options.uid ?? process.getuid?.()
     this.#now = options.now ?? ((): Date => new Date())
+    this.#sleep = options.sleep ?? ((ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)))
   }
 
   async run(): Promise<Discovery> {
@@ -936,7 +1048,8 @@ class Discoverer {
       throw stop(
         'legacy-plist',
         `the old supervisor's launchd plist${legacy.length > 1 ? 's are' : ' is'} still installed: ${legacy.map((p) => shown(p)).join(', ')}. ` +
-          `It runs pmmcp's services beside ${PLIST_LABEL}: unload and remove ${legacy.length > 1 ? 'them' : 'it'} (launchctl bootout gui/<uid> <plist>), then re-run`,
+          `It runs pmmcp's services beside ${PLIST_LABEL}: unload and remove ${legacy.length > 1 ? 'them' : 'it'} ` +
+          `(launchctl bootout ${this.#uid === undefined ? 'gui/$(id -u)' : `gui/${String(this.#uid)}`} <plist>, then rm <plist>), then re-run`,
       )
     }
 
@@ -981,6 +1094,8 @@ class Discoverer {
     const kernel = await this.#kernel(facts?.config.server)
     const service = await this.#service()
     const server = await this.#server()
+    // Only once launchctl answered that the service is not loaded: one it could not be asked about, or that failed otherwise, is not known to be.
+    const leftStopped = server === undefined && service.loaded === false ? earlierStop(this.#o.repoRoot, this.#o.runner.dir) : undefined
     const httpAuthModified = this.#httpAuthModified()
     const endpoints = await this.#endpoints(facts)
     const jobs = await this.#jobs(install.dir, features, facts, staleActive)
@@ -996,6 +1111,7 @@ class Discoverer {
       git,
       service,
       server,
+      leftStopped,
       httpAuthModified,
       endpoints,
       qdrant,
@@ -1028,16 +1144,61 @@ class Discoverer {
     }
     const { record } = active
     const what = `${shown(record.step, 48)} (pid ${String(record.pid)}, since ${shown(record.started, 40)})`
-    const running = await this.#recordedPid(record)
+    let running = await this.#recordedPid(record)
+    if (record.readOnly === true) {
+      // The jobs count an installer that ended on a Ctrl-C or a signal left running: it changes nothing, so it is waited for a while and then cleared, never read as a window.
+      if (running !== undefined) {
+        this.#o.print?.(
+          shownLine(`waiting up to ${String((READ_ONLY_POLLS * READ_ONLY_POLL_MS) / 1000)} s for an earlier run's count of pmmcp's jobs (pid ${String(record.pid)}) to end`),
+        )
+      }
+      for (let looked = 0; running !== undefined && looked < READ_ONLY_POLLS; looked += 1) {
+        await this.#sleep(READ_ONLY_POLL_MS)
+        running = await this.#recordedPid(record)
+      }
+      if (running === undefined) return this.#clearReadOnly(record, what)
+      throw stop(
+        'active-step',
+        `an earlier installer run's count of pmmcp's jobs, ${what}, still runs ${running} after ${String((READ_ONLY_POLLS * READ_ONLY_POLL_MS) / 1000)} s, ` +
+          'and .aos/install/active.json records it: it only counts and changes nothing. Wait for it to end, then re-run',
+      )
+    }
     if (running === undefined) return this.#stale(record, what)
-    const readOnly = /^stop-jobs(?:-\d+)?$/.test(record.step)
     throw stop(
       'active-step',
       `an earlier installer run started ${what} in its own session, and .aos/install/active.json still records it while that pid runs ${running}: ` +
-        (readOnly
-          ? "it only counts pmmcp's jobs and changes nothing. Wait for it to end, then re-run"
-          : `it may still be stopping, starting or changing pmmcp. Wait for it to end (its output: ${shown(record.out)}, ${shown(record.err)}), then re-run`),
+        `it may still be stopping, starting or changing pmmcp. Wait for it to end (its output: ${shown(record.out)}, ${shown(record.err)}), then re-run`,
     )
+  }
+
+  /**
+   * An earlier run's read-only jobs count whose pid has ended: its record is
+   * removed (only while active.json still holds that one record), so this
+   * run, a dry run included, counts the jobs itself. Removing it is the one
+   * change discovery makes outside its own run folder, and it changes no
+   * state anything acts on. When it cannot be removed it is left as a stale
+   * record, which the applier clears before a window of its own. A record
+   * gone meanwhile is nothing to remove; one that is no longer this record
+   * is no one's to remove here, and is not read in passing either: discovery
+   * stops, and a re-run reads it afresh.
+   */
+  #clearReadOnly(record: ActiveRecord, what: string): ActiveRecord | undefined {
+    const now = readActive(this.#o.repoRoot)
+    if (now.state === 'none') return undefined
+    if (now.state !== 'recorded' || now.record.pid !== record.pid || now.record.started !== record.started || now.record.step !== record.step) {
+      throw stop(
+        'active-step',
+        `.aos/install/active.json changed while discovery waited for an earlier run's count of pmmcp's jobs, ${what}, to end: it no longer holds that record, ` +
+          'so nothing was removed. Re-run, and the installer reads it afresh',
+      )
+    }
+    try {
+      clearActive(this.#o.repoRoot)
+    } catch {
+      return this.#stale(record, what)
+    }
+    this.#notes.push(`.aos/install/active.json still recorded an earlier run's count of pmmcp's jobs, ${what}, which has ended: the record was removed`)
+    return undefined
   }
 
   /**
@@ -1235,7 +1396,7 @@ class Discoverer {
       if (ps.ok) this.#discard(ps.result)
       const m = /^\s*(\d+)\s+(.+)$/.exec(line)
       if (m === null) throw stop('probe', `what pid ${String(pid)} on ${String(port)} runs cannot be read${ps.ok ? '' : `: ${ps.why}`}`)
-      const dir = serverDirOf(m[2] ?? '')
+      const dir = serverDirOf(m[2] ?? '', (d) => isFile(join(d, '.venv', 'bin', 'pmmcp')))
       if (Number(m[1]) !== this.#uid || dir === undefined) {
         throw stop('listener', `${String(port)} is held by pid ${String(pid)}, which is not a pmmcp MCP server of this account (it runs ${programOf(m[2] ?? '')}): stop that process, then re-run`)
       }
@@ -1462,21 +1623,31 @@ class Discoverer {
     const control = this.#o.config.control.port
     const daemon = control === 0 ? { status: 0, body: '' } : await this.#http({ host: '127.0.0.1', port: control, path: '/' }, HTTP_MS)
     const daemonListening = daemon.status !== 0
-    if (daemonListening) this.#notes.push(`the AOS daemon listens on ${String(control)}: restart it after this run`)
+    // The restart itself is the end report's to ask, and only when something the daemon reads changed (a re-run with nothing to do asks none).
+    if (daemonListening) {
+      this.#notes.push(`the AOS daemon listens on ${String(control)}: it reads .env when it starts, and the end report's next steps say whether this run needs it restarted`)
+    }
     return { url, urlMatches: server === undefined ? undefined : sameUrl(url, mcpUrl(server.host, server.port)), tokenEnv, ollamaShared, daemonListening }
   }
 
   async #service(): Promise<ServiceState> {
-    if (this.#uid === undefined) return { loaded: false, state: undefined, pid: undefined }
+    if (this.#uid === undefined) return { loaded: undefined, state: undefined, pid: undefined }
     const ran = await this.#quick('launchctl-print', 'launchctl', ['print', `gui/${String(this.#uid)}/${PLIST_LABEL}`])
     if (!ran.ok) {
       this.#notes.push(`launchd cannot be asked about ${PLIST_LABEL}: ${ran.why}`)
-      return { loaded: false, state: undefined, pid: undefined }
+      return { loaded: undefined, state: undefined, pid: undefined }
     }
     const out = this.#out(ran.result) ?? ''
     // launchd's copy of the service's environment is in there: once read, the log keeps none of it.
     this.#discard(ran.result)
-    if (ran.result.code !== 0) return { loaded: false, state: undefined, pid: undefined }
+    if (ran.result.code === LAUNCHCTL_NOT_FOUND) return { loaded: false, state: undefined, pid: undefined }
+    if (ran.result.code !== 0) {
+      this.#notes.push(
+        `launchctl print gui/${String(this.#uid)}/${PLIST_LABEL} exited ${String(ran.result.code)}, not ${String(LAUNCHCTL_NOT_FOUND)} ("Could not find service"): ` +
+          'whether launchd has pmmcp loaded is not known',
+      )
+      return { loaded: undefined, state: undefined, pid: undefined }
+    }
     const state = /^\tstate = (\S+)$/m.exec(out)?.[1]
     const pid = /^\tpid = (\d+)$/m.exec(out)?.[1]
     return { loaded: true, state, pid: pid === undefined ? undefined : Number(pid) }

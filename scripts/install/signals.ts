@@ -23,12 +23,19 @@
 //       sessions of their own (A3), so neither a Ctrl-C nor a closed
 //       terminal reaches them, and the installer goes on to the start and
 //       its checks; it says so at once, and again at the end.
+//     After the window, once it had opened in this run, until the end report
+//       is printed (`reporting`: windowChanged sets it at the first opening,
+//       the entry point clears it once the report is out): held. Those
+//       last checks (.env's ACL, the facts again) and the report say
+//       whether pmmcp is left stopped and what is left to do, so the run
+//       goes on to them, and ends with the gate's own code (a 4 stays a 4);
+//       it says so at once, and again at the end.
 //     While pmmcp's jobs are counted: the count ends, and the gate ends the
 //       run (130).
-//     Anywhere else: the run ends at once, with the status the signal's own
-//       default would give a shell (128 + its number: 130, 129, 143), and
-//       the lock is released. Outside the window nothing is half done that a
-//       re-run does not pick up from the state on disk.
+//     Anywhere else (before the window ever opened): the run ends at once,
+//       with the status the signal's own default would give a shell (128 +
+//       its number: 130, 129, 143), and the lock is released. Then nothing
+//       is half done that a re-run does not pick up from the state on disk.
 //
 //   A defect (an error main did not expect) exits 4 once the window had
 //   opened (pmmcp may be stopped, and the manual start is printed), 1 before.
@@ -50,6 +57,8 @@ export interface SignalView {
   readonly promptOpen: boolean
   /** Inside the stopped window. */
   readonly windowOpen: boolean
+  /** The window opened in this run, and the end report is not printed yet. */
+  readonly reporting: boolean
   /** stop-pmmcp-server.sh --jobs runs. */
   readonly counting: boolean
   /** The signal handled last (a repeat is not one), and when, in milliseconds. */
@@ -60,6 +69,7 @@ export type SignalDecision =
   | { readonly kind: 'repeat' }
   | { readonly kind: 'answered' }
   | { readonly kind: 'trapped' }
+  | { readonly kind: 'held' }
   | { readonly kind: 'count-aborted' }
   | { readonly kind: 'exit'; readonly code: number }
 
@@ -69,6 +79,7 @@ export function onSignal(view: SignalView, signal: HandledSignal, now: number): 
   if (last !== undefined && last.signal === signal && now >= last.at && now - last.at < REPEAT_MS) return { kind: 'repeat' }
   if (view.promptOpen) return { kind: 'answered' }
   if (view.windowOpen) return { kind: 'trapped' }
+  if (view.reporting) return { kind: 'held' }
   if (view.counting) return { kind: 'count-aborted' }
   return { kind: 'exit', code: SIGNAL_EXIT[signal] }
 }
@@ -78,13 +89,37 @@ export function defectExit(windowOpened: boolean): 1 | 4 {
   return windowOpened ? 4 : 1
 }
 
+/** Where the run is as to the stopped window. */
+export interface WindowMarks {
+  windowOpen: boolean
+  /** The window opened at some point in this run: a defect exits 4 from then on (defectExit). */
+  windowOpened: boolean
+  /** From the window's first opening until the end report is printed: a signal outside the window is held. */
+  reporting: boolean
+}
+
+/**
+ * The applier opened (true) or closed (false) the stopped window (its
+ * `window` callback). The first opening sets `windowOpened` and `reporting`,
+ * which a close leaves set: after the window the run still owes its report.
+ */
+export function windowChanged(marks: WindowMarks, open: boolean): void {
+  marks.windowOpen = open
+  if (!open) return
+  marks.windowOpened = true
+  marks.reporting = true
+}
+
 /** The run's side of the decision, kept between signals. */
 export interface SignalState {
   readonly windowOpen: boolean
+  readonly reporting: boolean
   readonly counting: boolean
   last: { readonly signal: HandledSignal; readonly at: number } | undefined
   /** Every signal the window trapped, for the end of the run. */
   readonly trapped: Set<HandledSignal>
+  /** Every signal held after the window until the end report, for the end of the run. */
+  readonly held: Set<HandledSignal>
 }
 
 /** How a decision is carried out. */
@@ -94,6 +129,8 @@ export interface SignalEffects {
   answer(): void
   /** Say that the window goes on. */
   trapped(signal: HandledSignal): void
+  /** Say that the run goes on to its end report. */
+  held(signal: HandledSignal): void
   /** End the jobs count. */
   abortCount(): void
   /** End the run now. */
@@ -102,13 +139,16 @@ export interface SignalEffects {
 
 /** Decide what `signal` does and do it; returns the decision. */
 export function handleSignal(state: SignalState, signal: HandledSignal, now: number, effects: SignalEffects): SignalDecision {
-  const decision = onSignal({ promptOpen: effects.promptOpen(), windowOpen: state.windowOpen, counting: state.counting, last: state.last }, signal, now)
+  const decision = onSignal({ promptOpen: effects.promptOpen(), windowOpen: state.windowOpen, reporting: state.reporting, counting: state.counting, last: state.last }, signal, now)
   if (decision.kind === 'repeat') return decision
   state.last = { signal, at: now }
   if (decision.kind === 'answered') effects.answer()
   else if (decision.kind === 'trapped') {
     state.trapped.add(signal)
     effects.trapped(signal)
+  } else if (decision.kind === 'held') {
+    state.held.add(signal)
+    effects.held(signal)
   } else if (decision.kind === 'count-aborted') effects.abortCount()
   else effects.exit(decision.code, signal)
   return decision

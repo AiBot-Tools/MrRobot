@@ -316,6 +316,11 @@ test('a value still holding the .env.example placeholder is refused, so the temp
     /line 1: ANTHROPIC_API_KEY still holds the \.env\.example placeholder/,
   )
   assert.match(refusal(() => parseDotenv('AOS_CONTROL_TOKEN=REPLACE-ME\n', ACCEPTED)), /placeholder/)
+  // Both fixes, as plan S2 gives them: deleting the line is one (the installer then appends a token it makes; a key of yours is then unset).
+  assert.match(
+    refusal(() => parseDotenv('AOS_CONTROL_TOKEN=replace-me-with-npm-run-aos-install\n', ACCEPTED)),
+    /line 1: AOS_CONTROL_TOKEN still holds the \.env\.example placeholder: delete that line, or put the real value there, then re-run/,
+  )
 })
 
 test('no refusal message contains any 8-character window of a value or a line', (t) => {

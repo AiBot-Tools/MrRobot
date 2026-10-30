@@ -61,9 +61,14 @@
 //
 //   How it ends (GateOutcome, with the installer's exit code): refused (2),
 //   nothing to do (0), dry run (0), not a terminal (3), declined (0: a no, a
-//   wrong word, or nothing chosen), aborted (EOF or Ctrl-C at a prompt or the
-//   wait, or Ctrl-C during a jobs count: 130; q at the wait: 0; a jobs
-//   count that is unknown or failed: 1),
+//   wrong word, or nothing chosen), aborted (EOF or an interrupt at a prompt
+//   or the wait, or an interrupt during a jobs count: 130; q at the wait: 0;
+//   a jobs count that is unknown or failed: 1; each says so in a line, EOF
+//   or an interrupt at a question with the phases applied before it,
+//   "aborted (...): nothing live was done"). An interrupt is the terminal's
+//   Ctrl-C or a signal the installer handles (SIGINT, SIGHUP, SIGTERM), which
+//   answers the open prompt: which one is not known here, so it is said as
+//   "interrupted", never as Ctrl-C.
 //   failed (apply's own code), done (0). Whatever ends the run before
 //   apply('live', …) leaves pmmcp as it was, and `applied` lists the phases
 //   that did run.
@@ -73,6 +78,7 @@ import {
   PMMCP_FOLDER,
   describeDotenv,
   describePlan,
+  impliedAnswer,
   nonLiveNumbers,
   nothingToDo,
   opensWindow,
@@ -238,7 +244,7 @@ class Gate {
     for (const offer of plan.offers) {
       if (offer.requires !== undefined && !accepted.has(offer.requires)) continue
       if (offer.impliedByWindow && opensWindow(plan, accepted)) {
-        this.#print(`${without(offer.question)}: yes, by the changes above, which restart pmmcp once`)
+        this.#print(`${without(offer.question)}: ${impliedAnswer(offer)}`)
         continue
       }
       const yes = await this.#yesNo(offer.question, 'offer', false)
@@ -344,7 +350,7 @@ class Gate {
   /** y/N (or Y/n): only y or yes is yes, only n or no is no, anything else the default; EOF or Ctrl-C ends the run. */
   async #yesNo(question: string, at: Checkpoint, byDefault: boolean): Promise<boolean | GateOutcome> {
     const answer = await this.#ask(question)
-    if (answer.kind !== 'line') return this.#aborted(at, answer.kind)
+    if (answer.kind !== 'line') return this.#abortedAt(at, answer.kind)
     const text = answer.text.trim().toLowerCase()
     if (byDefault) return !(text === 'n' || text === 'no')
     return text === 'y' || text === 'yes'
@@ -353,7 +359,7 @@ class Gate {
   /** A typed confirmation: undefined when the exact word came back, else how the run ends. */
   async #typed(question: string, word: string, at: Checkpoint): Promise<GateOutcome | undefined> {
     const answer = await this.#ask(question)
-    if (answer.kind !== 'line') return this.#aborted(at, answer.kind)
+    if (answer.kind !== 'line') return this.#abortedAt(at, answer.kind)
     if (answer.text.trim() === word) return undefined
     const done = this.#applied.length === 0 ? 'nothing was changed' : `nothing live was done (the ${this.#applied.join(' and ')} steps above were applied)`
     this.#print(`that is not \`${word}\`, so ${at === 'install' ? 'nothing was installed and ' : ''}${done}`)
@@ -381,6 +387,14 @@ class Gate {
 
   #declined(at: Checkpoint): GateOutcome {
     return { kind: 'declined', at, applied: [...this.#applied], exitCode: 0 }
+  }
+
+  /** EOF or an interrupt (Ctrl-C, or a signal that answered the prompt) at a question: said, with what was done before it, then aborted (130). */
+  #abortedAt(at: Checkpoint, by: 'eof' | 'interrupt'): GateOutcome {
+    const how = by === 'eof' ? 'the input ended' : 'interrupted'
+    const done = this.#applied.length === 0 ? 'and nothing was changed' : `(the ${this.#applied.join(' and ')} steps above were applied)`
+    this.#print(`aborted (${how}): nothing live was done${at === 'install' ? ', nothing was installed,' : ''} ${done}`)
+    return this.#aborted(at, by)
   }
 
   #aborted(at: Checkpoint, by: 'eof' | 'interrupt' | 'quit' | 'jobs'): GateOutcome {

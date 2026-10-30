@@ -84,9 +84,12 @@ npm run aos-install
 The first only looks: it finds pmmcp, reads what `.env` holds by name, and
 prints the plan, every step as "would" and every question and word it would ask
 you, then `dry run: nothing was changed`. The second does it, asking first. Run
-it from the repository root (npm runs it there) and in a terminal: with stdin
-not a terminal it prints the plan and exits 3, because only you, at a terminal,
-may confirm a change. What it does, in order (`scripts/install.ts`; decisions
+it from the repository root, and in a terminal. npm moves the script to the root
+whatever folder you type it in, but keeps its own cache and logs under that
+folder (`.npmrc`'s `cache=.aos/npm-cache`, where git does not ignore them), so a
+run typed anywhere else is refused with the `cd` to make. With stdin not a
+terminal it prints the plan and exits 3, because only you, at a terminal, may
+confirm a change. What it does, in order (`scripts/install.ts`; decisions
 D33, D35 and D36):
 
 - **Preflight**, read-only. It refuses root, a tree a falsify run holds, a Node
@@ -114,31 +117,57 @@ D33, D35 and D36):
   into `.env`. Its bearer gate stays in warn mode: switching it to enforce is
   your later step.
 - **Live pmmcp changes** (a restart to load the digest, the Qdrant key
-  cutover, the dashboard token and curator secret, a fast-forward of its code)
-  are each offered with a default of no, and run only after a warning that
+  cutover, the dashboard token and curator secret, a fast-forward of its code,
+  the start of a pmmcp an earlier run left stopped) are each offered with a default of no, and run only after a warning that
   says what stops and for how long, a first typed confirmation, `stop pmmcp`,
   pmmcp's job count, and a second, the folder name `Persistent-Memory-MCP`.
   pmmcp is stopped only by `stop-pmmcp-server.sh` without `--force`, and
   nothing ever sends it or the start script a signal or a timeout: inside that
   window neither Ctrl-C nor a closed terminal (SIGHUP) nor a SIGTERM ends the
   installer, which goes on to the start and its checks, and its steps run in
-  sessions of their own. There is no `--yes` and no `--force`.
+  sessions of their own. From the window's first opening until the end report
+  is printed, a signal outside the window (at no question) is held as well:
+  the run finishes its last checks and prints the report (whether pmmcp is
+  left stopped, and what is left to do) first, and ends with its own code.
+  There is no `--yes` and no `--force`.
 
 Flags: `--dry-run`; `--aos-only` (`.env` only, pmmcp is never touched);
 `--pmmcp-dir PATH` (use this install, still validated); `--no-install` (never
-offer the clone and `setup.sh`); `--help`. Exit codes: 0 done or nothing to do,
-1 a step failed (the end report says what state it left), 2 refused before any
+offer the clone and `setup.sh`); `--help`. Exit codes: 0 done, nothing to do,
+a dry run, or declined, 1 a step failed (the end report says what state it left), 2 refused before any
 change, 3 changes are needed but stdin is not a terminal, 4 a live step failed
-and pmmcp is not in its intended state, 130 interrupted outside the stopped
-window (129 and 143 for SIGHUP and SIGTERM). The flags go after `--`: npm
+and pmmcp is not in its intended state, 130 interrupted before the stopped
+window opened (129 and 143 for SIGHUP and SIGTERM; 130 for the input ending,
+or for any of those signals, at a question, which it answers, or during the
+jobs count, which it ends). The flags go after `--`: npm
 takes `npm run aos-install --dry-run` as its own `--dry-run` and hands the
-installer nothing, so the installer refuses any flag npm took that way. A dry
-run writes only the installer's probe logs under `.aos/install/<stamp>/`
-(`active.json` too, while a `--jobs` count runs) and its lock while it runs.
-If its output goes away mid-run (a `| tee` the same Ctrl-C ended, a closed
-terminal), it goes on, and what it said lands in `installer.out` beside those
-logs. After a failure, run it again: it picks up from the state on disk, and
-once everything is in place it says so and asks nothing.
+installer nothing, so the installer refuses any flag npm took that way. The
+installer's last line, `aos-install: exit N: …`, is its own code and how this
+run ended (a dry run, done, declined with nothing changed, the input ended or
+an interrupt at a question, a step that failed, a signal, a defect; it points
+at the end report only when one was printed above it), and is the run's word:
+npm 10 re-raises a Ctrl-C it forwarded, so after
+one (inside the stopped window, say, where the installer goes on to the start)
+`npm run aos-install` can end with status 130 for a run the installer finished
+with 0 or 4. Read that line, not `$?`; or run `node --import tsx
+scripts/install.ts` from the repository root, with the same flags and no `--`
+before them (`node --import tsx scripts/install.ts --dry-run`): its status is
+the installer's own. A dry run writes only the installer's probe
+logs under `.aos/install/<stamp>/` (`active.json` too, while a `--jobs` count
+runs: the count runs on if a Ctrl-C or a signal ends the installer, and its
+record, marked read-only, is waited for up to 15 s by the next run, or removed
+by it once the count has ended) and its lock while it runs. If its output goes
+away mid-run (a `| tee` the same Ctrl-C ended, a closed terminal), it goes on,
+and what it said lands in `installer.out` beside those logs. After a failure, run it again: it picks up from the state on disk,
+including a pmmcp that is stopped while the last run that stopped it ran no
+start after it (it was killed or crashed inside the stopped window, or a stop
+did not stop and no start followed; its run folder shows it, and what you ran
+by hand since is not known to it): it then offers the start, behind the same
+warning and two typed confirmations. Once everything is in place it says so and asks nothing. A
+`pmmcp-qdrant-prekey` kept from a Qdrant cutover counts as in place: it is not
+asked about on its own (the notes give its `qdrant_api_key.py cleanup` command,
+which also ends the cutover's rollback), and is offered, default no, only in a
+run that asks something else anyway.
 
 When you pull the commit that makes `kernel.yaml` declare `AOS_PMMCP_TOKEN`,
 run `npm run aos-install` before you restart `npm run dev`: a daemon restarted

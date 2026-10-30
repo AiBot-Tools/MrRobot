@@ -198,6 +198,7 @@ interface FoundOver {
   readonly git?: Partial<PmmcpFound['git']>
   readonly jobs?: PmmcpFound['jobs']
   readonly ollamaShared?: PmmcpFound['kernel']['ollamaShared']
+  readonly leftStopped?: PmmcpFound['leftStopped']
 }
 
 /** Discovery's result for an install that is in place, as the planner reads it, with the fields a test changes. */
@@ -214,6 +215,7 @@ function found(over: FoundOver = {}): PmmcpFound {
     missing: facts === undefined ? [FACTS_MISSING] : missingFeatures(facts),
     git: { head: HEAD, originMain: HEAD, fastForward: false, lockUnchanged: undefined, trackedChanges: 0, untracked: 0, ...over.git },
     server: over.server === null ? undefined : (over.server ?? { pid: 812, startedAfter: STARTED_AFTER }),
+    leftStopped: over.leftStopped,
     httpAuthModified: 'httpAuthModified' in over ? over.httpAuthModified : MODIFIED,
     qdrant: q === null ? undefined : parseQdrantStatus(JSON.stringify(q)),
     jobs: over.jobs ?? (facts === undefined ? noJobs : { state: 'counted', jobs: { running: 0, display: [] } }),
@@ -707,6 +709,73 @@ test('a wrong word, EOF or Ctrl-C at either confirmation aborts with nothing liv
   }
 })
 
+test('a failed apply ends the run with its own exit code, and nothing after it runs: no warning, no confirmation, no jobs count, no window', async () => {
+  // The digest staged (non-live), then the cutover's window.
+  const plan = planInstall(input({ config: DECLARED, dotenv: FULL, pmmcp: found({ qdrant: keyless(), bearer: { state: 'absent' } }) }))
+  assert.deepEqual(ids(select(plan, new Set(['qdrant'])).nonLive), ['stage-digest'])
+  const failing = (phase: Phase, exitCode: 1 | 2 | 4) => (p: Phase): Applied => (p === phase ? { ok: false, exitCode } : { ok: true })
+
+  // A non-live phase that failed (1 a step failed, 2 refused before a change): the run ends there, and pmmcp is never stopped.
+  for (const exitCode of [1, 2] as const) {
+    const io = new FakeIO({ apply: failing('non-live', exitCode) })
+    assert.deepEqual(await gate(plan, io), { kind: 'failed', phase: 'non-live', applied: [], exitCode }, String(exitCode))
+    assert.equal(io.events.at(-1), 'apply non-live', io.events.join('\n'))
+    assert.equal(io.events.includes('jobs'), false)
+    assert.equal(io.events.includes('apply live'), false)
+    assert.equal(io.asked.some((q) => q.includes(`\`${FIRST_CONFIRMATION}\``) || q.includes(`\`${SECOND_CONFIRMATION}\``)), false, io.asked.join('\n'))
+    assert.equal(has(io.printed, /^WARNING: /), false, 'the window was announced after a failed non-live step')
+  }
+  // The live window that failed: its own code (4 when pmmcp is not as intended, 1 when it changed nothing), with the non-live phase applied before it.
+  for (const exitCode of [4, 1] as const) {
+    const io = new FakeIO({ apply: failing('live', exitCode) })
+    assert.deepEqual(await gate(plan, io), { kind: 'failed', phase: 'live', applied: ['non-live'], exitCode }, String(exitCode))
+    assert.equal(io.events.at(-1), 'apply live', io.events.join('\n'))
+  }
+  // A window with nothing non-live before it: applied stays empty.
+  const restart = planInstall(input({ config: DECLARED, dotenv: FULL, pmmcp: found({ bearer: { state: 'matches' }, server: { pid: 812, startedAfter: STARTED_BEFORE } }) }))
+  assert.deepEqual(offerIds(restart), ['restart'])
+  assert.deepEqual(await gate(restart, new FakeIO({ apply: failing('live', 4) })), { kind: 'failed', phase: 'live', applied: [], exitCode: 4 })
+  // A fresh install that failed: its own code, whatever it is.
+  const fresh = planInstall(input({ pmmcp: ABSENT }))
+  assert.equal(fresh.kind, 'fresh-install')
+  for (const exitCode of [4, 2, 1] as const) {
+    const io = new FakeIO({ apply: failing('fresh-install', exitCode) })
+    assert.deepEqual(await gate(fresh, io), { kind: 'failed', phase: 'fresh-install', applied: [], exitCode }, String(exitCode))
+    assert.deepEqual(io.events, ['ask Type `install` to begin', 'apply fresh-install'])
+  }
+})
+
+test('EOF or Ctrl-C at an offer, the non-live question, a typed confirmation, the jobs wait or the typed install ends the run (130) with a line saying what was done', async () => {
+  const plan = planInstall(input({ config: DECLARED, dotenv: FULL, pmmcp: found({ qdrant: keyless(), bearer: { state: 'absent' } }) }))
+  const fresh = planInstall(input({ pmmcp: ABSENT }))
+  const cases: readonly { readonly plan: Plan; readonly at: RegExp; readonly checkpoint: string; readonly applied: readonly Phase[]; readonly line: string; readonly jobs?: JobsAnswer }[] = [
+    { plan, at: /^Enable the Qdrant/, checkpoint: 'offer', applied: [], line: 'nothing live was done and nothing was changed' },
+    { plan, at: /^Apply the non-live/, checkpoint: 'non-live', applied: [], line: 'nothing live was done and nothing was changed' },
+    { plan, at: /^Type `stop pmmcp`/, checkpoint: 'first-confirmation', applied: ['non-live'], line: 'nothing live was done (the non-live steps above were applied)' },
+    {
+      plan,
+      at: /^Wait for them/,
+      checkpoint: 'jobs',
+      applied: ['non-live'],
+      line: 'nothing live was done (the non-live steps above were applied)',
+      jobs: { state: 'counted', running: 1, display: ['  j1  index  aos  40%'] },
+    },
+    { plan, at: /^Second confirmation/, checkpoint: 'second-confirmation', applied: ['non-live'], line: 'nothing live was done (the non-live steps above were applied)' },
+    { plan: fresh, at: /^Type `install`/, checkpoint: 'install', applied: [], line: 'nothing live was done, nothing was installed, and nothing was changed' },
+  ]
+  for (const c of cases) {
+    for (const by of ['eof', 'interrupt'] as const) {
+      const io = new FakeIO({ answers: [[c.at, { kind: by }]], ...(c.jobs === undefined ? {} : { jobs: [c.jobs] }) })
+      const label = `${String(c.at)} ${by}`
+      assert.deepEqual(await gate(c.plan, io), { kind: 'aborted', at: c.checkpoint, by, applied: c.applied, exitCode: 130 }, label)
+      // The question was the last thing asked, and the line after it is the last thing said: nothing else ran.
+      assert.match(io.events.at(-1) ?? '', /^ask /, label)
+      assert.equal(io.transcript.at(-1), `print aborted (${by === 'eof' ? 'the input ended' : 'interrupted'}): ${c.line}`, `${label}:\n${io.transcript.join('\n')}`)
+      assert.equal(io.events.includes('apply live') || io.events.includes('apply fresh-install'), false, label)
+    }
+  }
+})
+
 test('a non-TTY stdin never reaches a write: plan printed, exit 3', async () => {
   const facts = factsDoc()
   edit(facts, 'dashboard_token', { state: 'absent' })
@@ -816,42 +885,56 @@ test('Qdrant cutover is offered only for an existing, keyless container with no 
     assert.equal(p.steps.some((s) => s.id === 'qdrant-enable'), false, what)
     if (note.source !== '^$') assert.ok(has(p.blocked, note), `${what}: ${p.blocked.join('\n')}`)
   }
-  // Enforced, with the prekey still kept: its cleanup is offered, default no, and touches nothing that runs.
-  const kept = qdrantPlan(edit(qdrantDoc(), 'prekey_kept', true))
-  assert.deepEqual(offerIds(kept), ['qdrant-cleanup'])
-  assert.deepEqual(kept.offers[0], {
+  // Enforced, with the prekey still kept, and nothing else to do: not asked, only noted with its command, and the run has nothing to do (plan A10).
+  const keptDoc = (): Doc => edit(qdrantDoc(), 'prekey_kept', true)
+  const KEPT_NOTE =
+    'pmmcp-qdrant-prekey, the keyless Qdrant the cutover kept stopped, is still there: once you no longer want to roll the cutover back, ' +
+    'remove it with cd /Users/op/Github/Persistent-Memory-MCP && .venv/bin/python scripts/qdrant_api_key.py cleanup (its volumes stay)'
+  const kept = qdrantPlan(keptDoc())
+  assert.deepEqual([kept.offers, kept.steps, kept.blocked], [[], [], []], 'a kept prekey is nothing missing')
+  assert.deepEqual(kept.notes, [KEPT_NOTE])
+  assert.equal(nothingToDo(kept), true)
+  for (const dryRun of [false, true]) {
+    const alone = new FakeIO()
+    assert.deepEqual(await gate(kept, alone, dryRun), { kind: 'nothing-to-do', exitCode: 0 })
+    assert.deepEqual(alone.events, [], 'a question was asked for the cleanup alone')
+    assert.ok(alone.printed.includes('nothing to do: everything the installer makes is in place'), alone.printed.join('\n'))
+    assert.ok(alone.printed.includes(`  - ${KEPT_NOTE}`), alone.printed.join('\n'))
+  }
+  // Beside something else the run asks anyway (a restart): offered too, default no, and touching nothing that runs.
+  const withRestart = planInstall(input({ config: DECLARED, dotenv: FULL, pmmcp: found({ qdrant: keptDoc(), bearer: { state: 'matches' }, server: { pid: 812, startedAfter: STARTED_BEFORE } }) }))
+  assert.deepEqual(offerIds(withRestart), ['qdrant-cleanup', 'restart'])
+  assert.deepEqual(withRestart.offers[0], {
     id: 'qdrant-cleanup',
     question: 'Remove the kept pmmcp-qdrant-prekey now (qdrant_api_key.py cleanup: its volumes stay, and the cutover can no longer be rolled back)? [y/N]',
     impliedByWindow: false,
     requires: undefined,
     live: false,
   })
-  const cleanup = kept.steps.find((s) => s.id === 'qdrant-cleanup')
+  assert.equal(withRestart.notes.includes(KEPT_NOTE), false, 'offered, so not noted as well')
+  const cleanup = withRestart.steps.find((s) => s.id === 'qdrant-cleanup')
   assert.ok(cleanup !== undefined)
-  assert.deepEqual(ids(kept.steps), ['qdrant-cleanup'], 'no window: nothing live')
-  assert.deepEqual([kept.notes, kept.blocked], [[], []], 'offered, so nothing else is said of it')
+  assert.deepEqual(ids(withRestart.steps), ['qdrant-cleanup', 'stop', 'start', 'bearer-check'])
   assert.equal(cleanup.tag, 'pmmcp-docker')
   assert.deepEqual(cleanup.commands, [`${DIR}/.venv/bin/python scripts/qdrant_api_key.py cleanup`])
   assert.equal(cleanup.rollback, undefined)
-  assert.ok(has(describe(kept), /^ {2}1\. \[pmmcp's Docker, not the running service\] remove pmmcp-qdrant-prekey, .*\(if you answer yes to "Remove the kept pmmcp-qdrant-prekey now/))
-  assert.deepEqual(select(kept, new Set<OfferId>(['qdrant-cleanup'])), { nonLive: [cleanup], live: [] })
-  assert.deepEqual(select(kept, new Set()), { nonLive: [], live: [] })
-  // A yes, then the non-live question; no typed confirmation, no jobs count.
-  const yes = new FakeIO()
-  assert.deepEqual(await gate(kept, yes), { kind: 'done', applied: ['non-live'], exitCode: 0 })
-  assert.deepEqual(yes.events, [`ask ${kept.offers[0]?.question ?? ''}`, 'ask Apply the non-live step 1 now? [y/N]', 'apply non-live'])
+  assert.ok(has(describe(withRestart), /^ {2}1\. \[pmmcp's Docker, not the running service\] remove pmmcp-qdrant-prekey, .*\(if you answer yes to "Remove the kept pmmcp-qdrant-prekey now/))
+  assert.deepEqual(select(withRestart, new Set<OfferId>(['qdrant-cleanup'])), { nonLive: [cleanup], live: [] })
+  assert.deepEqual(select(withRestart, new Set()), { nonLive: [], live: [] })
+  // A yes to it and a no to the restart: the non-live question, no typed confirmation, no jobs count.
+  const yes = new FakeIO({ answers: [[/^Restart/, 'n']] })
+  assert.deepEqual(await gate(withRestart, yes), { kind: 'done', applied: ['non-live'], exitCode: 0 })
+  assert.deepEqual(yes.events, [
+    `ask ${withRestart.offers[0]?.question ?? ''}`,
+    'ask Restart pmmcp to load the staged aos-kernel token? [y/N]',
+    'ask Apply the non-live step 1 now? [y/N]',
+    'apply non-live',
+  ])
   assert.deepEqual(yes.applied, [{ phase: 'non-live', steps: ['qdrant-cleanup'] }])
-  const no = new FakeIO({ answers: [[/^Remove the kept/, 'n']] })
-  assert.deepEqual(await gate(kept, no), { kind: 'declined', at: 'offer', applied: [], exitCode: 0 })
+  const no = new FakeIO({ answers: [[/^Remove the kept/, 'n'], [/^Restart/, 'n']] })
+  assert.deepEqual(await gate(withRestart, no), { kind: 'declined', at: 'offer', applied: [], exitCode: 0 })
   assert.equal(no.events.some((e) => e.startsWith('apply')), false)
-  // Not live, so offered when the jobs check cannot run; and it opens no window, so a restart beside it is still asked.
-  const blind = factsDoc()
-  edit(blind, 'features.stop_jobs_flag', false)
-  assert.deepEqual(offerIds(qdrantPlan(edit(qdrantDoc(), 'prekey_kept', true), blind)), ['qdrant-cleanup'])
-  const withRestart = planInstall(
-    input({ config: DECLARED, dotenv: FULL, pmmcp: found({ qdrant: edit(qdrantDoc(), 'prekey_kept', true), bearer: { state: 'matches' }, server: { pid: 812, startedAfter: STARTED_BEFORE } }) }),
-  )
-  assert.deepEqual(offerIds(withRestart), ['qdrant-cleanup', 'restart'])
+  // It opens no window, so the restart beside it is still asked.
   const both = new FakeIO()
   assert.deepEqual(await gate(withRestart, both), { kind: 'done', applied: ['non-live', 'live'], exitCode: 0 })
   assert.ok(both.events.includes('ask Restart pmmcp to load the staged aos-kernel token? [y/N]'), both.events.join('\n'))
@@ -859,6 +942,18 @@ test('Qdrant cutover is offered only for an existing, keyless container with no 
     { phase: 'non-live', steps: ['qdrant-cleanup'] },
     { phase: 'live', steps: ['stop', 'start', 'bearer-check'] },
   ])
+  // Beside a non-live step alone (the .env append), whose question the run asks anyway: offered.
+  const withEnv = planInstall(input({ dotenv: dotenv({ AOS_CONTROL_TOKEN: 'missing', ANTHROPIC_API_KEY: 5 }), pmmcp: found({ qdrant: keptDoc() }) }))
+  assert.deepEqual([offerIds(withEnv), ids(withEnv.steps)], [['qdrant-cleanup'], ['env', 'qdrant-cleanup']])
+  // When the jobs check cannot run, the live items beside it are not offered, and so neither is it: noted.
+  const blind = factsDoc()
+  edit(blind, 'features.stop_jobs_flag', false)
+  const blindRestart = planInstall(
+    input({ config: DECLARED, dotenv: FULL, pmmcp: found({ facts: blind, qdrant: keptDoc(), bearer: { state: 'matches' }, server: { pid: 812, startedAfter: STARTED_BEFORE } }) }),
+  )
+  assert.deepEqual(blindRestart.offers, [])
+  assert.ok(blindRestart.notes.includes(KEPT_NOTE), blindRestart.notes.join('\n'))
+  assert.equal(has(blindRestart.blocked, /prekey/), false)
   // A checkout without the script that removes it: named, not offered.
   const noScript = factsDoc()
   edit(noScript, 'features.qdrant_key_script', false)
@@ -1084,10 +1179,16 @@ test('a caller that hands the planner less than it needs gets a PlanError, never
   assert.deepEqual(appended.generate, ['AOS_PMMCP_TOKEN'])
   assert.deepEqual(ids(appended.steps), ['env'])
   assert.equal(appended.staged, undefined)
-  assert.ok(has(appended.blocked, /^--aos-only: pmmcp is not touched, so the aos-kernel digest of AOS_PMMCP_TOKEN is not staged/), appended.blocked.join('\n'))
+  assert.ok(has(appended.blocked, /^--aos-only: pmmcp is not touched, so the aos-kernel digest of the AOS_PMMCP_TOKEN this run appends is not staged/), appended.blocked.join('\n'))
   const kept = planInstall(input({ config: DECLARED, dotenv: FULL, pmmcp: undefined, options: aosOnly }))
   assert.equal(kept.staged, undefined)
   assert.deepEqual(kept.steps, [])
+  // A token .env already holds: on a configured system pmmcp holds its digest, so the note never says it "is not staged", only that it is not checked.
+  assert.deepEqual(kept.blocked, [
+    '--aos-only: pmmcp is not touched, so whether it holds the aos-kernel digest of AOS_PMMCP_TOKEN is not checked, nor is the digest staged: ' +
+      'run the installer without --aos-only to check it, and to stage it if pmmcp lacks it',
+  ])
+  assert.equal(kept.blocked.some((n) => /digest of AOS_PMMCP_TOKEN is not staged/.test(n)), false)
 })
 
 test('the jobs gate prompts only when something runs: running jobs: 0 goes straight on', async () => {
@@ -1458,6 +1559,59 @@ test('only y or yes is yes at a y/N offer, and only n or no skips the wait', asy
   }
 })
 
+test('pmmcp stopped while the last installer run that stopped it ran no start after it (killed or crashed inside the window) is offered the start, behind both typed confirmations', async () => {
+  const folder = '/Users/op/MrRobot/.aos/install/20261029T090000Z'
+  const MANUAL = 'cd /Users/op/Github/Persistent-Memory-MCP && ./start-pmmcp-server.sh'
+  // Said as the run folders show it: the installer cannot know what was run by hand since that run.
+  const QUESTION = 'Start pmmcp (stopped now; the last installer run that stopped it ran no start after it)? [y/N]'
+  const plan = planInstall(input({ pmmcp: found({ server: null, leftStopped: { folder } }) }))
+  assert.deepEqual(plan.offers, [{ id: 'start', question: QUESTION, impliedByWindow: true, requires: undefined, live: true }])
+  assert.deepEqual(ids(plan.steps), ['stop', 'start'])
+  assert.equal(plan.running, false)
+  assert.ok(
+    plan.notes.includes(
+      `the last installer run that stopped pmmcp (its logs: ${folder}) ran no start after it, and pmmcp is stopped now: no MCP server listens on its port, ` +
+        `and launchd has its service unloaded until a start (${MANUAL})`,
+    ),
+    plan.notes.join('\n'),
+  )
+  assert.equal(nothingToDo(plan), false)
+  // Asked, then the usual window: the warning, both typed words and the jobs count between them, then the stop (for whatever else runs) and the start.
+  const io = new FakeIO()
+  assert.deepEqual(await gate(plan, io), { kind: 'done', applied: ['live'], exitCode: 0 })
+  assert.deepEqual(io.events, [`ask ${QUESTION}`, `ask Type \`${FIRST_CONFIRMATION}\` to continue`, 'jobs', `ask Second confirmation: type the folder name \`${PMMCP_FOLDER}\` to stop it now`, 'apply live'])
+  assert.deepEqual(io.applied, [{ phase: 'live', steps: ['stop', 'start'] }])
+  assert.ok(has(io.printed, /^pmmcp's MCP server is not running now: the stop still stops whatever else of pmmcp runs, and the window ends by starting pmmcp/), io.printed.join('\n'))
+  // A no leaves it stopped, and nothing runs.
+  const no = new FakeIO({ answers: [[/^Start pmmcp/, 'n']] })
+  assert.deepEqual(await gate(plan, no), { kind: 'declined', at: 'offer', applied: [], exitCode: 0 })
+  // Beside another live item, it is that window's own start: said, not asked.
+  const withCutover = planInstall(input({ pmmcp: found({ server: null, leftStopped: { folder }, qdrant: keyless() }) }))
+  assert.deepEqual(offerIds(withCutover), ['qdrant', 'start'])
+  const cut = new FakeIO()
+  assert.deepEqual(await gate(withCutover, cut), { kind: 'done', applied: ['live'], exitCode: 0 })
+  assert.equal(cut.asked.includes(QUESTION), false)
+  // Said as what it is: the window ends by starting a pmmcp that is stopped, never a restart of it.
+  assert.ok(
+    cut.printed.includes('Start pmmcp (stopped now; the last installer run that stopped it ran no start after it)?: yes, the window the changes above open ends by starting pmmcp'),
+    cut.printed.join('\n'),
+  )
+  assert.equal(cut.printed.some((l) => l.startsWith('Start pmmcp') && l.includes('restart pmmcp once')), false, cut.printed.join('\n'))
+  // No earlier run's stop on record, or an MCP server that runs: nothing offered for it.
+  assert.deepEqual(planInstall(input({ pmmcp: found({ server: null }) })).offers, [])
+  assert.deepEqual(planInstall(input({ pmmcp: found({ leftStopped: { folder } }) })).offers, [])
+  // A jobs check that cannot run offers nothing live: blocked, and the note gives the manual start.
+  const blind = factsDoc()
+  edit(blind, 'features.stop_jobs_flag', false)
+  const blocked = planInstall(input({ pmmcp: found({ facts: blind, server: null, leftStopped: { folder } }) }))
+  assert.deepEqual(blocked.offers, [])
+  assert.ok(
+    has(blocked.blocked, /^not offered: Start pmmcp \(stopped now; the last installer run that stopped it ran no start after it\)\?: the stop script cannot count jobs/),
+    blocked.blocked.join('\n'),
+  )
+  assert.ok(has(blocked.notes, new RegExp(`launchd has its service unloaded until a start \\(${MANUAL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)$`)), blocked.notes.join('\n'))
+})
+
 test('the stop and start run their scripts bare: no command or rollback in any plan names --force, --restart, kickstart or enforce', () => {
   const all = factsDoc()
   edit(all, 'dashboard_token', { state: 'absent' })
@@ -1472,7 +1626,14 @@ test('the stop and start run their scripts bare: no command or rollback in any p
     ['after the update', planInstall(input({ pmmcp: found({ facts: later, git: FAST_FORWARD }) }))],
     ['a restart', planInstall(input({ config: DECLARED, dotenv: FULL, pmmcp: found({ bearer: { state: 'matches' }, server: { pid: 812, startedAfter: STARTED_BEFORE } }) }))],
     ['not running', planInstall(input({ pmmcp: found({ qdrant: keyless(), server: null }) }))],
-    ['the prekey', planInstall(input({ pmmcp: found({ qdrant: edit(qdrantDoc(), 'prekey_kept', true) }) }))],
+    // The kept prekey's cleanup is offered only beside something else the run asks: here, the restart.
+    [
+      'the prekey',
+      planInstall(
+        input({ config: DECLARED, dotenv: FULL, pmmcp: found({ qdrant: edit(qdrantDoc(), 'prekey_kept', true), bearer: { state: 'matches' }, server: { pid: 812, startedAfter: STARTED_BEFORE } }) }),
+      ),
+    ],
+    ['left stopped', planInstall(input({ pmmcp: found({ server: null, leftStopped: { folder: '/Users/op/MrRobot/.aos/install/20261029T090000Z' } }) }))],
     ['a fresh install', planInstall(freshInput)],
   ]
   for (const [what, plan] of plans) {
@@ -1480,7 +1641,6 @@ test('the stop and start run their scripts bare: no command or rollback in any p
     for (const step of plan.steps) {
       for (const text of [...step.commands, step.rollback ?? '']) assert.equal(/--force|--restart|kickstart|enforce/.test(text), false, `${what}: ${step.id}: ${text}`)
     }
-    if (what === 'the prekey') continue
     assert.deepEqual(plan.steps.find((s) => s.id === 'stop')?.commands, [`${DIR}/stop-pmmcp-server.sh`], what)
     assert.deepEqual(plan.steps.find((s) => s.id === 'start')?.commands, [`${DIR}/start-pmmcp-server.sh`], what)
   }

@@ -31,7 +31,10 @@ import {
   HTTP_BODY_CAP,
   PMMCP_FOLDER,
   PYPROJECT_CAP,
+  READ_ONLY_POLLS,
+  READ_ONLY_POLL_MS,
   discover,
+  earlierStop,
   githubRepo,
   loopbackGet,
   loopbackGetWith,
@@ -51,6 +54,7 @@ import {
   type Stopped,
 } from '../scripts/install/discover.js'
 import { Runner, STOP_SCRIPT, activePath, type ChildOptions, type SpawnFn } from '../scripts/install/run.js'
+import { foundScreen } from '../scripts/install.js'
 import { parseKernelConfig, type KernelConfig } from '../src/config.js'
 import { FEATURE_COMMITS, FEATURE_NAMES, PmmcpDocumentError, featuresOf, keyedLoopbackOnly, missingFeatures, parseFacts, parseQdrantStatus } from '../src/install/facts.js'
 import { parseProviders, type ProvidersFile } from '../src/models/registry.js'
@@ -213,6 +217,12 @@ class World {
   /** Logical port → the ephemeral port its fake server listens on. */
   readonly ports = new Map<number, number>()
   readonly handlers = new Map<number, (path: string) => { status: number; body: string }>()
+  /** Every pause discovery asked for, in milliseconds. */
+  readonly slept: number[] = []
+  /** Called at each pause, after it is counted: a test changes the world while discovery waits. */
+  onSleep: (() => void) | undefined
+  /** What discovery said at once (its print), with the number of pauses taken before each line. */
+  readonly said: { readonly line: string; readonly afterPauses: number }[] = []
 
   /** `under`: the install's folder, as path parts under HOME (default Github/Persistent-Memory-MCP). */
   constructor(t: TestContext, options: { under?: readonly string[]; install?: boolean; plist?: boolean; listener?: boolean } = {}) {
@@ -372,6 +382,12 @@ class World {
       inspect: { euid: OP_UID },
       http: this.http,
       now: () => NOW,
+      sleep: (ms) => {
+        this.slept.push(ms)
+        this.onSleep?.()
+        return Promise.resolve()
+      },
+      print: (line) => this.said.push({ line, afterPauses: this.slept.length }),
       ...extra,
     })
   }
@@ -883,7 +899,9 @@ test('a legacy com.aibot-tools.pmmcp-* plist, two candidate installs, or a lower
   writeFileSync(old, '<plist/>\n')
   const a = stopWith(await legacy.run(t), 'legacy-plist')
   assert.ok(a.message.includes(old), a.message)
-  assert.match(a.message, /launchctl bootout/)
+  // The domain as the operator pastes it: this account's uid, never a literal <uid>.
+  assert.match(a.message, /\(launchctl bootout gui\/501 <plist>, then rm <plist>\), then re-run$/)
+  assert.equal(a.message.includes('<uid>'), false, a.message)
   assert.equal(legacy.calls.length, 0)
   // Any of the old supervisor's names, in any case (APFS opens it whatever the case).
   const worker = new World(t)
@@ -1312,10 +1330,13 @@ test('--jobs is never run unless the facts show stop_jobs_flag', async (t) => {
   assert.equal(found(await checked.run(t)).jobs.state, 'counted')
 })
 
-/** An earlier run's record in active.json, as the runner writes it. */
-function record(w: World, step: string, pid: number, started: Date | string): void {
+/** An earlier run's record in active.json, as the runner writes it (readOnly: the jobs count's). */
+function record(w: World, step: string, pid: number, started: Date | string, readOnly = false): void {
   mkdirSync(join(w.root, '.aos', 'install'), { recursive: true })
-  writeFileSync(activePath(w.root), JSON.stringify({ step, pid, started: typeof started === 'string' ? started : started.toISOString(), out: '/x/stop.out', err: '/x/stop.err' }))
+  writeFileSync(
+    activePath(w.root),
+    JSON.stringify({ step, pid, started: typeof started === 'string' ? started : started.toISOString(), out: '/x/stop.out', err: '/x/stop.err', ...(readOnly ? { readOnly: true } : {}) }),
+  )
 }
 
 /** `ps -ww -o etime=,command= -p <pid>`'s key in World.overrides. */
@@ -1333,13 +1354,66 @@ test('an active.json record stops discovery while its pid still runs the recorde
   assert.deepEqual(busy.calls.map((c) => [c.command, ...c.args].join(' ')), [psActive(999_999)])
   assert.equal(logs(busy.root).get('ps-active-999999.out'), '')
 
-  // A read-only --jobs an earlier run left running is said to change nothing.
+  // A read-only --jobs an earlier run left running (a Ctrl-C during the count) is waited for, then said to change nothing: never a window.
   const counting = new World(t)
-  record(counting, 'stop-jobs', 4321, new Date(NOW.getTime() - 5_000))
+  record(counting, 'stop-jobs', 4321, new Date(NOW.getTime() - 5_000), true)
   counting.overrides.set(psActive(4321), { out: `   00:05 /bin/bash ${counting.dir}/stop-pmmcp-server.sh --jobs\n` })
   const b = stopWith(await counting.run(t), 'active-step')
-  assert.match(b.message, /it only counts pmmcp's jobs and changes nothing/)
+  assert.match(b.message, /count of pmmcp's jobs, stop-jobs \(pid 4321, .*\), still runs stop-pmmcp-server\.sh after 15 s, .*it only counts and changes nothing/)
   assert.equal(b.message.includes('may still be stopping'), false)
+  assert.deepEqual(counting.slept, Array.from({ length: READ_ONLY_POLLS }, () => READ_ONLY_POLL_MS))
+  assert.ok(existsSync(activePath(counting.root)), 'a count that still runs lost its record')
+  // The wait is said once, before its first pause: never a silent stop after the preflight and .env lines.
+  assert.deepEqual(counting.said, [{ line: "waiting up to 15 s for an earlier run's count of pmmcp's jobs (pid 4321) to end", afterPauses: 0 }])
+  // One that ends while discovery waits: its record is removed, and this run counts the jobs itself.
+  const ending = new World(t)
+  record(ending, 'stop-jobs', 4329, new Date(NOW.getTime() - 5_000), true)
+  ending.overrides.set(psActive(4329), { out: `   00:05 /bin/bash ${ending.dir}/stop-pmmcp-server.sh --jobs\n` })
+  ending.onSleep = (): void => {
+    if (ending.slept.length === 2) ending.overrides.set(psActive(4329), { code: 1 })
+  }
+  const ended = found(await ending.run(t))
+  assert.equal(ending.slept.length, 2)
+  assert.equal(ended.staleActive, undefined)
+  assert.equal(existsSync(activePath(ending.root)), false, "the ended count's record was kept")
+  assert.equal(ended.jobs.state, 'counted')
+  assert.ok(ended.notes.some((n) => /recorded an earlier run's count of pmmcp's jobs, stop-jobs \(pid 4329, .*\), which has ended: the record was removed/.test(n)), ended.notes.join('\n'))
+  assert.deepEqual(ending.said.map((s) => s.afterPauses), [0])
+  // Another record in active.json by the time the count has ended (written while this run waited): it is not this record, so it is
+  // no one's to remove here, and it stands; discovery stops rather than read past it, and a re-run reads it afresh.
+  const replaced = new World(t)
+  record(replaced, 'stop-jobs', 4332, new Date(NOW.getTime() - 5_000), true)
+  replaced.overrides.set(psActive(4332), { out: `   00:05 /bin/bash ${replaced.dir}/stop-pmmcp-server.sh --jobs\n` })
+  replaced.onSleep = (): void => {
+    if (replaced.slept.length !== 1) return
+    replaced.overrides.set(psActive(4332), { code: 1 })
+    record(replaced, 'stop', 4333, new Date(NOW.getTime() - 1_000))
+  }
+  assert.match(
+    stopWith(await replaced.run(t), 'active-step').message,
+    /active\.json changed while discovery waited for an earlier run's count of pmmcp's jobs, stop-jobs \(pid 4332, .*\), to end: it no longer holds that record, so nothing was removed\. Re-run/,
+  )
+  const standing = JSON.parse(readFileSync(activePath(replaced.root), 'utf8')) as { pid: number; step: string }
+  assert.deepEqual([standing.pid, standing.step], [4333, 'stop'], 'a record that is not the one waited for was removed')
+  assert.equal(replaced.ranScript(), false)
+  // Gone meanwhile (its own run removed it): nothing to remove, and discovery goes on.
+  const gone = new World(t)
+  record(gone, 'stop-jobs', 4334, new Date(NOW.getTime() - 5_000), true)
+  gone.overrides.set(psActive(4334), { out: `   00:05 /bin/bash ${gone.dir}/stop-pmmcp-server.sh --jobs\n` })
+  gone.onSleep = (): void => {
+    gone.overrides.set(psActive(4334), { code: 1 })
+    rmSync(activePath(gone.root))
+  }
+  const went = found(await gone.run(t))
+  assert.equal(went.staleActive, undefined)
+  assert.equal(went.jobs.state, 'counted')
+  assert.equal(went.notes.some((n) => n.includes('the record was removed')), false, went.notes.join('\n'))
+  // The same name without the runner's read-only mark is any other step: it may be changing pmmcp, and nothing waits on it.
+  const unmarked = new World(t)
+  record(unmarked, 'stop-jobs', 4330, new Date(NOW.getTime() - 5_000))
+  unmarked.overrides.set(psActive(4330), { out: `   00:05 /bin/bash ${unmarked.dir}/stop-pmmcp-server.sh\n` })
+  assert.match(stopWith(await unmarked.run(t), 'active-step').message, /it may still be stopping, starting or changing pmmcp/)
+  assert.deepEqual(unmarked.slept, [])
   // A step of the stopped window is named by its program, nothing more of its command line.
   const merging = new World(t)
   record(merging, 'git-merge', 4322, new Date(NOW.getTime() - 3_000))
@@ -1350,16 +1424,27 @@ test('an active.json record stops discovery while its pid still runs the recorde
 
   // The pid runs nothing now (the installer died before the exit cleared the record): discovery goes on and hands the record back.
   const dead = new World(t)
-  record(dead, 'stop-jobs', 4323, new Date(NOW.getTime() - 3_600_000))
+  record(dead, 'stop', 4323, new Date(NOW.getTime() - 3_600_000))
   dead.overrides.set(psActive(4323), { code: 1 })
   const c = found(await dead.run(t))
   assert.equal(c.staleActive?.pid, 4323)
-  assert.equal(c.staleActive?.step, 'stop-jobs')
+  assert.equal(c.staleActive?.step, 'stop')
   assert.ok(c.notes.some((n) => n.includes('that pid no longer runs it')), c.notes.join('\n'))
   // --jobs is not run meanwhile: the runner would refuse it while the record stands.
   assert.equal(dead.ranScript(), false)
   assert.equal(c.jobs.state, 'not-run')
   assert.ok(existsSync(activePath(dead.root)), 'discovery removed the record')
+  // A read-only count whose pid has ended: removed at once, nothing waited for, and the jobs counted, a dry run's included.
+  const deadCount = new World(t)
+  record(deadCount, 'stop-jobs', 4331, new Date(NOW.getTime() - 3_600_000), true)
+  deadCount.overrides.set(psActive(4331), { code: 1 })
+  const dc = found(await deadCount.run(t))
+  assert.equal(dc.staleActive, undefined)
+  assert.deepEqual(deadCount.slept, [])
+  assert.deepEqual(deadCount.said, [], 'a count that has ended is not waited for, so nothing is said')
+  assert.equal(existsSync(activePath(deadCount.root)), false)
+  assert.equal(dc.jobs.state, 'counted')
+  assert.equal(dc.notes.some((n) => n.includes('that pid no longer runs it')), false, dc.notes.join('\n'))
   // A pid reused by a process that started long after the record: the recorded child is gone.
   const reused = new World(t)
   record(reused, 'stop', 4324, new Date(NOW.getTime() - 3_600_000))
@@ -1479,8 +1564,11 @@ test("an AOS provider on 11434-11437 is reported as sharing pmmcp's Ollama", asy
   remote.providers = named('http://192.168.5.2:11434/v1')
   assert.deepEqual(found(await remote.run(t)).kernel.ollamaShared, [])
 
-  // And the daemon: something answers on control.port.
+  // And the daemon: something answers on control.port. The note says so, and asks no restart: the end report does, and only when
+  // something the daemon reads changed (a re-run with nothing to do, or a dry run, changes nothing).
   assert.equal(f.kernel.daemonListening, true)
+  assert.ok(f.notes.includes("the AOS daemon listens on 7777: it reads .env when it starts, and the end report's next steps say whether this run needs it restarted"), JSON.stringify(f.notes))
+  assert.equal(f.notes.some((n) => /restart it after this run/.test(n)), false)
   const quiet = new World(t)
   quiet.handlers.delete(7777)
   assert.equal(found(await quiet.run(t)).kernel.daemonListening, false)
@@ -1696,4 +1784,124 @@ test('the HTTP probes ask loopback only, through no proxy, with no credential', 
   assert.equal(serverDirOf('/Users/op/Github/Persistent-Memory-MCP/.venv/bin/python /Users/op/Github/Persistent-Memory-MCP/.venv/bin/pmmcp'), '/Users/op/Github/Persistent-Memory-MCP')
   assert.equal(serverDirOf('/usr/bin/python3 -m src.mcp_server'), undefined)
   assert.equal(serverDirOf('python .venv/bin/pmmcp'), undefined)
+  // ps joins the arguments with spaces: a folder whose name holds one is read back from the suffix, never split.
+  const spaced = '/Users/op/My Projects/Persistent-Memory-MCP'
+  assert.equal(serverDirOf(`${spaced}/.venv/bin/python ${spaced}/.venv/bin/pmmcp`), spaced)
+  assert.equal(serverDirOf(`/opt/homebrew/bin/python3.12 ${spaced}/.venv/bin/pmmcp --transport http`), spaced)
+  assert.equal(serverDirOf(`${spaced}/.venv/bin/pmmcp`), spaced)
+  // The suffix must end an argument; a start nearer to it is taken unless the caller's check accepts an earlier one.
+  assert.equal(serverDirOf(`${spaced}/.venv/bin/pmmcp-helper`), undefined)
+  const odd = '/Users/op/a /b/Persistent-Memory-MCP'
+  assert.equal(serverDirOf(`${odd}/.venv/bin/pmmcp`), '/b/Persistent-Memory-MCP')
+  assert.equal(serverDirOf(`${odd}/.venv/bin/pmmcp`, (d) => d === odd), odd)
+})
+
+test('a pmmcp under a folder whose name holds a space is found by its MCP server on 8766', async (t) => {
+  const w = new World(t, { under: ['My Projects', PMMCP_FOLDER], listener: true })
+  assert.ok(w.dir.includes(' '))
+  const f = found(await w.run(t))
+  assert.deepEqual(f.install, { dir: w.dir, source: 'listener' })
+  assert.equal(f.server?.pid, SERVER_PID)
+  // A folder name that ends in a space puts " /" in the command line: the nearest start reads as /b/Persistent-Memory-MCP, which holds
+  // no .venv/bin/pmmcp, so the start whose folder does is taken.
+  const odd = new World(t, { under: ['op ', 'b', PMMCP_FOLDER], listener: true })
+  assert.ok(odd.dir.includes(' /b/'), odd.dir)
+  assert.equal(existsSync(join('/b', PMMCP_FOLDER, '.venv', 'bin', 'pmmcp')), false, 'this machine has a /b install, which this case needs absent')
+  assert.deepEqual(found(await odd.run(t)).install, { dir: odd.dir, source: 'listener' })
+})
+
+test('an earlier run that stopped pmmcp and did not start it again is found from its run folder, only while pmmcp is stopped and launchd answers that its service is not loaded', async (t) => {
+  const runFolder = (w: World, name: string, ...logs: string[]): string => {
+    const dir = join(w.root, '.aos', 'install', name)
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    for (const log of logs) writeFileSync(join(dir, log), '')
+    return dir
+  }
+  // Killed inside the window: the stop's log, and no start's.
+  const killed = new World(t)
+  const folder = runFolder(killed, '20261029T070000Z', 'stop-jobs.out', 'stop.out', 'stop.err', 'git-merge.out')
+  // A dry run since, which ran no stop or start, does not hide it.
+  runFolder(killed, '20261029T073000Z', 'facts.out', 'stop-jobs.out')
+  const k = found(await killed.run(t))
+  assert.deepEqual(k.leftStopped, { folder })
+  assert.equal(k.server, undefined)
+  assert.equal(k.service.loaded, false)
+
+  // A later run that started it (L5, or the start offered after a stop that did not stop): nothing left stopped.
+  for (const start of ['start.out', 'start-again.out']) {
+    const restarted = new World(t)
+    runFolder(restarted, '20261029T070000Z', 'stop.out')
+    runFolder(restarted, '20261029T070000Z-2', 'stop.out', start)
+    assert.equal(found(await restarted.run(t)).leftStopped, undefined, start)
+  }
+  // The run that started it was the earlier one: the later stop stands. (-10 sorts after -9.)
+  const again = new World(t)
+  runFolder(again, '20261029T070000Z-9', 'stop.out', 'start.out')
+  const latest = runFolder(again, '20261029T070000Z-10', 'stop.out')
+  assert.deepEqual(found(await again.run(t)).leftStopped, { folder: latest })
+  // Runs at different stamps are read newest first, whatever order the folder lists them in: an old run killed after its stop,
+  // then a later run that stopped and started pmmcp, is nothing left stopped; the reverse is the later run's stop.
+  const startedSince = new World(t)
+  runFolder(startedSince, '20261029T090000Z', 'stop.out', 'start.out')
+  runFolder(startedSince, '20261028T070000Z', 'stop.out')
+  assert.equal(found(await startedSince.run(t)).leftStopped, undefined, 'a later run started pmmcp')
+  assert.equal(earlierStop(startedSince.root, undefined), undefined)
+  const stoppedSince = new World(t)
+  runFolder(stoppedSince, '20261028T070000Z', 'stop.out', 'start.out')
+  const newer = runFolder(stoppedSince, '20261029T090000Z', 'stop.out')
+  assert.deepEqual(found(await stoppedSince.run(t)).leftStopped, { folder: newer })
+  // A -n run of an older second is older than a plain run of a later one.
+  const seconds = new World(t)
+  runFolder(seconds, '20261029T085959Z-3', 'stop.out')
+  runFolder(seconds, '20261029T090000Z', 'stop.out', 'start.out')
+  assert.equal(earlierStop(seconds.root, undefined), undefined)
+
+  // pmmcp running, or a launchd that cannot be asked: not known to be left stopped.
+  const running = new World(t, { listener: true })
+  runFolder(running, '20261029T070000Z', 'stop.out')
+  assert.equal(found(await running.run(t)).leftStopped, undefined)
+  const loaded = new World(t, { plist: true })
+  runFolder(loaded, '20261029T070000Z', 'stop.out')
+  assert.equal(found(await loaded.run(t)).leftStopped, undefined, 'launchd has the service loaded')
+  const deaf = new World(t)
+  runFolder(deaf, '20261029T070000Z', 'stop.out')
+  deaf.overrides.set(`launchctl print gui/${String(OP_UID)}/com.aibot.pmmcp`, { spawnError: 'ENOENT' })
+  const d = found(await deaf.run(t))
+  assert.equal(d.leftStopped, undefined)
+  assert.equal(d.service.loaded, undefined)
+  // launchctl failing otherwise (an unusable gui domain, say) did not answer "no such service": not known to be unloaded, and noted so.
+  for (const code of [1, 5, 125]) {
+    const failing = new World(t)
+    runFolder(failing, '20261029T070000Z', 'stop.out')
+    failing.overrides.set(`launchctl print gui/${String(OP_UID)}/com.aibot.pmmcp`, { code, err: 'Bad request.\nCould not print domain: Domain does not support specified action\n' })
+    const f = found(await failing.run(t))
+    assert.equal(f.leftStopped, undefined, String(code))
+    assert.equal(f.service.loaded, undefined, String(code))
+    assert.ok(
+      f.notes.some((n) => n === `launchctl print gui/${String(OP_UID)}/com.aibot.pmmcp exited ${String(code)}, not 113 ("Could not find service"): whether launchd has pmmcp loaded is not known`),
+      JSON.stringify(f.notes),
+    )
+  }
+
+  // S3's screen says it as discovery found it: unloaded, with the run folder that shows the stop; or not known, with no claim either way.
+  assert.ok(
+    foundScreen(k, killed.config).includes(`service    com.aibot.pmmcp not loaded; no MCP server on its port; the last installer run that stopped it ran no start after it (${folder})`),
+    foundScreen(k, killed.config).join('\n'),
+  )
+  assert.ok(foundScreen(d, deaf.config).includes('service    com.aibot.pmmcp: whether launchd has it loaded is not known; no MCP server on its port'), foundScreen(d, deaf.config).join('\n'))
+  const loadedScreen = foundScreen(found(await new World(t, { plist: true, listener: true }).run(t)), killed.config)
+  assert.ok(loadedScreen.some((l) => new RegExp(`^service {4}com\\.aibot\\.pmmcp loaded, running, pid ${String(SERVER_PID)}; MCP server pid ${String(SERVER_PID)}`).test(l)), loadedScreen.join('\n'))
+  assert.equal(loadedScreen.some((l) => l.includes('ran no start')), false)
+
+  // Read by folder and entry names alone: a link where a run folder would be, or a name not a run's, is passed over.
+  const linked = new World(t)
+  const elsewhere = tmpdir(t)
+  writeFileSync(join(elsewhere, 'stop.out'), '')
+  mkdirSync(join(linked.root, '.aos', 'install'), { recursive: true })
+  symlinkSync(elsewhere, join(linked.root, '.aos', 'install', '20261029T070000Z'))
+  runFolder(linked, 'notes', 'stop.out')
+  assert.equal(earlierStop(linked.root, undefined), undefined)
+  assert.equal(earlierStop(tmpdir(t), undefined), undefined, 'no .aos/install at all')
+  // This run's own folder is never an earlier run.
+  assert.equal(earlierStop(killed.root, folder)?.folder, undefined)
 })

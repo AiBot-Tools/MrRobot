@@ -21,8 +21,11 @@
 //   preflight, in order, collecting every refusal with its fix (the caller
 //   prints them all and exits 2): not root; HOME an absolute path without a
 //   colon; the current directory this checkout's root (by spelling once
-//   links are resolved, and by device and inode); no falsify run holds the
-//   tree (src/falsify-hold.ts); Node within package.json's engines;
+//   links are resolved, and by device and inode), and so INIT_CWD when npm
+//   set it (npm run moves the cwd to the root, but npm writes its cache and
+//   logs under the folder the command was typed in, as .npmrc's relative
+//   cache names it, and git ignores only the root's /.aos/); no falsify run
+//   holds the tree (src/falsify-hold.ts); Node within package.json's engines;
 //   node_modules there; .gitignore ignoring .env and /.aos/ (git's rules,
 //   src/gitignore.ts), and .aos spelled so and not a link. Then, names only,
 //   which of DOCKER_CONFIG, DOCKER_HOST, DOCKER_CONTEXT and PMMCP_* the
@@ -37,7 +40,7 @@
 //   too. The system line names the macOS version (SystemVersion.plist) and
 //   the Darwin release. Every command or path in a fix is shell-quoted.
 
-import { accessSync, constants, readFileSync, realpathSync, statSync } from 'node:fs'
+import { accessSync, constants, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { arch, release, type, userInfo } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { z } from 'zod'
@@ -275,6 +278,23 @@ export function preflight(input: PreflightInput): Preflight {
   if (!homeOk) refusals.push('HOME is not set to an absolute path without a colon: run the installer from your own login shell')
   if (!sameDirectory(input.cwd ?? process.cwd(), root)) {
     refusals.push(`the current directory is not this checkout's root (${root}): run it from there, cd ${shellWord(root)} && npm run aos-install`)
+  }
+  // npm run sets the script's cwd to the package root whatever folder it was typed in, and says where in INIT_CWD. npm itself
+  // resolves .npmrc's cache=.aos/npm-cache against that folder, so its cache and logs land in <there>/.aos, which git does not ignore.
+  const init = env['INIT_CWD']
+  if (init !== undefined && init !== '' && !sameDirectory(init, root)) {
+    const stray = join(init, '.aos')
+    let made = false
+    try {
+      made = isAbsolute(init) && lstatSync(stray).isDirectory()
+    } catch {
+      made = false
+    }
+    refusals.push(
+      `npm run was typed in ${init}, not in this checkout's root (${root}), and npm keeps its cache and logs under the folder it was typed in (.npmrc's cache=.aos/npm-cache): ` +
+        `run it from the root, cd ${shellWord(root)} && npm run aos-install` +
+        (made ? `; ${stray} holds what npm wrote there, which git does not ignore: remove it once you have checked it holds only npm's cache and logs` : ''),
+    )
   }
   lines.push(`  checkout    ${root}`)
   const held = falsifyRefusal(root)

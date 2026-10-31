@@ -55,7 +55,23 @@
 //   value: `sha256:` and the 64 lowercase hex of SHA-256 over the value's UTF-8
 //   bytes, the form pmmcp's digest_of (src/transport/http_auth.py) writes and
 //   `rotate_http_auth_token.py --digest-stdin` and `http_auth check --expect`
-//   read on stdin. A blank or missing name has none.
+//   read on stdin. A blank or missing name has none, and neither has one that
+//   is cut short (below).
+//
+//   Cut short: a name the AOS mints (`minted` for inspect, `generatable` for
+//   append) whose value is lowercase hex shorter than GENERATED_LENGTH. That is
+//   what a write of a generated value leaves when it stops part way (EFBIG, a
+//   full disk): the last line, `NAME=` and the first characters of the value,
+//   with no newline, or with one a later edit or append put after it. Only
+//   that shape: a value of any other form cannot come from this writer (it
+//   writes GENERATED_LENGTH lowercase hex and nothing else), and the operator
+//   may set either token by hand (README: the control token is any 32
+//   printable ASCII characters, pmmcp's a value of their own), and a whole
+//   GENERATED_LENGTH value that lost only its final newline has its right
+//   digest. inspectCredentials reports each such name it is asked about
+//   (`damaged`), and appendCredentials refuses to write after one, so a token
+//   cut to 8 to 63 characters, which the kernel would still send, never has
+//   its digest staged as pmmcp's bearer.
 //
 //   What it refuses, changing nothing: running as root (the file would be
 //   root's, and the daemon run as the operator refuses it); a .gitignore that
@@ -64,8 +80,9 @@
 //   another owner, group or other mode bits, a second hard link, over 64 KiB
 //   (after the append, or as created, too), invalid UTF-8, a NUL byte, any
 //   line parseDotenv refuses (a placeholder, an undeclared name, a
-//   duplicate); a name to generate, or asked for in `digests`, that the
-//   config does not declare; a name to generate that is a provider's
+//   duplicate); a token the AOS mints that is cut short (above), however it
+//   got so: nothing is appended after it; a name to generate, or asked for in
+//   `digests`, that the config does not declare; a name to generate that is a provider's
 //   auth.envVar or ANTHROPIC_API_KEY, or that is not in `generatable` (both
 //   before the file is opened or a value made); an fstat or read of the file
 //   that fails (named by its errno); a file it must append to whose mode
@@ -191,6 +208,9 @@ interface Where {
   readonly digests?: Iterable<string>
 }
 
+/** What is left of a generated value (`length` lowercase hex) that a write did not finish: fewer lowercase hex characters. */
+const CUT_SHORT_OF_GENERATED = (length: number): RegExp => new RegExp(`^[0-9a-f]{1,${String(length - 1)}}$`)
+
 export interface AppendOptions extends Where {
   /** The names to add when the file holds no line for them, in order, each with what makes its value. */
   readonly generate: ReadonlyMap<string, () => string>
@@ -212,6 +232,12 @@ export interface AppendOptions extends Where {
 export interface InspectOptions extends Where {
   /** The names to report, in order. Each must be one `accepted` holds. */
   readonly names: Iterable<string>
+  /**
+   * The names the AOS mints (mintedCredentialNames(config)): one of them,
+   * asked for in `names` or `digests`, whose value is cut short (the
+   * contract) is reported in `damaged` and given no digest. None by default.
+   */
+  readonly minted?: Iterable<string>
   /** How many characters each missing name's value will have, for `fits`: GENERATED_LENGTH unless said. */
   readonly valueLength?: number
 }
@@ -256,6 +282,17 @@ export interface InspectResult {
   readonly blank: readonly NameLine[]
   /** Names that hold no line at all, in the order asked: the ones appendCredentials would add, given a value. */
   readonly missing: readonly string[]
+  /**
+   * Names of `minted` asked for (in `names` or `digests`) whose value looks
+   * cut short by a write that did not finish (the contract), by line, in the
+   * order asked. Each is in `present` too (it holds a value), and none has a
+   * digest: the operator deletes the line, and a re-run appends a whole one.
+   */
+  readonly damaged: readonly NameLine[]
+  /** The file's permission bits (0600 or 0400: the loader refuses any other), when it exists. */
+  readonly mode: number | undefined
+  /** The file's link count (1: the loader refuses a second), when it exists. */
+  readonly links: number | undefined
   /**
    * Whether the write could be made, by mode bits: for a file, whether its
    * owner may write it, as an append needs (false for a 0400 file, which
@@ -313,20 +350,27 @@ export function inspectCredentials(options: InspectOptions): InspectResult {
   const fd = openToRead(path)
   if (fd === undefined) {
     const size = Buffer.byteLength(CREATED_HEADER) + assignedBytes(names, length)
-    return { path, found: false, present: [], blank: [], missing: names, writable: mayCreateIn(dirname(path), uid), fits: size <= DOTENV_MAX_BYTES, digests: [] }
+    const none = { damaged: [], mode: undefined, links: undefined }
+    return { path, found: false, present: [], blank: [], missing: names, ...none, writable: mayCreateIn(dirname(path), uid), fits: size <= DOTENV_MAX_BYTES, digests: [] }
   }
   try {
     const held = readHeld(fd, path, names, options.accepted, uid)
     const size = held.before.size + (held.missing.length > 0 ? leadOf(held.buf).length + assignedBytes(held.missing, length) : 0)
+    const minted = new Set(options.minted ?? [])
+    const damaged = cutShort(held, [...new Set([...names, ...wanted])].filter((name) => minted.has(name)))
+    const cut = new Set(damaged.map((d) => d.name))
     return {
       path,
       found: true,
       present: held.present,
       blank: held.blank,
       missing: held.missing,
+      damaged,
+      mode: held.before.mode & 0o777,
+      links: held.before.nlink,
       writable: (held.before.mode & 0o200) !== 0,
       fits: size <= DOTENV_MAX_BYTES,
-      digests: digestsOf(wanted, (name) => held.parsed.get(name)?.value),
+      digests: digestsOf(wanted, (name) => (cut.has(name) ? undefined : held.parsed.get(name)?.value)),
     }
   } finally {
     closeSync(fd)
@@ -368,6 +412,10 @@ function append(path: string, options: AppendOptions, progress: Progress): Appen
   try {
     const held = readHeld(fd, path, options.generate.keys(), options.accepted, uid)
     const { buf, text, present, blank, missing } = held
+    // A token cut short by an earlier write that did not finish: nothing is written after it (a new line would end it, and it
+    // would pass for whole), and it has no digest. Every minted name is judged, whether asked for or not.
+    const damaged = cutShort(held, [...options.generatable])
+    if (damaged.length > 0) throw new ConfigError(`${cutShortMessage(path, damaged)}. Nothing was written`)
     const inFile = (name: string): string | undefined => held.parsed.get(name)?.value
     if (missing.length === 0) return { path, created: false, appended: [], present, blank, digests: digestsOf(wanted, inFile) }
 
@@ -399,6 +447,27 @@ function append(path: string, options: AppendOptions, progress: Progress): Appen
 /** What goes before the new lines: a newline when the file has bytes and does not end in one, without which the first new line would join its last key. */
 function leadOf(buf: Buffer): string {
   return buf.length > 0 && buf[buf.length - 1] !== NEWLINE ? '\n' : ''
+}
+
+/**
+ * Which of `names` hold a value cut short (the contract): lowercase hex
+ * shorter than GENERATED_LENGTH, what an append of a generated value leaves
+ * when it stops part way, newline or not. By line, in the order given.
+ */
+function cutShort(held: Pick<Held, 'parsed'>, names: readonly string[]): NameLine[] {
+  const shape = CUT_SHORT_OF_GENERATED(GENERATED_LENGTH)
+  const out: NameLine[] = []
+  for (const name of names) {
+    const got = held.parsed.get(name)
+    if (got !== undefined && shape.test(got.value)) out.push({ name, line: got.line })
+  }
+  return out
+}
+
+/** What is said of tokens cut short: each by line and name, never its value, with the fix. */
+export function cutShortMessage(path: string, damaged: readonly NameLine[]): string {
+  const each = damaged.map((d) => `line ${String(d.line)}: ${d.name} looks cut short (a write that did not finish)`)
+  return `${path} ${each.join('; ')}: delete ${damaged.length === 1 ? 'that line' : 'those lines'} and re-run`
 }
 
 /** The bytes `NAME=<value>\n` takes for each name, at `length` characters a value: names and generated values are ASCII. */

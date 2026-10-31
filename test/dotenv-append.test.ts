@@ -81,6 +81,8 @@ interface Who {
   readonly digests?: readonly string[]
   /** inspectIn only. */
   readonly valueLength?: number
+  /** inspectIn only: the names the AOS mints, judged for a value cut short. */
+  readonly minted?: ReadonlySet<string>
 }
 
 /**
@@ -124,6 +126,7 @@ function inspectIn(repo: string, names: readonly string[], who: Who = {}): Inspe
     ...(euid === 'process' ? {} : { euid }),
     ...(who.digests === undefined ? {} : { digests: who.digests }),
     ...(who.valueLength === undefined ? {} : { valueLength: who.valueLength }),
+    ...(who.minted === undefined ? {} : { minted: who.minted }),
   }
   return inspectCredentials(options)
 }
@@ -453,10 +456,11 @@ test('a name present on any line, blank included, is never appended again', (t) 
     ['AOS_CONTROL_TOKEN=""\n', 'blank', 1],
     ["  export AOS_CONTROL_TOKEN = ''\n", 'blank', 1],
     ['# no final newline\nAOS_CONTROL_TOKEN=', 'blank', 2],
-    [`export AOS_CONTROL_TOKEN="${'a'.repeat(40)}"\n`, 'present', 1],
-    [`# a comment\nAOS_CONTROL_TOKEN=${'b'.repeat(40)}\n`, 'present', 2],
+    // Values of the operator's own: not lowercase hex, so none reads as a generated one cut short.
+    [`export AOS_CONTROL_TOKEN="${'x'.repeat(40)}"\n`, 'present', 1],
+    [`# a comment\nAOS_CONTROL_TOKEN=${'y'.repeat(40)}\n`, 'present', 2],
     // Every name present and no final newline: not even a newline is added.
-    [`# a comment\nAOS_CONTROL_TOKEN=${'c'.repeat(40)}`, 'present', 2],
+    [`# a comment\nAOS_CONTROL_TOKEN=${'z'.repeat(40)}`, 'present', 2],
   ]
   for (const [original, kind, line] of fixtures) {
     const repo = repoWith(t, original)
@@ -1077,6 +1081,9 @@ test('inspectCredentials reports each name present, blank or missing by line, th
       present: [{ name: 'AOS_CONTROL_TOKEN', line: 2 }],
       blank: [{ name: 'ANTHROPIC_API_KEY', line: 4 }],
       missing: ['AOS_PMMCP_TOKEN'],
+      damaged: [],
+      mode,
+      links: 1,
       writable: mode === 0o600,
       fits: true,
       digests: [],
@@ -1103,7 +1110,7 @@ test('inspectCredentials reports each name present, blank or missing by line, th
   {
     const repo = repoWith(t)
     const { result, flags } = opens(() => inspectIn(repo, [...NAMES, 'AOS_CONTROL_TOKEN']))
-    assert.deepEqual(result, { path: join(repo, '.env'), found: false, present: [], blank: [], missing: NAMES, writable: true, fits: true, digests: [] })
+    assert.deepEqual(result, { path: join(repo, '.env'), found: false, present: [], blank: [], missing: NAMES, damaged: [], mode: undefined, links: undefined, writable: true, fits: true, digests: [] })
     assert.ok(flags.length >= 1)
     assert.deepEqual(flags.filter((f) => typeof f !== 'number' || (f & WRITE_FLAGS) !== 0), [])
     assert.deepEqual(readdirSync(repo).sort(), ['.gitignore'])
@@ -1730,4 +1737,116 @@ test("the by-hand path .env.example and README give for AOS_PMMCP_TOKEN meets th
     assert.deepEqual(done.digests, [{ name: 'AOS_PMMCP_TOKEN', digest: digestOf(own) }])
     assert.equal(snapshot(join(repo, '.env')), before)
   }
+})
+
+test('a token cut short by a write that did not finish is named by its line, never given a digest, and nothing is appended after it; a whole value, one of your own, or one that lost only its newline is not', (t) => {
+  // What `ulimit -f` (EFBIG) after 23 of 81 bytes leaves: the last line is the
+  // name and the first characters of pmmcp's token, with no newline. That run
+  // said to check the last line by hand; the next one must not read the rest
+  // as a token, stage its digest, and so make it pmmcp's aos-kernel bearer (the
+  // kernel sends any value of 8 characters or more).
+  const NAMES = ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY']
+  const digests = ['AOS_PMMCP_TOKEN']
+  const digestOf = (value: string): string => `sha256:${createHash('sha256').update(value, 'utf8').digest('hex')}`
+  const control = randomBytes(32).toString('hex')
+  const whole = randomBytes(32).toString('hex')
+  assert.equal(whole.length, GENERATED_LENGTH)
+  const torn = `${CREATED_HEADER}AOS_CONTROL_TOKEN=${control}\nAOS_PMMCP_TOKEN=${whole.slice(0, 7)}`
+  const CUT = /line 4: AOS_PMMCP_TOKEN looks cut short \(a write that did not finish\): delete that line and re-run/
+
+  for (const [why, text] of [
+    ['as the write left it, with no newline', torn],
+    ['with a newline put after it since (an edit, or an append by an earlier installer)', `${torn}\n`],
+    ['cut to the 8 characters the kernel still sends as a bearer', `${CREATED_HEADER}AOS_CONTROL_TOKEN=${control}\nAOS_PMMCP_TOKEN=${whole.slice(0, 8)}`],
+    ['cut one character short of a whole one', `${CREATED_HEADER}AOS_CONTROL_TOKEN=${control}\nAOS_PMMCP_TOKEN=${whole.slice(0, GENERATED_LENGTH - 1)}`],
+  ] as const) {
+    const repo = repoWith(t, text)
+    const before = snapshot(join(repo, '.env'))
+    const seen = inspectIn(repo, NAMES, { digests, minted: GENERATABLE })
+    assert.deepEqual(seen.damaged, [{ name: 'AOS_PMMCP_TOKEN', line: 4 }], why)
+    // It holds a value, which the loader reads: present, so never appended twice, but with no digest to stage.
+    assert.ok(seen.present.some((p) => p.name === 'AOS_PMMCP_TOKEN'), why)
+    assert.deepEqual(seen.digests, [], why)
+    // Nothing goes after it, whatever the call is asked to add: a new line would end the cut one, which would then pass for whole.
+    const g = generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN')
+    const message = untouched(() => appendIn(repo, g.generate, { digests }))
+    assert.match(message, CUT, why)
+    assert.match(message, /\. Nothing was written$/, why)
+    assert.equal(echoes(message, whole), false, `${why}: the refusal quotes the value`)
+    assert.equal(g.calls(), 0, `${why}: a value was generated`)
+    assert.equal(snapshot(join(repo, '.env')), before, `${why}: the file changed`)
+  }
+  // With the control token's line deleted as well, an append of that one alone is refused just the same.
+  {
+    const repo = repoWith(t, `${CREATED_HEADER}AOS_PMMCP_TOKEN=${whole.slice(0, 12)}`)
+    const before = snapshot(join(repo, '.env'))
+    const g = generators('AOS_CONTROL_TOKEN')
+    assert.match(untouched(() => appendIn(repo, g.generate)), /line 3: AOS_PMMCP_TOKEN looks cut short/)
+    assert.equal(g.calls(), 0)
+    assert.equal(snapshot(join(repo, '.env')), before)
+  }
+  // Told no names the AOS mints, the inspection judges none (what the writer's other callers are given by default).
+  {
+    const repo = repoWith(t, torn)
+    const seen = inspectIn(repo, NAMES, { digests })
+    assert.deepEqual(seen.damaged, [])
+  }
+  // None of these is cut short: a whole generated value whose line lost only its final newline (its digest is right), a token of
+  // your own that is not lowercase hex (README: the control token is any 32 printable ASCII characters), and a short lowercase
+  // hex value that is no name the AOS mints.
+  {
+    const own = 'Own-Control-Token_0123456789ABCDEFxyz'
+    const repo = repoWith(t, `AOS_CONTROL_TOKEN=${own}\nANTHROPIC_API_KEY=abc1234\nAOS_PMMCP_TOKEN=${whole}`)
+    const before = snapshot(join(repo, '.env'))
+    const seen = inspectIn(repo, NAMES, { digests, minted: GENERATABLE })
+    assert.deepEqual(seen.damaged, [])
+    assert.deepEqual(seen.digests, [{ name: 'AOS_PMMCP_TOKEN', digest: digestOf(whole) }])
+    const done = appendIn(repo, generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN').generate, { digests })
+    assert.deepEqual(done.appended, [])
+    assert.deepEqual(done.digests, [{ name: 'AOS_PMMCP_TOKEN', digest: digestOf(whole) }])
+    assert.equal(snapshot(join(repo, '.env')), before)
+  }
+  // What .env.example says of the control token is what the writer does: `openssl rand -hex 16` (32 lowercase hex) is cut short.
+  {
+    const flat = (text: string): string => text.replace(/^# ?/gm, '').replace(/\s+/g, ' ')
+    assert.match(
+      flat(readFileSync(join(REPO_ROOT, '.env.example'), 'utf8')),
+      new RegExp(
+        `Not a lowercase hex value shorter than ${String(GENERATED_LENGTH)} characters \\(openssl rand -hex 16 makes one\\): that is what a write npm run aos-install did not finish leaves, ` +
+          'so it refuses such a value of either token as cut short, by its line\\.',
+      ),
+    )
+    const sixteen = repoWith(t, `${CREATED_HEADER}AOS_CONTROL_TOKEN=${randomBytes(16).toString('hex')}\nAOS_PMMCP_TOKEN=${whole}\n`)
+    assert.deepEqual(inspectIn(sixteen, NAMES, { digests, minted: GENERATABLE }).damaged, [{ name: 'AOS_CONTROL_TOKEN', line: 3 }])
+  }
+  // Only lowercase hex is the writer's shape: a token of your own for a name the AOS mints, of 32 to 63 upper-case hex characters
+  // or of mixed case, is a value no write of the writer's left, so it is neither damaged nor refused, and its digest is given.
+  for (const [why, own] of [
+    ['40 upper-case hex characters', randomBytes(20).toString('hex').toUpperCase()],
+    ['40 hex characters of mixed case', [...randomBytes(20).toString('hex')].map((c, i) => (i % 2 === 0 ? c.toUpperCase() : c)).join('').replace(/^[0-9]/, 'B')],
+    ['32 upper-case letters', 'ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEF'],
+  ] as const) {
+    assert.ok(own.length >= 32 && own.length < GENERATED_LENGTH && /[A-Z]/.test(own), why)
+    const repo = repoWith(t, `${CREATED_HEADER}AOS_CONTROL_TOKEN=${control}\nAOS_PMMCP_TOKEN=${own}\n`)
+    const before = snapshot(join(repo, '.env'))
+    const seen = inspectIn(repo, NAMES, { digests, minted: GENERATABLE })
+    assert.deepEqual(seen.damaged, [], why)
+    assert.deepEqual(seen.digests, [{ name: 'AOS_PMMCP_TOKEN', digest: digestOf(own) }], why)
+    const done = appendIn(repo, generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN').generate, { digests })
+    assert.deepEqual(done.appended, [], why)
+    assert.deepEqual(done.digests, [{ name: 'AOS_PMMCP_TOKEN', digest: digestOf(own) }], why)
+    assert.equal(snapshot(join(repo, '.env')), before, why)
+  }
+})
+
+test("inspectCredentials gives an existing .env's mode and link count, as the S2 screen shows them, and neither for a missing one", (t) => {
+  const repo = repoWith(t, `ANTHROPIC_API_KEY=${KEY}\n`, 0o400)
+  const seen = inspectIn(repo, ['ANTHROPIC_API_KEY'])
+  assert.equal(seen.mode, 0o400)
+  assert.equal(seen.links, 1)
+  const writable = repoWith(t, `ANTHROPIC_API_KEY=${KEY}\n`)
+  assert.equal(inspectIn(writable, ['ANTHROPIC_API_KEY']).mode, 0o600)
+  const none = inspectIn(repoWith(t), ['ANTHROPIC_API_KEY'])
+  assert.equal(none.mode, undefined)
+  assert.equal(none.links, undefined)
 })

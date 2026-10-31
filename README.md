@@ -97,14 +97,23 @@ D33, D35 and D36):
   a missing program that pmmcp or the installer runs (git, curl, uv, ollama,
   python3, bash, docker, lsof, ps, pgrep, launchctl, plutil, and Docker
   Desktop's credential helper when `~/.docker/config.json` names it; not
-  checked with `--aos-only`). It names any of `DOCKER_CONFIG`, `DOCKER_HOST`,
+  checked with `--aos-only`). It names the bash pmmcp's scripts run and its
+  version, read from that file and never by running it (macOS's own is 3.2).
+  It names any of `DOCKER_CONFIG`, `DOCKER_HOST`,
   `DOCKER_CONTEXT` or `PMMCP_*` your shell exports: no program it starts sees
   them, nor any other `DOCKER_*`, `AOS_*` or credential name.
 - **`.env`**: created at mode 0600 when it is missing, or appended with the
   token names it lacks (64 random hex each). It never changes or removes a
   line, never writes a placeholder or a blank value, and never prints a value.
   It never writes `ANTHROPIC_API_KEY`: add that yourself. A `.env` the loader
-  would refuse is refused with its fix, and nothing is written.
+  would refuse is refused with its fix, and nothing is written. So is a token
+  an earlier write cut short (one that stopped part way, on a full disk or
+  past a file size limit, leaves `NAME=` and the first characters of its 64
+  hex): a value of either
+  token that is lowercase hex shorter than 64 characters is refused by its
+  line, "looks cut short (a write that did not finish): delete that line and
+  re-run", and no digest of it is ever staged. The screen gives `.env`'s mode,
+  link count and owner.
 - **pmmcp**: found from its launchd plist, the process on 8766, or
   `~/Github/Persistent-Memory-MCP`, with every fact read from pmmcp's own
   interfaces. With none, it offers to install it there, after one typed
@@ -115,7 +124,12 @@ D33, D35 and D36):
   keys (the Qdrant key, the dashboard token, the curator secret) are made by
   pmmcp's CLIs in its 0600 files under `~/.persistent-memory-mcp`, and never go
   into `.env`. Its bearer gate stays in warn mode: switching it to enforce is
-  your later step.
+  your later step. Every program it starts runs by the path its rules
+  checked, never by a name looked up again; a file on that PATH that is
+  pmmcp's stop or start script by a link or by identity (a hard link, a copy),
+  or a link there to a program it never runs, is refused before any change,
+  exit 2, naming the file to remove or rename. A refusal of its own rules
+  that nothing on the machine causes is its defect: exit 1, said as one.
 - **Live pmmcp changes** (a restart to load the digest, the Qdrant key
   cutover, the dashboard token and curator secret, a fast-forward of its code,
   the start of a pmmcp an earlier run left stopped) are each offered with a default of no, and run only after a warning that
@@ -163,7 +177,20 @@ including a pmmcp that is stopped while the last run that stopped it ran no
 start after it (it was killed or crashed inside the stopped window, or a stop
 did not stop and no start followed; its run folder shows it, and what you ran
 by hand since is not known to it): it then offers the start, behind the same
-warning and two typed confirmations. Once everything is in place it says so and asks nothing. A
+warning and two typed confirmations. A run whose non-live steps ran (it
+staged the `aos-kernel` digest, or appended to `.env`) but that restarted
+nothing (you declined the restart, typed another word, or stopped at a
+question) says in its next steps to run it again and accept the restart:
+pmmcp loads the digest only when it starts. When the digest was on file
+already and nothing was applied, no end report is printed: the plan's notes
+say the running server may not have loaded it, and every run offers the
+restart until one has.
+After the stopped window the end report reads pmmcp's facts and Qdrant's
+`status --json` again, so what it shows is what holds after the start, never
+what discovery read while pmmcp was stopped; a read it cannot make (a Ctrl-C
+there reaches the probe, which it then asks again) is said as a check it could
+not make. A `pmmcp-qdrant` that holds its key and is only stopped, as it is
+while pmmcp is, is no failure: the start runs it again. Once everything is in place it says so and asks nothing. A
 `pmmcp-qdrant-prekey` kept from a Qdrant cutover counts as in place: it is not
 asked about on its own (the notes give its `qdrant_api_key.py cleanup` command,
 which also ends the cutover's rollback), and is offered, default no, only in a
@@ -177,7 +204,9 @@ first boots with its hub degraded, because the token it then needs is not set.
 
 The daemon needs `AOS_CONTROL_TOKEN` (at least 32 printable ASCII characters,
 with no whitespace, quote, backtick or `#`, from the shell and `.env` alike;
-`openssl rand -hex 32` makes one), to reach pmmcp, `AOS_PMMCP_TOKEN` (its bearer
+`openssl rand -hex 32` makes one; lowercase hex shorter than 64 characters is
+what a write the installer did not finish leaves, so `npm run aos-install`
+refuses such a value as cut short), to reach pmmcp, `AOS_PMMCP_TOKEN` (its bearer
 as client `aos-kernel`, which `npm run aos-install` generates), and, to reach a
 model, `ANTHROPIC_API_KEY`: a key created inside a workspace, because an unscoped
 key needs an `anthropic-workspace-id` header the kernel does not send. All three live

@@ -37,10 +37,15 @@
 //   shown). On macOS a git or python3 found as /usr/bin's stub needs the
 //   Command Line Tools (or Xcode) behind it: without them the stub opens an
 //   install dialog and the probe that ran it fails, so that is a refusal
-//   too. The system line names the macOS version (SystemVersion.plist) and
-//   the Darwin release. Every command or path in a fix is shell-quoted.
+//   too. The bash pmmcp's scripts run (`#!/usr/bin/env bash` takes the first
+//   on that PATH) is named with its version, read from its own file (the
+//   `@(#)Bash version` string every bash carries), never by running it: a
+//   shell runs nothing here (scripts/install/run.ts), and macOS's /bin/bash
+//   is 3.2, which pmmcp's setup.sh had to be fixed for (plan P2b). The system
+//   line names the macOS version (SystemVersion.plist) and the Darwin
+//   release. Every command or path in a fix is shell-quoted.
 
-import { accessSync, constants, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { accessSync, closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from 'node:fs'
 import { arch, release, type, userInfo } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import { z } from 'zod'
@@ -129,6 +134,49 @@ function namesDesktopHelper(home: string): boolean | undefined {
   } catch {
     // A parse error quotes the text, which may hold a registry credential: never shown.
     return undefined
+  }
+}
+
+/** The most of a bash binary read for its version string (macOS's /bin/bash is about 1.3 MB, a universal binary). */
+const BASH_CAP = 16 * 1024 * 1024
+
+/** The version string bash's version.c compiles in (SCCSVERSION): `@(#)Bash version 3.2.57(1) release GNU`. */
+const BASH_VERSION = /@\(#\)Bash version ([0-9]{1,3}\.[0-9]{1,3}(?:\.[0-9]{1,4})?\([0-9]{1,4}\))/
+
+/**
+ * The version of the bash at `path`, read from its own bytes, never by
+ * running it: links followed as exec follows them, a regular file only,
+ * opened without blocking, to a cap. Undefined when it cannot be read or
+ * holds no such string.
+ */
+export function bashVersion(path: string): string | undefined {
+  let real: string
+  try {
+    real = realpathSync(path)
+  } catch {
+    return undefined
+  }
+  let fd: number
+  try {
+    fd = openSync(real, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  } catch {
+    return undefined
+  }
+  try {
+    const st = fstatSync(fd)
+    if (!st.isFile() || st.size > BASH_CAP) return undefined
+    const buf = Buffer.alloc(st.size)
+    let read = 0
+    while (read < st.size) {
+      const got = readSync(fd, buf, read, st.size - read, read)
+      if (got === 0) break
+      read += got
+    }
+    return BASH_VERSION.exec(buf.subarray(0, read).toString('latin1'))?.[1]
+  } catch {
+    return undefined
+  } finally {
+    closeSync(fd)
   }
 }
 
@@ -351,6 +399,11 @@ export function preflight(input: PreflightInput): Preflight {
     const missing = wanted.filter(([name]) => !at.has(name))
     const found = wanted.filter(([name]) => at.has(name)).map(([name]) => name)
     lines.push(`  programs    ${found.length === 0 ? 'none found' : list(found)} on the PATH pmmcp's commands get`)
+    const bash = at.get('bash')
+    if (bash !== undefined) {
+      const version = bashVersion(bash)
+      lines.push(`  bash        ${bash}, ${version === undefined ? 'version not readable from the file' : `version ${version}`} (the one pmmcp's scripts run)`)
+    }
     if (helper === undefined) lines.push(`  docker      ~/.docker/config.json cannot be read, so whether it names ${CREDENTIAL_HELPER} is not known`)
     if (missing.length > 0) {
       lines.push(`  PATH        ${path}`)

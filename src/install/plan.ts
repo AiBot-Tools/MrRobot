@@ -46,8 +46,11 @@
 //
 //   What stops the plan (Plan.stops: refused before any change, exit 2): a
 //   map name on a line with no value (the writer never appends a name that
-//   holds a line); a map name the shell exports while .env lacks it (the
-//   export would win at boot, so an appended line would go unused); pmmcp's
+//   holds a line); a map name whose value looks cut short by a write that did
+//   not finish (the writer's `damaged`: never staged, the line deleted by the
+//   operator, and a re-run appends a whole one); a map name the shell
+//   exports while .env lacks it (the export would win at boot, so an
+//   appended line would go unused); pmmcp's
 //   token set in .env while the shell exports it too (the kernel started
 //   from that shell sends the export, not the value whose digest pmmcp is
 //   given; the control token in that state is only noted, since nothing is
@@ -220,6 +223,11 @@ export interface DotenvView {
   readonly present: readonly NameLine[]
   readonly blank: readonly NameLine[]
   readonly missing: readonly string[]
+  /** Names whose value looks cut short by a write that did not finish (the writer's judgement of the names it is told the AOS mints); each is in `present` too. */
+  readonly damaged?: readonly NameLine[]
+  /** The file's permission bits and link count, when it exists (the writer has refused any but 0600 or 0400, one link, yours). */
+  readonly mode?: number | undefined
+  readonly links?: number | undefined
 }
 
 /** What the write would meet, from inspectCredentials over the credentials map's names alone (its `fits` counts every missing name it is given). */
@@ -299,10 +307,12 @@ export interface PlanInput {
   /**
    * The pids of every scripts/monitor_tui.py of the found checkout that runs
    * now (the installer's pgrep before it plans, which names no stop or start
-   * script); [] when none runs, and for --aos-only or a fresh install. The
-   * stop does not stop one, and the warning lists them.
+   * script); [] when none runs, and for --aos-only or a fresh install;
+   * undefined when pgrep gave no answer, and the warning then says whether
+   * one runs cannot be told. The stop does not stop one, and the warning
+   * lists them.
    */
-  readonly tuiPids: readonly number[]
+  readonly tuiPids: readonly number[] | undefined
   readonly options: PlanOptions
 }
 
@@ -370,7 +380,7 @@ export interface Offer {
 
 export type JobsGate = { readonly available: true } | { readonly available: false; readonly why: string }
 
-export type CredentialState = 'present' | 'blank' | 'missing'
+export type CredentialState = 'present' | 'blank' | 'missing' | 'damaged'
 
 /** One line of the S2 screen. */
 export interface CredentialLine {
@@ -396,7 +406,15 @@ export interface Plan {
   readonly kind: PlanKind
   /** Refusals, each with its fix: when any is here, nothing may run (exit 2). */
   readonly stops: readonly string[]
-  readonly dotenv: { readonly path: string; readonly found: boolean; readonly lines: readonly CredentialLine[]; readonly exported: readonly string[] }
+  readonly dotenv: {
+    readonly path: string
+    readonly found: boolean
+    /** Its permission bits and link count when found, as S2 shows them. */
+    readonly mode: number | undefined
+    readonly links: number | undefined
+    readonly lines: readonly CredentialLine[]
+    readonly exported: readonly string[]
+  }
   /** The names appendCredentials generates: the credentials map's alone (generatorsFor). */
   readonly generate: readonly string[]
   /** The token whose digest is staged in pmmcp, if any: the name asked for in `digests`. */
@@ -409,8 +427,8 @@ export interface Plan {
   readonly pmmcpDir: string | undefined
   /** Whether pmmcp's MCP server runs now; undefined when no install was found. */
   readonly running: boolean | undefined
-  /** The scripts/monitor_tui.py pids of the checkout, as handed in: the warning lists them. */
-  readonly tuiPids: readonly number[]
+  /** The scripts/monitor_tui.py pids of the checkout, as handed in: the warning lists them; undefined when pgrep could not say. */
+  readonly tuiPids: readonly number[] | undefined
   /** The fresh install's screen (S3b): what it does and writes, before the typed `install`. */
   readonly screen: readonly string[]
   readonly notes: readonly string[]
@@ -535,7 +553,7 @@ class Planner {
     return {
       kind,
       stops: [...this.#stops],
-      dotenv: { path: this.#in.dotenv.path, found: this.#in.dotenv.found, lines: [...this.#lines], exported },
+      dotenv: { path: this.#in.dotenv.path, found: this.#in.dotenv.found, mode: this.#in.dotenv.mode, links: this.#in.dotenv.links, lines: [...this.#lines], exported },
       generate: [...this.#generate],
       staged: this.#staged,
       steps: [...this.#steps],
@@ -543,7 +561,7 @@ class Planner {
       jobsGate: this.#jobsGate,
       pmmcpDir,
       running: this.#running,
-      tuiPids: [...this.#in.tuiPids],
+      tuiPids: this.#in.tuiPids === undefined ? undefined : [...this.#in.tuiPids],
       screen: [...this.#screen],
       notes: [...this.#notes],
       blocked: [...this.#blocked],
@@ -560,6 +578,9 @@ class Planner {
 
   #stateOf(name: string): { readonly state: CredentialState; readonly line: number | undefined } | undefined {
     const { dotenv } = this.#in
+    // Cut short: it holds a value, but not one to stage or keep.
+    const damaged = dotenv.damaged?.find((n) => n.name === name)
+    if (damaged !== undefined) return { state: 'damaged', line: damaged.line }
     const present = dotenv.present.find((n) => n.name === name)
     if (present !== undefined) return { state: 'present', line: present.line }
     const blank = dotenv.blank.find((n) => n.name === name)
@@ -588,6 +609,14 @@ class Planner {
       if (providerKeys.has(name)) {
         this.#line(name, at, isExported, 'refused: a provider key is yours to add')
         this.#stops.push(`kernel.yaml's ${cred.from} is ${name}, a provider's key, which the installer never generates: name a token of the AOS's own there, then re-run`)
+        continue
+      }
+      if (at.state === 'damaged') {
+        this.#line(name, at, isExported, `cut short (line ${String(at.line)}) -> delete that line and re-run; a re-run appends a whole one`)
+        this.#stops.push(
+          `${dotenv.path} line ${String(at.line)}: ${name} looks cut short (a write that did not finish): delete that line and re-run. ` +
+            `Its value is lowercase hex shorter than the ${String(TOKEN_HEX)} the installer writes, so no digest of it is staged`,
+        )
         continue
       }
       if (at.state === 'blank') {
@@ -884,6 +913,30 @@ class Planner {
       return undefined
     }
     if (q.container.key_set !== false) {
+      // Keyed and only stopped: nothing was asked, which is no failure. pmmcp's start runs it again; with pmmcp stopped that start is
+      // the window's, or the one offered for a pmmcp an earlier run left stopped, or the operator's.
+      if (q.verdict === 'not_running' && q.container.state === 'stopped') {
+        // Started, it is enforced only with a key file pmmcp can read and no binding beyond 127.0.0.1: either missing, it would be
+        // inconsistent then, which is no state the installer leaves in place.
+        const wrong: string[] = []
+        const kf = q.key_file
+        if (kf.state === 'absent') wrong.push('~/.persistent-memory-mcp/qdrant_api_key is not there')
+        else if (kf.state !== 'present') wrong.push(`~/.persistent-memory-mcp/qdrant_api_key is unusable (${kf.reason ?? 'no reason given'})`)
+        const wide = q.container.reachable_beyond_loopback
+        if (wide.length > 0) wrong.push(`it would be reachable beyond 127.0.0.1 (${wide.join(', ')})`)
+        if (wrong.length > 0) {
+          this.#block(`pmmcp-qdrant has its key and is stopped, but ${list(wrong)}: started, its verdict would be inconsistent, not enforced. Fix that by hand (check with ${status}), then re-run`)
+          return undefined
+        }
+        if (found.server === undefined) {
+          this.#notes.push(`pmmcp-qdrant has its key and is stopped, as pmmcp is: pmmcp's start runs it again (${within(dir, './start-pmmcp-server.sh')}), and a re-run then reads its verdict`)
+        } else {
+          this.#block(
+            `pmmcp-qdrant has its key but is stopped while pmmcp's MCP server runs, so pmmcp cannot reach it: stop and start pmmcp (${within(dir, './stop-pmmcp-server.sh && ./start-pmmcp-server.sh')}), then re-run`,
+          )
+        }
+        return undefined
+      }
       this.#block(`pmmcp-qdrant has a key, but its verdict is ${q.verdict}: see ${status}`)
       return undefined
     }
@@ -1179,7 +1232,12 @@ export function describe(plan: Plan): string[] {
 export function describeDotenv(plan: Plan): string[] {
   const out: string[] = []
   const { dotenv } = plan
-  out.push(`.env  ${dotenv.path}  ${dotenv.found ? 'present' : 'absent (created at 0600 when something is appended)'}`)
+  // Found, it passed the writer's refusals: yours, one link, no group or other bits.
+  const kept =
+    dotenv.mode === undefined || dotenv.links === undefined
+      ? 'present'
+      : `present, ${dotenv.mode.toString(8).padStart(4, '0')}, ${plural(dotenv.links, 'link')}, owner you`
+  out.push(`.env  ${dotenv.path}  ${dotenv.found ? kept : 'absent (created at 0600 when something is appended)'}`)
   for (const line of dotenv.lines) out.push(`  ${line.name.padEnd(20)} ${line.text}`)
   out.push(`  ${'shell exports'.padEnd(20)} ${dotenv.exported.length === 0 ? 'none of these' : dotenv.exported.join(', ')}`)
   return out
@@ -1234,7 +1292,12 @@ export function nonLiveNumbers(plan: Plan, steps: readonly Step[]): string {
 export function warning(plan: Plan, live: readonly Step[]): string[] {
   const dir = plan.pmmcpDir ?? '<pmmcp>'
   const pids = plan.tuiPids
-  const tui = pids.length === 0 ? 'none runs now' : `${pids.length === 1 ? 'pid' : 'pids'} ${list(pids.map(String))} ${pids.length === 1 ? 'runs' : 'run'} now`
+  const tui =
+    pids === undefined
+      ? 'whether one runs cannot be told: pgrep gave no answer'
+      : pids.length === 0
+        ? 'none runs now'
+        : `${pids.length === 1 ? 'pid' : 'pids'} ${list(pids.map(String))} ${pids.length === 1 ? 'runs' : 'run'} now`
   const out = [
     'WARNING: these changes stop pmmcp, and every program that uses it waits until it is back.',
     'What stops: the MCP server (Antigravity and the AOS lose their memory meanwhile), the dashboard, the curator, the worker, the scraper, the backup daemon, Qdrant, ' +

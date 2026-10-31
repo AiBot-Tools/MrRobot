@@ -44,3 +44,31 @@ export function pythonStandIn(t: TestContext, body: string, interpreter = '/bin/
   chmodSync(command, 0o755)
   return { command, args: ['scripts/pmmcp_facts.py', '--json'], cwd }
 }
+
+/**
+ * The programs the installer runs by a bare name (ps, pgrep, lsof, ls,
+ * plutil, launchctl, docker, git). The runner spawns a bare name only as the
+ * file it found for it on the child's PATH, whose first entry is
+ * ~/.local/bin, so a test whose spawn is a fake gives its HOME a file of
+ * each name there: what a call is then handed is that file's path on every
+ * machine, whatever /usr/bin holds. None of them is ever run (each would
+ * exit 97).
+ */
+export const BARE_PROGRAMS: readonly string[] = ['ps', 'pgrep', 'lsof', 'ls', 'plutil', 'launchctl', 'docker', 'git']
+
+/** Put BARE_PROGRAMS in <home>/.local/bin; returns that folder. */
+export function bareStandIns(home: string): string {
+  const bin = join(home, '.local', 'bin')
+  mkdirSync(bin, { recursive: true })
+  for (const name of BARE_PROGRAMS) {
+    writeFileSync(join(bin, name), `#!/bin/sh\n# a stand-in for ${name} on the child's PATH, never run\nexit 97\n`)
+    chmodSync(join(bin, name), 0o755)
+  }
+  return bin
+}
+
+/** The command a fake spawn was handed, by the name the installer gave it: a stand-in of bareStandIns(home) by its bare name, anything else as it is. */
+export function bareName(command: string, home: string): string {
+  const bin = join(home, '.local', 'bin')
+  return command.startsWith(`${bin}/`) && BARE_PROGRAMS.includes(command.slice(bin.length + 1)) ? command.slice(bin.length + 1) : command
+}

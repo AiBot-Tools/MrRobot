@@ -33,6 +33,7 @@ import { runGate, type Answer, type GateIO, type JobsAnswer } from '../src/insta
 import { credentialsMap, planInstall, select, type OfferId, type Plan, type Step } from '../src/install/plan.js'
 import { parseProviders, type ProvidersFile } from '../src/models/registry.js'
 import { appendCredentials, credentialNames, inspectCredentials, mintedCredentialNames, type InspectResult } from '../src/secrets/dotenv-append.js'
+import { bareName, bareStandIns } from './helpers/python-stand-in.js'
 import { tmpdir } from './helpers/tmpdir.js'
 
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '')
@@ -115,6 +116,15 @@ function enforced(): Doc {
     collections: { without_key: 401, with_key: 200 },
     verdict: 'enforced',
   }
+}
+
+/** A keyed pmmcp-qdrant that is stopped, as status --json gives it while pmmcp is stopped: nothing asked. */
+function stoppedKeyed(): Doc {
+  const doc = enforced()
+  edit(doc, 'container.state', 'stopped')
+  edit(doc, 'collections', { without_key: null, with_key: null })
+  edit(doc, 'verdict', 'not_running')
+  return doc
 }
 
 /** A keyless Qdrant, as before the cutover. */
@@ -200,6 +210,8 @@ class Machine {
   leftStopped: Found['leftStopped']
   /** Discovery found the MCP server running on 8766 (false: pmmcp is stopped). */
   discoveredServer = true
+  /** When discovery could show that server started, at the earliest (ps etime); undefined: it could not. */
+  discoveredStartedAfter: Date | undefined = OLD_STARTED_AFTER
   /** pmmcp is installed (false: a fresh install's machine). */
   installed = true
 
@@ -280,6 +292,8 @@ class Machine {
     this.root = tmpdir(t)
     writeFileSync(join(this.root, '.gitignore'), '/.aos/\n/.env\n')
     this.home = tmpdir(t)
+    // What the runner spawns for a bare name: the file it found on the child's PATH, whose first entry is ~/.local/bin.
+    bareStandIns(this.home)
     this.dir = join(this.home, options.parent ?? 'Github', 'Persistent-Memory-MCP')
     this.facts = factsDoc(this.dir, this.home)
     this.installed = options.installed ?? true
@@ -487,7 +501,9 @@ class Machine {
 
   readonly spawn: SpawnFn = (command, args, options) => {
     const child = new FakeChild(5000 + this.calls.length, options.stdio[0] === 'pipe')
-    const call: Call = { key: [command, ...args].join(' '), command, args: [...args], options, stdin: '', active: undefined, child }
+    // By the name the installer gave it: a bare name reaches spawn as its stand-in's path.
+    const named = bareName(command, this.home)
+    const call: Call = { key: [named, ...args].join(' '), command: named, args: [...args], options, stdin: '', active: undefined, child }
     this.calls.push(call)
     const reply = this.answerFor(call)
     if (reply.out !== undefined) writeSync(options.stdio[1], reply.out)
@@ -538,7 +554,7 @@ class Machine {
       missing: missingFeatures(facts),
       git: { head: HEAD, originMain: this.originMain, fastForward: this.originMain !== HEAD, lockUnchanged: this.originMain !== HEAD ? true : undefined, trackedChanges: 0, untracked: 0 },
       service: { loaded: true, state: 'running', pid: OLD_PID },
-      server: this.discoveredServer ? { pid: OLD_PID, startedAfter: OLD_STARTED_AFTER } : undefined,
+      server: this.discoveredServer ? { pid: OLD_PID, startedAfter: this.discoveredStartedAfter } : undefined,
       leftStopped: this.leftStopped,
       httpAuthModified: statSync(this.authFile).mtime,
       endpoints: { health: 200, bearer: 'off-or-warn', dashboard: { status: 200, authRequired: false, source: 'none' }, qdrant: { status: 200, version: '1.13.4' } },
@@ -780,6 +796,28 @@ test('the non-live steps create .env through the writer, stage the digest it ret
   assert.deepEqual(refused, { ok: false, exitCode: 2 })
   assert.deepEqual(readFileSync(join(m2.root, '.env')), before)
   assert.equal(m2.ran(/rotate_http_auth_token/).length, 0, 'a digest was staged after the .env was refused')
+})
+
+test('a token cut short since the plan was made is never staged: the step fails by its line, nothing is piped to pmmcp, exit 2', async (t) => {
+  const m = new Machine(t)
+  m.preEnv()
+  m.bearer = { state: 'absent' }
+  const plan = m.plan()
+  assert.deepEqual(plan.staged, { name: 'AOS_PMMCP_TOKEN', client: 'aos-kernel', from: 'file' })
+  const { nonLive } = chosen(plan, ['restart'])
+  assert.deepEqual(nonLive.map((s) => s.id), ['stage-digest'])
+  // Since the plan: its line rewritten as a write cut short leaves it, the last line, 7 hex characters and no newline.
+  const env = join(m.root, '.env')
+  const lines = readFileSync(env, 'utf8').split('\n').filter((l) => l !== '')
+  const at = lines.findIndex((l) => l.startsWith('AOS_PMMCP_TOKEN='))
+  const kept = lines.filter((_, i) => i !== at)
+  writeFileSync(env, `${kept.join('\n')}\nAOS_PMMCP_TOKEN=${'5b8bca5'}`)
+  const applier = m.applier(plan)
+  assert.deepEqual(await applier.apply('non-live', nonLive), { ok: false, exitCode: 2 })
+  assert.deepEqual(m.ran(/rotate_http_auth_token|check --expect/), [], 'a digest went to pmmcp')
+  const item = itemNamed(applier.items, /the aos-kernel digest staged/)
+  assert.equal(item.state, 'failed')
+  assert.match(item.detail, new RegExp(`\\.env line ${String(kept.length + 1)}: AOS_PMMCP_TOKEN looks cut short \\(a write that did not finish\\): delete that line and re-run$`))
 })
 
 test('rotate exit 130 is re-checked with --expect, whichever way stderr says it ended', async (t) => {
@@ -1860,8 +1898,11 @@ test("L3 runs enable only after its own dry run passed; a refused dry run, enabl
     assert.equal(m.ran(/qdrant_api_key\.py enable --dry-run$/).length, 1, c.name)
     assert.equal(m.ran(/qdrant_api_key\.py enable$/).length, c.key === 'enable --dry-run' ? 0 : 1, `${c.name}: enable ran ${c.key === 'enable --dry-run' ? 'after its own dry run refused' : 'again'}`)
     assert.equal(itemNamed(applier.items, /the start/).state, 'done', c.name)
-    // No key was set, so no verdict is asked for.
-    assert.equal(m.ran(/status --json$/).length, 0, c.name)
+    // No key was set, so the start's checks ask for no verdict: the one status --json is the end report's, read after the window,
+    // since discovery's verdict was read before the stop.
+    assert.doesNotMatch(itemNamed(applier.items, /the start/).detail, /verdict/, c.name)
+    assert.equal(m.ran(/qdrant_api_key\.py status --json$/).length, 1, c.name)
+    assert.ok(m.indexOf(/qdrant_api_key\.py status --json$/) > m.indexOf(new RegExp(`${START_SCRIPT}$`)), c.name)
     assert.deepEqual(m.windows, [true, false], c.name)
   }
 })
@@ -2261,6 +2302,8 @@ test('a whole window ends in a report of every item, the .env lines and mode, th
   assert.match(text, /pmmcp bearer: http_auth\.yaml present, mode warn, tokens \[antigravity\]/)
   assert.match(text, /aos-kernel digest matches \.env: yes; loaded by the running server: yes/)
   assert.match(text, /qdrant: verdict enforced/)
+  // The start's own check read it after the cutover: what holds now, so the report asks for it no second time.
+  assert.equal(m.ran(/qdrant_api_key\.py status --json$/).length, 1)
   assert.match(text, /pmmcp-qdrant-prekey kept; remove it later with cd .* && \.venv\/bin\/python scripts\/qdrant_api_key\.py cleanup/)
   assert.match(text, /dashboard: open it with cd .* && \.venv\/bin\/python -m src\.dashboard\.auth open/)
   assert.match(text, /backups made: .*http_auth\.yaml\.bak-20261029T100000Z/)
@@ -2385,6 +2428,15 @@ test('npm run dev is asked to restart only when something it reads changed: .env
   assert.deepEqual(await restarted.apply('live', chosen(restartPlan, ['restart']).live), { ok: true }, JSON.stringify(restarted.items))
   assert.ok(restarted.report().some((l) => /loaded by the running server: yes/.test(l)))
   assert.equal(says(restarted.report()), true, restarted.report().join('\n'))
+  // The same restart where discovery could not show when the server before it started (ps gave no etime): whether it had loaded the
+  // digest is not known, so the restart that did is new to the daemon.
+  const unknown = new Machine(t)
+  unknown.discoveredStartedAfter = undefined
+  const unknownPlan = restartOnly(unknown)
+  const unknownApplier = unknown.applier(unknownPlan)
+  assert.deepEqual(await unknownApplier.apply('live', chosen(unknownPlan, ['restart']).live), { ok: true }, JSON.stringify(unknownApplier.items))
+  assert.ok(unknownApplier.report().some((l) => /loaded by the running server: yes/.test(l)))
+  assert.equal(says(unknownApplier.report()), true, unknownApplier.report().join('\n'))
   // .env appended: always.
   const appended = new Machine(t)
   const appendPlan = appended.plan()
@@ -2521,6 +2573,294 @@ test('pmmcp stopped after the last installer run that stopped it ran no start is
   assert.match(itemNamed(applier.items, /the start/).detail, /^\/health 200; a new MCP server \(pid 913\), started after http_auth\.yaml last changed; pmmcp-qdrant running/)
   assert.deepEqual(m.windows, [true, false])
   assert.match(applier.report().join('\n'), /loaded by the running server: yes/)
+})
+
+/** As a run killed after L1 left pmmcp: nothing listens, no PID file names a live process, Qdrant stopped with its key, launchd unloaded. */
+function leftStoppedPlan(m: Machine): Plan {
+  m.preEnv()
+  m.bearer = { state: 'matches' }
+  m.auth.dashboard_token = 'present'
+  m.auth.curator_secret = 'present'
+  edit(m.facts, 'dashboard_token', { state: 'present' })
+  edit(m.facts, 'curator_secret', { state: 'present' })
+  m.listeners.clear()
+  m.alive.clear()
+  m.running = false
+  m.qdrant = 'exited'
+  m.qdrantBefore = stoppedKeyed()
+  for (const name of ['mcp.pid', 'worker.pid', 'scraper_worker.pid']) rmSync(join(m.pmmcpHome, 'pids', name), { force: true })
+  m.discoveredServer = false
+  m.leftStopped = { folder: join(m.root, '.aos', 'install', '20261029T090000Z') }
+  const plan = m.plan()
+  assert.deepEqual(plan.offers.map((o) => o.id), ['start'])
+  assert.deepEqual(plan.blocked, [], 'a keyed pmmcp-qdrant that is only stopped was reported as not in place')
+  return plan
+}
+
+test("after the window the end report reads Qdrant's status and the facts again: never a stopped pmmcp's not_running beside a start that found pmmcp-qdrant running", async (t) => {
+  // Scenario 10's re-run: discovery read Qdrant while pmmcp was stopped, and the window started it.
+  const m = new Machine(t)
+  const plan = leftStoppedPlan(m)
+  const applier = m.applier(plan)
+  assert.deepEqual(await applier.apply('live', chosen(plan, ['start']).live), { ok: true }, JSON.stringify(applier.items))
+  assert.match(itemNamed(applier.items, /the start/).detail, /pmmcp-qdrant running/)
+  const report = applier.report()
+  assert.ok(report.includes('qdrant: verdict enforced'), report.join('\n'))
+  assert.equal(report.some((l) => l.includes('not_running')), false, report.join('\n'))
+  // Read after the start, and the facts with it (the bearer line is the restarted pmmcp's).
+  assert.ok(m.indexOf(/qdrant_api_key\.py status --json$/) > m.indexOf(new RegExp(`${START_SCRIPT}$`)), m.calls.map((c) => c.key).join('\n'))
+  assert.ok(m.indexOf(/pmmcp_facts\.py --json$/) > m.indexOf(new RegExp(`${START_SCRIPT}$`)))
+  // The installer's recheck before the report reads nothing more: the window's end read it all.
+  const calls = m.calls.length
+  await applier.recheck()
+  assert.equal(m.calls.length, calls)
+})
+
+test('after the window a probe a held Ctrl-C ended is asked again, and one that still cannot answer is said as a check not made, never as what was read before the stop', async (t) => {
+  // From L5's end to the report, a Ctrl-C at the terminal is held, not trapped (signals.ts), and the read-only probes there share the
+  // installer's process group, so each dies by SIGINT. Once: asked again and answered.
+  {
+    const m = new Machine(t)
+    const plan = leftStoppedPlan(m)
+    m.over.set(`${m.py} scripts/pmmcp_facts.py --json`, once({ signal: 'SIGINT' }))
+    m.over.set(`${m.py} -B scripts/qdrant_api_key.py status --json`, once({ code: 130 }))
+    const applier = m.applier(plan)
+    assert.deepEqual(await applier.apply('live', chosen(plan, ['start']).live), { ok: true }, JSON.stringify(applier.items))
+    assert.equal(m.ran(/pmmcp_facts\.py --json$/).length, 2)
+    assert.equal(m.ran(/qdrant_api_key\.py status --json$/).length, 2)
+    assert.ok(m.printed.includes('facts-after: ended by Ctrl-C, which does not end the run before its end report: asked again'), m.text())
+    assert.ok(m.printed.includes('qdrant-status: ended by Ctrl-C, which does not end the run before its end report: asked again'), m.text())
+    const report = applier.report()
+    assert.ok(report.includes('qdrant: verdict enforced'), report.join('\n'))
+    assert.ok(report.includes('pmmcp bearer: http_auth.yaml present, mode warn, tokens [antigravity]'), report.join('\n'))
+  }
+  // Every time: asked INTERRUPT_RERUNS more times, then a check not made, with what was read before the stop said as that.
+  {
+    const m = new Machine(t)
+    const plan = leftStoppedPlan(m)
+    m.over.set(`${m.py} scripts/pmmcp_facts.py --json`, { signal: 'SIGINT' })
+    m.over.set(`${m.py} -B scripts/qdrant_api_key.py status --json`, { signal: 'SIGHUP' })
+    const applier = m.applier(plan)
+    assert.deepEqual(await applier.apply('live', chosen(plan, ['start']).live), { ok: true }, JSON.stringify(applier.items))
+    assert.equal(m.ran(/pmmcp_facts\.py --json$/).length, 1 + INTERRUPT_RERUNS)
+    assert.equal(m.ran(/qdrant_api_key\.py status --json$/).length, 1 + INTERRUPT_RERUNS)
+    const report = applier.report()
+    assert.ok(
+      report.includes(
+        "pmmcp bearer: could not check after this run's changes (the facts cannot be had: facts-after: " +
+          `${m.py} ended by SIGINT); before them: http_auth.yaml present, mode warn, tokens [antigravity]`,
+      ),
+      report.join('\n'),
+    )
+    assert.ok(
+      report.includes(
+        `qdrant: could not check after this run's stop and start (qdrant-status: ${m.py} ended by SIGHUP); before them its verdict was not_running: ` +
+          `cd ${m.dir} && .venv/bin/python scripts/qdrant_api_key.py status`,
+      ),
+      report.join('\n'),
+    )
+    assert.equal(report.some((l) => l === 'qdrant: verdict not_running'), false)
+  }
+  // Before the window ever opened a Ctrl-C ends the installer: a non-live phase's facts read is never asked again, and the bearer line then says it could not check.
+  {
+    const m = new Machine(t)
+    m.preEnv()
+    m.bearer = { state: 'absent' }
+    const plan = m.plan()
+    m.over.set(`${m.py} scripts/pmmcp_facts.py --json`, { signal: 'SIGINT' })
+    const applier = m.applier(plan)
+    assert.deepEqual(await applier.apply('non-live', chosen(plan, []).nonLive), { ok: true })
+    assert.equal(m.ran(/pmmcp_facts\.py --json$/).length, 1)
+    assert.ok(applier.report().some((l) => l.startsWith("pmmcp bearer: could not check after this run's changes (the facts cannot be had: facts-after: ")), applier.report().join('\n'))
+  }
+})
+
+test("a window that ended before its start is read again by the installer's recheck before the report: the facts, and Qdrant's status", async (t) => {
+  const m = new Machine(t)
+  const plan = leftStoppedPlan(m)
+  // A stop that did not stop, and the start declined: the phase ends inside the window, before its own reads.
+  m.stopCode = 1
+  m.answer = { kind: 'line', text: 'n' }
+  m.qdrantAfter = stoppedKeyed()
+  const applier = m.applier(plan)
+  assert.deepEqual(await applier.apply('live', chosen(plan, ['start']).live), { ok: false, exitCode: 4 })
+  assert.equal(m.ran(/pmmcp_facts\.py --json$/).length, 0)
+  assert.equal(m.ran(/qdrant_api_key\.py status --json$/).length, 0)
+  await applier.recheck()
+  assert.equal(m.ran(/pmmcp_facts\.py --json$/).length, 1)
+  assert.equal(m.ran(/qdrant_api_key\.py status --json$/).length, 1)
+  assert.ok(applier.report().includes('qdrant: verdict not_running'), applier.report().join('\n'))
+  // Once.
+  await applier.recheck()
+  assert.equal(m.ran(/pmmcp_facts\.py --json$/).length, 1)
+  // The same window with Qdrant's status unanswered every time: the check it could not make names the stop alone, since no start ran.
+  {
+    const u = new Machine(t)
+    const uPlan = leftStoppedPlan(u)
+    u.stopCode = 1
+    u.answer = { kind: 'line', text: 'n' }
+    u.over.set(`${u.py} -B scripts/qdrant_api_key.py status --json`, { signal: 'SIGHUP' })
+    const uApplier = u.applier(uPlan)
+    assert.deepEqual(await uApplier.apply('live', chosen(uPlan, ['start']).live), { ok: false, exitCode: 4 })
+    assert.equal(u.ran(new RegExp(`${START_SCRIPT}$`)).length, 0)
+    assert.equal(await uApplier.recheck(), undefined)
+    const report = uApplier.report()
+    assert.ok(
+      report.includes(
+        `qdrant: could not check after this run's stop (qdrant-status: ${u.py} ended by SIGHUP); before it its verdict was not_running: ` +
+          `cd ${u.dir} && .venv/bin/python scripts/qdrant_api_key.py status`,
+      ),
+      report.join('\n'),
+    )
+    assert.equal(report.some((l) => l.includes('stop and start')), false, report.join('\n'))
+  }
+  // A run whose window never opened reads nothing again.
+  const none = new Machine(t)
+  const nonePlan = none.plan()
+  const noneApplier = none.applier(nonePlan)
+  assert.deepEqual(await noneApplier.apply('non-live', chosen(nonePlan, []).nonLive), { ok: true })
+  const before = none.calls.length
+  await noneApplier.recheck()
+  assert.equal(none.calls.length, before)
+})
+
+test("a leak in what the recheck reads after a window that ended early is reported as apply() reports one: the report still comes, naming the emptied file, the manual start, what is left and how to go back (exit 4)", async (t) => {
+  // The non-live steps minted the tokens (and registered them); the cutover ran, and the start failed, so the window ended before
+  // its own reads. The recheck's facts read then echoes pmmcp's token: never thrown out of recheck (main would print "failed (a
+  // defect, report it)" and no report), but the defect apply() reports, with the report it owes.
+  const m = new Machine(t)
+  m.qdrantBefore = keyless()
+  m.auth.dashboard_token = 'present'
+  m.auth.curator_secret = 'present'
+  edit(m.facts, 'dashboard_token', { state: 'present' })
+  edit(m.facts, 'curator_secret', { state: 'present' })
+  const plan = m.plan()
+  const { nonLive, live } = chosen(plan, ['restart', 'qdrant'])
+  assert.deepEqual(live.map((s) => s.id), ['stop', 'qdrant-enable', 'start', 'bearer-check'])
+  const applier = m.applier(plan)
+  assert.deepEqual(await applier.apply('non-live', nonLive), { ok: true })
+  m.startCode = 1
+  m.over.set(`${m.py} scripts/pmmcp_facts.py --json`, () => (m.ran(new RegExp(`${START_SCRIPT}$`)).length > 0 ? { out: `{"echo": "${m.minted[1] ?? ''}"}\n` } : undefined))
+  assert.deepEqual(await applier.apply('live', live), { ok: false, exitCode: 4 }, JSON.stringify(applier.items))
+  assert.equal(itemNamed(applier.items, /the start/).state, 'failed')
+  const facts = m.ran(/pmmcp_facts\.py --json$/).length
+  assert.equal(await applier.recheck(), 4)
+  // The facts were read, and nothing after them: Qdrant's status is not asked again once the runner halted.
+  assert.equal(m.ran(/pmmcp_facts\.py --json$/).length, facts + 1)
+  const statuses = m.ran(/qdrant_api_key\.py status --json$/).length
+  const step = applier.leak?.step ?? ''
+  assert.match(step, /^facts-after(?:-\d+)?$/)
+  const file = join(m.runner.dir ?? '', `${step}.out`)
+  assert.equal(readFileSync(file, 'utf8'), '', 'the file that held the value was not emptied')
+  assert.ok(m.printed.some((l) => l.startsWith('stopped: ') && l.endsWith('. Nothing more is run.')), m.text())
+  const report = applier.report()
+  const text = report.join('\n')
+  // Every item, the leak's among them; the defect and the file it emptied; what is left to do; and how to go back on the cutover.
+  assert.equal(itemNamed(applier.items, /facts-after(?:-\d+)?'s output/).state, 'failed')
+  assert.ok(report.some((l) => /^ {2}done {9}the Qdrant key cutover: /.test(l)), text)
+  assert.ok(report.some((l) => /^ {2}failed {7}the start \(start-pmmcp-server\.sh\) and its checks: /.test(l)), text)
+  assert.ok(report.some((l) => l.startsWith('stopped by a defect: ') && l.includes(file)), text)
+  assert.match(text, /not checked: what listens on 8766, 8765 and 8767/)
+  assert.ok(report.includes('to do by hand:'), text)
+  assert.ok(report.includes(`  pmmcp may be stopped: start it with cd ${m.dir} && ./start-pmmcp-server.sh`), text)
+  assert.ok(report.includes('to go back on what this run changed:'), text)
+  assert.ok(report.some((l) => l.startsWith('  to undo the Qdrant cutover: ')), text)
+  assert.ok(report.includes('next steps:'), text)
+  for (const v of m.minted) assert.equal(text.includes(v) || m.text().includes(v), false, 'a minted token was shown')
+  // Once: a second recheck reads nothing, and finds no leak of its own.
+  const calls = m.calls.length
+  assert.equal(await applier.recheck(), undefined)
+  assert.equal(m.calls.length, calls)
+  assert.equal(m.ran(/qdrant_api_key\.py status --json$/).length, statuses)
+
+  // A stop that did not stop, with the start declined: the same, the manual start among what is left.
+  const declined = new Machine(t)
+  const declinedPlan = declined.plan()
+  const both = chosen(declinedPlan, ['restart'])
+  const declinedApplier = declined.applier(declinedPlan)
+  assert.deepEqual(await declinedApplier.apply('non-live', both.nonLive), { ok: true })
+  declined.stopCode = 1
+  declined.answer = { kind: 'line', text: 'n' }
+  declined.over.set(`${declined.py} scripts/pmmcp_facts.py --json`, () =>
+    declined.ran(new RegExp(`${STOP_SCRIPT}$`)).length > 0 ? { out: `{"echo": "${declined.minted[1] ?? ''}"}\n` } : undefined,
+  )
+  assert.deepEqual(await declinedApplier.apply('live', both.live), { ok: false, exitCode: 4 })
+  assert.equal(await declinedApplier.recheck(), 4)
+  const declinedReport = declinedApplier.report()
+  assert.ok(declinedReport.some((l) => l.startsWith('stopped by a defect: ')), declinedReport.join('\n'))
+  assert.ok(declinedReport.includes(`  start pmmcp: cd ${declined.dir} && ./start-pmmcp-server.sh`), declinedReport.join('\n'))
+  for (const v of declined.minted) assert.equal(declinedReport.join('\n').includes(v) || declined.text().includes(v), false)
+
+  // A recheck that reads cleanly reports no leak.
+  const clean = new Machine(t)
+  const cleanPlan = leftStoppedPlan(clean)
+  clean.stopCode = 1
+  clean.answer = { kind: 'line', text: 'n' }
+  const cleanApplier = clean.applier(cleanPlan)
+  assert.deepEqual(await cleanApplier.apply('live', chosen(cleanPlan, ['start']).live), { ok: false, exitCode: 4 })
+  assert.equal(await cleanApplier.recheck(), undefined)
+  assert.equal(cleanApplier.leak, undefined)
+})
+
+test('a run that staged the aos-kernel digest, or found it on file, but restarted nothing says how pmmcp loads it: run the installer again and accept the restart', async (t) => {
+  const NEXT = "  pmmcp's running MCP server has not loaded the aos-kernel digest: run npm run aos-install again and accept the restart"
+  // Staged by the non-live steps, the restart declined (or a wrong word, or an abort, at either typed confirmation): no window ran.
+  const staged = new Machine(t)
+  const plan = staged.plan()
+  assert.ok(plan.offers.some((o) => o.id === 'restart'))
+  const applier = staged.applier(plan)
+  assert.deepEqual(await applier.apply('non-live', chosen(plan, []).nonLive), { ok: true })
+  const report = applier.report()
+  assert.ok(report.some((l) => /aos-kernel digest matches \.env: yes; loaded by the running server: no$/.test(l)), report.join('\n'))
+  assert.ok(report.includes(NEXT), report.join('\n'))
+  // On file from before, and the server cannot be shown to have started after http_auth.yaml changed: it may not have.
+  const unknown = new Machine(t)
+  unknown.discoveredStartedAfter = undefined
+  const unknownPlan = restartOnly(unknown)
+  const unknownApplier = unknown.applier(unknownPlan)
+  assert.ok(
+    unknownApplier.report().includes("  pmmcp's running MCP server may not have loaded the aos-kernel digest: run npm run aos-install again and accept the restart"),
+    unknownApplier.report().join('\n'),
+  )
+  // Not running at all: its next start loads it.
+  const stopped = new Machine(t)
+  stopped.discoveredServer = false
+  stopped.preEnv()
+  stopped.bearer = { state: 'absent' }
+  const stoppedPlan = stopped.plan()
+  const stoppedApplier = stopped.applier(stoppedPlan)
+  assert.deepEqual(await stoppedApplier.apply('non-live', chosen(stoppedPlan, []).nonLive), { ok: true })
+  assert.ok(
+    stoppedApplier.report().includes(`  pmmcp is not running: it loads the aos-kernel digest when it next starts (cd ${stopped.dir} && ./start-pmmcp-server.sh)`),
+    stoppedApplier.report().join('\n'),
+  )
+  // Staged where the jobs check cannot run (an older stop script): no restart was offered, nor would a re-run offer one.
+  const unoffered = new Machine(t)
+  edit(unoffered.facts, 'features.stop_jobs_flag', false)
+  const unofferedPlan = unoffered.plan()
+  assert.deepEqual(unofferedPlan.offers, [])
+  const unofferedApplier = unoffered.applier(unofferedPlan)
+  assert.deepEqual(await unofferedApplier.apply('non-live', chosen(unofferedPlan, []).nonLive), { ok: true })
+  assert.ok(
+    unofferedApplier.report().includes("  pmmcp's running MCP server has not loaded the aos-kernel digest: it loads it when pmmcp next restarts, which this run could not offer (the notes above say why)"),
+    unofferedApplier.report().join('\n'),
+  )
+  assert.equal(unofferedApplier.report().some((l) => /accept the restart/.test(l)), false)
+  // Restarted by this run's window: loaded, and nothing more to do for it.
+  const restarted = new Machine(t)
+  const restartPlan = restarted.plan()
+  const restarter = restarted.applier(restartPlan)
+  assert.deepEqual(await restarter.apply('non-live', chosen(restartPlan, ['restart']).nonLive), { ok: true })
+  assert.deepEqual(await restarter.apply('live', chosen(restartPlan, ['restart']).live), { ok: true }, JSON.stringify(restarter.items))
+  assert.ok(restarter.report().some((l) => /loaded by the running server: yes$/.test(l)))
+  assert.equal(restarter.report().some((l) => /accept the restart|loads the aos-kernel digest when it next starts/.test(l)), false, restarter.report().join('\n'))
+  // A stop that did not stop: what to do is the manual start the report names, not a re-run's restart.
+  const failed = new Machine(t)
+  const failedPlan = restartOnly(failed)
+  failed.stopCode = 1
+  const failer = failed.applier(failedPlan)
+  assert.deepEqual(await failer.apply('live', chosen(failedPlan, ['restart']).live), { ok: false, exitCode: 4 })
+  assert.equal(failer.report().some((l) => /accept the restart/.test(l)), false, failer.report().join('\n'))
 })
 
 test('logTail reads a regular file from its end, never through a link, and nothing else', (t) => {

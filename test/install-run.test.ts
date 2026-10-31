@@ -31,6 +31,7 @@ import {
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -75,7 +76,7 @@ import {
   type SpawnFn,
 } from '../scripts/install/run.js'
 import { CREDENTIAL_NAME } from './helpers/guard.js'
-import { pythonStandIn, shWord } from './helpers/python-stand-in.js'
+import { bareStandIns, pythonStandIn, shWord } from './helpers/python-stand-in.js'
 import { tmpdir } from './helpers/tmpdir.js'
 
 const NOW = new Date('2026-10-29T05:45:06.123Z')
@@ -190,6 +191,8 @@ function checkout(t: TestContext, scripts: Readonly<Record<string, string>> = {}
 }
 
 const refusedCode = (e: unknown): boolean => e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_REFUSED'
+/** A refusal of the machine's state (InstallRunError.machine): the installer ends the run with exit 2 and the fix the message names. */
+const machineRefusal = (e: unknown): boolean => refusedCode(e) && (e as InstallRunError).machine
 const busyCode = (e: unknown): boolean => e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_BUSY'
 const haltedCode = (e: unknown): boolean => e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_HALTED'
 const outputCode = (e: unknown): boolean => e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_OUTPUT'
@@ -275,27 +278,32 @@ test('a registered secret in argv, env or stdin is refused before anything is sp
   SecretMask.register(registeredDigest)
 
   const home = tmpdir(t)
+  // ls, by its bare name, is the file found on the child's PATH: a stand-in, never run (the spawn is a fake).
+  bareStandIns(home)
   const pmmcp = checkout(t)
   const python = join(pmmcp, '.venv', 'bin', 'python')
-  const rotate = { step: 'rotate', command: python, args: ['scripts/rotate_http_auth_token.py', 'aos-kernel', '--create', '--digest-stdin'], cwd: pmmcp }
+  // Each case is the spec of a run the rules allow, a digest on stdin included, with one thing changed: so only the secret refuses it.
+  // Its clean twin (the same with the secret taken out) is run, which proves nothing else in the case would have refused it.
+  const rotate: RunSpec = { step: 'rotate', command: python, args: ['scripts/rotate_http_auth_token.py', 'aos-kernel', '--create', '--digest-stdin'], cwd: pmmcp, digest: digestOf(OTHER) }
+  const list: RunSpec = { step: 'ls', command: 'ls', args: ['-l', 'x'], cwd: pmmcp, timeoutMs: 5000 }
 
-  const cases: { readonly why: string; readonly env?: Record<string, string | undefined>; readonly spec: Parameters<Runner['start']>[0] }[] = [
-    { why: 'an argument that is the token', spec: { ...rotate, args: [...rotate.args, TOKEN] } },
-    { why: 'an argument that holds it', spec: { ...rotate, args: ['--token=' + TOKEN] } },
-    { why: 'a credential shape in an argument', spec: { ...rotate, args: ['sk-ant-api03-abcdefghijklmnopqrstuvwx'] } },
-    { why: 'the command', spec: { ...rotate, command: `/opt/${TOKEN}/bin/python` } },
-    { why: 'the working directory', spec: { ...rotate, cwd: `/tmp/${TOKEN}` } },
-    { why: 'an allowlisted environment value', env: { LANG: TOKEN }, spec: rotate },
-    { why: 'an allowlisted environment value that holds it', env: { TERM: `xterm-${TOKEN}` }, spec: rotate },
-    { why: 'HOME, which PATH is built from', env: { HOME: join(home, TOKEN) }, spec: rotate },
-    { why: 'stdin that is the token', spec: { ...rotate, digest: TOKEN } },
-    { why: 'stdin that is a registered value in a digest\'s form', spec: { ...rotate, digest: registeredDigest } },
-    { why: 'stdin that is not a digest', spec: { ...rotate, digest: 'aos-kernel' } },
-    { why: 'stdin in upper case', spec: { ...rotate, digest: digestOf(OTHER).toUpperCase().replace('SHA256', 'sha256') } },
-    { why: 'stdin with its own newline', spec: { ...rotate, digest: `${digestOf(OTHER)}\n` } },
-    { why: 'stdin with a second line', spec: { ...rotate, digest: `${digestOf(OTHER)}\n${digestOf(OTHER)}` } },
-    { why: 'a relative working directory', spec: { ...rotate, cwd: 'Persistent-Memory-MCP' } },
-    { why: 'a relative command', spec: { ...rotate, command: '.venv/bin/python' } },
+  const cases: { readonly why: string; readonly env?: Record<string, string | undefined>; readonly spec: RunSpec; readonly clean: RunSpec; readonly cleanEnv?: Record<string, string | undefined> }[] = [
+    { why: 'an argument that is the token', spec: { ...list, args: ['-l', TOKEN] }, clean: list },
+    { why: 'an argument that holds it', spec: { ...list, args: [`--token=${TOKEN}`] }, clean: { ...list, args: ['--token=x'] } },
+    { why: 'a credential shape in an argument', spec: { ...list, args: ['sk-ant-api03-abcdefghijklmnopqrstuvwx'] }, clean: { ...list, args: ['a-plain-word'] } },
+    { why: 'the command', spec: { ...rotate, command: `/opt/${TOKEN}/.venv/bin/python` }, clean: { ...rotate, command: '/opt/x/.venv/bin/python' } },
+    { why: 'the working directory', spec: { ...rotate, cwd: `/tmp/${TOKEN}` }, clean: { ...rotate, cwd: '/tmp/x' } },
+    { why: 'an allowlisted environment value', env: { LANG: TOKEN }, spec: rotate, clean: rotate },
+    { why: 'an allowlisted environment value that holds it', env: { TERM: `xterm-${TOKEN}` }, spec: rotate, clean: rotate },
+    { why: 'HOME, which PATH is built from', env: { HOME: join(home, TOKEN) }, spec: rotate, clean: rotate },
+    { why: 'stdin that is the token', spec: { ...rotate, digest: TOKEN }, clean: rotate },
+    { why: "stdin that is a registered value in a digest's form", spec: { ...rotate, digest: registeredDigest }, clean: rotate },
+    { why: 'stdin that is not a digest', spec: { ...rotate, digest: 'aos-kernel' }, clean: rotate },
+    { why: 'stdin in upper case', spec: { ...rotate, digest: digestOf(OTHER).toUpperCase().replace('SHA256', 'sha256') }, clean: rotate },
+    { why: 'stdin with its own newline', spec: { ...rotate, digest: `${digestOf(OTHER)}\n` }, clean: rotate },
+    { why: 'stdin with a second line', spec: { ...rotate, digest: `${digestOf(OTHER)}\n${digestOf(OTHER)}` }, clean: rotate },
+    { why: 'a relative working directory', spec: { ...rotate, cwd: 'Persistent-Memory-MCP' }, clean: rotate },
+    { why: 'a relative command', spec: { ...rotate, command: '.venv/bin/python' }, clean: rotate },
   ]
   for (const c of cases) {
     const root = repo(t)
@@ -312,6 +320,11 @@ test('a registered secret in argv, env or stdin is refused before anything is sp
     )
     assert.equal(fake.calls.length, 0, `${c.why}: something was spawned`)
     assert.equal(existsSync(join(root, '.aos')), false, `${c.why}: something was created`)
+    // Its clean twin runs.
+    const twin = recorder((call) => setImmediate(() => call.child.emit('exit', 0, null)))
+    const result = await new Runner({ repoRoot: repo(t), env: { ...installerEnv(home), ...c.cleanEnv }, spawn: twin.spawn, now: () => NOW }).run(c.clean)
+    assert.equal(result.code, 0, c.why)
+    assert.equal(twin.calls.length, 1, `${c.why}: its clean twin did not run`)
   }
 
   // A value the child never gets is not its business: an unlisted name holding the token is dropped, not refused.
@@ -798,9 +811,9 @@ test('the logs go under .aos/install only while .gitignore ignores /.aos/, never
   // Not ignored: nothing is made, nothing is run.
   const bare = tmpdir(t)
   const f1 = exits()
-  assert.throws(() => new Runner({ repoRoot: bare, env: installerEnv(home), spawn: f1.spawn }).start(spec(bare)), refusedCode)
+  assert.throws(() => new Runner({ repoRoot: bare, env: installerEnv(home), spawn: f1.spawn }).start(spec(bare)), machineRefusal)
   writeFileSync(join(bare, '.gitignore'), '/.aos/\n!/.aos/\n')
-  assert.throws(() => new Runner({ repoRoot: bare, env: installerEnv(home), spawn: f1.spawn }).start(spec(bare)), refusedCode)
+  assert.throws(() => new Runner({ repoRoot: bare, env: installerEnv(home), spawn: f1.spawn }).start(spec(bare)), machineRefusal)
   assert.equal(existsSync(join(bare, '.aos')), false)
   assert.equal(f1.calls.length, 0)
 
@@ -811,7 +824,7 @@ test('the logs go under .aos/install only while .gitignore ignores /.aos/, never
     mkdirSync(dirname(join(root, link)), { recursive: true })
     symlinkSync(elsewhere, join(root, link))
     const f = exits()
-    assert.throws(() => new Runner({ repoRoot: root, env: installerEnv(home), spawn: f.spawn }).start(spec(root)), refusedCode, link)
+    assert.throws(() => new Runner({ repoRoot: root, env: installerEnv(home), spawn: f.spawn }).start(spec(root)), machineRefusal, link)
     assert.deepEqual(readdirSync(elsewhere), [])
     assert.equal(f.calls.length, 0)
   }
@@ -832,7 +845,7 @@ test('the logs go under .aos/install only while .gitignore ignores /.aos/, never
     const f = exits()
     assert.throws(
       () => new Runner({ repoRoot: loose, env: installerEnv(home), spawn: f.spawn }).start(spec(loose)),
-      (e: unknown) => refusedCode(e) && e instanceof Error && /is writable by group or others/.test(e.message),
+      (e: unknown) => machineRefusal(e) && e instanceof Error && /is writable by group or others/.test(e.message),
       `${level} ${bits.toString(8)}`,
     )
     assert.equal(f.calls.length, 0)
@@ -848,7 +861,7 @@ test('the logs go under .aos/install only while .gitignore ignores /.aos/, never
   const upper = repo(t)
   mkdirSync(join(upper, '.AOS'), { mode: 0o700 })
   const fu = exits()
-  assert.throws(() => new Runner({ repoRoot: upper, env: installerEnv(home), spawn: fu.spawn }).start(spec(upper)), refusedCode)
+  assert.throws(() => new Runner({ repoRoot: upper, env: installerEnv(home), spawn: fu.spawn }).start(spec(upper)), machineRefusal)
   assert.deepEqual(readdirSync(join(upper, '.AOS')), [])
   assert.equal(fu.calls.length, 0)
 
@@ -865,7 +878,7 @@ test('the logs go under .aos/install only while .gitignore ignores /.aos/, never
   symlinkSync(target, join(dir, 'linked.out'))
   writeFileSync(join(dir, 'errs.err'), 'planted\n', { mode: 0o600 })
   for (const step of ['facts', 'linked', 'errs']) {
-    assert.throws(() => runner.start({ ...spec(pre), step }), refusedCode, step)
+    assert.throws(() => runner.start({ ...spec(pre), step }), machineRefusal, step)
   }
   assert.equal(fp.calls.length, 1)
   assert.equal(readFileSync(target, 'utf8'), 'kept\n')
@@ -1141,6 +1154,114 @@ test("a step's two files can be emptied once read, and only a step this runner r
   assert.match(readFileSync(theirs.out, 'utf8'), /ssh -N -L/)
   assert.equal(readFileSync(keep, 'utf8'), 'kept\n')
   assert.equal(readFileSync(outside, 'utf8'), 'kept\n')
+})
+
+test("a refusal says whose it is: the machine's state (a file on the child's PATH or an argument's that is a script by link or identity, a link to a program never run here, HOME, the log folder) or a defect of the installer's", (t) => {
+  // The installer ends a run refused for the machine's state with exit 2 and the fix the message names; any other refusal is its own
+  // defect, exit 1 (scripts/install.ts stoppedBy). Either way nothing is created or spawned.
+  const home = tmpdir(t)
+  mkdirSync(join(home, '.local', 'bin'), { recursive: true })
+  // An install where the runner looks (~/Github/Persistent-Memory-MCP), its stop reached on the child's PATH by a hard link named pgrep
+  // and a symbolic link of another name, and in its folder by a hard link an argument names.
+  const install = join(home, 'Github', 'Persistent-Memory-MCP')
+  mkdirSync(install, { recursive: true })
+  const STOP = join(install, STOP_SCRIPT)
+  writeFileSync(STOP, '#!/bin/sh\necho "STOP RAN WITH: $*"\n', { mode: 0o755 })
+  writeFileSync(join(install, START_SCRIPT), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  linkSync(STOP, join(home, '.local', 'bin', 'pgrep'))
+  symlinkSync(STOP, join(home, '.local', 'bin', 'stopper'))
+  linkSync(STOP, join(install, 'notes'))
+  // A file named as the stop on the child's PATH, which only a bare name the installer's code spelled so would reach.
+  writeFileSync(join(home, '.local', 'bin', STOP_SCRIPT), '#!/bin/sh\n# on the PATH\nexit 0\n', { mode: 0o755 })
+  // A folder whose stop is the start by hard link: taken for both.
+  const both = checkout(t, { [START_SCRIPT]: '#!/bin/sh\nexit 0\n' })
+  linkSync(join(both, START_SCRIPT), join(both, STOP_SCRIPT))
+  // Programs reached through links of other names: killall on the child's PATH, perl as an absolute path, tar as an allowlisted name.
+  const bin = tmpdir(t)
+  for (const name of ['killall', 'perl', 'tar']) writeFileSync(join(bin, name), `#!/bin/sh\n# ${name}\nexit 0\n`, { mode: 0o755 })
+  symlinkSync(join(bin, 'killall'), join(home, '.local', 'bin', 'zap'))
+  const links = tmpdir(t)
+  symlinkSync(join(bin, 'perl'), join(links, 'ls'))
+  symlinkSync(join(bin, 'tar'), join(links, 'ps'))
+
+  const machine: RunSpec[] = [
+    { step: 'pgrep-tui', command: 'pgrep', args: ['-f', 'scripts/monitor_tui\\.py'], cwd: install, timeoutMs: 5000 },
+    { step: 'stopper', command: 'stopper', args: [], cwd: install },
+    { step: 'both', command: join(both, STOP_SCRIPT), args: [], cwd: both },
+    { step: 'zap', command: 'zap', args: ['pmmcp'], cwd: install, timeoutMs: 5000 },
+    { step: 'ls', command: join(links, 'ls'), args: ['-l'], cwd: install, timeoutMs: 5000 },
+    { step: 'ps', command: join(links, 'ps'), args: ['-o', 'etime=', '-p', '812'], cwd: install, timeoutMs: 5000 },
+    { step: 'notes', command: '/bin/ls', args: ['-l', 'notes'], cwd: install, timeoutMs: 5000 },
+  ]
+  const defect: RunSpec[] = [
+    { step: 'Bad Step', command: 'ps', args: [], cwd: install },
+    { step: 'stop', command: STOP, args: [], cwd: install, killSignal: 'SIGKILL' } as RunSpec,
+    { step: 'kill', command: 'kill', args: ['-TERM', '812'], cwd: install },
+    { step: 'sh', command: '/bin/sh', args: ['-c', 'true'], cwd: install },
+    { step: 'cat', command: 'cat', args: ['x'], cwd: install },
+    { step: 'docker', command: 'docker', args: ['kill', 'pmmcp-qdrant'], cwd: install },
+    { step: 'ls', command: '/bin/ls', args: ['-l', STOP_SCRIPT], cwd: install, timeoutMs: 5000 },
+    { step: 'stop', command: STOP, args: ['--force'], cwd: install },
+    { step: 'stop', command: STOP, args: [], cwd: install, timeoutMs: 600_000 },
+    { step: 'stop', command: STOP_SCRIPT, args: [], cwd: tmpdir(t) },
+    { step: 'stop', command: STOP_SCRIPT.toUpperCase(), args: ['--jobs'], cwd: install },
+    { step: 'ps', command: '/bin/ps', args: ['-o', 'etime=', '-p', '812'], cwd: install, ownSession: true, timeoutMs: 5000 },
+  ]
+  for (const [specs, expected] of [
+    [machine, true],
+    [defect, false],
+  ] as const) {
+    for (const spec of specs) {
+      const root = repo(t)
+      const fake = recorder()
+      const what = JSON.stringify([spec.step, spec.command, ...spec.args])
+      assert.throws(
+        () => new Runner({ repoRoot: root, env: installerEnv(home), spawn: fake.spawn, now: () => NOW }).start(spec),
+        (e: unknown) => {
+          assert.ok(refusedCode(e), `${what}: ${String(e)}`)
+          assert.equal((e as InstallRunError).machine, expected, `${what}: ${String(e)}`)
+          return true
+        },
+        what,
+      )
+      assert.equal(fake.calls.length, 0, `${what}: something was spawned`)
+      assert.equal(existsSync(join(root, '.aos')), false, `${what}: something was created`)
+    }
+  }
+  // Each of the machine's names the file to change and how: remove or rename it.
+  for (const spec of machine.filter((s) => s.step !== 'both')) {
+    assert.throws(
+      () => new Runner({ repoRoot: repo(t), env: installerEnv(home), spawn: recorder().spawn, now: () => NOW }).start(spec),
+      (e: unknown) => e instanceof Error && / remove or rename that (?:file|link), then re-run; nothing was run$/.test(e.message),
+      spec.step,
+    )
+  }
+  assert.throws(
+    () => new Runner({ repoRoot: repo(t), env: installerEnv(home), spawn: recorder().spawn, now: () => NOW }).start(machine[0] as RunSpec),
+    (e: unknown) =>
+      e instanceof Error &&
+      e.message === `pgrep-tui: stop-pmmcp-server.sh runs only by absolute path, and pgrep on the child's PATH is ${join(home, '.local', 'bin', 'pgrep')}, which is the same file as ${realpathSync(STOP)} (a hard link): remove or rename that file, then re-run; nothing was run`,
+  )
+  assert.throws(
+    () => new Runner({ repoRoot: repo(t), env: installerEnv(home), spawn: recorder().spawn, now: () => NOW }).start(machine[3] as RunSpec),
+    (e: unknown) =>
+      e instanceof Error &&
+      e.message ===
+        `zap: killall signals the processes it names or runs, and nothing here signals a process (never the stop or start script). zap on the child's PATH is ${join(home, '.local', 'bin', 'zap')}, ` +
+          `which leads to ${realpathSync(join(bin, 'killall'))}: remove or rename that link, then re-run; nothing was run`,
+  )
+  // HOME, which no child's PATH can be built from, and a log folder others may write in: the machine's too.
+  assert.throws(
+    () => new Runner({ repoRoot: repo(t), env: { ...installerEnv(home), HOME: 'relative/home' }, spawn: recorder().spawn }).start(defect[2] as RunSpec),
+    (e: unknown) => refusedCode(e) && (e as InstallRunError).machine,
+  )
+  const loose = repo(t)
+  mkdirSync(join(loose, '.aos', 'install'), { recursive: true, mode: 0o700 })
+  chmodSync(join(loose, '.aos', 'install'), 0o777)
+  assert.throws(
+    () => new Runner({ repoRoot: loose, env: installerEnv(home), spawn: recorder().spawn, now: () => NOW }).start({ step: 'ps', command: '/bin/ps', args: ['-o', 'etime=', '-p', '812'], cwd: loose, timeoutMs: 5000 }),
+    (e: unknown) => refusedCode(e) && (e as InstallRunError).machine && /is writable by group or others: chmod go-w/.test((e as Error).message),
+  )
 })
 
 test('nothing that signals, restarts or shells around these rules runs: launchctl kickstart, kill, pkill, killall, a shell command string, a stop or start with --force, a timeout or a kill signal', (t) => {
@@ -1486,7 +1607,15 @@ test('nothing that signals, restarts or shells around these rules runs: launchct
     assert.equal(existsSync(join(root, '.aos')), false, `${what}: something was created`)
   }
 
-  // What the installer runs, each form it runs, is still run.
+  // What the installer runs, each form it runs, is still run. A bare name runs only as a file found for it on the child's PATH
+  // (~/.local/bin comes first on it), so each one the list names by its bare name has a stand-in there; on a case-insensitive
+  // volume PS is ps.
+  for (const name of ['launchctl', 'pgrep', 'ls', 'ps', 'PS', 'lsof', 'plutil', 'docker', 'git']) {
+    const at = join(home, '.local', 'bin', name)
+    if (existsSync(at)) continue
+    writeFileSync(at, '#!/bin/sh\nexit 0\n')
+    chmodSync(at, 0o755)
+  }
   const plist = join(home, 'Library', 'LaunchAgents', 'com.aibot.pmmcp.plist')
   const allowed: RunSpec[] = [
     { step: 'print', command: 'launchctl', args: ['print', LABEL], cwd: pmmcp, timeoutMs: 5000 },
@@ -1535,10 +1664,92 @@ test('nothing that signals, restarts or shells around these rules runs: launchct
   const runner = new Runner({ repoRoot: repo(t), env: installerEnv(home), spawn: fake.spawn, now: () => NOW })
   for (const spec of allowed) {
     assert.doesNotThrow(() => runner.start(spec), JSON.stringify(spec))
+    // What spawn is handed is a path, never a name for it to look up again: the command when absolute, else the file found on the child's PATH.
+    const handed = fake.calls.at(-1)?.command ?? ''
+    assert.ok(handed.startsWith('/'), `${JSON.stringify(spec)}: spawn was handed ${handed}`)
+    if (spec.command.startsWith('/')) assert.equal(handed, spec.command)
+    else assert.equal(handed, join(home, '.local', 'bin', spec.command))
     // Each to its end, so a step in its own session does not hold the next one up.
     fake.calls.at(-1)?.child.emit('exit', 0, null)
   }
   assert.equal(fake.calls.length, allowed.length)
+})
+
+test("the python forms' patterns hold whole names: a client name is http_auth's _NAME and nothing more, and the venv's python is python by its name, never a name that starts so", (t) => {
+  const home = tmpdir(t)
+  const pmmcp = checkout(t)
+  const venv = join(pmmcp, '.venv', 'bin')
+  const rotate = (name: string, command = join(venv, 'python')): RunSpec => ({ step: 'rotate', command, args: ['scripts/rotate_http_auth_token.py', name, '--create', '--digest-stdin'], cwd: pmmcp, digest: DIGEST })
+  const expect = (name: string): RunSpec => ({ step: 'expect', command: join(venv, 'python'), args: ['-B', '-m', 'src.transport.http_auth', 'check', '--expect', name], cwd: pmmcp, digest: DIGEST, timeoutMs: 5000 })
+  const facts = (command: string): RunSpec => ({ step: 'facts', command, args: ['scripts/pmmcp_facts.py', '--json'], cwd: pmmcp, timeoutMs: 5000 })
+  const fake = recorder((c) => setImmediate(() => c.child.emit('exit', 0, null)))
+  const runner = new Runner({ repoRoot: repo(t), env: installerEnv(home), spawn: fake.spawn, now: () => NOW })
+  const runs = (spec: RunSpec): boolean => {
+    try {
+      runner.start(spec)
+      fake.calls.at(-1)?.child.emit('exit', 0, null)
+      return true
+    } catch (e) {
+      assert.ok(refusedCode(e), String(e))
+      return false
+    }
+  }
+  // A client name as pmmcp's http_auth takes one: [a-z0-9][a-z0-9._-]{0,63}, the whole argument.
+  for (const name of ['aos-kernel', 'a', 'x.y_z-1', `a${'b'.repeat(63)}`]) {
+    assert.equal(runs(rotate(name)), true, name)
+    assert.equal(runs(expect(name)), true, name)
+  }
+  for (const name of [`a${'b'.repeat(64)}`, 'aos-kernel/../../x', 'aos-kernel x', 'aos-kernel;id', 'aos-kernel$(id)', 'aos-kernel\u0007', '-aos-kernel', '']) {
+    assert.equal(runs(rotate(name)), false, JSON.stringify(name))
+    assert.equal(runs(expect(name)), false, JSON.stringify(name))
+  }
+  // The venv's python by any name python runs as (python, python3, python3.12), and nothing else that starts with python.
+  for (const name of ['python', 'python3', 'python3.12']) assert.equal(runs(facts(join(venv, name))), true, name)
+  for (const name of ['python-shim', 'pythonw', 'python3.x', 'python3.12-config', 'python.sh']) assert.equal(runs(facts(join(venv, name))), false, name)
+})
+
+test("a bare name runs as the file the rules found on the child's PATH: one whose #! names no interpreter fails the step, and a later file of that name never runs", async (t) => {
+  // ~/.local/bin is the first entry of the child's PATH and ~/.docker/bin a late one: spawn handed the bare name would look the
+  // name up again as execvp does, and on the first file's ENOENT go on to the second, which no rule examined.
+  const home = tmpdir(t)
+  const first = join(home, '.local', 'bin', 'launchctl')
+  mkdirSync(dirname(first), { recursive: true })
+  writeFileSync(first, '#!/nonexistent/interpreter\n')
+  chmodSync(first, 0o755)
+  const spec: RunSpec = { step: 'print', command: 'launchctl', args: ['print', 'gui/0/x'], cwd: home, timeoutMs: 5000 }
+  const fake = recorder((c) => setImmediate(() => c.child.emit('exit', 0, null)))
+  await new Runner({ repoRoot: repo(t), env: installerEnv(home), spawn: fake.spawn, now: () => NOW }).run(spec)
+  assert.equal(fake.calls[0]?.command, first, 'spawn was handed something other than the file the rules checked')
+
+  // With Node's own spawn. Only where no system folder on the child's PATH has a launchctl of its own (not macOS, where
+  // /bin/launchctl is the one a bare name would reach next): the late file stands in for whatever is found after the first.
+  const elsewhere = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'].some((d) => existsSync(join(d, 'launchctl')))
+  if (elsewhere) {
+    t.diagnostic('a launchctl is in a system folder of the child PATH here: the real spawn is held by the recorded one above')
+    return
+  }
+  const later = join(home, '.docker', 'bin', 'launchctl')
+  const mark = join(home, 'the-later-file-ran')
+  mkdirSync(dirname(later), { recursive: true })
+  writeFileSync(later, `#!/bin/sh\necho ran > ${shWord(mark)}\n`)
+  chmodSync(later, 0o755)
+  const real = new Runner({ repoRoot: repo(t), env: installerEnv(home), now: () => NOW })
+  await assert.rejects(
+    () => real.run(spec),
+    (e: unknown) => e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_SPAWN' && /print: launchctl could not be started \(ENOENT\)/.test(e.message),
+  )
+  assert.equal(existsSync(mark), false, 'a file the rules never examined ran')
+
+  // A bare name on no entry of the child's PATH: nothing was examined, so nothing is spawned for spawn to find, and nothing is created.
+  const empty = tmpdir(t)
+  const root = repo(t)
+  const none = recorder()
+  assert.throws(
+    () => new Runner({ repoRoot: root, env: installerEnv(empty), spawn: none.spawn, now: () => NOW }).start(spec),
+    (e: unknown) => e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_SPAWN' && /print: launchctl is not on the child's PATH \(ENOENT\); nothing was run/.test(e.message),
+  )
+  assert.equal(none.calls.length, 0)
+  assert.equal(existsSync(join(root, '.aos')), false)
 })
 
 test('the stop and start scripts are known by identity: a hard link of another name or a renamed copy runs by their rules, and is refused anywhere else', async (t) => {
@@ -1672,6 +1883,22 @@ test('the stop and start scripts are known by identity: a hard link of another n
     const quiet = new Runner({ repoRoot: repo(t), env: installerEnv(home), spawn: fake.spawn, now: () => NOW })
     assert.throws(() => quiet.start({ step: 'stop', command, args, cwd }), (e: unknown) => refusedCode(e) && BOTH.test(String(e)), `${command} from ${cwd}`)
   }
+  // The refusal names the file, how it is taken for each, and the fix: the operator's machine, not the installer, is what to change.
+  assert.throws(
+    () => new Runner({ repoRoot: repo(t), env: installerEnv(home), spawn: fake.spawn, now: () => NOW }).start({ step: 'stop', command: join(swapped, STOP_SCRIPT), args: [], cwd: pmmcp }),
+    (e: unknown) =>
+      refusedCode(e) &&
+      String(e).includes(`${join(swapped, STOP_SCRIPT)} is named ${STOP_SCRIPT}, is the same file as ${realpathSync(START)} (a hard link). Make each script a file of its own`),
+  )
+  // A link found on the child's PATH by a bare name: the refusal names the PATH entry, and what it is the same file as.
+  assert.throws(
+    () => new Runner({ repoRoot: repo(t), env: installerEnv(home), spawn: fake.spawn, now: () => NOW }).start({ step: 'stop', command: 'halt', args: [], cwd: pmmcp }),
+    (e: unknown) =>
+      refusedCode(e) &&
+      String(e).includes(
+        `stop: ${STOP_SCRIPT} runs only by absolute path, and halt on the child's PATH is ${join(home, '.local', 'bin', 'halt')}, which is the same file as ${realpathSync(STOP)} (a hard link): remove or rename that file, then re-run; nothing was run`,
+      ),
+  )
   assert.equal(fake.calls.length, 1)
   // A copy is the script whoever owns it (only root can give one away here).
   if (process.geteuid?.() === 0) {

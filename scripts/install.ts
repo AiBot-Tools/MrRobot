@@ -43,14 +43,24 @@
 //       `writable` and `fits` (its `fits` counts every missing name it is
 //       given). A refusal of the writer's (the trap .env's mode, a placeholder,
 //       an undeclared name, ...) changes nothing: exit 2.
-//     S3, discovery, unless --aos-only: a stop (exit 2), or the screen of what
-//       was found (or not) and discovery's notes, which the gate prints after
-//       S2's (plan §5's order); for a found install the pids of every running
-//       scripts/monitor_tui.py (the planner lists them, and the applier
-//       checks again before a curator secret is made).
+//     S3, discovery, unless --aos-only: a stop (exit 2), a probe the runner's
+//       rules refused for the machine's state (InstallRunError.machine: a
+//       file on the child's PATH that is pmmcp's stop or start script by
+//       link or identity, a link to a program never run there, the log
+//       folder's mode: exit 2, the runner's message naming the file and the
+//       fix; any other refusal of the runner's is the installer's defect,
+//       exit 1), or the screen of what was found (or not) and discovery's
+//       notes, which the gate prints after S2's (plan §5's order); for a
+//       found install the pids of every running scripts/monitor_tui.py,
+//       handed to the planner as pgrep gave them (the warning lists them,
+//       or says whether one runs cannot be told when pgrep gave no answer,
+//       never that none runs, and the applier checks again before a curator
+//       secret is made), the same refusals and stops ending the run there.
 //     S4 on: the plan (planInstall) walked by the gate (runGate) with the
 //       applier as its apply and jobs count, and, once a phase was applied or
-//       failed, the applier's end report (S8).
+//       failed, the applier's recheck (the facts and Qdrant's status read
+//       again when the window opened, with a signal held meanwhile) and its
+//       end report (S8).
 //
 //   A dry run (--dry-run) stops after the gate printed the plan, every step as
 //   would-do and every question and typed word it would ask. What it writes:
@@ -116,10 +126,10 @@ import { ConfigError } from '../src/errors.js'
 import { runGate, type GateIO, type GateOutcome, type JobsAnswer } from '../src/install/gate.js'
 import { credentialsMap, exportedNames, planInstall, shellWord } from '../src/install/plan.js'
 import { parseProviders, type ProvidersFile } from '../src/models/registry.js'
-import { DotenvWriteError, credentialNames, inspectCredentials, type InspectResult } from '../src/secrets/dotenv-append.js'
+import { DotenvWriteError, credentialNames, inspectCredentials, mintedCredentialNames, type InspectResult } from '../src/secrets/dotenv-append.js'
 import { Applier, tuiPids } from './install/apply.js'
 import { DiscoverError, PLIST_LABEL, discover, type Absent, type Found } from './install/discover.js'
-import { defectEnding, exitLine, outcomeEnding, refusedEnding, signalEnding, stoppedEnding, type Ending } from './install/ending.js'
+import { defectEnding, exitLine, outcomeEnding, refusedEnding, signalEnded, signalEnding, stoppedEnding, type Ending } from './install/ending.js'
 import { startWithPs, takeLock } from './install/lock.js'
 import { Output } from './install/output.js'
 import { npmTookFlags, preflight } from './install/preflight.js'
@@ -286,13 +296,35 @@ export const ranAPhase = (outcome: GateOutcome): boolean =>
   outcome.kind === 'failed' || outcome.kind === 'done' || ((outcome.kind === 'declined' || outcome.kind === 'aborted') && outcome.applied.length > 0)
 
 /**
- * What a throw from discovery or the TUI check ends the run with: a leak
- * or a halted runner (a registered value reached a child's output), or
- * discovery's own defect, stops it before any change, exit 1 (a defect,
- * never 2: nothing was refused); anything else is undefined here, and
- * main throws it on (a defect of its own). Exported for its test.
+ * The outcome once the applier's recheck before the report ran: a leak
+ * there (`leaked`, the exit code it implies) ends a failed phase with that
+ * code when it is the worse, as a leak inside the phase would have. recheck
+ * reads only after a phase that ended inside the window, so a failed one;
+ * any other outcome is left as it is. Exported for its test.
+ */
+export const afterRecheck = (outcome: GateOutcome, leaked: 1 | 4 | undefined): GateOutcome =>
+  leaked !== undefined && outcome.kind === 'failed' && leaked > outcome.exitCode ? { ...outcome, exitCode: leaked } : outcome
+
+/**
+ * What a throw from discovery or the TUI check ends the run with: a probe
+ * the runner's rules refused for the machine's state (InstallRunError.
+ * machine: a file on the child's PATH, an argument's file or pmmcp's own
+ * script that is the stop or start script by link or identity, a link to a
+ * program never run here, the log folder's owner or mode: plan §5's failure
+ * table) is a refusal before any change, exit 2, its message naming the
+ * file and the fix; any other refusal of the runner's (a bad step name,
+ * arguments off the allowlist, a timeout on a step in its own session) only
+ * an installer defect makes, and stops it before any change, exit 1, said
+ * as a defect; so do a leak or a halted runner (a registered value reached a
+ * child's output) and discovery's own defect (exit 1, never 2: nothing of
+ * the machine's was refused); anything else is undefined here, and main
+ * throws it on (a defect of its own). Exported for its test.
  */
 export function stoppedBy(e: unknown): { readonly line: string; readonly ending: Ending } | undefined {
+  if (e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_REFUSED') {
+    if (e.machine) return { line: `refused before any change: ${e.message}`, ending: refusedEnding() }
+    return { line: `stopped by a defect (report it): the runner refused a probe the installer asked for: ${e.message}`, ending: stoppedEnding() }
+  }
   if (e instanceof InstallRunError && (e.code === 'AOS_INSTALL_RUN_LEAK' || e.code === 'AOS_INSTALL_RUN_HALTED')) return { line: `stopped: ${e.message}`, ending: stoppedEnding() }
   if (e instanceof DiscoverError) return { line: `discovery failed (a defect, report it): ${e.message}`, ending: stoppedEnding() }
   return undefined
@@ -382,9 +414,11 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
   const shown = [...mapped, ...[...accepted].filter((n) => !mapped.includes(n))]
   let screen: InspectResult
   let room: InspectResult
+  // The tokens the installer mints are judged for a write an earlier run did not finish: one cut short is refused, never staged.
+  const minted = mintedCredentialNames(config)
   try {
-    screen = inspectCredentials({ repoRoot: root, accepted, names: shown })
-    room = inspectCredentials({ repoRoot: root, accepted, names: mapped })
+    screen = inspectCredentials({ repoRoot: root, accepted, names: shown, minted })
+    room = inspectCredentials({ repoRoot: root, accepted, names: mapped, minted })
   } catch (e) {
     if (!(e instanceof DotenvWriteError) && !(e instanceof ConfigError)) throw e
     say(`refused before any change: ${e.message}`)
@@ -393,7 +427,8 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
   const exported = exportedNames(process.env, accepted)
 
   let discovery: Found | Absent | undefined
-  let tui: readonly number[] = []
+  // undefined when pgrep could not say: the warning then says so, never that none runs.
+  let tui: readonly number[] | undefined = []
   // S3's screen: the gate prints it after S2's, as plan §5 orders them.
   const s3: string[] = []
   if (!flags.aosOnly) {
@@ -421,14 +456,14 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
       try {
         pids = await tuiPids(runner, found.install.dir)
       } catch (e) {
-        // tuiPids throws a leak or a halt only: any other failure of pgrep is no answer.
+        // tuiPids throws a leak, a halt or the runner's refusal (of the machine's state, or a defect): any other failure of pgrep is no answer.
         const stopped = stoppedBy(e)
         if (stopped === undefined) throw e
         say(stopped.line)
         return stopped.ending
       }
       if (pids === undefined) notes.push('whether a scripts/monitor_tui.py runs cannot be told (pgrep gave no answer): the installer checks again before it makes a curator secret')
-      tui = pids ?? []
+      tui = pids
     } else {
       state.pmmcpDir = found.at
     }
@@ -486,10 +521,15 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
   }
   const outcome = await runGate(plan, io, { dryRun: flags.dryRun, discovery: s3, ...(runner.dir === undefined ? {} : { logs: runner.dir }) })
   const reported = ranAPhase(outcome)
-  if (reported) for (const line of applier.report()) say(line)
+  let ended = outcome
+  if (reported) {
+    // What the report says of pmmcp is read again first when the window opened (a signal is held until the report is out); a leak there is reported in it.
+    ended = afterRecheck(outcome, await applier.recheck())
+    for (const line of applier.report()) say(line)
+  }
   // The report is out: what a held signal waited for is said.
   state.reporting = false
-  return outcomeEnding(outcome, reported)
+  return outcomeEnding(ended, reported)
 }
 
 /**
@@ -549,7 +589,8 @@ if (entry !== undefined && fileURLToPath(import.meta.url) === resolve(entry)) {
           out.say(`${signalWords(s)} does not end the run yet: the stopped window opened in this run, so the installer finishes its last checks and prints the end report (what was done, and what is left to do) first.`),
         abortCount: () => state.interrupt.abort(),
         exit: (code, s) => {
-          out.say(s === 'SIGINT' ? 'interrupted: nothing more is done' : `ended by ${s}: nothing more is done`)
+          // The same words as the last line's: the two match.
+          out.say(signalEnded(s))
           finish(out, state, signalEnding(code, s))
         },
       })

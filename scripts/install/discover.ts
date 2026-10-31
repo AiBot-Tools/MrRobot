@@ -112,8 +112,11 @@
 //   checkout.
 //
 //   What it throws: the runner's leak and halt (a registered value reached a
-//   child's output: nothing more may run, and the caller reports it), and a
-//   refusal, which is a defect here. A program that cannot be started or
+//   child's output: nothing more may run, and the caller reports it), and its
+//   refusal: one of the machine's state (InstallRunError.machine, a file on
+//   the child's PATH that is pmmcp's stop or start script, say), which the
+//   caller reports as a refusal with the fix the message names, or any
+//   other, which only a defect makes. A program that cannot be started or
 //   does not answer in time is a probe that failed, and says so.
 
 import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, realpathSync, statSync } from 'node:fs'
@@ -137,7 +140,7 @@ import {
   type QdrantStatus,
 } from '../../src/install/facts.js'
 import type { ProvidersFile } from '../../src/models/registry.js'
-import { credentialNames, inspectCredentials, type InspectOptions } from '../../src/secrets/dotenv-append.js'
+import { credentialNames, cutShortMessage, inspectCredentials, mintedCredentialNames, type InspectOptions } from '../../src/secrets/dotenv-append.js'
 import {
   InstallRunError,
   STOP_SCRIPT,
@@ -1767,9 +1770,12 @@ class Discoverer {
         accepted: credentialNames(this.#o.config, this.#o.providers),
         names: [],
         digests: [tokenEnv],
+        minted: mintedCredentialNames(this.#o.config),
         ...(this.#o.inspect?.uid === undefined ? {} : { uid: this.#o.inspect.uid }),
         ...(this.#o.inspect?.euid === undefined ? {} : { euid: this.#o.inspect.euid }),
       })
+      // Cut short by a write that did not finish: it has no digest, and no check is made of one.
+      if (inspected.damaged.length > 0) return { state: 'not-checked', why: cutShortMessage('.env', inspected.damaged) }
       digest = inspected.digests.find((d) => d.name === tokenEnv)?.digest
     } catch (e) {
       // The writer's refusals name the path, names and line numbers only.

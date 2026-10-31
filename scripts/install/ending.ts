@@ -10,10 +10,12 @@
 //
 //   Every Ending is built here: the gate's outcome (outcomeEnding), a refusal
 //   or a stop before the gate (refusedEnding, stoppedEnding), a signal that
-//   ended the run before the stopped window ever opened (signalEnding), and
-//   a defect (defectEnding). `reported` says whether the end report (S8) was
-//   printed: a line points at "the end report above" only then, and at
-//   "above" (the lines that said why) otherwise. EOF and an interrupt at a
+//   ended the run before the stopped window ever opened (signalEnding, whose
+//   words, signalEnded, are also what the installer says as the signal
+//   comes, so the two lines match), and a defect (defectEnding). `reported`
+//   says whether the end report (S8) was printed: a line points at "the end
+//   report above" only then, and at "above" (the lines that said why)
+//   otherwise. EOF and an interrupt at a
 //   question are told apart, and either at the jobs check (its question, its
 //   wait or a count) is named as the check's; an interrupt may have been the
 //   terminal's Ctrl-C, a SIGINT, a SIGHUP or a SIGTERM (each answers the open
@@ -71,14 +73,25 @@ export function refusedEnding(): Ending {
   return { code: 2, why: 'refused before any change: see above' }
 }
 
-/** Discovery or the TUI check stopped by a defect (a leak, a halted runner, discovery's own): exit 1, before any change. */
+/** Discovery or the TUI check stopped by a defect (a leak, a halted runner, a refusal of the runner's only a defect makes, discovery's own): exit 1, before any change. */
 export function stoppedEnding(): Ending {
   return { code: 1, why: 'stopped before any change: see above' }
 }
 
-/** A signal that ended the run outside the stopped window (before it ever opened: after, one is held until the end report): 128 + its number. */
+/**
+ * What a signal that ends the run is, in words: said as it comes and again
+ * as the last line's why. It ends the run only before the stopped window
+ * ever opened (signals.ts: inside it a signal is trapped, and from its first
+ * opening until the end report it is held, and the run ends with the gate's
+ * code), so that is where it says it came.
+ */
+export function signalEnded(signal: HandledSignal): string {
+  return `ended by ${signal === 'SIGINT' ? 'SIGINT (Ctrl-C)' : signalWords(signal)} before the stopped window opened: nothing more was done`
+}
+
+/** A signal that ended the run before the stopped window ever opened: 128 + its number. */
 export function signalEnding(code: number, signal: HandledSignal): Ending {
-  return { code, why: `ended by ${signal === 'SIGINT' ? 'SIGINT (Ctrl-C)' : signalWords(signal)} outside the stopped window: nothing more was done` }
+  return { code, why: signalEnded(signal) }
 }
 
 /** A defect main did not expect: 4 once the window had opened (pmmcp may be stopped), 1 before. No end report is printed then. */

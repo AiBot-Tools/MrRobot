@@ -36,6 +36,13 @@
 //     - Exactly cwd, env, stdio and detached from Node's spawn: no timeout,
 //       no kill signal, no shell (spawnWith, the one way Node's spawn is
 //       reached here).
+//     - The file the rules below examined, by absolute path: a bare name is
+//       spawned as the file found for it on the child's PATH, never as the
+//       name, since spawn would search the PATH again as execvp does and,
+//       where execve fails for one file (a #! naming an interpreter that is
+//       not there), go on to a later file of that name that no rule looked
+//       at. A bare name on no PATH entry is not spawned at all (the step
+//       fails with AOS_INSTALL_RUN_SPAWN, ENOENT, before anything exists).
 //
 //   What a dry run writes through this module, as a real run does: .aos and
 //   .aos/install when missing (0700), the run's folder with each probe's
@@ -122,6 +129,21 @@
 //       resolves to, or given what its entry does not allow (above);
 //     - once a child's output held a registered value, every further run
 //       (below).
+//
+//   Whose refusal it is (InstallRunError.machine): true for one of the
+//   machine's state, which the operator can change and the message names
+//   with its fix: a file on the child's PATH, an argument's file or the
+//   command's that is the stop or start script by link or identity (a
+//   command taken for both included); a program whose link, on the child's
+//   PATH or as given, leads to one never run here (the name typed passes);
+//   HOME unfit for a child's PATH; and the log folder (.gitignore not
+//   ignoring /.aos/, a folder that is a link, another account's, writable
+//   by group or others, or out of room for a stamp, a file that cannot be
+//   made or does not keep mode 0600, an active.json that cannot be made or
+//   removed). Every other refusal (a spec's fields or step name, a command
+//   or argument as the installer's code spelled it, the allowlist, a
+//   timeout or stdin the rules do not give) only a defect of the
+//   installer's makes: machine is false, and the installer says so.
 //
 //   The stop and start scripts (stop-pmmcp-server.sh, start-pmmcp-server.sh)
 //   are recognised by name in any case (APFS runs Stop-PMMCP-Server.sh as the
@@ -398,11 +420,14 @@ export class InstallRunError extends KernelError {
   readonly step: string | undefined
   /** For a leak: how the child ended. Its output is gone. */
   readonly result: RunResult | undefined
+  /** For a refusal: of the machine's state, the operator's to change (the contract's "Whose refusal it is"); false: only a defect of the installer's makes it. */
+  readonly machine: boolean
 
-  constructor(code: RunErrorCode, message: string, step?: string, result?: RunResult) {
+  constructor(code: RunErrorCode, message: string, step?: string, result?: RunResult, machine?: boolean) {
     super(code, message)
     this.step = step
     this.result = result
+    this.machine = machine === true
   }
 }
 
@@ -504,7 +529,11 @@ export interface RunnerOptions {
   readonly now?: () => Date
 }
 
+/** A refusal only a defect of the installer's makes: its code asked for what the rules never run. */
 const refused = (message: string, step?: string): InstallRunError => new InstallRunError('AOS_INSTALL_RUN_REFUSED', message, step)
+
+/** A refusal of the machine's state (InstallRunError.machine): the message names the file and the fix. */
+const refusedByMachine = (message: string, step?: string): InstallRunError => new InstallRunError('AOS_INSTALL_RUN_REFUSED', message, step, undefined, true)
 
 /** An error by its errno or Node code, else its class: never its message, which may quote what it was handed. */
 const errnoOf = (e: unknown): string => {
@@ -519,7 +548,7 @@ const errnoOf = (e: unknown): string => {
 export function childEnv(parent: Readonly<Record<string, string | undefined>>, command: string): Record<string, string> {
   const home = parent['HOME']
   if (home === undefined || !isAbsolute(home) || home.includes(':')) {
-    throw refused('HOME is not set to an absolute path without a colon, so no PATH can be built for a child')
+    throw refusedByMachine('HOME is not set to an absolute path without a colon, so no PATH can be built for a child')
   }
   const env: Record<string, string> = {}
   const names = basename(command) === 'git' ? [...PASSED_NAMES, ...GIT_ONLY_NAMES] : PASSED_NAMES
@@ -655,6 +684,21 @@ function scriptsByIdentity(path: string, scripts: readonly ScriptFile[], copies:
   const mine = real === undefined ? undefined : bytesOf(real, Number(id.size))
   if (mine === undefined) return []
   return sized.filter((s) => bytesOf(s.path, Number(s.size))?.equals(mine) === true)
+}
+
+/** How a file is taken for a service script, for a refusal's fix: by its name, as a link, or by identity with the file it matched. */
+function identityWords(located: string | undefined, named: string | undefined, linkedAs: string | undefined, matched: readonly ScriptFile[]): string[] {
+  const out: string[] = []
+  if (named !== undefined) out.push(`is named ${named}`)
+  const real = located === undefined ? undefined : realOf(located)
+  if (linkedAs !== undefined && real !== undefined && real !== located) out.push(`is a symbolic link to ${real}`)
+  const id = located === undefined ? undefined : fileId(located)
+  // The file itself, found where it is, says nothing: only the others it is taken for.
+  for (const m of matched) {
+    if (m.path === real) continue
+    out.push(id !== undefined && m.dev === id.dev && m.ino === id.ino ? `is the same file as ${m.path} (a hard link)` : `is a copy of ${m.path}`)
+  }
+  return out
 }
 
 /**
@@ -842,8 +886,22 @@ function notOnAllowlist(command: string, names: readonly string[], args: readonl
   return undefined
 }
 
-/** What checkSpec found: the service script the spec runs, if any, whether it runs in its own session, and the folders a script runs from. */
+/** Where a program refused by the name its link gives it is, and the fix: the link, on the child's PATH or as given, is the machine's. */
+function linkFix(command: string, located: string | undefined): string {
+  const at = located ?? command
+  return `. ${isAbsolute(command) ? at : `${command} on the child's PATH is ${at}`}, which leads to ${realOf(at) ?? 'another program'}: remove or rename that link, then re-run`
+}
+
+/** What checkSpec found: the file spawned, the service script the spec runs, if any, whether it runs in its own session, and the folders a script runs from. */
 interface Checked {
+  /**
+   * What is spawned: the command when it is absolute, else the file the rules
+   * located on the child's PATH and checked. Never a bare name: spawn would
+   * search the PATH again as execvp does and, when execve fails for a file
+   * (a #! naming an interpreter that is not there), go on to a later file of
+   * that name, which no rule here examined.
+   */
+  readonly program: string
   readonly script: string | undefined
   readonly ownSession: boolean
   /** For a service script: the folders it ran from (the command's, as typed and as resolved, and the script's it was found to be), where later commands are compared with the install's scripts. */
@@ -891,7 +949,13 @@ function checkSpec(spec: RunSpec, env: Readonly<Record<string, string>>, install
   const located = isAbsolute(spec.command) ? spec.command : onChildPath(spec.command, env)
   const names = programNames(spec.command, located)
   const why = programRefusal(new Set(names), spec.command, spec.args, spec.digest !== undefined)
-  if (why !== undefined) throw refused(`${step}: ${why}; nothing was run`, step)
+  if (why !== undefined) {
+    // By the name a link gives it alone (the name typed passes): the link is the machine's, and the operator's to remove.
+    if (names.length > 1 && programRefusal(new Set(names.slice(0, 1)), spec.command, spec.args, spec.digest !== undefined) === undefined) {
+      throw refusedByMachine(`${step}: ${why}${linkFix(spec.command, located)}; nothing was run`, step)
+    }
+    throw refused(`${step}: ${why}; nothing was run`, step)
+  }
 
   // Each argument as the file a child opening it would get, `..` left for the kernel (and realOf) to resolve.
   const argPaths = spec.args.map((a) => argPath(spec.cwd, a))
@@ -915,16 +979,38 @@ function checkSpec(spec: RunSpec, env: Readonly<Record<string, string>>, install
   const linkedAs = located === undefined ? undefined : scriptLinkedAt(located)
   const matched = located === undefined ? [] : scriptsByIdentity(located, scripts, true)
   const taken = new Set([named, linkedAs, ...matched.map((m) => m.script)].filter((s): s is string => s !== undefined))
+  // What the operator is told to change: the file, and how it is taken for a script (by its name, as a link, or by identity).
+  const how = (): string => identityWords(located, named, linkedAs, matched).join(', ')
   if (taken.size > 1) {
-    throw refused(`${step}: the command is taken for both the stop and the start script (named or linked as one, the same file or bytes as the other, or a copy of both); nothing was run`, step)
+    throw refusedByMachine(
+      `${step}: the command is taken for both the stop and the start script (named or linked as one, the same file or bytes as the other, or a copy of both): ` +
+        `${located ?? spec.command} ${how()}. Make each script a file of its own (delete the link or copy, and restore the script from pmmcp's git, git -C <checkout> checkout -- <script>), then re-run; nothing was run`,
+      step,
+    )
   }
   const [script] = taken
   if (script === undefined) {
-    if (spec.args.some((a, i) => namesScript(a, argPaths[i], scripts)) || SERVICE_SCRIPTS.some((s) => spec.command.toLowerCase().includes(s))) {
+    // Named in the command or an argument as the installer's code spelled it: its defect.
+    if ([spec.command, ...spec.args].some((a) => SERVICE_SCRIPTS.some((s) => a.toLowerCase().includes(s)))) {
       throw refused(`${step}: the stop and start scripts run only as the command itself, by absolute path; nothing was run`, step)
     }
+    // An argument's file that is one by link or identity: the file is the machine's.
+    const at = spec.args.findIndex((a, i) => namesScript(a, argPaths[i], scripts))
+    if (at >= 0) {
+      throw refusedByMachine(
+        `${step}: argument ${String(at + 1)} is ${argPaths[at] ?? spec.args[at] ?? ''}, which is the stop or start script by link or identity, and the stop and start scripts run only as the command itself, by absolute path: ` +
+          'remove or rename that file, then re-run; nothing was run',
+        step,
+      )
+    }
     const unlisted = notOnAllowlist(spec.command, names, spec.args)
-    if (unlisted !== undefined) throw refused(`${step}: ${unlisted}; nothing was run`, step)
+    if (unlisted !== undefined) {
+      // As with programRefusal: refused by the name a link gives it alone, the link is the machine's.
+      if (names.length > 1 && notOnAllowlist(spec.command, names.slice(0, 1), spec.args) === undefined) {
+        throw refusedByMachine(`${step}: ${unlisted}${linkFix(spec.command, located)}; nothing was run`, step)
+      }
+      throw refused(`${step}: ${unlisted}; nothing was run`, step)
+    }
     const ownSession = spec.ownSession === true
     if (spec.timeoutMs !== undefined) {
       if (ownSession) throw refused(`${step}: a step in its own session is given no timeout; nothing was run`, step)
@@ -932,9 +1018,16 @@ function checkSpec(spec: RunSpec, env: Readonly<Record<string, string>>, install
         throw refused(`${step}: timeoutMs must be a whole number of milliseconds from 1 to a day`, step)
       }
     }
-    return { script: undefined, ownSession, installs: [] }
+    // Not on the child's PATH: there is nothing the rules examined, so nothing is spawned for spawn to find later on it.
+    if (located === undefined) throw new InstallRunError('AOS_INSTALL_RUN_SPAWN', `${step}: ${spec.command} is not on the child's PATH (ENOENT); nothing was run`, step)
+    return { program: located, script: undefined, ownSession, installs: [] }
   }
-  if (!isAbsolute(spec.command)) throw refused(`${step}: ${script} runs only by absolute path; nothing was run`, step)
+  if (!isAbsolute(spec.command)) {
+    const found = located === undefined ? `${spec.command} is on no entry of the child's PATH` : `${spec.command} on the child's PATH is ${located}, which ${how()}`
+    const message = `${step}: ${script} runs only by absolute path, and ${found}: remove or rename that file, then re-run; nothing was run`
+    // A bare name that is the script's own is the installer's spelling; a file of another name on the child's PATH that is one by link or identity is the machine's.
+    throw named === undefined ? refusedByMachine(message, step) : refused(message, step)
+  }
   if (!scriptArgsAllowed(script, spec.args)) {
     const allowed = script === START_SCRIPT ? 'no argument or --check' : `no argument, --jobs alone, or --quiet and --wait-timeout N (N at least ${String(MIN_WAIT_TIMEOUT_S)})`
     throw refused(`${step}: ${script} is run here only with ${allowed}; nothing was run`, step)
@@ -942,7 +1035,7 @@ function checkSpec(spec: RunSpec, env: Readonly<Record<string, string>>, install
   if (spec.timeoutMs !== undefined) throw refused(`${step}: ${script} is given no timeout; nothing was run`, step)
   if (spec.digest !== undefined) throw refused(`${step}: ${script} takes no stdin; nothing was run`, step)
   // The install it ran from: the command's folder as typed and as resolved, and that of the script a link or copy of another name is.
-  return { script, ownSession: true, installs: [...dirsOf(spec.command), ...matched.flatMap((m) => dirsOf(m.path))] }
+  return { program: spec.command, script, ownSession: true, installs: [...dirsOf(spec.command), ...matched.flatMap((m) => dirsOf(m.path))] }
 }
 
 /** The UTC stamp a run's folder is named by: 20261029T054506Z. */
@@ -970,7 +1063,7 @@ function makeDirectory(path: string): boolean {
     mkdirSync(path, { mode: 0o700 })
   } catch (e) {
     if (errnoOf(e) === 'EEXIST') return false
-    throw refused(`cannot make ${path} (${errnoOf(e)})`)
+    throw refusedByMachine(`cannot make ${path} (${errnoOf(e)})`)
   }
   chmodSync(path, 0o700)
   return true
@@ -979,10 +1072,10 @@ function makeDirectory(path: string): boolean {
 /** A directory the logs may go beneath: one, not a link, this account's, and no one else's to write in. */
 function checkDirectory(path: string): void {
   const st = lstatSync(path)
-  if (st.isSymbolicLink() || !st.isDirectory()) throw refused(`${path} is not a directory (a link is not one): the installer writes its logs only beneath a real one`)
+  if (st.isSymbolicLink() || !st.isDirectory()) throw refusedByMachine(`${path} is not a directory (a link is not one): the installer writes its logs only beneath a real one`)
   const me = euid()
-  if (me !== undefined && st.uid !== me) throw refused(`${path} belongs to uid ${String(st.uid)}, not this account`)
-  if ((st.mode & 0o022) !== 0) throw refused(`${path} is writable by group or others: chmod go-w ${path}, then re-run`)
+  if (me !== undefined && st.uid !== me) throw refusedByMachine(`${path} belongs to uid ${String(st.uid)}, not this account`)
+  if ((st.mode & 0o022) !== 0) throw refusedByMachine(`${path} is writable by group or others: chmod go-w ${path}, then re-run`)
 }
 
 /** Create a log file: 0600, exclusive, never through a link, appended to by the child. */
@@ -991,11 +1084,11 @@ function createLog(path: string): number {
   try {
     fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_APPEND, 0o600)
   } catch (e) {
-    throw refused(`cannot create ${path} (${errnoOf(e)}); nothing was run`)
+    throw refusedByMachine(`cannot create ${path} (${errnoOf(e)}); nothing was run`)
   }
   try {
     fchmodSync(fd, 0o600)
-    if ((fstatSync(fd).mode & 0o777) !== 0o600) throw refused(`${path} does not keep mode 0600 on this filesystem`)
+    if ((fstatSync(fd).mode & 0o777) !== 0o600) throw refusedByMachine(`${path} does not keep mode 0600 on this filesystem`)
   } catch (e) {
     closeSync(fd)
     throw e
@@ -1126,7 +1219,7 @@ export function clearActive(repoRoot: string): void {
   try {
     unlinkSync(activePath(repoRoot))
   } catch (e) {
-    if (errnoOf(e) !== 'ENOENT') throw refused(`cannot remove ${activePath(repoRoot)} (${errnoOf(e)})`)
+    if (errnoOf(e) !== 'ENOENT') throw refusedByMachine(`cannot remove ${activePath(repoRoot)} (${errnoOf(e)})`)
   }
 }
 
@@ -1323,7 +1416,7 @@ export class Runner {
       throw new InstallRunError('AOS_INSTALL_RUN_HALTED', `${spec.step}: not run: ${this.#halted}`, spec.step)
     }
     const env = childEnv(this.#env, spec.command)
-    const { script, ownSession, installs } = checkSpec(spec, env, this.#installs)
+    const { program, script, ownSession, installs } = checkSpec(spec, env, this.#installs)
     // The jobs count is pmmcp's one read-only use of the stop script (its interface: no drain lock, no launchctl, no signal); its record says so.
     const readOnly = script === STOP_SCRIPT && spec.args.length === 1 && spec.args[0] === '--jobs'
     for (const dir of installs) this.#installs.add(dir)
@@ -1350,7 +1443,7 @@ export class Runner {
     let claim: number | undefined
     try {
       if (ownSession) claim = this.#claim(spec.step)
-      child = this.#spawn(spec.command, spec.args, {
+      child = this.#spawn(program, spec.args, {
         cwd: spec.cwd,
         env,
         stdio: [spec.digest === undefined ? 'ignore' : 'pipe', outFd, errFd],
@@ -1482,12 +1575,12 @@ export class Runner {
   #logDir(): string {
     if (this.#dir !== undefined) return this.#dir
     if (!gitignoresAos(this.repoRoot)) {
-      throw refused('.gitignore does not ignore /.aos/, where the installer keeps its logs: add the line /.aos/, then re-run')
+      throw refusedByMachine('.gitignore does not ignore /.aos/, where the installer keeps its logs: add the line /.aos/, then re-run')
     }
     try {
       assertAosEntry(this.repoRoot)
     } catch (e) {
-      throw e instanceof ConfigError ? refused(e.message) : e
+      throw e instanceof ConfigError ? refusedByMachine(e.message) : e
     }
     for (const dir of [join(this.repoRoot, '.aos'), installDir(this.repoRoot)]) {
       makeDirectory(dir)
@@ -1501,7 +1594,7 @@ export class Runner {
       this.#dir = dir
       return dir
     }
-    throw refused(`${installDir(this.repoRoot)} already holds 100 runs stamped ${stamp}`)
+    throw refusedByMachine(`${installDir(this.repoRoot)} already holds 100 runs stamped ${stamp}`)
   }
 
   #uniqueStep(step: string): string {
@@ -1519,7 +1612,7 @@ export class Runner {
       return fd
     } catch (e) {
       if (errnoOf(e) === 'EEXIST') throw this.#busy(step, readActive(this.repoRoot))
-      throw refused(`${step}: cannot create ${activePath(this.repoRoot)} (${errnoOf(e)}); nothing was run`, step)
+      throw refusedByMachine(`${step}: cannot create ${activePath(this.repoRoot)} (${errnoOf(e)}); nothing was run`, step)
     }
   }
 

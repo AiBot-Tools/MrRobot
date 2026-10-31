@@ -58,7 +58,7 @@ import { foundScreen } from '../scripts/install.js'
 import { parseKernelConfig, type KernelConfig } from '../src/config.js'
 import { FEATURE_COMMITS, FEATURE_NAMES, PmmcpDocumentError, featuresOf, keyedLoopbackOnly, missingFeatures, parseFacts, parseQdrantStatus } from '../src/install/facts.js'
 import { parseProviders, type ProvidersFile } from '../src/models/registry.js'
-import { pythonStandIn, shWord } from './helpers/python-stand-in.js'
+import { bareName, bareStandIns, pythonStandIn, shWord } from './helpers/python-stand-in.js'
 import { tmpdir } from './helpers/tmpdir.js'
 
 const REPO = fileURLToPath(new URL('..', import.meta.url))
@@ -229,6 +229,8 @@ class World {
     this.root = tmpdir(t)
     writeFileSync(join(this.root, '.gitignore'), '/.aos/\n.env\n')
     this.home = tmpdir(t)
+    // What the runner spawns for a bare name: the file it found on the child's PATH, whose first entry is ~/.local/bin.
+    bareStandIns(this.home)
     this.dir = join(this.home, ...(options.under ?? ['Github', PMMCP_FOLDER]))
     if (options.install ?? true) makeInstall(this.dir)
     this.plistDir = options.plist === true ? this.dir : undefined
@@ -307,7 +309,8 @@ class World {
   }
 
   readonly spawn: SpawnFn = (command, args, options) => {
-    const call: Call = { command, args: [...args], options, stdin: '' }
+    // By the name the installer gave it: a bare name reaches spawn as its stand-in's path.
+    const call: Call = { command: bareName(command, this.home), args: [...args], options, stdin: '' }
     this.calls.push(call)
     const a = this.answer(call)
     const child = new FakeChild(a.spawnError === undefined ? 4000 + this.calls.length : undefined, options.stdio[0] === 'pipe')
@@ -1396,6 +1399,22 @@ test('an active.json record stops discovery while its pid still runs the recorde
   const standing = JSON.parse(readFileSync(activePath(replaced.root), 'utf8')) as { pid: number; step: string }
   assert.deepEqual([standing.pid, standing.step], [4333, 'stop'], 'a record that is not the one waited for was removed')
   assert.equal(replaced.ranScript(), false)
+  // A record that cannot be read by the time the count has ended (written part way, or not the runner's shape): it may be a window's,
+  // so it is neither removed nor read past, and discovery stops as for another record.
+  const garbled = new World(t)
+  record(garbled, 'stop-jobs', 4335, new Date(NOW.getTime() - 5_000), true)
+  garbled.overrides.set(psActive(4335), { out: `   00:05 /bin/bash ${garbled.dir}/stop-pmmcp-server.sh --jobs\n` })
+  garbled.onSleep = (): void => {
+    if (garbled.slept.length !== 1) return
+    garbled.overrides.set(psActive(4335), { code: 1 })
+    writeFileSync(activePath(garbled.root), '{"step":"stop","pid":', { mode: 0o600 })
+  }
+  assert.match(
+    stopWith(await garbled.run(t), 'active-step').message,
+    /active\.json changed while discovery waited for an earlier run's count of pmmcp's jobs, stop-jobs \(pid 4335, .*\), to end: it no longer holds that record, so nothing was removed\. Re-run/,
+  )
+  assert.equal(readFileSync(activePath(garbled.root), 'utf8'), '{"step":"stop","pid":', 'an unreadable record was removed')
+  assert.equal(garbled.ranScript(), false)
   // Gone meanwhile (its own run removed it): nothing to remove, and discovery goes on.
   const gone = new World(t)
   record(gone, 'stop-jobs', 4334, new Date(NOW.getTime() - 5_000), true)
@@ -1682,6 +1701,15 @@ test('http_auth check --expect gets the aos-kernel digest from inspectCredential
     mismatched.check = answer
     assert.equal(found(await mismatched.run(t)).bearer.state, 'failed', JSON.stringify(answer))
   }
+
+  // Cut short by a write that did not finish (the last line, 7 hex characters, no newline): no digest of it is checked, and it is said why.
+  const torn = new World(t)
+  withEnv(torn, `AOS_CONTROL_TOKEN=${randomBytes(32).toString('hex')}\nAOS_PMMCP_TOKEN=${TOKEN.slice(0, 7)}`)
+  assert.deepEqual(found(await torn.run(t)).bearer, {
+    state: 'not-checked',
+    why: '.env line 2: AOS_PMMCP_TOKEN looks cut short (a write that did not finish): delete that line and re-run',
+  })
+  assert.equal(checks(torn).length, 0)
 
   // No value yet (missing, or blank): not checked.
   const blank = new World(t)

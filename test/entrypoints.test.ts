@@ -26,8 +26,8 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, existsSync, lchownSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { chmodSync, existsSync, lchownSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { createServer, type IncomingHttpHeaders } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { fileURLToPath } from 'node:url'
@@ -42,12 +42,15 @@ import { CEO_SUITE } from '../src/eval/suite.js'
 import { BOOT_SLACK_MS, lockPath, takeLock, type LockOptions } from '../scripts/install/lock.js'
 import { defectEnding, exitLine, outcomeEnding, refusedEnding, signalEnding, stoppedEnding } from '../scripts/install/ending.js'
 import { Output, TRANSCRIPT_FILE } from '../scripts/install/output.js'
-import { npmTookFlags, preflight, productVersion, stubRefusals } from '../scripts/install/preflight.js'
+import { bashVersion, npmTookFlags, preflight, productVersion, stubRefusals } from '../scripts/install/preflight.js'
 import { HANDLED_SIGNALS, REPEAT_MS, SIGNAL_EXIT, defectExit, handleSignal, onSignal, windowChanged, type HandledSignal, type SignalState, type SignalView, type WindowMarks } from '../scripts/install/signals.js'
-import { ranAPhase, stoppedBy } from '../scripts/install.js'
+import { afterRecheck, ranAPhase, stoppedBy } from '../scripts/install.js'
 import { DiscoverError } from '../scripts/install/discover.js'
 import { InstallRunError } from '../scripts/install/run.js'
 import { TYPE_AHEAD_MS, Terminal } from '../scripts/install/terminal.js'
+
+// The gate's outcome as main hands it on, named without importing src/install, which only the installer and its own tests import (hygiene.test.ts).
+type GateOutcome = Parameters<typeof afterRecheck>[0]
 
 // Every program here runs from a copy of the checkout holding a trap .env,
 // never from the checkout itself, where the operator keeps the real one (see
@@ -862,6 +865,58 @@ test("aos-install refuses the shadow checkout's trap .env, exits 2 and leaves it
   }
 })
 
+test("aos-install refuses a token an earlier run's write cut short, by its line, exits 2 and leaves .env byte for byte", async (t) => {
+  // `writing .env failed after 23 of 81 bytes (EFBIG)`: the last line is AOS_PMMCP_TOKEN and 7 hex characters, no newline. The
+  // installer judges the tokens it mints at S2, so this is a refusal, never a token whose digest is staged as pmmcp's bearer.
+  for (const args of [['--aos-only'], ['--aos-only', '--dry-run'], ['--dry-run']]) {
+    const m = await installerMachine(t, { trap: false })
+    const env = join(m.checkout.root, '.env')
+    writeFileSync(env, `# Created by npm run aos-install\nAOS_CONTROL_TOKEN=${'c'.repeat(64)}\nAOS_PMMCP_TOKEN=5b8bca5`, { mode: 0o600 })
+    chmodSync(env, 0o600)
+    handOver(env)
+    const before = readFileSync(env)
+    const run = installer(m, args)
+    const printed = `${run.stdout}${run.stderr}`
+    assert.equal(run.status, 2, `${JSON.stringify(args)}: ${printed}`)
+    assert.match(run.stdout, /^ {2}AOS_PMMCP_TOKEN +cut short \(line 3\) -> delete that line and re-run/m, JSON.stringify(args))
+    assert.match(run.stdout, /^ {2}- .*\.env line 3: AOS_PMMCP_TOKEN looks cut short \(a write that did not finish\): delete that line and re-run\./m, JSON.stringify(args))
+    assert.equal(run.stdout.trimEnd().split('\n').at(-1), 'aos-install: exit 2: refused before any change: see above', JSON.stringify(args))
+    assert.deepEqual(readFileSync(env), before, `${JSON.stringify(args)}: .env changed`)
+    // No digest of it was handed to anything: no python ran at all.
+    assert.equal(m.calls().some((l) => /python|rotate|http_auth/.test(l)), false, m.calls().join('\n'))
+    assert.equal(printed.includes('5b8bca5'), false, 'a byte of the value was printed')
+  }
+})
+
+test("aos-install refuses, before any change and with exit 2, a program on the child's PATH that is pmmcp's stop script by identity, naming the file and the fix", async (t) => {
+  // ~/.local/bin/lsof a hard link of the stop script where discovery looks first (~/Github/Persistent-Memory-MCP): the runner refuses the
+  // first lsof discovery runs. That is the machine's state, not a defect of the installer's (scenario 12's ps and start cases).
+  const m = await installerMachine(t, { trap: false })
+  const install = join(m.home, 'Github', 'Persistent-Memory-MCP')
+  mkdirSync(install, { recursive: true })
+  const stop = join(install, 'stop-pmmcp-server.sh')
+  writeFileSync(stop, '#!/bin/sh\necho "the stop ran" >&2\nexit 99\n', { mode: 0o755 })
+  const lsof = join(m.home, '.local', 'bin', 'lsof')
+  rmSync(lsof)
+  linkSync(stop, lsof)
+  handOver(m.home)
+  for (const args of [['--dry-run'], []]) {
+    const run = installer(m, args)
+    const printed = `${run.stdout}${run.stderr}`
+    assert.equal(run.status, 2, `${JSON.stringify(args)}: ${printed}`)
+    assert.ok(
+      run.stdout.includes(
+        `refused before any change: lsof-8766: stop-pmmcp-server.sh runs only by absolute path, and lsof on the child's PATH is ${lsof}, which is the same file as ${realpathSync(stop)} (a hard link): ` +
+          'remove or rename that file, then re-run; nothing was run',
+      ),
+      printed,
+    )
+    assert.equal(run.stdout.trimEnd().split('\n').at(-1), 'aos-install: exit 2: refused before any change: see above', JSON.stringify(args))
+    assert.doesNotMatch(printed, /a defect|the stop ran/)
+    assert.equal(existsSync(join(m.checkout.root, '.env')), false)
+  }
+})
+
 test('aos-install --dry-run with an empty HOME finds no pmmcp, prints the plan and writes nothing', async (t) => {
   const m = await installerMachine(t, { trap: false })
   const root = m.checkout.root
@@ -977,6 +1032,331 @@ test('aos-install at a terminal: the input ending at its question aborts with ex
   assert.equal(existsSync(join(m.checkout.root, '.env')), false, '.env was written')
   assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false, 'the lock was left behind')
   assert.deepEqual(m.calls().filter((l) => !l.startsWith('env ')), ['lsof -nP -iTCP:8766 -sTCP:LISTEN -Fpu', 'docker context show', 'docker info --format {{.ServerVersion}}'])
+})
+
+/** A /bin/sh stand-in for one of a fresh checkout's programs: it logs its name and arguments, then runs `body`. */
+const standIn = (log: string, name: string, body: string): string =>
+  ['#!/bin/sh', `# a stand-in for pmmcp's ${name}`, `{ printf '%s' ${shQuote(name)}; for a in "$@"; do printf ' %s' "$a"; done; printf '\\n'; } >> ${shQuote(log)}`, body, ''].join('\n')
+
+const shQuote = (s: string): string => `'${s.replace(/'/g, "'\\''")}'`
+
+/** The facts document of the checkout a fresh install cloned to `at`: every feature, pmmcp's own ports on loopback, http_auth holding `tokens`. */
+const freshFacts = (home: string, at: string, tokens: readonly string[]): string =>
+  JSON.stringify({
+    facts: 1,
+    dir: at,
+    git: { head: 'e6516d5'.padEnd(40, '0'), branch: 'main', dirty: false, origin: 'https://github.com/AiBot-Tools/persistent-memory-mcp.git' },
+    features: { bearer_gate: true, rotate_digest_stdin: true, check_expect: true, qdrant_key_script: true, qdrant_init: true, qdrant_status_json: true, dashboard_auth: true, curator_secret: true, stop_jobs_flag: true, stop_engine_guard: true, curator_proof: true, stop_listener_check: true },
+    config: {
+      source: join(home, '.persistent-memory-mcp', 'config.yaml'),
+      server: { host: '127.0.0.1', port: 8766, enabled: true },
+      dashboard: { host: '127.0.0.1', port: 8765, enabled: true, legacy_token_key: false },
+      curator: { host: '127.0.0.1', port: 8767, enabled: true },
+    },
+    env_overrides: [],
+    http_auth: { state: tokens.length === 0 ? 'absent' : 'present', mode: tokens.length === 0 ? null : 'warn', tokens, reason: null, links: tokens.length === 0 ? null : 1 },
+    qdrant_key_file: { state: 'absent' },
+    dashboard_token: { state: 'absent' },
+    curator_secret: { state: 'absent' },
+    launchd: { plist: join(home, 'Library', 'LaunchAgents', 'com.aibot.pmmcp.plist'), exists: true, working_directory: at, legacy_plists: [] },
+  })
+
+test('aos-install at a terminal: a Ctrl-C after the stopped window is held until the end report, the probe it reached is asked again, and the run ends with the gate\'s code', async (t) => {
+  // A fresh install whose stop does not stop, with "start pmmcp again?" answered n: the window opened (setup) and closed (the
+  // question), and the run owes its report. The facts are read again for it, and the Ctrl-C typed while that probe runs reaches the
+  // probe (the terminal signals its whole foreground group), which dies by SIGINT. The installer holds the signal (main wires the
+  // applier's window to it), asks the probe again, prints the report with what the second answer said, says why it went on, and ends
+  // with exit 4, the live step's code, never 130.
+  if (!terminalAvailable()) {
+    t.diagnostic('no python3 with its pty module here, so no terminal can be given to the installer')
+    return
+  }
+  const m = await installerMachine(t, { trap: false })
+  const base = dirname(m.home)
+  const log = join(base, 'calls', 'fresh.log')
+  const marks = join(base, 'marks')
+  mkdirSync(marks)
+  const at = join(m.home, 'Github', 'Persistent-Memory-MCP')
+  const factsDoc = (tokens: readonly string[]): string => freshFacts(m.home, at, tokens)
+  // What the clone copies: setup, the stop (which does not stop), the start, and the venv's python, whose facts are read three times:
+  // after setup; for the report, held until the test's Ctrl-C ends it (its start leaves a mark); and again, as the second answer.
+  const template = join(base, 'template')
+  mkdirSync(join(template, '.venv', 'bin'), { recursive: true })
+  writeFileSync(join(base, 'facts-1.json'), `${factsDoc([])}\n`)
+  writeFileSync(join(base, 'facts-2.json'), `${factsDoc(['aos-kernel'])}\n`)
+  const count = join(base, 'facts.count')
+  const reading = join(marks, 'facts-after-started')
+  const files: [string, string][] = [
+    ['setup.sh', standIn(log, 'setup.sh', 'exit 0')],
+    ['stop-pmmcp-server.sh', standIn(log, 'stop-pmmcp-server.sh', "echo 'pmmcp-worker FAILED TO STOP' >&2\nexit 1")],
+    ['start-pmmcp-server.sh', standIn(log, 'start-pmmcp-server.sh', 'exit 0')],
+    [
+      join('.venv', 'bin', 'python'),
+      standIn(
+        log,
+        'python',
+        [
+          'case "$*" in',
+          "  'scripts/pmmcp_facts.py --json')",
+          `    n=$(cat ${shQuote(count)} 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > ${shQuote(count)}`,
+          `    if [ "$n" = 1 ]; then cat ${shQuote(join(base, 'facts-1.json'))}; exit 0; fi`,
+          `    if [ "$n" = 2 ]; then : > ${shQuote(reading)}; i=0; while [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done; cat ${shQuote(join(base, 'facts-1.json'))}; exit 0; fi`,
+          `    cat ${shQuote(join(base, 'facts-2.json'))}; exit 0 ;;`,
+          'esac',
+          'exit 97',
+        ].join('\n'),
+      ),
+    ],
+  ]
+  for (const [rel, body] of files) writeFileSync(join(template, rel), body, { mode: 0o755 })
+  writeFileSync(join(m.home, '.local', 'bin', 'git'), standIn(log, 'git', `if [ "$1" = clone ] && [ "$#" = 3 ]; then mkdir -p "$(dirname "$3")" && cp -Rp ${shQuote(template)} "$3"; exit $?; fi\nexit 97`), { mode: 0o755 })
+  handOver(base)
+
+  const child = spawnEntry(m.checkout, 'scripts/install.ts', [], {
+    env: installerEnv(m),
+    typed: [
+      { cue: 'Type `install` to begin', send: 'install\r', delayMs: 300 },
+      { cue: 'start pmmcp again to restore service?', send: 'n\r', delayMs: 300 },
+      { file: reading, send: '\x03', delayMs: 100 },
+    ],
+    ...INSTALLER_AS,
+  })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')))
+  child.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')))
+  const timer = setTimeout(() => child.kill('SIGKILL'), 120_000)
+  const status = await new Promise<number | null>((resolve) => child.on('close', (code) => resolve(code)))
+  clearTimeout(timer)
+  const text = stdout.replace(/\r\n/g, '\n')
+  const lines = text.trimEnd().split('\n')
+  const calls = existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter((l) => l !== '') : []
+  const said = `${text}${stderr}\n${calls.join('\n')}`
+
+  assert.equal(status, 4, said)
+  assert.ok(existsSync(reading), `the facts were never read for the report:\n${said}`)
+  // The window ran: setup, the stop that did not stop, and no start (the question was answered n).
+  assert.deepEqual(calls.filter((c) => !c.startsWith('python')), [`git clone https://github.com/AiBot-Tools/persistent-memory-mcp.git ${at}`, 'setup.sh --non-interactive', 'stop-pmmcp-server.sh'], said)
+  // The Ctrl-C was held: said at once, and the run went on to its report.
+  assert.ok(
+    text.includes('Ctrl-C does not end the run yet: the stopped window opened in this run, so the installer finishes its last checks and prints the end report (what was done, and what is left to do) first.'),
+    said,
+  )
+  // The probe it reached was asked again, and the report says what that answer said: the facts after this run's changes.
+  assert.equal(calls.filter((c) => c === 'python scripts/pmmcp_facts.py --json').length, 3, said)
+  assert.ok(text.includes('facts-after: ended by Ctrl-C, which does not end the run before its end report: asked again'), said)
+  assert.ok(lines.includes('pmmcp bearer: http_auth.yaml present, mode warn, tokens [aos-kernel]'), said)
+  assert.equal(text.includes('could not check'), false, said)
+  assert.ok(lines.includes('end report:'), said)
+  // Its last two lines: what the held signal waited for, and the gate's own code with the report named.
+  assert.equal(lines.at(-2), 'Ctrl-C came after the stopped window; the installer finished its checks and printed the end report above first', said)
+  assert.equal(lines.at(-1), 'aos-install: exit 4: a live step failed, and pmmcp is not in its intended state: see the end report above', said)
+  assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false, 'the lock was left behind')
+})
+
+test("aos-install at a terminal: a registered value in what is read again for the end report stops the run there, and the report is still printed, with the defect, the emptied file and the manual start (exit 4)", async (t) => {
+  // A fresh install whose stop refuses its arguments (exit 2: nothing more of the window runs, exit 1 so far). The facts are read
+  // again for the report, and that read echoes the AOS_PMMCP_TOKEN this run appended to the shadow checkout's .env. main's recheck
+  // reports it as a leak inside the window is reported: its report is printed, its last line is exit 4 (setup ran, so pmmcp may be
+  // up or half up), never "failed (a defect, report it)" with no report, and the value is never printed.
+  if (!terminalAvailable()) {
+    t.diagnostic('no python3 with its pty module here, so no terminal can be given to the installer')
+    return
+  }
+  const m = await installerMachine(t, { trap: false })
+  const base = dirname(m.home)
+  const log = join(base, 'calls', 'fresh.log')
+  const at = join(m.home, 'Github', 'Persistent-Memory-MCP')
+  const env = join(m.checkout.root, '.env')
+  const template = join(base, 'template')
+  mkdirSync(join(template, '.venv', 'bin'), { recursive: true })
+  writeFileSync(join(base, 'facts-1.json'), `${freshFacts(m.home, at, [])}\n`)
+  const count = join(base, 'facts.count')
+  const files: [string, string][] = [
+    ['setup.sh', standIn(log, 'setup.sh', 'exit 0')],
+    ['stop-pmmcp-server.sh', standIn(log, 'stop-pmmcp-server.sh', "echo 'unknown argument' >&2\nexit 2")],
+    ['start-pmmcp-server.sh', standIn(log, 'start-pmmcp-server.sh', 'exit 0')],
+    [
+      join('.venv', 'bin', 'python'),
+      standIn(
+        log,
+        'python',
+        [
+          'case "$*" in',
+          "  'scripts/pmmcp_facts.py --json')",
+          `    n=$(cat ${shQuote(count)} 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > ${shQuote(count)}`,
+          `    if [ "$n" = 1 ]; then cat ${shQuote(join(base, 'facts-1.json'))}; exit 0; fi`,
+          // The second read, for the report: a defect of pmmcp's that prints the bearer it was handed.
+          `    printf '{"echo": "%s"}\\n' "$(sed -n 's/^AOS_PMMCP_TOKEN=//p' ${shQuote(env)})"; exit 0 ;;`,
+          'esac',
+          'exit 97',
+        ].join('\n'),
+      ),
+    ],
+  ]
+  for (const [rel, body] of files) writeFileSync(join(template, rel), body, { mode: 0o755 })
+  writeFileSync(join(m.home, '.local', 'bin', 'git'), standIn(log, 'git', `if [ "$1" = clone ] && [ "$#" = 3 ]; then mkdir -p "$(dirname "$3")" && cp -Rp ${shQuote(template)} "$3"; exit $?; fi\nexit 97`), { mode: 0o755 })
+  handOver(base)
+
+  const child = spawnEntry(m.checkout, 'scripts/install.ts', [], {
+    env: installerEnv(m),
+    typed: [{ cue: 'Type `install` to begin', send: 'install\r', delayMs: 300 }],
+    ...INSTALLER_AS,
+  })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')))
+  child.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')))
+  const timer = setTimeout(() => child.kill('SIGKILL'), 120_000)
+  const status = await new Promise<number | null>((resolve) => child.on('close', (code) => resolve(code)))
+  clearTimeout(timer)
+  const text = stdout.replace(/\r\n/g, '\n')
+  const lines = text.trimEnd().split('\n')
+  const calls = existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter((l) => l !== '') : []
+  const said = `${text}${stderr}\n${calls.join('\n')}`
+
+  assert.equal(status, 4, said)
+  // The window ran setup and the stop, which refused its arguments: nothing after it, and the facts were read twice.
+  assert.deepEqual(calls.filter((c) => !c.startsWith('python')), [`git clone https://github.com/AiBot-Tools/persistent-memory-mcp.git ${at}`, 'setup.sh --non-interactive', 'stop-pmmcp-server.sh'], said)
+  assert.equal(calls.filter((c) => c === 'python scripts/pmmcp_facts.py --json').length, 2, said)
+  // The report came, with the leak as its defect, the file it emptied, and the manual start.
+  assert.ok(lines.includes('end report:'), said)
+  const defect = lines.find((l) => l.startsWith('stopped by a defect: '))
+  assert.ok(defect !== undefined, said)
+  const emptied = /: (\/\S+\/facts-after(?:-\d+)?\.out)$/.exec(defect)?.[1]
+  assert.ok(emptied !== undefined, defect)
+  assert.equal(readFileSync(emptied, 'utf8'), '', 'the file that held the value was not emptied')
+  assert.ok(lines.includes(`  pmmcp may be stopped: start it with cd ${at} && ./start-pmmcp-server.sh`), said)
+  assert.ok(lines.includes('next steps:'), said)
+  assert.doesNotMatch(said, /failed \(a defect, report it\)/)
+  assert.equal(lines.at(-1), 'aos-install: exit 4: a live step failed, and pmmcp is not in its intended state: see the end report above', said)
+  // The value reached no line the installer printed.
+  const token = /^AOS_PMMCP_TOKEN=([0-9a-f]{64})$/m.exec(readFileSync(env, 'utf8'))?.[1]
+  assert.ok(token !== undefined, 'the run appended no AOS_PMMCP_TOKEN')
+  assert.equal(`${stdout}${stderr}`.includes(token), false, 'the token was printed')
+  assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false, 'the lock was left behind')
+})
+
+/**
+ * An install found where discovery looks first (~/Github/Persistent-Memory-MCP), its programs /bin/sh stand-ins that log to `log`:
+ * stopped (nothing listens on 8766), every feature but Qdrant's status document (so none is read), the aos-kernel digest on file and
+ * matching the AOS_PMMCP_TOKEN of a .env that holds both tokens, no dashboard token or curator secret yet, and no job running.
+ */
+function foundInstall(m: InstallerMachine): { readonly at: string; readonly log: string } {
+  const base = dirname(m.home)
+  const log = join(base, 'calls', 'found.log')
+  const at = join(m.home, 'Github', 'Persistent-Memory-MCP')
+  mkdirSync(join(at, '.venv', 'bin'), { recursive: true })
+  mkdirSync(join(at, '.git'))
+  mkdirSync(join(at, 'scripts'))
+  writeFileSync(join(at, 'scripts', 'pmmcp_facts.py'), '# read by the python stand-in\n')
+  writeFileSync(join(at, 'pyproject.toml'), '[project]\nname = "persistent-memory-mcp"\n')
+  writeFileSync(join(at, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/AiBot-Tools/persistent-memory-mcp.git\n')
+  writeFileSync(join(at, '.venv', 'bin', 'pmmcp'), standIn(log, 'pmmcp', 'exit 97'), { mode: 0o755 })
+  const facts = JSON.parse(freshFacts(m.home, at, ['aos-kernel'])) as { features: Record<string, boolean> }
+  facts.features['qdrant_status_json'] = false
+  writeFileSync(join(base, 'facts.json'), `${JSON.stringify(facts)}\n`)
+  writeFileSync(
+    join(at, '.venv', 'bin', 'python'),
+    standIn(
+      log,
+      'python',
+      [
+        'case "$*" in',
+        `  'scripts/pmmcp_facts.py --json') cat ${shQuote(join(base, 'facts.json'))}; exit 0 ;;`,
+        "  '-B -m src.transport.http_auth check --expect aos-kernel') read -r digest; echo 'aos-kernel: matches'; exit 0 ;;",
+        'esac',
+        'exit 97',
+      ].join('\n'),
+    ),
+    { mode: 0o755 },
+  )
+  writeFileSync(join(at, 'stop-pmmcp-server.sh'), standIn(log, 'stop-pmmcp-server.sh', 'if [ "$*" = --jobs ]; then echo "running jobs: 0"; exit 0; fi\nexit 97'), { mode: 0o755 })
+  writeFileSync(join(at, 'start-pmmcp-server.sh'), standIn(log, 'start-pmmcp-server.sh', 'exit 97'), { mode: 0o755 })
+  const env = join(m.checkout.root, '.env')
+  writeFileSync(env, `AOS_CONTROL_TOKEN=${'c'.repeat(64)}\nAOS_PMMCP_TOKEN=${'d'.repeat(64)}\n`, { mode: 0o600 })
+  chmodSync(env, 0o600)
+  handOver(env)
+  return { at, log }
+}
+
+test("aos-install at a terminal: for a found pmmcp whose ~/.local/bin/pgrep gives no answer, the warning says whether a TUI runs cannot be told, never that none runs", async (t) => {
+  // main hands the planner what the TUI check said as it is: undefined when pgrep gave no answer (here it exits 3), never [], which
+  // the warning would read as "none runs now" of a scripts/monitor_tui.py that may be running. A found install, stopped, with both
+  // tokens in .env and the aos-kernel digest on file: the one offer is the dashboard token and curator secret (live), so the window's
+  // warning is printed, and the first typed confirmation is answered with another word, so nothing is stopped or changed.
+  if (!terminalAvailable()) {
+    t.diagnostic('no python3 with its pty module here, so no terminal can be given to the installer')
+    return
+  }
+  const m = await installerMachine(t, { trap: false })
+  const { at, log } = foundInstall(m)
+  // pgrep gives no answer: neither its pids (exit 0) nor "none" (exit 1 with nothing printed).
+  writeFileSync(join(m.home, '.local', 'bin', 'pgrep'), standIn(log, 'pgrep', 'exit 3'), { mode: 0o755 })
+  handOver(dirname(m.home))
+
+  const child = spawnEntry(m.checkout, 'scripts/install.ts', [], {
+    env: installerEnv(m),
+    typed: [
+      { cue: 'Create the dashboard token and curator secret (live)? [y/N]', send: 'y\r', delayMs: 300 },
+      { cue: 'Type `stop pmmcp` to continue', send: 'not now\r', delayMs: 300 },
+    ],
+    ...INSTALLER_AS,
+  })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')))
+  child.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')))
+  const timer = setTimeout(() => child.kill('SIGKILL'), 120_000)
+  const status = await new Promise<number | null>((resolve) => child.on('close', (code) => resolve(code)))
+  clearTimeout(timer)
+  const text = stdout.replace(/\r\n/g, '\n')
+  const lines = text.trimEnd().split('\n')
+  const calls = existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter((l) => l !== '') : []
+  const said = `${text}${stderr}\n${calls.join('\n')}`
+
+  assert.equal(status, 0, said)
+  assert.ok(calls.includes('pgrep -f scripts/monitor_tui\\.py'), said)
+  assert.ok(lines.some((l) => l.startsWith('  - whether a scripts/monitor_tui.py runs cannot be told (pgrep gave no answer)')), said)
+  // The warning, twice over (what does not stop, and the curator secret's quit-first line), says it cannot be told; never that none runs.
+  const blind = 'whether one runs cannot be told: pgrep gave no answer'
+  assert.ok(lines.includes(`What does not stop: a scripts/monitor_tui.py of ${at} (${blind}).`), said)
+  assert.ok(lines.some((l) => l.startsWith(`Quit any scripts/monitor_tui.py of ${at} first (${blind}), and start none until this run ends`)), said)
+  assert.doesNotMatch(text, /none runs now/)
+  // Nothing was stopped or changed: the stop ran only to count jobs, the start never, and the run ended at the first typed word.
+  assert.deepEqual(calls.filter((c) => /-pmmcp-server\.sh/.test(c)), ['stop-pmmcp-server.sh --jobs'], said)
+  assert.equal(lines.at(-1), 'aos-install: exit 0: declined: nothing was changed', said)
+  assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false, 'the lock was left behind')
+})
+
+test("aos-install refuses, before any change and with exit 2, a ~/.local/bin/pgrep that is the found pmmcp's stop script by hard link: the TUI check names the file and the fix, never 'cannot be told'", async (t) => {
+  // Discovery's probes pass (none of them is pgrep); the TUI check after it is the first to run pgrep, which the runner refuses for
+  // the machine's state. That is a refusal with its fix (exit 2), as discovery's own would be, never read as pgrep giving no answer.
+  const m = await installerMachine(t, { trap: false })
+  const { at, log } = foundInstall(m)
+  const stop = join(at, 'stop-pmmcp-server.sh')
+  const pgrep = join(m.home, '.local', 'bin', 'pgrep')
+  rmSync(pgrep)
+  linkSync(stop, pgrep)
+  handOver(dirname(m.home))
+  for (const args of [['--dry-run'], []]) {
+    rmSync(log, { force: true })
+    const run = await installerAsync(m, args)
+    const printed = `${run.stdout}${run.stderr}`
+    assert.equal(run.status, 2, `${JSON.stringify(args)}: ${printed}`)
+    assert.ok(
+      run.stdout.includes(
+        `refused before any change: pgrep-tui: stop-pmmcp-server.sh runs only by absolute path, and pgrep on the child's PATH is ${pgrep}, which is the same file as ${realpathSync(stop)} (a hard link): ` +
+          'remove or rename that file, then re-run; nothing was run',
+      ),
+      printed,
+    )
+    assert.equal(run.stdout.trimEnd().split('\n').at(-1), 'aos-install: exit 2: refused before any change: see above', JSON.stringify(args))
+    assert.doesNotMatch(printed, /a defect|cannot be told|plan:/)
+    // The stop script ran only as discovery's jobs count, by its own path: never as pgrep.
+    const calls = existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter((l) => l !== '') : []
+    assert.deepEqual(calls.filter((c) => c.startsWith('stop-pmmcp-server.sh')), ['stop-pmmcp-server.sh --jobs'], printed)
+  }
 })
 
 test('aos-install rejects an unknown flag with usage and exit 2', async (t) => {
@@ -1297,10 +1677,10 @@ test('aos-install ends at once on Ctrl-C, a hangup or SIGTERM outside the stoppe
   // status its default would give, and the lock is released (a default
   // SIGHUP or SIGTERM would leave it behind). Here it comes while discovery
   // waits on docker.
-  for (const [signal, code, said, last] of [
-    ['SIGINT', 130, /interrupted: nothing more is done/, 'SIGINT (Ctrl-C)'],
-    ['SIGHUP', 129, /ended by SIGHUP: nothing more is done/, 'SIGHUP (the terminal closed)'],
-    ['SIGTERM', 143, /ended by SIGTERM: nothing more is done/, 'SIGTERM'],
+  for (const [signal, code, last] of [
+    ['SIGINT', 130, 'SIGINT (Ctrl-C)'],
+    ['SIGHUP', 129, 'SIGHUP (the terminal closed)'],
+    ['SIGTERM', 143, 'SIGTERM'],
   ] as const) {
     const m = await installerMachine(t, { trap: false })
     m.hold()
@@ -1319,8 +1699,11 @@ test('aos-install ends at once on Ctrl-C, a hangup or SIGTERM outside the stoppe
     const ended = await closed
     m.release()
     assert.deepEqual(ended, { code, signal: null }, `${signal}: ${stdout}`)
-    assert.match(stdout, said)
-    assert.equal(stdout.trimEnd().split('\n').at(-1), `aos-install: exit ${String(code)}: ended by ${last} outside the stopped window: nothing more was done`, signal)
+    // Said as it came, and as the last line, in the same words: where it came (before the window ever opened) and what was done.
+    const words = `ended by ${last} before the stopped window opened: nothing more was done`
+    const lines = stdout.trimEnd().split('\n')
+    assert.equal(lines.at(-1), `aos-install: exit ${String(code)}: ${words}`, signal)
+    assert.equal(lines.at(-2), words, `${signal}: what was said as it came differs from the last line:\n${stdout}`)
     assert.doesNotMatch(stdout, /^plan:/m, `${signal}: it went on to plan`)
     assert.equal(existsSync(join(m.checkout.root, '.env')), false)
     assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false, `${signal}: the lock was left behind`)
@@ -1397,7 +1780,7 @@ test("the installer's last line says how this run ended: the input ending or an 
   assert.equal(exitLine(stoppedEnding()), 'aos-install: exit 1: stopped before any change: see above')
   assert.equal(exitLine(defectEnding(1)), 'aos-install: exit 1: a defect (report it) before the stopped window: see above')
   assert.equal(exitLine(defectEnding(4)), 'aos-install: exit 4: a defect (report it) once the stopped window had opened: pmmcp may be stopped, see above')
-  assert.equal(exitLine(signalEnding(143, 'SIGTERM')), 'aos-install: exit 143: ended by SIGTERM outside the stopped window: nothing more was done')
+  assert.equal(exitLine(signalEnding(143, 'SIGTERM')), 'aos-install: exit 143: ended by SIGTERM before the stopped window opened: nothing more was done')
   // No line points at an end report that was not printed, and none names Ctrl-C for an interrupt at a prompt.
   for (const reported of [false, true]) {
     for (const by of ['eof', 'interrupt', 'quit', 'jobs'] as const) {
@@ -1500,7 +1883,7 @@ test('handleSignal carries out the decision: a Ctrl-C delivered twice at "start 
   assert.deepEqual(done, ['exit 130 SIGINT'])
 })
 
-test("main's ends that are not the gate's: the end report only after a phase ran, and discovery's or the TUI check's defect is exit 1, never a refusal", () => {
+test("main's ends that are not the gate's: the end report only after a phase ran, a probe the runner's rules refused for the machine's state is a refusal (exit 2), and any other refusal, or discovery's or the TUI check's defect, is exit 1, never a refusal", () => {
   // The end report is printed after a phase ran or failed, and not for a jobs count that failed (or anything else) with nothing applied.
   for (const [outcome, reported] of [
     [{ kind: 'aborted', at: 'jobs', by: 'jobs', applied: [], exitCode: 1 }, false],
@@ -1517,6 +1900,17 @@ test("main's ends that are not the gate's: the end report only after a phase ran
   ] as const) {
     assert.equal(ranAPhase(outcome), reported, JSON.stringify(outcome))
   }
+  // A leak in the recheck before the report makes a failed phase's code the worse of the two (4 while pmmcp may be stopped), and
+  // changes nothing else: no leak, a code no worse, or an outcome that is not a failed phase.
+  const failed = (exitCode: 1 | 2 | 4): GateOutcome => ({ kind: 'failed', phase: 'live', applied: ['non-live'], exitCode })
+  assert.deepEqual(afterRecheck(failed(1), 4), failed(4))
+  assert.deepEqual(afterRecheck(failed(2), 1), failed(2))
+  assert.deepEqual(afterRecheck(failed(4), 1), failed(4))
+  assert.deepEqual(afterRecheck(failed(1), undefined), failed(1))
+  assert.deepEqual(afterRecheck(failed(1), 1), failed(1))
+  const done: GateOutcome = { kind: 'done', applied: ['live'], exitCode: 0 }
+  assert.equal(afterRecheck(done, 4), done)
+  assert.equal(exitLine(outcomeEnding(afterRecheck(failed(1), 4), true)), 'aos-install: exit 4: a live step failed, and pmmcp is not in its intended state: see the end report above')
   // A leak or a halted runner, or discovery's own defect: stopped before any change, exit 1 (nothing was refused), with the line that says why.
   for (const [e, said] of [
     [new InstallRunError('AOS_INSTALL_RUN_LEAK', 'lsof-8766: a registered secret value reached its output', 'lsof-8766'), 'stopped: lsof-8766: a registered secret value reached its output'],
@@ -1529,8 +1923,30 @@ test("main's ends that are not the gate's: the end report only after a phase ran
     assert.equal(stopped.ending.code, 1, said)
     assert.equal(exitLine(stopped.ending), 'aos-install: exit 1: stopped before any change: see above')
   }
-  // Anything else is main's own defect, thrown on: a probe that merely failed, or an error of no kind it knows.
-  assert.equal(stoppedBy(new InstallRunError('AOS_INSTALL_RUN_REFUSED', 'refused')), undefined)
+  // A probe the runner's rules refused for the machine's state (a file on the child's PATH that is the stop script by identity): a refusal
+  // before any change, exit 2, the runner's message, which names the file and its fix, said as it is (plan §5's failure table: discovery
+  // refusals are exit 2).
+  const MACHINE = "ps-40001: stop-pmmcp-server.sh runs only by absolute path, and ps on the child's PATH is /Users/op/.local/bin/ps"
+  const refusedProbe = stoppedBy(new InstallRunError('AOS_INSTALL_RUN_REFUSED', MACHINE, 'ps-40001', undefined, true))
+  assert.ok(refusedProbe !== undefined)
+  assert.equal(refusedProbe.line, `refused before any change: ${MACHINE}`)
+  assert.equal(refusedProbe.ending.code, 2)
+  assert.equal(exitLine(refusedProbe.ending), 'aos-install: exit 2: refused before any change: see above')
+  // Any other refusal of the runner's only an installer defect makes (a bad step name, arguments off the allowlist, a timeout on a step in
+  // its own session): never read as the machine's fault with no fix, but stopped as a defect, exit 1.
+  for (const message of [
+    'a step is named [a-z0-9][a-z0-9._-]*, at most 48 characters; got "Bad Step"; nothing was run',
+    'pgrep-tui: "pgrep" is given what its entry does not allow; nothing was run',
+    'auth-init: a step in its own session is given no timeout; nothing was run',
+  ]) {
+    const defect = stoppedBy(new InstallRunError('AOS_INSTALL_RUN_REFUSED', message, 'pgrep-tui'))
+    assert.ok(defect !== undefined, message)
+    assert.equal(defect.line, `stopped by a defect (report it): the runner refused a probe the installer asked for: ${message}`)
+    assert.equal(defect.ending.code, 1, message)
+    assert.equal(exitLine(defect.ending), 'aos-install: exit 1: stopped before any change: see above')
+  }
+  // Anything else is main's own defect, thrown on: a probe that could not be started, or an error of no kind it knows.
+  assert.equal(stoppedBy(new InstallRunError('AOS_INSTALL_RUN_SPAWN', 'lsof-8766: lsof could not be started (EACCES)')), undefined)
   assert.equal(stoppedBy(new Error('boom')), undefined)
 })
 
@@ -1753,4 +2169,20 @@ test("the preflight refuses root and a current directory that is not the checkou
 
   assert.deepEqual(npmTookFlags({ PATH: '/usr/bin', npm_config_cache: '/x', npm_config_local_prefix: '/r' }), [], "npm's own settings are no trace")
   assert.deepEqual(npmTookFlags({ npm_config_install: '', npm_config_dry_run: 'true' }), ['--dry-run', '--no-install'])
+
+  // S1 names the bash pmmcp's scripts run (#!/usr/bin/env bash: the first on the child's PATH) and its version, read from the file's own
+  // version string and never by running it. A stand-in carries macOS's, amid bytes that are not UTF-8, as in a binary.
+  const bin = join(home, '.local', 'bin')
+  mkdirSync(bin, { recursive: true })
+  const bash = join(bin, 'bash')
+  writeFileSync(bash, Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x00, 0xff]), Buffer.from('\0@(#)Bash version 3.2.57(1) release GNU\0'), Buffer.from([0xfe, 0x00])]), { mode: 0o755 })
+  chmodSync(bash, 0o755)
+  assert.equal(bashVersion(bash), '3.2.57(1)')
+  const checked = preflight({ ...input, aosOnly: false })
+  assert.ok(checked.lines.includes(`  bash        ${bash}, version 3.2.57(1) (the one pmmcp's scripts run)`), checked.lines.join('\n'))
+  // A bash whose file holds no version string, or that cannot be read: said so, and nothing is run to find out.
+  writeFileSync(bash, '#!/bin/sh\nexit 0\n')
+  assert.equal(bashVersion(bash), undefined)
+  assert.ok(preflight({ ...input, aosOnly: false }).lines.includes(`  bash        ${bash}, version not readable from the file (the one pmmcp's scripts run)`))
+  assert.equal(bashVersion(join(bin, 'nowhere')), undefined)
 })

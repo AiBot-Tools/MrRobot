@@ -46,10 +46,13 @@
 //   marked ownSession), with no timeout, and nothing here ever signals one.
 //   A read-only probe (lsof, ps, docker, pgrep, git, the facts, a check) is
 //   the installer's own child, in its process group, so the terminal's
-//   Ctrl-C or hangup reaches it even while the installer traps it: inside
-//   the window a probe that ended by SIGINT or SIGHUP (or exit 130 or 129)
-//   is run again, up to INTERRUPT_RERUNS times, rather than read as a
-//   finding. A question asked
+//   Ctrl-C or hangup reaches it even while the installer traps it, or, after
+//   the window, holds it until the end report: from the window's first
+//   opening until the report, a probe that ended by SIGINT or SIGHUP (or
+//   exit 130 or 129) is run again, up to INTERRUPT_RERUNS times, rather than
+//   read as a finding, and one that still gives no answer is reported as a
+//   check that could not be made, never as what it would have said. A
+//   question asked
 //   from inside the window ("start pmmcp again?", "start the old
 //   revision?") is asked with the window closed, so a Ctrl-C there answers
 //   it as no; a yes opens it again for the start.
@@ -126,6 +129,15 @@
 //        hub reconnects to the restarted pmmcp within its 240 s heartbeat.
 //        Plan S7 L6 reads so since A6 fix round 3 (plan §9, option (a)), and
 //        so does the planner's title for the step.
+//   After the window, before the end report (and, when the window ended
+//   early, from `recheck`, which the installer calls before `report`): the
+//   facts and Qdrant's `status --json` are read again, so the report never
+//   gives what discovery read before the stop as what holds now (a stopped
+//   pmmcp's not_running beside a start whose checks found pmmcp-qdrant
+//   running). One that cannot be had is said so on its line ("could not
+//   check"), with what was read before. A registered value in their output
+//   is a leak there as anywhere: `recheck` reports it as apply() does, and
+//   the report is still printed, saying where it stopped.
 //   A fresh install runs its whole sequence the same way: the .env append,
 //   the clone, setup.sh --non-interactive in its own session (stdin
 //   /dev/null), the facts of the new checkout (its features, and each
@@ -157,9 +169,13 @@
 //   before it had not: staged this run, or on file but loaded by no server
 //   that discovery could show started after http_auth.yaml last changed; a
 //   cutover, a dashboard token or an update on a system whose server had
-//   the digest loaded asks none), and the
-//   steps about pmmcp only for a pmmcp this run touched (not with --aos-only,
-//   nor with --no-install and none installed).
+//   the digest loaded asks none), how the aos-kernel digest gets loaded when
+//   it is on file but no stop or start ran this run (run the installer again
+//   and accept the restart; for a pmmcp that is not running, its next start),
+//   and the steps about pmmcp only for a pmmcp this run touched (not with
+//   --aos-only, nor with --no-install and none installed). The bearer and
+//   Qdrant lines give what was read after the window, or say they could not
+//   check, with what was read before it said as that.
 //
 //   Exit codes (Applied): 0 done; 1 a step failed and the state is as
 //   reported (a non-live step; a live item that changed nothing, or a leak
@@ -184,6 +200,7 @@ import {
   DotenvWriteError,
   appendCredentials,
   credentialNames,
+  cutShortMessage,
   inspectCredentials,
   mintedCredentialNames,
   type AppendResult,
@@ -221,12 +238,13 @@ export const PROBE_TRIES = 10
 export const PROBE_WAIT_MS = 3_000
 
 /**
- * Inside the window, how many times a probe the terminal's Ctrl-C or hangup
- * ended (SIGINT or SIGHUP, or exit 130 or 129) is run again before its end
- * is read as it is: the probe shares the installer's process group, which
- * the terminal signals as a whole, the installer traps both there, and the
- * window goes on. No terminal sends SIGTERM, so a probe it ended is read as
- * it is.
+ * From the window's first opening until the end report, how many times a
+ * probe the terminal's Ctrl-C or hangup ended (SIGINT or SIGHUP, or exit 130
+ * or 129) is run again before its end is read as it is: the probe shares the
+ * installer's process group, which the terminal signals as a whole, and the
+ * installer traps both inside the window and holds both after it until the
+ * report, so the run goes on. No terminal sends SIGTERM, so a probe it ended
+ * is read as it is.
  */
 export const INTERRUPT_RERUNS = 3
 
@@ -453,15 +471,20 @@ function spellings(dir: string): string[] {
  * older TUI reads ~/.persistent-memory-mcp/curator_secret, the same file
  * whichever checkout it runs from, and sends it raw to whatever answers on
  * 8767 (plan P9), and pgrep cannot tell a TUI started by a relative path
- * from another checkout's. Undefined when pgrep cannot say. A read-only
+ * from another checkout's. Undefined when pgrep cannot say (it cannot be
+ * started, gives no answer in time, or says something else). A read-only
  * probe through the runner; pgrep prints pids only, never a command line.
+ * Thrown on, for the installer to end the run with: a leak or a halt, and
+ * the runner's refusal, which is never "cannot say": one of the machine's
+ * state (a ~/.local/bin/pgrep that is the stop script by hard link) is a
+ * refusal naming the file and its fix, any other an installer defect.
  */
 export async function tuiPids(runner: Runner, cwd: string): Promise<readonly number[] | undefined> {
   let result: RunResult
   try {
     result = await runner.run(tuiProbe(cwd))
   } catch (e) {
-    if (e instanceof InstallRunError && (e.code === 'AOS_INSTALL_RUN_LEAK' || e.code === 'AOS_INSTALL_RUN_HALTED')) throw e
+    if (e instanceof InstallRunError && (e.code === 'AOS_INSTALL_RUN_LEAK' || e.code === 'AOS_INSTALL_RUN_HALTED' || e.code === 'AOS_INSTALL_RUN_REFUSED')) throw e
     return undefined
   }
   return tuiPidsOf(result)
@@ -540,6 +563,18 @@ export class Applier {
   /** Set once every check of the start passed: pmmcp is up as checked, and a leak after it no longer leaves it maybe stopped. */
   #upChecked = false
   #windowOpen = false
+  /** The window opened in this run: from then until the report, a probe a Ctrl-C or hangup ended is asked again (INTERRUPT_RERUNS). */
+  #windowOpened = false
+  /** The facts and Qdrant's status were read again after the window (#afterWindow). */
+  #afterWindowRead = false
+  /** Why the facts could not be read again after this run changed pmmcp: the report's bearer line then says it could not check. */
+  #factsUnread: string | undefined
+  /** #qdrant was read after this run's stop (by the start's checks or after the window): what holds now, not what discovery saw. */
+  #qdrantFresh = false
+  /** Why Qdrant's status could not be read again after the window: the report's Qdrant line then says it could not check. */
+  #qdrantUnread: string | undefined
+  /** The stop ran (its result came back): the server discovery found may be gone. */
+  #stopRan = false
   #staleCleared = false
   #leak: { readonly step: string | undefined; readonly what: string; readonly live: boolean } | undefined
   /** How to undo each change this run made by hand: printed when a later step fails, and in the report then. */
@@ -818,8 +853,11 @@ export class Applier {
           accepted: credentialNames(this.#o.config, this.#o.providers),
           names: [],
           digests: [staged.name],
+          minted: mintedCredentialNames(this.#o.config),
           ...this.#ids(),
         })
+        // Cut short since the plan was made (the planner stops on one it sees): never staged.
+        if (inspected.damaged.length > 0) throw new ConfigError(cutShortMessage(inspected.path, inspected.damaged))
         digest = inspected.digests.find((d) => d.name === staged.name)?.digest
       } catch (e) {
         if (e instanceof ConfigError) {
@@ -972,7 +1010,7 @@ export class Applier {
       this.#reached.add(bearer)
       this.#bearerCheck(bearer)
     }
-    await this.#refreshFacts()
+    await this.#afterWindow()
   }
 
   /** L1: the graceful stop, and the check that it stopped. A stop that did not stop ends the run, offering the start. */
@@ -989,6 +1027,7 @@ export class Applier {
       throw new End(1, 'the stop refused its arguments, so nothing was stopped')
     }
     // The stop ran: the server discovery found may be gone, so what it loaded says nothing of what runs from here; only a new server the start's checks find sets it again.
+    this.#stopRan = true
     this.#loaded = undefined
     const state = await this.#stoppedState(dir)
     if (ran.ok && code === 0 && state.ok) {
@@ -1389,6 +1428,8 @@ export class Applier {
       if (status === undefined) failed.push(`Qdrant's status --json cannot be had, so whether it enforces the key is not known; to undo the cutover: ${this.#qdrantRollback(dir)}`)
       else {
         this.#qdrant = status
+        this.#qdrantFresh = true
+        this.#qdrantUnread = undefined
         if (status.verdict === 'enforced') passed.push('Qdrant verdict enforced')
         else failed.push(`Qdrant's verdict is ${status.verdict}, not enforced; to undo the cutover: ${this.#qdrantRollback(dir)}`)
       }
@@ -1491,12 +1532,19 @@ export class Applier {
   }
 
   async #qdrantStatus(dir: string): Promise<QdrantStatus | undefined> {
+    const read = await this.#readQdrant(dir)
+    return 'status' in read ? read.status : undefined
+  }
+
+  /** `status --json`, or why there is no document. */
+  async #readQdrant(dir: string): Promise<{ readonly status: QdrantStatus } | { readonly why: string }> {
     const ran = await this.#exec({ step: 'qdrant-status', command: this.#python(dir), args: ['-B', 'scripts/qdrant_api_key.py', 'status', '--json'], cwd: dir, timeoutMs: PYTHON_MS })
-    if (!ran.ok || ran.result.code !== 0) return undefined
+    if (!ran.ok) return { why: ran.why }
+    if (ran.result.code !== 0) return { why: `qdrant_api_key.py status --json exited ${String(ran.result.code)}` }
     try {
-      return parseQdrantStatus(this.#out(ran.result) ?? '')
+      return { status: parseQdrantStatus(this.#out(ran.result) ?? '') }
     } catch (e) {
-      if (e instanceof PmmcpDocumentError) return undefined
+      if (e instanceof PmmcpDocumentError) return { why: e.message }
       throw e
     }
   }
@@ -1629,7 +1677,7 @@ export class Applier {
           throw new ApplyError(`${step.id} is not a step of a fresh install`)
       }
     }
-    await this.#refreshFacts()
+    await this.#afterWindow()
   }
 
   async #clone(step: Step, at: string): Promise<void> {
@@ -1695,11 +1743,13 @@ export class Applier {
 
   /**
    * Run one child through the runner; a step (with a label) prints its
-   * elapsed time and the tail of its logs. Inside the window, a probe the
-   * terminal's Ctrl-C or hangup ended is run again (INTERRUPT_RERUNS at
-   * most): only a probe is given a timeout here, and only a probe is the
-   * installer's own child, so a spec with timeoutMs is one; a step in its own
-   * session never sees the Ctrl-C, and a step that writes is never run twice.
+   * elapsed time and the tail of its logs. From the window's first opening
+   * until the report, a probe the terminal's Ctrl-C or hangup ended is run
+   * again (INTERRUPT_RERUNS at most): only a probe is given a timeout here,
+   * and only a probe is the installer's own child, so a spec with timeoutMs
+   * is one; a step in its own session never sees the Ctrl-C, and a step that
+   * writes is never run twice. Before the window ever opened a Ctrl-C ends
+   * the installer, so a probe is never run again there.
    */
   async #exec(spec: RunSpec, label?: string): Promise<Ran> {
     for (let rerun = 0; ; rerun += 1) {
@@ -1721,8 +1771,9 @@ export class Applier {
         for (const line of this.#tailOf(result.err, 5)) this.#print(`  ! ${line}`)
       }
       const by = result.exited ? endedBy(result) : undefined
-      if (by !== undefined && this.#windowOpen && spec.timeoutMs !== undefined && spec.ownSession !== true && rerun < INTERRUPT_RERUNS) {
-        this.#print(`${spec.step}: ended by ${by}, which does not end the window: asked again`)
+      // From the window's first opening until the report: inside it the signal is trapped, after it held until the report.
+      if (by !== undefined && this.#windowOpened && spec.timeoutMs !== undefined && spec.ownSession !== true && rerun < INTERRUPT_RERUNS) {
+        this.#print(`${spec.step}: ended by ${by}, which does not end ${this.#windowOpen ? 'the window' : 'the run before its end report'}: asked again`)
         continue
       }
       if (result.timedOut || !result.exited) return { ok: false, why: `${spec.step}: ${spec.command} gave no answer within ${seconds(spec.timeoutMs ?? 0)}`, result }
@@ -1847,13 +1898,65 @@ export class Applier {
     }
   }
 
-  /** The facts once a phase changed pmmcp, for the end report's bearer line; the last ones kept when they cannot be had. */
+  /**
+   * The facts once a phase changed pmmcp, for the end report's bearer line.
+   * The last ones are kept when they cannot be had, and the line then says
+   * the check could not be made (#factsUnread), never that they hold now.
+   */
   async #refreshFacts(): Promise<void> {
     const dir = this.#o.plan.pmmcpDir
     if (dir === undefined || this.#o.runner.halted !== undefined || this.#o.discovery === undefined) return
     if (this.#o.discovery.kind === 'absent' && this.#facts === undefined) return
     const facts = await this.#readFacts(dir, 'facts-after')
-    if ('facts' in facts) this.#facts = facts.facts
+    if ('facts' in facts) {
+      this.#facts = facts.facts
+      this.#factsUnread = undefined
+    } else this.#factsUnread = facts.why
+  }
+
+  /**
+   * After the window, for the end report: the facts, and Qdrant's status
+   * unless the start's checks read it, each read again, since what discovery
+   * read before the stop (a stopped pmmcp's not_running, say) no longer says
+   * what holds. Once, and only once the window opened; nothing after a leak.
+   */
+  async #afterWindow(): Promise<void> {
+    if (!this.#windowOpened || this.#afterWindowRead || this.#o.runner.halted !== undefined) return
+    this.#afterWindowRead = true
+    await this.#refreshFacts()
+    const dir = this.#o.plan.pmmcpDir
+    const facts = this.#factsNow()
+    // Only a verdict on hand from before the stop, or a key this run made, is read again: with neither, the report gives no Qdrant line.
+    const onHand = this.#qdrant !== undefined || this.#keyed
+    if (dir === undefined || !onHand || this.#qdrantFresh || facts === undefined || !featuresOf(facts).qdrant_status_json || this.#o.runner.halted !== undefined) return
+    const read = await this.#readQdrant(dir)
+    if ('why' in read) {
+      this.#qdrantUnread = read.why
+      return
+    }
+    this.#qdrant = read.status
+    this.#qdrantFresh = true
+    this.#qdrantUnread = undefined
+  }
+
+  /**
+   * Before the end report, once the gate is done: what #afterWindow reads,
+   * when a phase ended inside or just after the window before it could
+   * (a stop that did not stop, a failed start). The installer calls it, with
+   * a signal held meanwhile, as it is from the window's first opening until
+   * the report. A registered value in either read's output is the defect
+   * apply() reports (#leaked): nothing more is run, the report still comes,
+   * and says it stopped there; the exit code that leak implies (4 while pmmcp
+   * may be stopped) is returned, undefined when nothing leaked.
+   */
+  async recheck(): Promise<1 | 4 | undefined> {
+    try {
+      await this.#afterWindow()
+    } catch (e) {
+      if (e instanceof InstallRunError && (e.code === 'AOS_INSTALL_RUN_LEAK' || e.code === 'AOS_INSTALL_RUN_HALTED')) return this.#leaked(e)
+      throw e
+    }
+    return undefined
   }
 
   // ── small helpers ──
@@ -1940,6 +2043,7 @@ export class Applier {
   #openWindow(): void {
     if (this.#windowOpen) return
     this.#windowOpen = true
+    this.#windowOpened = true
     this.#o.window?.(true)
   }
 
@@ -2001,16 +2105,27 @@ export class Applier {
 
     const facts = this.#facts
     if (dir !== undefined && plan.kind !== 'aos-only' && plan.kind !== 'not-installed') {
-      if (facts !== undefined) {
-        const a = facts.http_auth
-        out.push(`pmmcp bearer: http_auth.yaml ${a.state}${a.mode === null ? '' : `, mode ${a.mode}`}, tokens [${a.tokens.map((t) => shownLine(t)).join(', ')}]`)
+      const authOf = (f: Facts): string => {
+        const a = f.http_auth
+        return `http_auth.yaml ${a.state}${a.mode === null ? '' : `, mode ${a.mode}`}, tokens [${a.tokens.map((t) => shownLine(t)).join(', ')}]`
       }
+      // Facts that could not be read again after this run's changes are never given as what holds now.
+      if (this.#factsUnread !== undefined) {
+        out.push(`pmmcp bearer: could not check after this run's changes (${shownLine(this.#factsUnread)})${facts === undefined ? '' : `; before them: ${authOf(facts)}`}`)
+      } else if (facts !== undefined) out.push(`pmmcp bearer: ${authOf(facts)}`)
       const yes = (b: boolean | undefined): string => (b === undefined ? 'not known' : b ? 'yes' : 'no')
       if (plan.staged !== undefined || this.#digestOnFile !== undefined) {
         out.push(`  ${PMMCP_CLIENT} digest matches .env: ${yes(this.#digestOnFile)}; loaded by the running server: ${yes(this.#digestOnFile === true ? this.#loaded : undefined)}`)
       }
       const q = this.#qdrant
-      if (q !== undefined) {
+      if (q !== undefined && this.#qdrantUnread !== undefined) {
+        // A stop that did not stop, with the start declined, ran no start: only the stop is named then.
+        const ran = this.#started ? ['stop and start', 'them'] : ['stop', 'it']
+        out.push(
+          `qdrant: could not check after this run's ${ran[0] ?? ''} (${shownLine(this.#qdrantUnread)}); before ${ran[1] ?? ''} its verdict was ${q.verdict}: ` +
+            within(dir, '.venv/bin/python scripts/qdrant_api_key.py status'),
+        )
+      } else if (q !== undefined) {
         out.push(`qdrant: verdict ${q.verdict}`)
         if (q.prekey_kept) out.push(`  pmmcp-qdrant-prekey kept; remove it later with ${within(dir, '.venv/bin/python scripts/qdrant_api_key.py cleanup')}`)
       } else if (this.#keyed) {
@@ -2045,6 +2160,20 @@ export class Applier {
     // Only when something the daemon reads changed (#daemonRestartNeeded).
     if (failed?.written === true) out.push('  check .env as above before you restart npm run dev: the loader refuses a .env that git does not ignore or that others can read')
     else if (this.#daemonRestartNeeded()) out.push('  restart npm run dev (it reads .env when it starts), and check that its credentials line names the tokens and that the hub is ok')
+    // The digest is on file but no restart this run loaded it (a decline, a wrong word, an abort before the stop): how it gets loaded.
+    const d = this.#o.discovery
+    if (plan.kind === 'found' && d?.kind === 'found' && this.#digestOnFile === true && this.#loaded !== true && !this.#stopRan && !this.#started && dir !== undefined) {
+      const server = `pmmcp's running MCP server ${this.#loaded === false ? 'has not loaded' : 'may not have loaded'} the ${PMMCP_CLIENT} digest`
+      // A re-run offers the restart only where this one could: with the jobs check unavailable it offered none, and the notes say why.
+      const offered = plan.offers.some((o) => o.live)
+      out.push(
+        d.server === undefined
+          ? `  pmmcp is not running: it loads the ${PMMCP_CLIENT} digest when it next starts (${within(dir, './start-pmmcp-server.sh')})`
+          : offered
+            ? `  ${server}: run npm run aos-install again and accept the restart`
+            : `  ${server}: it loads it when pmmcp next restarts, which this run could not offer (the notes above say why)`,
+      )
+    }
     if (plan.dotenv.lines.some((l) => l.name === 'ANTHROPIC_API_KEY' && l.state !== 'present')) out.push('  add ANTHROPIC_API_KEY to .env yourself: the installer never writes it')
     // The virtualenv's own module, not `uv run`, which may sync (and prune) the virtualenv on the way.
     if (plan.kind === 'fresh-install') out.push(`  for scraping pages that need JavaScript: ${within(dir ?? `~/Github/${PMMCP_FOLDER}`, '.venv/bin/python -m playwright install chromium')}`)

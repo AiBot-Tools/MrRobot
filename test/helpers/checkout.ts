@@ -64,21 +64,51 @@ export function runEntry(
 }
 
 /**
+ * What is typed at the terminal, in order: each step waits for its cue in
+ * what the command wrote there since the last step's (or for a file to
+ * exist), then, `delayMs` later, types `send`. A file step is how a test
+ * types at a moment the screen does not show (a probe that has started).
+ */
+export type PtyStep =
+  | { readonly cue: string; readonly send: string; readonly delayMs?: number }
+  | { readonly file: string; readonly send: string; readonly delayMs?: number }
+
+/**
  * Gives a child a terminal: python3's pty module (no Node dependency has
  * one). It forks the command on a new pseudo-terminal, its stdin, stdout and
- * stderr; copies what the command writes there to its own stdout; types
- * Ctrl-D (the end of the input) once that output holds the cue, and never
- * anything else; and exits with the command's status.
+ * stderr; copies what the command writes there to its own stdout; types each
+ * step's keys (PtyStep) and nothing else; and exits with the command's
+ * status. The terminal's own line discipline turns a typed Ctrl-C (\x03)
+ * into SIGINT for its foreground process group, as a real one does.
  */
 const PTY_WRAPPER = [
-  'import os, pty, sys',
-  'cue = sys.argv[1].encode()',
+  'import json, os, pty, select, sys, time',
+  'steps = json.loads(sys.argv[1])',
   'pid, fd = pty.fork()',
   'if pid == 0:',
   '    os.execv(sys.argv[2], sys.argv[2:])',
   "out = b''",
-  'sent = False',
+  'at = 0',
+  'i = 0',
   'while True:',
+  '    if i < len(steps):',
+  '        step = steps[i]',
+  '        hit = False',
+  "        if 'cue' in step:",
+  "            k = out.find(step['cue'].encode(), at)",
+  '            if k >= 0:',
+  '                hit = True',
+  "                at = k + len(step['cue'].encode())",
+  '        else:',
+  "            hit = os.path.exists(step['file'])",
+  '        if hit:',
+  "            time.sleep(step.get('delayMs', 0) / 1000)",
+  "            os.write(fd, step['send'].encode())",
+  '            i += 1',
+  '            continue',
+  '    ready, _, _ = select.select([fd], [], [], 0.05)',
+  '    if not ready:',
+  '        continue',
   '    try:',
   '        chunk = os.read(fd, 4096)',
   '    except OSError:',
@@ -86,9 +116,6 @@ const PTY_WRAPPER = [
   '    if not chunk:',
   '        break',
   '    out += chunk',
-  '    if not sent and cue in out:',
-  "        os.write(fd, b'\\x04')",
-  '        sent = True',
   '_, status = os.waitpid(pid, 0)',
   'sys.stdout.buffer.write(out)',
   'sys.stdout.flush()',
@@ -103,21 +130,23 @@ export function terminalAvailable(): boolean {
 
 /**
  * Start an entry point from the copy, stdin closed, stdout and stderr piped.
- * With `eofAfter`, it runs at a terminal instead (PTY_WRAPPER): its stdin and
- * stdout are one, the end of the input is typed once its output holds that
- * text, and what it wrote there (stderr included, lines ending \r\n) comes on
- * stdout when it has exited.
+ * With `eofAfter` or `typed`, it runs at a terminal instead (PTY_WRAPPER):
+ * its stdin and stdout are one, the end of the input is typed once its output
+ * holds `eofAfter`'s text (or `typed`'s steps are typed), and what it wrote
+ * there (stderr included, lines ending \r\n) comes on stdout when it has
+ * exited.
  */
 export function spawnEntry(
   checkout: ShadowCheckout,
   entry: EntryPoint,
   args: readonly string[],
-  opts: Omit<SpawnOptions, 'cwd' | 'stdio'> & { readonly eofAfter?: string } = {},
+  opts: Omit<SpawnOptions, 'cwd' | 'stdio'> & { readonly eofAfter?: string; readonly typed?: readonly PtyStep[] } = {},
 ): ChildProcessByStdio<null, Readable, Readable> {
   noCwd(opts)
-  const { eofAfter, ...options } = opts
+  const { eofAfter, typed, ...options } = opts
   const node = [process.execPath, '--import', 'tsx', entry, ...args]
-  if (eofAfter !== undefined) return spawn('python3', ['-I', '-c', PTY_WRAPPER, eofAfter, ...node], { ...options, cwd: checkout.root, stdio: ['ignore', 'pipe', 'pipe'] })
+  const steps: readonly PtyStep[] | undefined = typed ?? (eofAfter === undefined ? undefined : [{ cue: eofAfter, send: '\x04' }])
+  if (steps !== undefined) return spawn('python3', ['-I', '-c', PTY_WRAPPER, JSON.stringify(steps), ...node], { ...options, cwd: checkout.root, stdio: ['ignore', 'pipe', 'pipe'] })
   return spawn(process.execPath, node.slice(1), { ...options, cwd: checkout.root, stdio: ['ignore', 'pipe', 'pipe'] })
 }
 

@@ -15,7 +15,7 @@ import './helpers/guard.js'
 
 import assert from 'node:assert/strict'
 import { createHash, randomBytes } from 'node:crypto'
-import { readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { chmodSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { tmpdir as osTmpdir } from 'node:os'
 import { join, sep } from 'node:path'
 import test, { type TestContext } from 'node:test'
@@ -46,6 +46,7 @@ import {
   PlanError,
   credentialsMap,
   describe,
+  describeDotenv,
   exportedNames,
   generatorsFor,
   nonLiveNumbers,
@@ -385,6 +386,8 @@ function inspectIn(repo: string, names: readonly string[], config: KernelConfig,
     repoRoot: repo,
     accepted: credentialNames(config, PROVIDERS),
     names,
+    // As the installer asks (scripts/install.ts): the tokens it mints are judged for a write that did not finish.
+    minted: mintedCredentialNames(config),
     uid: process.getuid?.() ?? OPERATOR_UID,
     euid: OPERATOR_UID,
     digests,
@@ -549,6 +552,53 @@ test("a name the installer's shell exports is never appended", async () => {
   const control = planInstall(input({ exported: new Set(['AOS_CONTROL_TOKEN']) }))
   assert.deepEqual([control.stops, control.generate], [[], []])
   assert.ok(has(control.notes, /AOS_CONTROL_TOKEN is exported by this shell as well as set in \.env \(line 3\)/))
+})
+
+test('a token cut short by a write that did not finish stops the plan by its line: nothing is generated or staged for it, nothing is offered, exit 2', async (t) => {
+  // A re-run after `writing .env failed after 23 of 81 bytes (EFBIG)`: the last line is AOS_PMMCP_TOKEN and 7 hex characters,
+  // no newline. Read through the real writer's inspection, as the installer reads it.
+  const repo = scratchRepo(t)
+  const control = 'c'.repeat(64)
+  writeFileSync(join(repo, '.env'), `AOS_CONTROL_TOKEN=${control}\nANTHROPIC_API_KEY=sk-ant-0000\nAOS_PMMCP_TOKEN=5b8bca5`, { mode: 0o600 })
+  chmodSync(join(repo, '.env'), 0o600)
+  const before = readFileSync(join(repo, '.env'))
+  const plan = planInstall(inspected(repo, DECLARED, found({ bearer: { state: 'not-checked', why: 'the token is cut short' }, server: { pid: 812, startedAfter: STARTED_BEFORE } })))
+  assert.ok(
+    has(plan.stops, /^\/.*\.env line 3: AOS_PMMCP_TOKEN looks cut short \(a write that did not finish\): delete that line and re-run\. Its value is lowercase hex shorter than the 64 the installer writes, so no digest of it is staged$/),
+    plan.stops.join('\n'),
+  )
+  assert.equal(plan.staged, undefined)
+  assert.deepEqual(plan.generate, [])
+  assert.equal(plan.steps.some((s) => s.id === 'stage-digest' || s.id === 'env'), false)
+  assert.deepEqual(plan.offers, [])
+  const line = plan.dotenv.lines.find((l) => l.name === 'AOS_PMMCP_TOKEN')
+  assert.equal(line?.state, 'damaged')
+  assert.equal(line?.text, 'cut short (line 3) -> delete that line and re-run; a re-run appends a whole one')
+  const io = new FakeIO()
+  assert.deepEqual(await gate(plan, io), { kind: 'refused', exitCode: 2 })
+  assert.deepEqual(io.events, [], 'a refused plan asks and applies nothing')
+  assert.ok(io.printed.some((l) => /^ {2}AOS_PMMCP_TOKEN +cut short \(line 3\)/.test(l)), io.printed.join('\n'))
+  assert.deepEqual(readFileSync(join(repo, '.env')), before)
+
+  // The line deleted, as the stop says: a re-run appends a whole token and stages its digest.
+  writeFileSync(join(repo, '.env'), `AOS_CONTROL_TOKEN=${control}\nANTHROPIC_API_KEY=sk-ant-0000\n`, { mode: 0o600 })
+  const fixed = planInstall(inspected(repo, DECLARED, found({ bearer: { state: 'not-checked', why: 'AOS_PMMCP_TOKEN holds no value in .env yet' } })))
+  assert.deepEqual(fixed.stops, [])
+  assert.deepEqual(fixed.generate, ['AOS_PMMCP_TOKEN'])
+  assert.deepEqual(fixed.staged, { name: 'AOS_PMMCP_TOKEN', client: PMMCP_CLIENT, from: 'append' })
+})
+
+test("S2's .env line gives the file's mode, link count and owner, as the writer's inspection found them", (t) => {
+  const repo = scratchRepo(t)
+  writeFileSync(join(repo, '.env'), `AOS_CONTROL_TOKEN=${'c'.repeat(64)}\n`, { mode: 0o600 })
+  chmodSync(join(repo, '.env'), 0o600)
+  const plan = planInstall(inspected(repo, UNDECLARED, found()))
+  assert.equal(describeDotenv(plan)[0], `.env  ${join(repo, '.env')}  present, 0600, 1 link, owner you`)
+  chmodSync(join(repo, '.env'), 0o400)
+  assert.equal(describeDotenv(planInstall(inspected(repo, UNDECLARED, found())))[0], `.env  ${join(repo, '.env')}  present, 0400, 1 link, owner you`)
+  // Absent: created at 0600 only when something is appended.
+  const none = planInstall(inspected(scratchRepo(t), UNDECLARED, found()))
+  assert.equal(describeDotenv(none)[0], `.env  ${join(none.dotenv.path)}  absent (created at 0600 when something is appended)`)
 })
 
 test('a staged digest the running server has not loaded adds one restart', () => {
@@ -1559,6 +1609,65 @@ test('only y or yes is yes at a y/N offer, and only n or no skips the wait', asy
   }
 })
 
+test('a keyed pmmcp-qdrant that is only stopped is no failure: beside a stopped pmmcp the start is what brings it back, and only beside a running MCP server is it blocked', async () => {
+  const folder = '/Users/op/MrRobot/.aos/install/20261029T090000Z'
+  // As status --json gives a keyed container that is stopped: nothing asked, so not_running.
+  const stopped = (): Doc => edit(edit(edit(qdrantDoc(), 'container.state', 'stopped'), 'collections', { without_key: null, with_key: null }), 'verdict', 'not_running')
+  const NOTE =
+    "pmmcp-qdrant has its key and is stopped, as pmmcp is: pmmcp's start runs it again (cd /Users/op/Github/Persistent-Memory-MCP && ./start-pmmcp-server.sh), and a re-run then reads its verdict"
+  // Left stopped by an earlier run (scenario 10's re-run): the start is offered, and nothing says the Qdrant item failed.
+  const left = planInstall(input({ pmmcp: found({ server: null, leftStopped: { folder }, qdrant: stopped() }) }))
+  assert.deepEqual(offerIds(left), ['start'])
+  assert.deepEqual(left.blocked, [], left.blocked.join('\n'))
+  assert.equal(has(left.notes, /has a key, but its verdict is not_running/), false, left.notes.join('\n'))
+  assert.ok(left.notes.includes(NOTE), left.notes.join('\n'))
+  // Stopped by hand: nothing to do, the note naming the start, and "everything the installer makes is in place" is not claimed falsely: nothing is blocked.
+  const byHand = planInstall(input({ pmmcp: found({ server: null, qdrant: stopped() }) }))
+  assert.deepEqual([byHand.offers, byHand.steps, byHand.blocked], [[], [], []])
+  assert.ok(byHand.notes.includes(NOTE), byHand.notes.join('\n'))
+  // Stopped while the MCP server runs: pmmcp cannot reach it, which is not in place, and the fix is named.
+  const running = planInstall(input({ pmmcp: found({ qdrant: stopped() }) }))
+  assert.ok(
+    has(running.blocked, /^pmmcp-qdrant has its key but is stopped while pmmcp's MCP server runs, so pmmcp cannot reach it: stop and start pmmcp \(cd .* && \.\/stop-pmmcp-server\.sh && \.\/start-pmmcp-server\.sh\), then re-run$/),
+    running.blocked.join('\n'),
+  )
+  // Any other verdict of a keyed container stays blocked as it was.
+  assert.ok(has(planInstall(input({ pmmcp: found({ qdrant: edit(qdrantDoc(), 'verdict', 'inconsistent') }) })).blocked, /^pmmcp-qdrant has a key, but its verdict is inconsistent/))
+  // Stopped, but its start would make it inconsistent: the key file gone or unusable, or a binding beyond 127.0.0.1. Blocked, beside a
+  // stopped pmmcp too, each naming what is wrong: never "nothing to do: everything the installer makes is in place" (exit 0).
+  const STATUS = 'check with cd /Users/op/Github/Persistent-Memory-MCP && .venv/bin/python scripts/qdrant_api_key.py status'
+  for (const [what, doc, wrong] of [
+    ['its key file absent', edit(stopped(), 'key_file', { state: 'absent', reason: null }), '~/.persistent-memory-mcp/qdrant_api_key is not there'],
+    [
+      'its key file unusable',
+      edit(stopped(), 'key_file', { state: 'unusable', reason: '/Users/op/.persistent-memory-mcp/qdrant_api_key has mode 0644' }),
+      '~/.persistent-memory-mcp/qdrant_api_key is unusable (/Users/op/.persistent-memory-mcp/qdrant_api_key has mode 0644)',
+    ],
+    [
+      'a binding on every interface',
+      edit(edit(stopped(), 'container.published', [{ host_ip: '0.0.0.0', host_port: 6333, container_port: '6333/tcp' }]), 'container.reachable_beyond_loopback', ['0.0.0.0:6333->6333/tcp']),
+      'it would be reachable beyond 127.0.0.1 (0.0.0.0:6333->6333/tcp)',
+    ],
+    [
+      'both',
+      edit(edit(stopped(), 'key_file', { state: 'absent', reason: null }), 'container.reachable_beyond_loopback', ['*:6333->6333/tcp', 'PublishAllPorts (docker run -P)']),
+      '~/.persistent-memory-mcp/qdrant_api_key is not there and it would be reachable beyond 127.0.0.1 (*:6333->6333/tcp, PublishAllPorts (docker run -P))',
+    ],
+  ] as const) {
+    const blocked = `pmmcp-qdrant has its key and is stopped, but ${wrong}: started, its verdict would be inconsistent, not enforced. Fix that by hand (${STATUS}), then re-run`
+    for (const server of [null, undefined]) {
+      const plan = planInstall(input({ pmmcp: found({ ...(server === null ? { server: null } : {}), qdrant: doc }) }))
+      assert.ok(plan.blocked.includes(blocked), `${what}, ${server === null ? 'pmmcp stopped' : 'pmmcp running'}: ${plan.blocked.join('\n')}`)
+      assert.equal(plan.notes.includes(NOTE), false, what)
+      assert.equal(nothingToDo(plan), true, what)
+      const io = new FakeIO({})
+      assert.equal((await gate(plan, io)).kind, 'nothing-to-do', what)
+      assert.ok(io.printed.includes('nothing the installer can do now: see the notes above'), `${what}: ${io.printed.join('\n')}`)
+      assert.equal(io.printed.includes('nothing to do: everything the installer makes is in place'), false, what)
+    }
+  }
+})
+
 test('pmmcp stopped while the last installer run that stopped it ran no start after it (killed or crashed inside the window) is offered the start, behind both typed confirmations', async () => {
   const folder = '/Users/op/MrRobot/.aos/install/20261029T090000Z'
   const MANUAL = 'cd /Users/op/Github/Persistent-Memory-MCP && ./start-pmmcp-server.sh'
@@ -1712,6 +1821,16 @@ test('a curator off 127.0.0.1:8767 or an unusable file is offered nothing; the T
   assert.ok(has(noneWarning, /^Quit any scripts\/monitor_tui\.py of \/Users\/op\/Github\/Persistent-Memory-MCP first \(none runs now\)/))
   const two = planInstall(input({ pmmcp: found({ facts: both }), tuiPids: [4242, 4250] }))
   assert.ok(warning(two, []).includes('What does not stop: a scripts/monitor_tui.py of /Users/op/Github/Persistent-Memory-MCP (pids 4242 and 4250 run now).'))
+  // pgrep gave no answer: whether one runs cannot be told, and the warning never says that none does.
+  const blind = planInstall(input({ pmmcp: found({ facts: both }), tuiPids: undefined }))
+  assert.equal(blind.tuiPids, undefined)
+  const blindWarning = warning(blind, select(blind, new Set<OfferId>(['auth'])).live)
+  assert.ok(
+    blindWarning.includes('What does not stop: a scripts/monitor_tui.py of /Users/op/Github/Persistent-Memory-MCP (whether one runs cannot be told: pgrep gave no answer).'),
+    blindWarning.join('\n'),
+  )
+  assert.ok(has(blindWarning, /^Quit any scripts\/monitor_tui\.py of \/Users\/op\/Github\/Persistent-Memory-MCP first \(whether one runs cannot be told: pgrep gave no answer\)/))
+  assert.equal(blindWarning.some((l) => l.includes('none runs now')), false, blindWarning.join('\n'))
   // Through the gate: before the first confirmation.
   const io = new FakeIO({ answers: [[/^Enable the Qdrant/, 'n']] })
   assert.equal((await gate(withTui, io)).kind, 'done')

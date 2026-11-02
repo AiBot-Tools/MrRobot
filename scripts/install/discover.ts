@@ -60,7 +60,14 @@
 //   is no one's to remove here); a legacy
 //   com.aibot-tools.pmmcp* plist; a com.aibot.pmmcp plist whose
 //   WorkingDirectory is gone; two candidate installs; a folder that is not an
-//   install; something other than this account's pmmcp MCP server on 8766;
+//   install; a program's file on the child's PATH that is the stop or start
+//   script of the install the plist or the listener on 8766 names, by
+//   identity (the runner's rules, scripts/install/run.ts pathRefusals), held
+//   to them right after that source names it and before the next probe (the
+//   preflight could compare them only with the default install's and
+//   --pmmcp-dir's), each such stop saying whether its file already ran among
+//   the probes before it ('path-ran') or not ('path'), never that nothing
+//   ran; something other than this account's pmmcp MCP server on 8766;
 //   facts that cannot be had or do not fit `facts: 1` (src/install/facts.ts);
 //   facts about another folder or origin, or that saw PMMCP_* names; a pmmcp
 //   port other than 8766/8765/8767 or a host that is not loopback;
@@ -114,10 +121,17 @@
 //   What it throws: the runner's leak and halt (a registered value reached a
 //   child's output: nothing more may run, and the caller reports it), and its
 //   refusal: one of the machine's state (InstallRunError.machine, a file on
-//   the child's PATH that is pmmcp's stop or start script, say), which the
-//   caller reports as a refusal with the fix the message names, or any
-//   other, which only a defect makes. A program that cannot be started or
-//   does not answer in time is a probe that failed, and says so.
+//   the child's PATH that is pmmcp's stop or start script, say, or a .aos or
+//   .aos/install of another account's, which is checked before active.json
+//   is read, so its EACCES never passes for a record an earlier run left),
+//   which the caller reports as a refusal with the fix the message names, or
+//   any other, which only a defect makes. A program that cannot be started or
+//   does not answer in time is a probe that failed, and says so: one that
+//   cannot be started is named once in the notes with the runner's message
+//   (the file a bare name was spawned as, and why: a #! naming an
+//   interpreter that is not there gives ENOENT), and a git that cannot be
+//   started says that no update is offered, since no fast-forward can be
+//   checked.
 
 import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import http from 'node:http'
@@ -142,13 +156,17 @@ import {
 import type { ProvidersFile } from '../../src/models/registry.js'
 import { credentialNames, cutShortMessage, inspectCredentials, mintedCredentialNames, type InspectOptions } from '../../src/secrets/dotenv-append.js'
 import {
+  INSTALLER_PROGRAMS,
   InstallRunError,
+  PMMCP_PROGRAMS,
   STOP_SCRIPT,
+  checkLogFolder,
   clearActive,
   installDir,
   readActive,
   readAt,
   readJobs,
+  pathRefusals,
   readOut,
   shownLine,
   tail,
@@ -276,6 +294,8 @@ export type StopCode =
   | 'docker'
   | 'qdrant-status'
   | 'dotenv'
+  | 'path'
+  | 'path-ran'
 
 /** Why discovery stops: matched by code, shown by message (names, paths and fixes, never a value). */
 export interface Stop {
@@ -1017,6 +1037,8 @@ class Discoverer {
   readonly #now: () => Date
   readonly #sleep: (ms: number) => Promise<void>
   readonly #notes: string[] = []
+  /** The programs a probe could not start (AOS_INSTALL_RUN_SPAWN): each is named once in the notes, with the file and why. */
+  readonly #unstarted = new Set<string>()
   #install: Install | undefined
   #facts: Facts | undefined
   /** The MCP server found on 8766 while locating, if any. */
@@ -1136,6 +1158,8 @@ class Discoverer {
    * clear before a window of its own.
    */
   async #activeStep(): Promise<ActiveRecord | undefined> {
+    // The folder first: one of another account's makes active.json unreadable whether or not a run left one, and is the fault to name.
+    checkLogFolder(this.#o.repoRoot)
     const active = readActive(this.#o.repoRoot)
     if (active.state === 'none') return undefined
     if (active.state === 'unreadable') {
@@ -1248,7 +1272,14 @@ class Discoverer {
     try {
       result = await this.#o.runner.run(spec)
     } catch (e) {
-      if (e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_SPAWN') return { ok: false, why: e.message }
+      if (e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_SPAWN') {
+        // Said once a program, on the screen: the runner's message names the file spawned and why (a #! naming no interpreter).
+        if (!this.#unstarted.has(spec.command)) {
+          this.#unstarted.add(spec.command)
+          this.#notes.push(`${spec.command} could not be started, so what it would have read is not known: ${e.message}`)
+        }
+        return { ok: false, why: e.message }
+      }
       throw e
     }
     if (result.timedOut || !result.exited) {
@@ -1323,6 +1354,8 @@ class Discoverer {
             `Unload and remove it (launchctl bootout ${domain}/${PLIST_LABEL}, then rm ${shown(plist)}), or reinstall it with ./setup.sh from the clone you use, then re-run`,
         )
       }
+      // Before any other probe: a program's file on the child's PATH that is this install's stop or start script, by identity, is refused now.
+      this.#checkPath(working)
       const program = await this.#plutil(plist, 'ProgramArguments.1')
       const expected = join(working, '.venv', 'bin', 'pmmcp')
       if (program !== expected) {
@@ -1406,8 +1439,27 @@ class Discoverer {
       dirs.add(dir)
     }
     if (dirs.size > 1) throw stop('two-installs', `${String(port)} is held by MCP servers of two installs: ${[...dirs].map((d) => shown(d)).join(', ')}. Stop the one you do not use, then re-run`)
+    for (const dir of dirs) this.#checkPath(dir)
     this.#serverPids = listeners.map((l) => l.pid)
     return [...dirs][0]
+  }
+
+  /**
+   * Each program's file on the child's PATH held to the runner's rules again
+   * with the scripts of an install a source has just named (the plist's
+   * folder, the listener's), before the next probe: the preflight compared
+   * them only with the default install's and --pmmcp-dir's. Each refusal says
+   * whether its file already ran among the probes so far ('path-ran').
+   */
+  #checkPath(dir: string): void {
+    const found = pathRefusals({
+      home: this.#o.home,
+      cwd: this.#o.repoRoot,
+      programs: [...INSTALLER_PROGRAMS, ...PMMCP_PROGRAMS],
+      dirs: this.#o.pmmcpDir === undefined ? [dir] : [dir, this.#o.pmmcpDir],
+      ran: this.#o.runner.ranByName(),
+    })
+    if (found.length > 0) throw new Halt(found.map((r) => stopOf(r.ran ? 'path-ran' : 'path', r.message)))
   }
 
   /** Is the chosen folder an install, named as the stop script expects, from AiBot-Tools' repository? */
@@ -1637,7 +1689,8 @@ class Discoverer {
     if (this.#uid === undefined) return { loaded: undefined, state: undefined, pid: undefined }
     const ran = await this.#quick('launchctl-print', 'launchctl', ['print', `gui/${String(this.#uid)}/${PLIST_LABEL}`])
     if (!ran.ok) {
-      this.#notes.push(`launchd cannot be asked about ${PLIST_LABEL}: ${ran.why}`)
+      // One that could not be started is named already (#run), with its file and why.
+      if (!this.#unstarted.has('launchctl')) this.#notes.push(`launchd cannot be asked about ${PLIST_LABEL}: ${ran.why}`)
       return { loaded: undefined, state: undefined, pid: undefined }
     }
     const out = this.#out(ran.result) ?? ''
@@ -1729,6 +1782,7 @@ class Discoverer {
       untracked = lines.filter((l) => l.startsWith('?? ')).length
       trackedChanges = lines.length - untracked
     }
+    if (this.#unstarted.has('git')) this.#notes.push('git could not be started (above), so whether origin/main is a fast-forward of HEAD cannot be checked: no update is offered')
     return { head, originMain, fastForward, lockUnchanged, trackedChanges, untracked }
   }
 

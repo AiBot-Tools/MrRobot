@@ -68,9 +68,17 @@ export function outcomeEnding(outcome: GateOutcome, reported: boolean): Ending {
   }
 }
 
-/** A refusal before the gate (the preflight, the lock, the config, the .env screen, discovery's stops): exit 2. */
-export function refusedEnding(): Ending {
-  return { code: 2, why: 'refused before any change: see above' }
+/**
+ * A refusal before the gate (the preflight, the lock, the config, the .env
+ * screen, discovery's stops): exit 2. `ranFirst`: a file the refusal names
+ * had already run among discovery's probes (a program's file on the child's
+ * PATH found to be pmmcp's stop or start script only once discovery named its
+ * install), so it is not said that nothing changed.
+ */
+export function refusedEnding(ranFirst = false): Ending {
+  return ranFirst
+    ? { code: 2, why: "refused before the installer changed anything, but a file it refused had already run among discovery's probes: see above" }
+    : { code: 2, why: 'refused before any change: see above' }
 }
 
 /** Discovery or the TUI check stopped by a defect (a leak, a halted runner, a refusal of the runner's only a defect makes, discovery's own): exit 1, before any change. */

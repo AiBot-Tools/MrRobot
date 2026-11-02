@@ -167,7 +167,7 @@ export async function takeLock(o: LockOptions): Promise<Lock | string> {
     const st = lstatSync(dir)
     if (st.isSymbolicLink() || !st.isDirectory()) return `${dir} is not a directory (a link is not one): the installer keeps its lock only in a real one`
     const me = process.geteuid?.()
-    if (me !== undefined && st.uid !== me) return `${dir} belongs to uid ${String(st.uid)}, not this account`
+    if (me !== undefined && st.uid !== me) return `${dir} belongs to uid ${String(st.uid)}, not you (uid ${String(me)}): fix its owner (chown) and re-run`
     if ((st.mode & 0o022) !== 0) return `${dir} is writable by group or others: chmod go-w ${shellWord(dir)}, then re-run`
   } catch (e) {
     return `cannot examine ${dir} (${errnoOf(e)})`

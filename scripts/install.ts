@@ -28,10 +28,18 @@
 //     S1, the preflight (scripts/install/preflight.ts), read-only and
 //       in-process (no child is started): not root, HOME, the checkout's
 //       root as the current directory, no falsify hold, Node's engines,
-//       node_modules, .gitignore, the shell's DOCKER_* and PMMCP_* exports
-//       by name, and, unless --aos-only, the programs pmmcp and its scripts
-//       call on the PATH a child gets. Any refusal: every one is printed
-//       with its fix, exit 2.
+//       node_modules, .gitignore, .aos and .aos/install as the runner's log
+//       folder (another account's is named with its owner and the chown),
+//       the shell's DOCKER_* and PMMCP_* exports by name, unless --aos-only
+//       the programs pmmcp and its scripts call on the PATH a child gets, and
+//       every program this run starts (with --aos-only, ls and ps alone) and,
+//       unless --aos-only, every one pmmcp's scripts run, resolved on that
+//       PATH and held to the runner's rules without a child (a file that is
+//       pmmcp's stop or start script by link, by identity with the default
+//       install's or --pmmcp-dir's, or by its #! header wherever its install
+//       is; a link to a program never run): so such a file is refused before
+//       the lock, .env or any child. Any refusal: every one is printed with
+//       its fix, exit 2.
 //     The lock (scripts/install/lock.ts), <repo>/.aos/install.lock: one
 //       installer at a time. A stale one (its pid gone, the machine booted
 //       since, or the pid given to a process that started after it) is
@@ -42,16 +50,25 @@
 //       credentials map's first), and again over the map's names alone for
 //       `writable` and `fits` (its `fits` counts every missing name it is
 //       given). A refusal of the writer's (the trap .env's mode, a placeholder,
-//       an undeclared name, ...) changes nothing: exit 2.
-//     S3, discovery, unless --aos-only: a stop (exit 2), a probe the runner's
+//       an undeclared name, a name a write cut short, ...) changes nothing:
+//       exit 2. So does a token the installer mints whose value an earlier
+//       write cut short (the writer's `damaged`), by its line, before
+//       discovery runs a probe: no digest of it is ever staged.
+//     S3, discovery, unless --aos-only: a stop (exit 2; among them, as the
+//       plist or the listener on 8766 names an install the preflight could
+//       not know, a program's file on the child's PATH that is that
+//       install's stop or start script, refused before discovery's next
+//       probe, naming the file and saying whether it already ran among the
+//       probes before it, and then the first line and the last say so too,
+//       never that nothing ran or changed), a probe the runner's
 //       rules refused for the machine's state (InstallRunError.machine: a
 //       file on the child's PATH that is pmmcp's stop or start script by
-//       link or identity, a link to a program never run there, the log
-//       folder's mode: exit 2, the runner's message naming the file and the
-//       fix; any other refusal of the runner's is the installer's defect,
+//       link, identity or header, a link to a program never run there, the
+//       log folder's mode: exit 2, the runner's message naming the file and
+//       the fix; any other refusal of the runner's is the installer's defect,
 //       exit 1), or the screen of what was found (or not) and discovery's
 //       notes, which the gate prints after S2's (plan §5's order); for a
-//       found install the pids of every running scripts/monitor_tui.py,
+//       found install, the pids of every running scripts/monitor_tui.py,
 //       handed to the planner as pgrep gave them (the warning lists them,
 //       or says whether one runs cannot be told when pgrep gave no answer,
 //       never that none runs, and the applier checks again before a curator
@@ -126,7 +143,7 @@ import { ConfigError } from '../src/errors.js'
 import { runGate, type GateIO, type GateOutcome, type JobsAnswer } from '../src/install/gate.js'
 import { credentialsMap, exportedNames, planInstall, shellWord } from '../src/install/plan.js'
 import { parseProviders, type ProvidersFile } from '../src/models/registry.js'
-import { DotenvWriteError, credentialNames, inspectCredentials, mintedCredentialNames, type InspectResult } from '../src/secrets/dotenv-append.js'
+import { DotenvWriteError, credentialNames, cutShortMessage, inspectCredentials, mintedCredentialNames, type InspectResult } from '../src/secrets/dotenv-append.js'
 import { Applier, tuiPids } from './install/apply.js'
 import { DiscoverError, PLIST_LABEL, discover, type Absent, type Found } from './install/discover.js'
 import { defectEnding, exitLine, outcomeEnding, refusedEnding, signalEnded, signalEnding, stoppedEnding, type Ending } from './install/ending.js'
@@ -355,6 +372,9 @@ interface RunState {
 /** A usage error or --help: no run, so no exit line. */
 const noRun = (code: 0 | 2): Ending => ({ code, why: '' })
 
+/** A refusal's first line when a file it names had already run among discovery's probes: not "before any change". */
+const RAN_FIRST = "refused before the installer changed anything, but discovery's read-only probes had already run a file refused below:"
+
 async function main(argv: readonly string[], state: RunState, out: Output): Promise<Ending> {
   const root = REPO_ROOT
   const say = (line: string): void => out.say(line)
@@ -381,7 +401,7 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
 
   // S1
   const home = process.env['HOME']
-  const pre = preflight({ aosOnly: flags.aosOnly, root, home, env: process.env })
+  const pre = preflight({ aosOnly: flags.aosOnly, root, home, env: process.env, pmmcpDir: flags.pmmcpDir })
   for (const line of pre.lines) say(line)
   if (pre.refusals.length > 0 || home === undefined) {
     say('refused before any change:')
@@ -424,6 +444,11 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
     say(`refused before any change: ${e.message}`)
     return refusedEnding()
   }
+  // A token an earlier write cut short stops here, as a loader refusal does (plan S2), before discovery runs a probe: never staged.
+  if (screen.damaged.length > 0) {
+    say(`refused before any change: ${cutShortMessage(screen.path, screen.damaged)}; no digest of it is staged, and nothing was run`)
+    return refusedEnding()
+  }
   const exported = exportedNames(process.env, accepted)
 
   let discovery: Found | Absent | undefined
@@ -444,9 +469,10 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
     }
     if (found.kind === 'stopped') {
       if (found.install !== undefined) say(`pmmcp      ${found.install.dir} (${SOURCE_LABEL[found.install.source]})`)
-      say('refused before any change:')
+      const ranFirst = found.stops.some((s) => s.code === 'path-ran')
+      say(ranFirst ? RAN_FIRST : 'refused before any change:')
       for (const stop of found.stops) say(`  - ${stop.message}`)
-      return refusedEnding()
+      return refusedEnding(ranFirst)
     }
     discovery = found
     const notes = [...found.notes]

@@ -137,13 +137,32 @@
 //   command taken for both included); a program whose link, on the child's
 //   PATH or as given, leads to one never run here (the name typed passes);
 //   HOME unfit for a child's PATH; and the log folder (.gitignore not
-//   ignoring /.aos/, a folder that is a link, another account's, writable
-//   by group or others, or out of room for a stamp, a file that cannot be
-//   made or does not keep mode 0600, an active.json that cannot be made or
-//   removed). Every other refusal (a spec's fields or step name, a command
-//   or argument as the installer's code spelled it, the allowlist, a
+//   ignoring /.aos/, a folder that is a link, another account's (named by
+//   its uid, with the chown fix), not its owner's to read, write and search,
+//   writable by group or others, or out of room for a stamp, a file that
+//   cannot be made or does not keep mode 0600, an active.json that cannot be
+//   made or removed). Every other refusal (a spec's fields or step name, a
+//   command or argument as the installer's code spelled it, the allowlist, a
 //   timeout or stdin the rules do not give) only a defect of the
 //   installer's makes: machine is false, and the installer says so.
+//
+//   Before any child (childPathRefusals, checkLogFolder): the preflight, and
+//   the installer again once discovery found an install, hold the file each
+//   program finds on the child's PATH to the machine's refusals above
+//   without running it, so such a file stops the run before any change:
+//   each program the installer runs by name (INSTALLER_PROGRAMS) as checkSpec
+//   checks a run of it, and each one pmmcp's own scripts run by name
+//   (PMMCP_PROGRAMS: bash, curl, uv, python3, ollama) refused when it is the
+//   stop or start script by a link's name, by identity or by its header
+//   (below), or a link to a program refused by any name (bash may lead to
+//   another shell and python3 to a python). Called once probes have run
+//   (discovery's, before the install it found was known), each refusal says
+//   whether its file was among them (Runner.ranByName), never that nothing
+//   was run. The log folder's two levels are held to the rules above the
+//   same way, without being made. A spawn that fails names the file a
+//   bare name was spawned as and why, with its fix: for ENOENT of a file that
+//   is there, its #! line; of none, the file to put back; for EACCES, the
+//   chmod u+x a file without its execute bit needs.
 //
 //   The stop and start scripts (stop-pmmcp-server.sh, start-pmmcp-server.sh)
 //   are recognised by name in any case (APFS runs Stop-PMMCP-Server.sh as the
@@ -156,15 +175,20 @@
 //   ~/Github/Persistent-Memory-MCP, and every install this runner has run
 //   one of them from (the folder of the command, as typed and as resolved,
 //   and of the script a link or copy of another name was found to be), each
-//   file under every name it is found by. A command taken for both (named or
-//   linked as one and the other by identity, as a hard link of the start
-//   named stop-pmmcp-server.sh is, in whichever folder it is found first, or
-//   a copy of both) is refused. A changed copy, or a link or copy outside
-//   all of those folders, is not recognised: as the command it is then
-//   refused as no program the installer runs unless it has an allowlisted
-//   name (a hard link of the stop named ps, in a folder not yet learned,
-//   runs as ps does, with what ps may be given: --force, or a timeout), and
-//   as an argument it is a file like any other. Recognised, they run only as
+//   file under every name it is found by. A bare name, and a program pmmcp's
+//   scripts run, is also recognised by its content, whatever folder its
+//   install is in: a #! script whose header (the comment lines after its #!
+//   line) names either script, as pmmcp's own two do on their second line.
+//   A command taken for both (named or linked as one and the other by
+//   identity, as a hard link of the start named stop-pmmcp-server.sh is, in
+//   whichever folder it is found first, or a copy of both) is refused. A
+//   changed copy, or a link or copy outside all of those folders, run by
+//   absolute path, or found by a bare name with a header that names neither
+//   script, is not recognised: as the command it is then refused as no
+//   program the installer runs unless it has an allowlisted name (such a
+//   hard link of the stop named ps runs as ps does, with what ps may be
+//   given: --force, or a timeout), and as an argument it is a file like any
+//   other. Recognised, they run only as
 //   the command itself, by absolute path; any other run whose command or
 //   arguments name either (as text in any case, through a link, or by
 //   dev:ino, an argument taken as the file it names from the working
@@ -666,6 +690,46 @@ function bytesOf(path: string, size: number): Buffer | undefined {
   }
 }
 
+/** How much of a file's start is read for its #! header: pmmcp's scripts name themselves on the line after it. */
+const HEADER_BYTES = 4096
+
+/**
+ * The service script a file is by its content: a #! script whose header (the
+ * comment lines right after its #! line, within its first HEADER_BYTES) names
+ * stop-pmmcp-server.sh or start-pmmcp-server.sh, in any case, as each of
+ * pmmcp's two does on its second line. So a link or copy of an install no
+ * folder here names (one found only from the plist, or present but not given
+ * with --pmmcp-dir) is still known for what it is. Read where a link leads,
+ * a regular file only, opened without blocking; undefined when it is no such
+ * script or cannot be read.
+ */
+function scriptByHeader(path: string): string | undefined {
+  const real = realOf(path)
+  if (real === undefined) return undefined
+  let fd: number
+  try {
+    fd = openRegular(real, true)
+  } catch {
+    return undefined
+  }
+  let head: string
+  try {
+    head = readAt(fd, HEADER_BYTES, 0).toString('latin1')
+  } catch {
+    return undefined
+  } finally {
+    closeSync(fd)
+  }
+  if (!head.startsWith('#!')) return undefined
+  for (const line of head.split('\n').slice(1)) {
+    if (!line.startsWith('#')) break
+    const lower = line.toLowerCase()
+    const named = SERVICE_SCRIPTS.find((s) => lower.includes(s))
+    if (named !== undefined) return named
+  }
+  return undefined
+}
+
 /**
  * The install scripts a file is by identity: each found with the same
  * dev:ino (a hard link of any name, or a symbolic link to one), or, with
@@ -687,9 +751,10 @@ function scriptsByIdentity(path: string, scripts: readonly ScriptFile[], copies:
 }
 
 /** How a file is taken for a service script, for a refusal's fix: by its name, as a link, or by identity with the file it matched. */
-function identityWords(located: string | undefined, named: string | undefined, linkedAs: string | undefined, matched: readonly ScriptFile[]): string[] {
+function identityWords(located: string | undefined, named: string | undefined, linkedAs: string | undefined, matched: readonly ScriptFile[], header?: string): string[] {
   const out: string[] = []
   if (named !== undefined) out.push(`is named ${named}`)
+  if (header !== undefined) out.push(`is a #! script whose header names ${header}, as pmmcp's own does (a link or copy of an install's script, wherever that install is)`)
   const real = located === undefined ? undefined : realOf(located)
   if (linkedAs !== undefined && real !== undefined && real !== located) out.push(`is a symbolic link to ${real}`)
   const id = located === undefined ? undefined : fileId(located)
@@ -978,9 +1043,12 @@ function checkSpec(spec: RunSpec, env: Readonly<Record<string, string>>, install
   const named = scriptNamed(basename(spec.command))
   const linkedAs = located === undefined ? undefined : scriptLinkedAt(located)
   const matched = located === undefined ? [] : scriptsByIdentity(located, scripts, true)
-  const taken = new Set([named, linkedAs, ...matched.map((m) => m.script)].filter((s): s is string => s !== undefined))
-  // What the operator is told to change: the file, and how it is taken for a script (by its name, as a link, or by identity).
-  const how = (): string => identityWords(located, named, linkedAs, matched).join(', ')
+  // By its content, for a bare name nothing else took for one: a #! script whose header names one is pmmcp's, wherever its install is.
+  const header =
+    !isAbsolute(spec.command) && located !== undefined && named === undefined && linkedAs === undefined && matched.length === 0 ? scriptByHeader(located) : undefined
+  const taken = new Set([named, linkedAs, ...matched.map((m) => m.script), header].filter((s): s is string => s !== undefined))
+  // What the operator is told to change: the file, and how it is taken for a script (by its name, as a link, by identity, or by its header).
+  const how = (): string => identityWords(located, named, linkedAs, matched, header).join(', ')
   if (taken.size > 1) {
     throw refusedByMachine(
       `${step}: the command is taken for both the stop and the start script (named or linked as one, the same file or bytes as the other, or a copy of both): ` +
@@ -1038,6 +1106,179 @@ function checkSpec(spec: RunSpec, env: Readonly<Record<string, string>>, install
   return { program: spec.command, script, ownSession: true, installs: [...dirsOf(spec.command), ...matched.flatMap((m) => dirsOf(m.path))] }
 }
 
+/**
+ * What a spawn failure adds to its message: the file a bare name was spawned
+ * as, then why, with the fix: for ENOENT of a file that is there, its #! line
+ * names an interpreter that is not; for ENOENT of none, it is gone; for
+ * EACCES, it is not executable (its owner's x bit is off), or, with that bit
+ * on, a folder above it or its filesystem keeps it from running.
+ */
+function spawnedAs(command: string, program: string, errno: string): string {
+  const file = program === command ? '' : `: ${command} is ${program}, the first on the child's PATH`
+  const there = fileId(program) !== undefined
+  let why = ''
+  if (errno === 'ENOENT') {
+    why = there
+      ? `; that file is there, so its #! line names an interpreter that is not: fix or remove ${program}, then re-run`
+      : `; no file is at ${program}: put it back (a script of pmmcp's from its git, git -C <its checkout> checkout -- <file>; its .venv with its ./setup.sh), then re-run`
+  } else if (errno === 'EACCES') {
+    let executable = false
+    try {
+      executable = (statSync(program).mode & 0o100) !== 0
+    } catch {
+      executable = false
+    }
+    why = !there
+      ? ''
+      : executable
+        ? `; ${program} is executable, so a folder above it is not searchable or its filesystem does not let it run (mounted noexec): fix that, then re-run`
+        : `; it is not executable: chmod u+x ${program}, then re-run`
+  }
+  return `${file}${why}`
+}
+
+/**
+ * The programs the installer runs by a bare name, each with arguments of a
+ * form its rule lets through (what childPathRefusals hands checkSpec for
+ * it): ls (.env's mode and ACL), ps, pgrep, lsof, plutil, launchctl, docker
+ * and git. None of the arguments names a file.
+ */
+const RUN_BY_NAME: ReadonlyMap<string, readonly string[]> = new Map<string, readonly string[]>([
+  ['ls', ['-lde']],
+  ['ps', ['-o', 'pid=', '-p', '1']],
+  ['pgrep', ['-f', 'scripts/monitor_tui\\.py']],
+  ['lsof', ['-nP', '-iTCP:8766', '-sTCP:LISTEN', '-Fpu']],
+  ['plutil', ['-extract', 'WorkingDirectory', 'raw', '-o', '-', 'com.aibot.pmmcp.plist']],
+  ['launchctl', ['print', 'gui']],
+  ['docker', ['context', 'show']],
+  ['git', ['--no-optional-locks', 'status', '--porcelain']],
+])
+
+/** The programs the installer runs by a bare name (RUN_BY_NAME). */
+export const INSTALLER_PROGRAMS: readonly string[] = [...RUN_BY_NAME.keys()]
+
+/**
+ * The programs pmmcp's own scripts run by name on the child's PATH (setup.sh,
+ * the stop and the start: `#!/usr/bin/env bash`, curl, uv, python3, ollama),
+ * which the installer never runs itself.
+ */
+export const PMMCP_PROGRAMS: readonly string[] = ['bash', 'curl', 'uv', 'python3', 'ollama']
+
+/**
+ * Why a program pmmcp's scripts run would run something else there: the file
+ * its name finds on the child's PATH is the stop or start script by a link's
+ * name, by identity (a hard link, a copy) or by its #! header (scriptByHeader),
+ * or a link to a program the rules
+ * refuse by any name (one that signals, launches or runs program text; bash
+ * may lead to a shell, python3 to a python). Undefined when it is none of
+ * these, or not there.
+ */
+function pmmcpProgramRefusal(name: string, env: Readonly<Record<string, string>>, dirs: ReadonlySet<string>): string | undefined {
+  const located = onChildPath(name, env)
+  if (located === undefined) return undefined
+  const real = realOf(located)
+  const scripts = scriptsIn(new Set([...dirs, dirname(located), ...(real === undefined ? [] : [dirname(real)])]))
+  const linkedAs = scriptLinkedAt(located)
+  const matched = scriptsByIdentity(located, scripts, true)
+  const header = linkedAs === undefined && matched.length === 0 ? scriptByHeader(located) : undefined
+  if (linkedAs !== undefined || matched.length > 0 || header !== undefined) {
+    return (
+      `${name}: pmmcp's own scripts run ${name} by that name, and ${name} on the child's PATH is ${located}, which ${identityWords(located, undefined, linkedAs, matched, header).join(', ')}: ` +
+      'it would run the stop or start script in its place. Remove or rename that file, then re-run; nothing was run'
+    )
+  }
+  const names = programNames(name, located)
+  const resolved = names[1]
+  if (resolved === undefined) return undefined
+  if ((name === 'python3' && PYTHON.test(resolved)) || (name === 'bash' && SHELLS.includes(resolved))) return undefined
+  // pmmcp's scripts hand it arguments: env given one runs a program, launchctl one but print or list changes a service.
+  const why = programRefusal(new Set([resolved]), located, ['--'], false)
+  return why === undefined ? undefined : `${name}: pmmcp's own scripts run ${name} by that name, and ${why}${linkFix(name, located)}; nothing was run`
+}
+
+/**
+ * Before any change, and before a child exists: the machine's refusals the
+ * rules would make of the file each of `programs` finds on the child's PATH
+ * (built from `home`), each naming the file and its fix, in the order given.
+ * A program the installer runs by name (INSTALLER_PROGRAMS) is checked as
+ * checkSpec checks a run of it from `cwd` (a file that is the stop or start
+ * script by link, by identity, compared with the scripts of the default
+ * install, `dirs` and the folders the file is in, or by its #! header, which
+ * needs no folder; a link to a program never run here); one of pmmcp's
+ * (PMMCP_PROGRAMS) by pmmcpProgramRefusal; any other name is a defect. A
+ * name on no entry of the PATH is no refusal here (the preflight names the
+ * ones pmmcp needs). Called again once probes have run, with `ran`, each
+ * refusal says whether its file was one of them.
+ */
+export function childPathRefusals(options: ChildPathOptions): string[] {
+  return pathRefusals(options).map((r) => r.message)
+}
+
+/** What childPathRefusals is given. */
+export interface ChildPathOptions {
+  readonly home: string
+  readonly cwd: string
+  readonly programs: readonly string[]
+  readonly dirs?: readonly string[]
+  /**
+   * Once probes have run (discovery's, before the install they found was
+   * known): the files this runner spawned for each bare name
+   * (Runner.ranByName). A refusal then says whether its file already ran,
+   * never that nothing was run.
+   */
+  readonly ran?: ReadonlyMap<string, ReadonlySet<string>>
+}
+
+/** One of childPathRefusals' refusals, and whether its file already ran (only ever true with `ran`). */
+export interface PathRefusal {
+  readonly message: string
+  readonly ran: boolean
+}
+
+/** How a refusal made once probes have run ends, for a file the runner already ran under that name. */
+export const RAN_ALREADY = 'it already ran'
+
+/** childPathRefusals, with whether each refused file already ran (`ran`). */
+export function pathRefusals(options: ChildPathOptions): PathRefusal[] {
+  const { home, cwd, programs, ran } = options
+  const installs = new Set(options.dirs ?? [])
+  const out: PathRefusal[] = []
+  const push = (name: string, env: Readonly<Record<string, string>>, message: string): void => {
+    if (ran === undefined) {
+      out.push({ message, ran: false })
+      return
+    }
+    // "nothing was run" is the check's word for the run it refused: once probes have run, what is true is whether this file was one of them.
+    const at = onChildPath(name, env)
+    const already = at !== undefined && ran.get(name)?.has(at) === true
+    const tail = already
+      ? `; ${RAN_ALREADY}, as ${name}, among discovery's read-only probes before this install was known, so it may have stopped or started pmmcp: see whether pmmcp runs as you left it`
+      : '; the installer has not run it'
+    out.push({ message: `${message.replace(/; nothing was run$/, '')}${tail}`, ran: already })
+  }
+  for (const name of programs) {
+    const env = childEnv({ HOME: home }, name)
+    if (PMMCP_PROGRAMS.includes(name)) {
+      const why = pmmcpProgramRefusal(name, env, new Set([...installs, join(home, ...DEFAULT_INSTALL), cwd]))
+      if (why !== undefined) push(name, env, why)
+      continue
+    }
+    const args = RUN_BY_NAME.get(name)
+    if (args === undefined) throw refused(`${name} is not a program the installer runs by name, so its file on the child's PATH is not checked here`)
+    try {
+      checkSpec({ step: name, command: name, args, cwd }, env, installs)
+    } catch (e) {
+      if (e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_SPAWN') continue
+      if (e instanceof InstallRunError && e.machine) {
+        push(name, env, e.message)
+        continue
+      }
+      throw e
+    }
+  }
+  return out
+}
+
 /** The UTC stamp a run's folder is named by: 20261029T054506Z. */
 export function stampOf(at: Date): string {
   return at.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')
@@ -1063,19 +1304,46 @@ function makeDirectory(path: string): boolean {
     mkdirSync(path, { mode: 0o700 })
   } catch (e) {
     if (errnoOf(e) === 'EEXIST') return false
-    throw refusedByMachine(`cannot make ${path} (${errnoOf(e)})`)
+    throw refusedByMachine(`cannot make ${path} (${errnoOf(e)}): make its folder yours to write in (chown, chmod u+rwx), then re-run`)
   }
   chmodSync(path, 0o700)
   return true
 }
 
-/** A directory the logs may go beneath: one, not a link, this account's, and no one else's to write in. */
+/**
+ * A directory the logs may go beneath: one, not a link, this account's, its
+ * own to read, write and search (u+rwx: one of 0500 refuses the run folder's
+ * mkdir, and one of 0000 every read of active.json, which would then pass for
+ * an unreadable record), and no one else's to write in.
+ */
 function checkDirectory(path: string): void {
   const st = lstatSync(path)
   if (st.isSymbolicLink() || !st.isDirectory()) throw refusedByMachine(`${path} is not a directory (a link is not one): the installer writes its logs only beneath a real one`)
   const me = euid()
-  if (me !== undefined && st.uid !== me) throw refusedByMachine(`${path} belongs to uid ${String(st.uid)}, not this account`)
+  if (me !== undefined && st.uid !== me) throw refusedByMachine(`${path} belongs to uid ${String(st.uid)}, not you (uid ${String(me)}): fix its owner (chown) and re-run`)
+  if ((st.mode & 0o700) !== 0o700) throw refusedByMachine(`${path} is mode ${(st.mode & 0o7777).toString(8).padStart(4, '0')}, which keeps you from writing in it: chmod u+rwx ${path}, then re-run`)
   if ((st.mode & 0o022) !== 0) throw refusedByMachine(`${path} is writable by group or others: chmod go-w ${path}, then re-run`)
+}
+
+/**
+ * The log folder's two levels, <repo>/.aos and <repo>/.aos/install, held to
+ * the rules the runner's first child meets (checkDirectory), without making
+ * either: for the preflight, and for discovery before it reads active.json,
+ * so a folder of another account's (whose active.json no read can open) is
+ * refused as what it is, the machine's, naming the owner and the fix, never
+ * as a record an earlier run left. One not there yet is no refusal: the
+ * runner makes it 0700.
+ */
+export function checkLogFolder(repoRoot: string): void {
+  for (const dir of [join(repoRoot, '.aos'), installDir(repoRoot)]) {
+    try {
+      lstatSync(dir)
+    } catch (e) {
+      if (errnoOf(e) === 'ENOENT') return
+      throw refusedByMachine(`cannot examine ${dir} (${errnoOf(e)})`)
+    }
+    checkDirectory(dir)
+  }
 }
 
 /** Create a log file: 0600, exclusive, never through a link, appended to by the child. */
@@ -1358,6 +1626,8 @@ export class Runner {
   readonly #steps = new Set<string>()
   /** Every folder this runner has run the stop or start script from: later commands are compared with the scripts there. */
   readonly #installs = new Set<string>()
+  /** The files spawned for each bare name: a refusal made once probes have run says whether its file was one (pathRefusals). */
+  readonly #ran = new Map<string, Set<string>>()
   #halted: string | undefined
 
   constructor(options: RunnerOptions) {
@@ -1376,6 +1646,11 @@ export class Runner {
   /** Why nothing more is run, once a child's output held a registered value. */
   get halted(): string | undefined {
     return this.#halted
+  }
+
+  /** The files this runner spawned for each bare program name, a spawn that never started (ENOENT, EACCES) left out. */
+  ranByName(): ReadonlyMap<string, ReadonlySet<string>> {
+    return new Map([...this.#ran].map(([name, files]) => [name, new Set(files)]))
   }
 
   /**
@@ -1452,13 +1727,14 @@ export class Runner {
     } catch (e) {
       const left = claim === undefined ? undefined : this.#release(claim)
       if (e instanceof InstallRunError && left === undefined) throw e
-      throw new InstallRunError('AOS_INSTALL_RUN_SPAWN', `${step}: ${spec.command} could not be started (${errnoOf(e)})${left === undefined ? '' : `; ${left}`}`, step)
+      throw new InstallRunError('AOS_INSTALL_RUN_SPAWN', `${step}: ${spec.command} could not be started (${errnoOf(e)})${spawnedAs(spec.command, program, errnoOf(e))}${left === undefined ? '' : `; ${left}`}`, step)
     } finally {
       // The child holds its own copies.
       closeSync(outFd)
       closeSync(errFd)
     }
     const pid = child.pid
+    if (pid !== undefined && !isAbsolute(spec.command)) this.#ran.set(spec.command, new Set([...(this.#ran.get(spec.command) ?? []), program]))
     let activeError: string | undefined
     if (claim !== undefined) {
       // No pid: the spawn failed, and its 'error' comes next, so nothing here may throw past the listeners below.
@@ -1542,7 +1818,7 @@ export class Runner {
         if (settled) return
         settled = true
         stopTimers()
-        reject(new InstallRunError('AOS_INSTALL_RUN_SPAWN', `${step}: ${spec.command} could not be started (${errnoOf(e)})`, step))
+        reject(new InstallRunError('AOS_INSTALL_RUN_SPAWN', `${step}: ${spec.command} could not be started (${errnoOf(e)})${spawnedAs(spec.command, program, errnoOf(e))}`, step))
       })
       child.once('exit', (code, signal) => {
         finish(code, signal, true)
@@ -1594,7 +1870,7 @@ export class Runner {
       this.#dir = dir
       return dir
     }
-    throw refusedByMachine(`${installDir(this.repoRoot)} already holds 100 runs stamped ${stamp}`)
+    throw refusedByMachine(`${installDir(this.repoRoot)} already holds 100 runs stamped ${stamp}: remove the ones you no longer need, then re-run`)
   }
 
   #uniqueStep(step: string): string {
@@ -1612,7 +1888,7 @@ export class Runner {
       return fd
     } catch (e) {
       if (errnoOf(e) === 'EEXIST') throw this.#busy(step, readActive(this.repoRoot))
-      throw refusedByMachine(`${step}: cannot create ${activePath(this.repoRoot)} (${errnoOf(e)}); nothing was run`, step)
+      throw refusedByMachine(`${step}: cannot create ${activePath(this.repoRoot)} (${errnoOf(e)}): make ${installDir(this.repoRoot)} yours to write in (chown, chmod u+rwx), then re-run; nothing was run`, step)
     }
   }
 

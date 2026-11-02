@@ -71,7 +71,11 @@
 //   digest. inspectCredentials reports each such name it is asked about
 //   (`damaged`), and appendCredentials refuses to write after one, so a token
 //   cut to 8 to 63 characters, which the kernel would still send, never has
-//   its digest staged as pmmcp's bearer.
+//   its digest staged as pmmcp's bearer. A write cut short inside the name
+//   (the file's last line, with no final newline, the start of a minted name
+//   or all of it with no `=`) is refused by both calls before the loader's
+//   reading, by its line and in the same words ("looks cut short ... delete
+//   that line and re-run"), never as the loader's bare "not NAME=value".
 //
 //   What it refuses, changing nothing: running as root (the file would be
 //   root's, and the daemon run as the operator refuses it); a .gitignore that
@@ -354,9 +358,9 @@ export function inspectCredentials(options: InspectOptions): InspectResult {
     return { path, found: false, present: [], blank: [], missing: names, ...none, writable: mayCreateIn(dirname(path), uid), fits: size <= DOTENV_MAX_BYTES, digests: [] }
   }
   try {
-    const held = readHeld(fd, path, names, options.accepted, uid)
-    const size = held.before.size + (held.missing.length > 0 ? leadOf(held.buf).length + assignedBytes(held.missing, length) : 0)
     const minted = new Set(options.minted ?? [])
+    const held = readHeld(fd, path, names, options.accepted, uid, minted)
+    const size = held.before.size + (held.missing.length > 0 ? leadOf(held.buf).length + assignedBytes(held.missing, length) : 0)
     const damaged = cutShort(held, [...new Set([...names, ...wanted])].filter((name) => minted.has(name)))
     const cut = new Set(damaged.map((d) => d.name))
     return {
@@ -410,7 +414,7 @@ function append(path: string, options: AppendOptions, progress: Progress): Appen
   // Held open to the end, so the inode read cannot be freed and its number
   // handed to a new file that would then pass for it.
   try {
-    const held = readHeld(fd, path, options.generate.keys(), options.accepted, uid)
+    const held = readHeld(fd, path, options.generate.keys(), options.accepted, uid, options.generatable)
     const { buf, text, present, blank, missing } = held
     // A token cut short by an earlier write that did not finish: nothing is written after it (a new line would end it, and it
     // would pass for whole), and it has no digest. Every minted name is judged, whether asked for or not.
@@ -462,6 +466,20 @@ function cutShort(held: Pick<Held, 'parsed'>, names: readonly string[]): NameLin
     if (got !== undefined && shape.test(got.value)) out.push({ name, line: got.line })
   }
   return out
+}
+
+/**
+ * A write cut short inside a name: the file's last line, with no final
+ * newline, is the start of a name the AOS mints, or all of it with no `=`,
+ * which is what an append that stopped before the value leaves. By its line,
+ * named as the line holds it (the start of a name, never a value).
+ */
+function cutInName(text: string, minted: ReadonlySet<string>): NameLine | undefined {
+  const lines = text.split('\n')
+  // After a final newline the last piece is empty: a line the newline ended is no write cut short in its name.
+  const last = lines.at(-1) ?? ''
+  if (last === '' || ![...minted].some((name) => name.startsWith(last))) return undefined
+  return { name: last, line: lines.length }
 }
 
 /** What is said of tokens cut short: each by line and name, never its value, with the fix. */
@@ -600,7 +618,7 @@ interface Held {
   readonly missing: string[]
 }
 
-function readHeld(fd: number, path: string, names: Iterable<string>, accepted: ReadonlySet<string>, uid: number): Held {
+function readHeld(fd: number, path: string, names: Iterable<string>, accepted: ReadonlySet<string>, uid: number, minted: ReadonlySet<string>): Held {
   let before: Stats
   try {
     before = fstatSync(fd)
@@ -612,6 +630,9 @@ function readHeld(fd: number, path: string, names: Iterable<string>, accepted: R
   refuseLikeTheLoader(before, path, uid)
   const buf = readAll(fd, before.size, path)
   const text = decode(buf, path)
+  // A write cut short inside a minted name leaves a line the loader calls "not NAME=value": said as what it is, with its fix.
+  const torn = cutInName(text, minted)
+  if (torn !== undefined) throw new ConfigError(`${cutShortMessage(path, [torn])}. Nothing was written`)
   // Any line the loader refuses stops here: its message names line numbers
   // only, and the operator fixes the file by hand.
   const parsed = parseDotenv(text, accepted, path)

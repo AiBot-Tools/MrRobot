@@ -104,9 +104,17 @@
 //        (an lsof that fails is a check that could not be made, never "no
 //        server listens", and leaves whether the digest loaded not known);
 //        pmmcp-qdrant running; the worker and scraper PID files naming live
-//        processes; after L3, `status --json` verdict `enforced` (any other
-//        names the rollback); after L4 left a usable dashboard token,
-//        auth_required and a 401 for an unauthenticated /api/fingerprint;
+//        processes; after L3 (or a fresh install's init), `status --json`
+//        verdict `enforced`, asked once more when a read gives no document
+//        (one failed read is no failed start), and the advice by what made
+//        the key: after a cutover, its rollback for a verdict read and not
+//        enforced, and for one that could not be read, check first and roll
+//        back only on a verdict that says it failed (the cutover's undo line
+//        is held back from the ways back until a read says so); after init,
+//        what to check and that the key file is removed only with pmmcp
+//        stopped, never a rollback (there is no prekey); after L4 left a
+//        usable dashboard token, auth_required and a 401 for an
+//        unauthenticated /api/fingerprint;
 //        after L4 left a usable curator secret with the curator enabled, a
 //        401 from :8767/api/curator/status. A probe that gets no answer
 //        shows the last "refused to start" lines of server.log, the stderr
@@ -173,9 +181,29 @@
 //   it is on file but no stop or start ran this run (run the installer again
 //   and accept the restart; for a pmmcp that is not running, its next start),
 //   and the steps about pmmcp only for a pmmcp this run touched (not with
-//   --aos-only, nor with --no-install and none installed). The bearer and
-//   Qdrant lines give what was read after the window, or say they could not
-//   check, with what was read before it said as that.
+//   --aos-only, nor with --no-install and none installed). After a stop
+//   that refused its arguments (exit 2) or never ran, never "run it again
+//   and accept the restart": exit 2 is a refusal to report (the installer
+//   gives the stop no arguments, so pmmcp's stop script may have changed),
+//   one of the installer's own rules a defect to report (a re-run meets the
+//   same refusal), and, when the machine's state kept it from running (a
+//   file, a step still running, a spawn that failed), the fix its line names
+//   and then a re-run. After a stop that did not stop and a start
+//   again whose checks passed, a re-run to finish what was not reached (the
+//   chosen changes, and the restart that loads the digest when it is not
+//   known loaded). The bearer and Qdrant lines give what was read after the
+//   window, or say they could not check (with the reason, and with no "after
+//   this run's stop" when no stop ran), with what was read before it said as
+//   that; after a leak once the stop began, a verdict read before it is
+//   never shown as current: inside the stretch it is listed under "not
+//   checked", after the start's checks passed it is said as not read again.
+//
+//   A probe the runner refuses for the machine's state (InstallRunError.
+//   machine: a file on the child's PATH that the preflight's check of every
+//   program did not see, put there since or reached only now) is printed with
+//   the fix its message names and reported as a failed item, so the phase
+//   ends with exit 1 at least (4 inside the window, as its steps say), never
+//   done with only a check that "cannot be told" to show for it.
 //
 //   Exit codes (Applied): 0 done; 1 a step failed and the state is as
 //   reported (a non-live step; a live item that changed nothing, or a leak
@@ -338,7 +366,14 @@ class End {
   }
 }
 
-type Ran = { readonly ok: true; readonly result: RunResult } | { readonly ok: false; readonly why: string; readonly result?: RunResult }
+/**
+ * A child's run, or why there is none. `refused` says, for a run the runner
+ * never started, whose that was: the machine's (InstallRunError.machine, or
+ * a spawn that failed: a file to fix) or a defect of the installer's.
+ */
+type Ran =
+  | { readonly ok: true; readonly result: RunResult }
+  | { readonly ok: false; readonly why: string; readonly result?: RunResult; readonly refused?: 'machine' | 'defect' }
 
 type Listening = { readonly state: 'none' } | { readonly state: 'listening'; readonly pids: readonly { readonly pid: number; readonly uid: number | undefined }[] } | { readonly state: 'unknown'; readonly why: string }
 
@@ -553,6 +588,12 @@ export class Applier {
   #qdrant: QdrantStatus | undefined
   /** L3's enable (or a fresh install's init) made the key: L5 then wants verdict enforced. */
   #keyed = false
+  /** Which made it: a cutover (enable, which a rollback undoes) or a fresh install's init (no prekey: nothing to roll back to). */
+  #keyedBy: 'enable' | 'init' | undefined
+  /** The cutover's own undo line, among #undo: advice only once its failure is real (#offerRollback). */
+  #cutoverUndo: string | undefined
+  /** The start's checks could not read Qdrant's verdict, twice: its rollback is not advised until a read says it is not enforced. */
+  #verdictUnknownAtStart = false
   /** What L4 chose and auth status said afterwards. */
   readonly #chosen = new Set<AuthFile>()
   #auth: AuthStatus | undefined
@@ -575,6 +616,16 @@ export class Applier {
   #qdrantUnread: string | undefined
   /** The stop ran (its result came back): the server discovery found may be gone. */
   #stopRan = false
+  /** The stop's turn came but it stopped nothing: it refused its arguments (exit 2) or never ran (refused, or not started), and whose that is. */
+  /**
+   * The stop never stopped anything: it refused its arguments (exit 2: the installer gave it none, so pmmcp's stop changed), or it
+   * did not run, for a defect of the installer's or for the machine's state (a file to fix, a spawn that failed, a busy record).
+   */
+  #stopNotRun: { readonly why: string; readonly by: 'interface' | 'defect' | 'machine' } | undefined
+  /** "start pmmcp again?" after a stop that did not stop was answered yes, and that start's checks passed. */
+  #startedAgain = false
+  /** The handed steps a phase skipped as not reached. */
+  readonly #notReached: Step[] = []
   #staleCleared = false
   #leak: { readonly step: string | undefined; readonly what: string; readonly live: boolean } | undefined
   /** How to undo each change this run made by hand: printed when a later step fails, and in the report then. */
@@ -649,6 +700,7 @@ export class Applier {
     for (const step of steps) {
       if (this.#reached.has(step)) continue
       this.#reached.add(step)
+      this.#notReached.push(step)
       this.#item(step.short, 'skipped', `not reached: ${notReached}`)
     }
     // An existing .env is looked at once a run, whether or not this run wrote it (S8: its mode and any ACL).
@@ -1018,11 +1070,13 @@ export class Applier {
     this.#liveBegun = true
     const ran = await this.#exec({ step: 'stop', command: join(dir, STOP_SCRIPT), args: [], cwd: dir }, `L1 ${STOP_SCRIPT}`)
     if (!ran.ok && ran.result === undefined) {
+      this.#stopNotRun = { why: 'did not run', by: ran.refused === 'defect' ? 'defect' : 'machine' }
       this.#item(step.short, 'failed', `${ran.why}: nothing was stopped`)
       throw new End(1, 'the stop did not run, so nothing was stopped')
     }
     const code = ran.result?.code ?? null
     if (code === 2) {
+      this.#stopNotRun = { why: 'refused its arguments (exit 2)', by: 'interface' }
       this.#item(step.short, 'failed', `${STOP_SCRIPT} refused its arguments (exit 2): nothing was stopped`)
       throw new End(1, 'the stop refused its arguments, so nothing was stopped')
     }
@@ -1092,6 +1146,7 @@ export class Applier {
     this.#started = true
     const health = await this.#health(this.#factsNow())
     if (ran.ok && ran.result.code === 0 && health === 200) {
+      this.#startedAgain = true
       this.#item('start pmmcp again', 'done', '/health answers 200; none of the chosen changes was made')
       return
     }
@@ -1265,11 +1320,13 @@ export class Applier {
     const ran = await this.#exec({ step: 'qdrant-enable', command: this.#python(dir), args: [script, 'enable'], cwd: dir, ownSession: true }, 'L3 qdrant_api_key.py enable')
     if (ran.ok && ran.result.code === 0) {
       this.#keyed = true
+      this.#keyedBy = 'enable'
       this.#written = true
       // Discovery's verdict was the keyless container's: only a status --json read after the start says what holds now.
       this.#qdrant = undefined
       this.#item(step.short, 'done', 'a new pmmcp-qdrant with the key; the old one kept, stopped, as pmmcp-qdrant-prekey')
-      this.#undo.push(`to undo the Qdrant cutover: ${this.#qdrantRollback(dir)}`)
+      this.#cutoverUndo = `to undo the Qdrant cutover: ${this.#qdrantRollback(dir)}`
+      this.#undo.push(this.#cutoverUndo)
       return
     }
     const code = ran.result?.code ?? null
@@ -1294,6 +1351,7 @@ export class Applier {
     const ran = await this.#exec({ step: 'qdrant-init', command: this.#python(dir), args: ['scripts/qdrant_api_key.py', 'init'], cwd: dir, ownSession: true }, 'qdrant_api_key.py init')
     if (ran.ok && ran.result.code === 0) {
       this.#keyed = true
+      this.#keyedBy = 'init'
       this.#qdrant = undefined
       this.#item(step.short, 'done', '~/.persistent-memory-mcp/qdrant_api_key is there: the start creates pmmcp-qdrant with it')
       return
@@ -1424,14 +1482,19 @@ export class Applier {
     }
 
     if (this.#keyed) {
-      const status = await this.#qdrantStatus(dir)
-      if (status === undefined) failed.push(`Qdrant's status --json cannot be had, so whether it enforces the key is not known; to undo the cutover: ${this.#qdrantRollback(dir)}`)
-      else {
+      const read = await this.#keyedStatus(dir)
+      if ('why' in read) {
+        // No verdict is no failure of the key's: the advice is to check first, and the rollback waits on a read that says it failed.
+        this.#qdrantUnread = read.why
+        this.#verdictUnknownAtStart = true
+        failed.push(`Qdrant's status --json cannot be had (${read.why}), so whether it enforces the key is not known: ${this.#keyedAdvice(dir, undefined)}`)
+      } else {
+        const status = read.status
         this.#qdrant = status
         this.#qdrantFresh = true
         this.#qdrantUnread = undefined
         if (status.verdict === 'enforced') passed.push('Qdrant verdict enforced')
-        else failed.push(`Qdrant's verdict is ${status.verdict}, not enforced; to undo the cutover: ${this.#qdrantRollback(dir)}`)
+        else failed.push(`Qdrant's verdict is ${status.verdict}, not enforced: ${this.#keyedAdvice(dir, status.verdict)}`)
       }
     }
 
@@ -1475,9 +1538,10 @@ export class Applier {
     else this.#print('the start did not run: pmmcp is stopped, and launchd stays disabled until the start script runs. Once what failed is fixed, start it:')
     this.#print(`  ${within(dir, './start-pmmcp-server.sh')}`)
     this.#todo.push(`once what failed is fixed: ${within(dir, './start-pmmcp-server.sh')}`)
-    if (this.#undo.length > 0) {
+    const ways = this.#undoLines()
+    if (ways.length > 0) {
       this.#print('or go back on what this window changed:')
-      for (const way of this.#undo) this.#print(`  ${way}`)
+      for (const way of ways) this.#print(`  ${way}`)
     }
     throw new End(4, 'the start, or a check after it, failed')
   }
@@ -1531,16 +1595,15 @@ export class Applier {
     }
   }
 
-  async #qdrantStatus(dir: string): Promise<QdrantStatus | undefined> {
-    const read = await this.#readQdrant(dir)
-    return 'status' in read ? read.status : undefined
-  }
-
   /** `status --json`, or why there is no document. */
   async #readQdrant(dir: string): Promise<{ readonly status: QdrantStatus } | { readonly why: string }> {
     const ran = await this.#exec({ step: 'qdrant-status', command: this.#python(dir), args: ['-B', 'scripts/qdrant_api_key.py', 'status', '--json'], cwd: dir, timeoutMs: PYTHON_MS })
     if (!ran.ok) return { why: ran.why }
-    if (ran.result.code !== 0) return { why: `qdrant_api_key.py status --json exited ${String(ran.result.code)}` }
+    if (ran.result.code !== 0) {
+      // Its interface puts a `failed:` line on stderr (docker cannot be asked): shown, never parsed, as the facts' is.
+      const err = this.#tailOf(ran.result.err, 1)
+      return { why: `qdrant_api_key.py status --json exited ${String(ran.result.code)}${err.length > 0 ? `: ${err.join(' ')}` : ''}` }
+    }
     try {
       return { status: parseQdrantStatus(this.#out(ran.result) ?? '') }
     } catch (e) {
@@ -1551,6 +1614,56 @@ export class Applier {
 
   #qdrantRollback(dir: string): string {
     return `${within(dir, './stop-pmmcp-server.sh')}, then .venv/bin/python scripts/qdrant_api_key.py rollback, then ./start-pmmcp-server.sh`
+  }
+
+  /**
+   * After the start, the key's verdict: status --json, read once more when
+   * the first read gives no document (a docker that was slow to answer just
+   * after the start), so one failed read is not taken for a failed start.
+   */
+  async #keyedStatus(dir: string): Promise<{ readonly status: QdrantStatus } | { readonly why: string }> {
+    const first = await this.#readQdrant(dir)
+    if (!('why' in first)) return first
+    this.#print(`Qdrant's status --json gave no document after the start (${first.why}): asking it once more`)
+    const second = await this.#readQdrant(dir)
+    return 'why' in second ? { why: `${first.why}; then ${second.why}` } : second
+  }
+
+  /**
+   * What to do when the start's checks did not see the key enforced, by
+   * what made it and whether a verdict was read: after a cutover whose
+   * verdict was read and is not enforced, its rollback (a real failure);
+   * after one whose verdict could not be read, check first, the rollback
+   * only on a verdict that says it failed; after a fresh install's init, no
+   * rollback at all (there is no prekey to go back to): what to check, and
+   * that the key file is removed only with pmmcp stopped.
+   */
+  #keyedAdvice(dir: string, verdict: string | undefined): string {
+    const status = within(dir, '.venv/bin/python scripts/qdrant_api_key.py status')
+    if (this.#keyedBy === 'init') {
+      return (
+        `check it with ${status}${verdict === undefined ? '' : ', which says what it found'}. No cutover ran, so there is nothing to roll back: ` +
+        `the key file init made, ~/.persistent-memory-mcp/qdrant_api_key, is removed only with pmmcp stopped (${within(dir, './stop-pmmcp-server.sh')} first, then rm ~/.persistent-memory-mcp/qdrant_api_key)`
+      )
+    }
+    if (verdict === undefined) return `check it with ${status}, and undo the cutover only if that says it is not enforced: ${this.#qdrantRollback(dir)}`
+    return `to undo the cutover: ${this.#qdrantRollback(dir)}`
+  }
+
+  /** Whether the Qdrant verdict on hand is discovery's, from before this run's stop began, which a leak kept from being read again since. */
+  #qdrantStale(): boolean {
+    return this.#leak !== undefined && this.#liveBegun && !this.#qdrantFresh
+  }
+
+  /** Whether the cutover's rollback is advice: not while the start could not read its verdict and no read since says it failed. */
+  #offerRollback(): boolean {
+    if (!this.#verdictUnknownAtStart) return true
+    return this.#qdrantFresh && this.#qdrant !== undefined && this.#qdrant.verdict !== 'enforced'
+  }
+
+  /** The ways back on what this run changed, the cutover's only as #offerRollback says. */
+  #undoLines(): string[] {
+    return this.#undo.filter((u) => u !== this.#cutoverUndo || this.#offerRollback())
   }
 
   /**
@@ -1759,7 +1872,15 @@ export class Applier {
       } catch (e) {
         if (e instanceof InstallRunError && e.code !== 'AOS_INSTALL_RUN_LEAK' && e.code !== 'AOS_INSTALL_RUN_HALTED') {
           if (label !== undefined) this.#print(`${label}: not run: ${e.message}`)
-          return { ok: false, why: e.message }
+          else if (e.machine) {
+            // A probe refused for a file of the machine's (one the preflight did not see: put there since, or reached only now): said
+            // with its fix, and a failed item, so the run never ends done with only "cannot be told" to show for it.
+            this.#print(`not run: ${e.message}`)
+            this.#item(`${spec.step}, refused by the runner's rules`, 'failed', e.message)
+          }
+          // A file to fix, a spawn that failed, or a step an earlier run left in its own session: the machine's state, not the installer's code.
+          const machine = e.machine || e.code === 'AOS_INSTALL_RUN_SPAWN' || e.code === 'AOS_INSTALL_RUN_BUSY'
+          return { ok: false, why: e.message, refused: machine ? 'machine' : 'defect' }
         }
         throw e
       }
@@ -2118,19 +2239,32 @@ export class Applier {
         out.push(`  ${PMMCP_CLIENT} digest matches .env: ${yes(this.#digestOnFile)}; loaded by the running server: ${yes(this.#digestOnFile === true ? this.#loaded : undefined)}`)
       }
       const q = this.#qdrant
-      if (q !== undefined && this.#qdrantUnread !== undefined) {
-        // A stop that did not stop, with the start declined, ran no start: only the stop is named then.
-        const ran = this.#started ? ['stop and start', 'them'] : ['stop', 'it']
-        out.push(
-          `qdrant: could not check after this run's ${ran[0] ?? ''} (${shownLine(this.#qdrantUnread)}); before ${ran[1] ?? ''} its verdict was ${q.verdict}: ` +
-            within(dir, '.venv/bin/python scripts/qdrant_api_key.py status'),
-        )
+      const status = within(dir, '.venv/bin/python scripts/qdrant_api_key.py status')
+      if (this.#qdrantStale()) {
+        // Read before the stop, and not again since: never shown as what holds now. After a leak inside the window the "not checked"
+        // line below lists it; after one once the start's checks passed (no such line), it is said here.
+        if (this.#leak?.live !== true && q !== undefined) {
+          out.push(`qdrant: not read again after this run's stop (the defect below stopped the run first); before the stop its verdict was ${q.verdict}: ${status}`)
+        }
+      } else if (q !== undefined && this.#qdrantUnread !== undefined) {
+        if (this.#stopRan) {
+          // A stop that did not stop, with the start declined, ran no start: only the stop is named then.
+          const ran = this.#started ? ['stop and start', 'them'] : ['stop', 'it']
+          out.push(`qdrant: could not check after this run's ${ran[0] ?? ''} (${shownLine(this.#qdrantUnread)}); before ${ran[1] ?? ''} its verdict was ${q.verdict}: ${status}`)
+        } else {
+          // No stop ran (it refused its arguments, or never ran): nothing of this run's came between discovery's read and this one.
+          out.push(`qdrant: could not check (${shownLine(this.#qdrantUnread)}); when discovery read it, its verdict was ${q.verdict}: ${status}`)
+        }
       } else if (q !== undefined) {
         out.push(`qdrant: verdict ${q.verdict}`)
         if (q.prekey_kept) out.push(`  pmmcp-qdrant-prekey kept; remove it later with ${within(dir, '.venv/bin/python scripts/qdrant_api_key.py cleanup')}`)
       } else if (this.#keyed) {
         // The key was made this run, and no status --json was read since: the verdict from before the key no longer holds.
-        out.push(`qdrant: verdict not known (no status --json was read after the key was made): ${within(dir, '.venv/bin/python scripts/qdrant_api_key.py status')}`)
+        const why =
+          this.#qdrantUnread === undefined
+            ? 'no status --json was read after the key was made'
+            : `could not check after this run's ${this.#started ? 'start' : 'key was made'}: ${shownLine(this.#qdrantUnread)}`
+        out.push(`qdrant: verdict not known (${why}): ${status}`)
       }
       const dash = this.#auth?.dashboard_token.state ?? facts?.dashboard_token.state
       if (dash === 'present') out.push(`dashboard: open it with ${within(dir, '.venv/bin/python -m src.dashboard.auth open')}`)
@@ -2141,19 +2275,27 @@ export class Applier {
     if (leak !== undefined) {
       out.push(`stopped by a defect: ${leak.what}`)
       if (leak.live && dir !== undefined) {
-        out.push(
-          `  not checked: what listens on ${list([PMMCP_PORTS.server, PMMCP_PORTS.dashboard, PMMCP_PORTS.curator].map(String))}, whether ${QDRANT_CONTAINER} runs, ` +
-            'the PID files under ~/.persistent-memory-mcp/pids, and /health',
-        )
+        const q = this.#qdrant
+        // Discovery's verdict, from before the stop, is one more check not made: listed with what it was, never shown as current.
+        const verdict = this.#qdrantStale() && (q !== undefined || this.#keyed) ? [`Qdrant's verdict${q === undefined ? '' : ` (${q.verdict} before the stop)`}`] : []
+        const checks = [
+          `what listens on ${list([PMMCP_PORTS.server, PMMCP_PORTS.dashboard, PMMCP_PORTS.curator].map(String))}`,
+          `whether ${QDRANT_CONTAINER} runs`,
+          'the PID files under ~/.persistent-memory-mcp/pids',
+          '/health',
+          ...verdict,
+        ]
+        out.push(`  not checked: ${list(checks)}`)
       }
     }
     if (this.#todo.length > 0) {
       out.push('to do by hand:')
       for (const t of this.#todo) out.push(`  ${t}`)
     }
-    if (this.#undo.length > 0 && this.#items.some((i) => i.state === 'failed')) {
+    const ways = this.#undoLines()
+    if (ways.length > 0 && this.#items.some((i) => i.state === 'failed')) {
       out.push('to go back on what this run changed:')
-      for (const u of this.#undo) out.push(`  ${u}`)
+      for (const u of ways) out.push(`  ${u}`)
     }
 
     out.push('next steps:')
@@ -2162,7 +2304,26 @@ export class Applier {
     else if (this.#daemonRestartNeeded()) out.push('  restart npm run dev (it reads .env when it starts), and check that its credentials line names the tokens and that the hub is ok')
     // The digest is on file but no restart this run loaded it (a decline, a wrong word, an abort before the stop): how it gets loaded.
     const d = this.#o.discovery
-    if (plan.kind === 'found' && d?.kind === 'found' && this.#digestOnFile === true && this.#loaded !== true && !this.#stopRan && !this.#started && dir !== undefined) {
+    const unloaded = `the ${PMMCP_CLIENT} digest`
+    const stopNotRun = this.#stopNotRun
+    if (stopNotRun !== undefined) {
+      // Never a restart to accept: a refusal a re-run would meet again is to report, and what kept the stop from running is fixed first.
+      const loads = this.#digestOnFile === true && this.#loaded !== true ? `; pmmcp's running MCP server loads ${unloaded} only when pmmcp next restarts` : ''
+      const next: Record<typeof stopNotRun.by, string> = {
+        interface: "a refusal the installer cannot fix by running again: report it (the installer gave it no arguments, so pmmcp's stop script may have changed)",
+        defect: "a defect of the installer's, so report it rather than run the installer again, which would meet the same refusal",
+        machine: 'fix what its line above names, then run npm run aos-install again',
+      }
+      out.push(`  the stop ${stopNotRun.why}, so nothing was stopped or started: ${next[stopNotRun.by]}${loads}`)
+    }
+    if (this.#startedAgain) {
+      // pmmcp is back up, and the chosen changes were not made: what a re-run finishes once the stop stops pmmcp.
+      const left = this.#notReached.filter((s) => s.id === 'update' || s.id === 'qdrant-enable' || s.id === 'auth-init').map((s) => shownLine(s.short))
+      // As #daemonRestartNeeded reads it: a digest the server before the stop had loaded, and this run did not stage again, is loaded either way.
+      if (this.#digestOnFile === true && this.#loaded !== true && (this.#digestStaged || this.#loadedBefore !== true)) left.push(`the restart that loads ${unloaded}`)
+      if (left.length > 0) out.push(`  once what kept the stop from stopping pmmcp is fixed (above), run npm run aos-install again to finish what this run did not reach: ${list(left)}`)
+    }
+    if (plan.kind === 'found' && d?.kind === 'found' && this.#digestOnFile === true && this.#loaded !== true && !this.#liveBegun && !this.#started && dir !== undefined) {
       const server = `pmmcp's running MCP server ${this.#loaded === false ? 'has not loaded' : 'may not have loaded'} the ${PMMCP_CLIENT} digest`
       // A re-run offers the restart only where this one could: with the jobs check unavailable it offered none, and the notes say why.
       const offered = plan.offers.some((o) => o.live)

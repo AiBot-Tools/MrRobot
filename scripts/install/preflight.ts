@@ -27,7 +27,11 @@
 //   cache names it, and git ignores only the root's /.aos/); no falsify run
 //   holds the tree (src/falsify-hold.ts); Node within package.json's engines;
 //   node_modules there; .gitignore ignoring .env and /.aos/ (git's rules,
-//   src/gitignore.ts), and .aos spelled so and not a link. Then, names only,
+//   src/gitignore.ts), and .aos spelled so and not a link, and .aos and
+//   .aos/install, when there, held to the runner's rules for its log folder
+//   (scripts/install/run.ts checkLogFolder: this account's, u+rwx, not
+//   writable by group or others; one of another account's is named with its
+//   owner and the chown fix). Then, names only,
 //   which of DOCKER_CONFIG, DOCKER_HOST, DOCKER_CONTEXT and PMMCP_* the
 //   shell exports (pmmcp's commands run without them). Unless --aos-only,
 //   the programs pmmcp and its scripts call, found on the PATH the runner
@@ -43,7 +47,19 @@
 //   shell runs nothing here (scripts/install/run.ts), and macOS's /bin/bash
 //   is 3.2, which pmmcp's setup.sh had to be fixed for (plan P2b). The system
 //   line names the macOS version (SystemVersion.plist) and the Darwin
-//   release. Every command or path in a fix is shell-quoted.
+//   release. Last, with HOME usable, every program the run will start
+//   (scripts/install/run.ts INSTALLER_PROGRAMS, or with --aos-only ls and ps
+//   alone) and, unless --aos-only, every one pmmcp's scripts run by name
+//   (PMMCP_PROGRAMS: bash, curl, uv, python3, ollama) is resolved on the
+//   child's PATH and held to the runner's rules without running it
+//   (childPathRefusals): a file there that is the stop or start script by a
+//   link, by identity with the default install's or --pmmcp-dir's, or by its
+//   #! header (pmmcp's two name themselves on their second line), wherever
+//   its install is, or a link to a program never run, is a refusal naming the
+//   file and its fix, so it stops the run here, before the lock, .env or any
+//   child (H4). With --aos-only the programs line says their presence is not
+//   checked and that ls and ps are held to those rules. Every command or path
+//   in a fix is shell-quoted.
 
 import { accessSync, closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from 'node:fs'
 import { arch, release, type, userInfo } from 'node:os'
@@ -56,7 +72,7 @@ import { falsifyRefusal } from '../../src/falsify-hold.js'
 import { rootGitignoreIgnores } from '../../src/gitignore.js'
 import { shellWord } from '../../src/install/plan.js'
 import { readRegular } from './discover.js'
-import { childPath } from './run.js'
+import { INSTALLER_PROGRAMS, InstallRunError, PMMCP_PROGRAMS, checkLogFolder, childPath, childPathRefusals } from './run.js'
 
 /** The names a shell may export that would point pmmcp's commands elsewhere: shown, never passed on (the runner's allowlist). */
 export const DOCKER_NAMES: readonly string[] = ['DOCKER_CONFIG', 'DOCKER_HOST', 'DOCKER_CONTEXT']
@@ -76,6 +92,9 @@ export const PROGRAMS: readonly (readonly [string, string])[] = [
   ['launchctl', 'it ships with macOS: pmmcp runs as a launchd service, so the installer changes pmmcp on macOS only (--aos-only works anywhere)'],
   ['plutil', 'it ships with macOS: the installer reads pmmcp\'s launchd plist with it (--aos-only works anywhere)'],
 ]
+
+/** What an --aos-only run starts: ls for .env's mode and ACL, and ps for a live lock's holder. */
+export const AOS_ONLY_PROGRAMS: readonly string[] = ['ls', 'ps']
 
 /** Docker Desktop's credential helper: the start script's Qdrant image pull needs it when ~/.docker/config.json names it. */
 export const CREDENTIAL_HELPER = 'docker-credential-desktop'
@@ -278,6 +297,8 @@ const isExecutable = (path: string): boolean => {
 
 export interface PreflightInput {
   readonly aosOnly: boolean
+  /** --pmmcp-dir: its stop and start scripts are among those each program's file on the child's PATH is compared with. */
+  readonly pmmcpDir?: string | undefined
   /** This checkout's root. */
   readonly root: string
   readonly home: string | undefined
@@ -373,9 +394,12 @@ export function preflight(input: PreflightInput): Preflight {
   } else {
     try {
       assertAosEntry(root)
+      // .aos and .aos/install as the runner's first child and discovery's read of active.json will meet them: another account's is
+      // refused here, by its owner, before the lock or .env is touched.
+      checkLogFolder(root)
     } catch (e) {
-      if (!(e instanceof ConfigError)) throw e
-      refusals.push(e.message)
+      if (e instanceof ConfigError || (e instanceof InstallRunError && e.machine)) refusals.push(e.message)
+      else throw e
     }
   }
 
@@ -385,7 +409,7 @@ export function preflight(input: PreflightInput): Preflight {
   )
 
   if (input.aosOnly) {
-    lines.push('  programs    not checked (--aos-only: pmmcp is not touched)')
+    lines.push(`  programs    presence not checked (--aos-only: pmmcp is not touched); ${list(AOS_ONLY_PROGRAMS)} held to the runner's rules`)
   } else if (homeOk) {
     const path = childPath(home)
     const wanted: (readonly [string, string])[] = [...PROGRAMS]
@@ -410,6 +434,12 @@ export function preflight(input: PreflightInput): Preflight {
       for (const [name, fix] of missing) refusals.push(`${name} is not on the PATH pmmcp's commands get (above): ${fix}`)
     }
     refusals.push(...stubRefusals(at, platform, input.developer ?? developerDirs(), isExecutable))
+  }
+  if (homeOk) {
+    // Every program this run will start, or pmmcp's scripts will, held to the runner's rules now, before any change: a file on the
+    // child's PATH that is the stop or start script by link or identity, or a link to one never run, is refused here, naming the file.
+    const programs = input.aosOnly ? AOS_ONLY_PROGRAMS : [...INSTALLER_PROGRAMS, ...PMMCP_PROGRAMS]
+    refusals.push(...childPathRefusals({ home, cwd: root, programs, dirs: input.pmmcpDir === undefined ? [] : [input.pmmcpDir] }))
   }
   return { lines, refusals }
 }

@@ -865,10 +865,11 @@ test("aos-install refuses the shadow checkout's trap .env, exits 2 and leaves it
   }
 })
 
-test("aos-install refuses a token an earlier run's write cut short, by its line, exits 2 and leaves .env byte for byte", async (t) => {
+test("aos-install refuses a token an earlier run's write cut short, by its line, at S2 before any probe, exits 2 and leaves .env byte for byte", async (t) => {
   // `writing .env failed after 23 of 81 bytes (EFBIG)`: the last line is AOS_PMMCP_TOKEN and 7 hex characters, no newline. The
-  // installer judges the tokens it mints at S2, so this is a refusal, never a token whose digest is staged as pmmcp's bearer.
-  for (const args of [['--aos-only'], ['--aos-only', '--dry-run'], ['--dry-run']]) {
+  // installer judges the tokens it mints at S2, so this is a refusal, never a token whose digest is staged as pmmcp's bearer, and it
+  // stops there as a loader refusal does (plan S2), before discovery runs a probe.
+  for (const args of [['--aos-only'], ['--aos-only', '--dry-run'], ['--dry-run'], []]) {
     const m = await installerMachine(t, { trap: false })
     const env = join(m.checkout.root, '.env')
     writeFileSync(env, `# Created by npm run aos-install\nAOS_CONTROL_TOKEN=${'c'.repeat(64)}\nAOS_PMMCP_TOKEN=5b8bca5`, { mode: 0o600 })
@@ -878,19 +879,24 @@ test("aos-install refuses a token an earlier run's write cut short, by its line,
     const run = installer(m, args)
     const printed = `${run.stdout}${run.stderr}`
     assert.equal(run.status, 2, `${JSON.stringify(args)}: ${printed}`)
-    assert.match(run.stdout, /^ {2}AOS_PMMCP_TOKEN +cut short \(line 3\) -> delete that line and re-run/m, JSON.stringify(args))
-    assert.match(run.stdout, /^ {2}- .*\.env line 3: AOS_PMMCP_TOKEN looks cut short \(a write that did not finish\): delete that line and re-run\./m, JSON.stringify(args))
+    assert.match(
+      run.stdout,
+      /^refused before any change: .*\.env line 3: AOS_PMMCP_TOKEN looks cut short \(a write that did not finish\): delete that line and re-run; no digest of it is staged, and nothing was run$/m,
+      JSON.stringify(args),
+    )
     assert.equal(run.stdout.trimEnd().split('\n').at(-1), 'aos-install: exit 2: refused before any change: see above', JSON.stringify(args))
     assert.deepEqual(readFileSync(env), before, `${JSON.stringify(args)}: .env changed`)
-    // No digest of it was handed to anything: no python ran at all.
-    assert.equal(m.calls().some((l) => /python|rotate|http_auth/.test(l)), false, m.calls().join('\n'))
+    // No digest of it was handed to anything, and discovery never ran: no program at all, no log folder.
+    assert.deepEqual(m.calls(), [], `${JSON.stringify(args)}: a program ran after S2`)
+    assert.deepEqual(runFolders(m.checkout.root), [], JSON.stringify(args))
     assert.equal(printed.includes('5b8bca5'), false, 'a byte of the value was printed')
   }
 })
 
 test("aos-install refuses, before any change and with exit 2, a program on the child's PATH that is pmmcp's stop script by identity, naming the file and the fix", async (t) => {
-  // ~/.local/bin/lsof a hard link of the stop script where discovery looks first (~/Github/Persistent-Memory-MCP): the runner refuses the
-  // first lsof discovery runs. That is the machine's state, not a defect of the installer's (scenario 12's ps and start cases).
+  // ~/.local/bin/lsof a hard link of the stop script where discovery looks first (~/Github/Persistent-Memory-MCP): the preflight holds
+  // each program's file to the runner's rules and refuses it before the lock or any child. That is the machine's state, not a defect of
+  // the installer's (scenario 12's ps and start cases).
   const m = await installerMachine(t, { trap: false })
   const install = join(m.home, 'Github', 'Persistent-Memory-MCP')
   mkdirSync(install, { recursive: true })
@@ -906,15 +912,70 @@ test("aos-install refuses, before any change and with exit 2, a program on the c
     assert.equal(run.status, 2, `${JSON.stringify(args)}: ${printed}`)
     assert.ok(
       run.stdout.includes(
-        `refused before any change: lsof-8766: stop-pmmcp-server.sh runs only by absolute path, and lsof on the child's PATH is ${lsof}, which is the same file as ${realpathSync(stop)} (a hard link): ` +
-          'remove or rename that file, then re-run; nothing was run',
+        `refused before any change:\n  - lsof: stop-pmmcp-server.sh runs only by absolute path, and lsof on the child's PATH is ${lsof}, which is the same file as ${realpathSync(stop)} (a hard link): ` +
+          'remove or rename that file, then re-run; nothing was run\n',
       ),
       printed,
     )
     assert.equal(run.stdout.trimEnd().split('\n').at(-1), 'aos-install: exit 2: refused before any change: see above', JSON.stringify(args))
     assert.doesNotMatch(printed, /a defect|the stop ran/)
     assert.equal(existsSync(join(m.checkout.root, '.env')), false)
+    assert.deepEqual(m.calls(), [], 'a program ran before the preflight refused')
+    assert.deepEqual(runFolders(m.checkout.root), [])
   }
+})
+
+test("aos-install refuses at the preflight, with exit 2 and before .env is touched, an ls on the child's PATH that is pmmcp's stop script by identity, --aos-only included, naming the file", async (t) => {
+  // Scenario 12's open case: with --aos-only the ls that looks for an ACL on .env was refused only after the append, silently, and the
+  // run ended done (exit 0). Every program the run will start is held to the runner's rules at the preflight now.
+  const m = await installerMachine(t, { trap: false })
+  const install = join(m.home, 'Github', 'Persistent-Memory-MCP')
+  mkdirSync(install, { recursive: true })
+  const stop = join(install, 'stop-pmmcp-server.sh')
+  const mark = join(dirname(m.home), 'the-stop-ran')
+  writeFileSync(stop, `#!/bin/sh\necho ran > '${mark}'\nexit 99\n`, { mode: 0o755 })
+  const ls = join(m.home, '.local', 'bin', 'ls')
+  linkSync(stop, ls)
+  // .env holding the control token alone: a run past the preflight appends AOS_PMMCP_TOKEN, then runs ls on it.
+  const env = join(m.checkout.root, '.env')
+  writeFileSync(env, `AOS_CONTROL_TOKEN=${'c'.repeat(64)}\n`, { mode: 0o600 })
+  chmodSync(env, 0o600)
+  handOver(env)
+  handOver(m.home)
+  handOver(dirname(m.home))
+  const before = readFileSync(env)
+  const refusal =
+    `refused before any change:\n  - ls: stop-pmmcp-server.sh runs only by absolute path, and ls on the child's PATH is ${ls}, which is the same file as ${realpathSync(stop)} (a hard link): ` +
+    'remove or rename that file, then re-run; nothing was run\n'
+  for (const args of [['--aos-only'], ['--aos-only', '--dry-run'], []]) {
+    const run = installer(m, args)
+    const printed = `${run.stdout}${run.stderr}`
+    assert.equal(run.status, 2, `${JSON.stringify(args)}: ${printed}`)
+    assert.ok(run.stdout.includes(refusal), printed)
+    assert.equal(run.stdout.trimEnd().split('\n').at(-1), 'aos-install: exit 2: refused before any change: see above', JSON.stringify(args))
+    assert.deepEqual(readFileSync(env), before, `${JSON.stringify(args)}: .env changed`)
+    assert.deepEqual(m.calls(), [], `${JSON.stringify(args)}: a program ran`)
+    assert.deepEqual(runFolders(m.checkout.root), [], JSON.stringify(args))
+    assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false)
+  }
+  assert.equal(existsSync(mark), false, 'the stop ran as ls')
+  // At a terminal, where the scenario's run asked for the append and made it: refused the same, nothing asked, .env as it was.
+  if (!terminalAvailable()) {
+    t.diagnostic('no python3 with its pty module here, so the terminal case is held by the piped runs above')
+    return
+  }
+  const child = spawnEntry(m.checkout, 'scripts/install.ts', ['--aos-only'], { env: installerEnv(m), typed: [{ cue: '[y/N]', send: 'y\r' }], ...INSTALLER_AS })
+  let stdout = ''
+  child.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')))
+  const timer = setTimeout(() => child.kill('SIGKILL'), 90_000)
+  const status = await new Promise<number | null>((resolve) => child.on('close', (code) => resolve(code)))
+  clearTimeout(timer)
+  const text = stdout.replace(/\r\n/g, '\n')
+  assert.equal(status, 2, text)
+  assert.ok(text.includes(refusal), text)
+  assert.doesNotMatch(text, /\[y\/N\]/)
+  assert.deepEqual(readFileSync(env), before, '.env changed at a terminal')
+  assert.equal(existsSync(mark), false, 'the stop ran as ls')
 })
 
 test('aos-install --dry-run with an empty HOME finds no pmmcp, prints the plan and writes nothing', async (t) => {
@@ -1060,6 +1121,272 @@ const freshFacts = (home: string, at: string, tokens: readonly string[]): string
     curator_secret: { state: 'absent' },
     launchd: { plist: join(home, 'Library', 'LaunchAgents', 'com.aibot.pmmcp.plist'), exists: true, working_directory: at, legacy_plists: [] },
   })
+
+test("aos-install refuses at the preflight, with exit 2, an .aos/install that is not the installer's account's to write in, naming its owner and the fix, never an earlier run's record", async (t) => {
+  // Scenario p-install-owner: .aos/install root's (0700), the installer run as nobody. Its active.json, which no run left, cannot be
+  // opened (EACCES); that is the folder's owner, which the preflight names with the chown, before the lock or any program. Run as
+  // anyone but root, the suite cannot make another account's folder: its own at 0000 meets the same EACCES and is named by its mode.
+  const m = await installerMachine(t, { trap: false })
+  const aos = join(m.checkout.root, '.aos')
+  const install = join(aos, 'install')
+  mkdirSync(install, { recursive: true, mode: 0o700 })
+  chmodSync(aos, 0o700)
+  chmodSync(install, 0o700)
+  handOver(aos)
+  let fault: string
+  if (INSTALLER_AS !== undefined) {
+    lchownSync(install, 0, 0)
+    fault = `refused before any change:\n  - ${install} belongs to uid 0, not you (uid ${String(INSTALLER_AS.uid)}): fix its owner (chown) and re-run\n`
+  } else {
+    chmodSync(install, 0o000)
+    fault = `refused before any change:\n  - ${install} is mode 0000, which keeps you from writing in it: chmod u+rwx ${install}, then re-run\n`
+  }
+  // Its removal needs it searchable again, whichever hook runs first.
+  t.after(() => {
+    if (existsSync(install)) chmodSync(install, 0o700)
+  })
+  for (const args of [['--aos-only'], ['--dry-run'], []]) {
+    const run = installer(m, args)
+    const printed = `${run.stdout}${run.stderr}`
+    assert.equal(run.status, 2, `${JSON.stringify(args)}: ${printed}`)
+    assert.ok(run.stdout.includes(fault), printed)
+    assert.doesNotMatch(printed, /earlier installer run|active\.json/)
+    assert.equal(run.stdout.trimEnd().split('\n').at(-1), 'aos-install: exit 2: refused before any change: see above', JSON.stringify(args))
+    assert.deepEqual(m.calls(), [], `${JSON.stringify(args)}: a program ran`)
+    assert.equal(existsSync(join(aos, 'install.lock')), false)
+    assert.equal(existsSync(join(m.checkout.root, '.env')), false)
+  }
+  chmodSync(install, 0o700)
+})
+
+/** pmmcp's own script headers: each names itself on the line after its #! (every checkout of it, e646096 included). */
+const STOP_HEADER = '# stop-pmmcp-server.sh \u2014 Stop all Persistent Memory MCP services.\n#\n'
+const START_HEADER = '# start-pmmcp-server.sh \u2014 Start the Persistent Memory MCP stack.\n#\n'
+
+/**
+ * A pmmcp install at ~/Code/Persistent-Memory-MCP, where only its launchd
+ * plist names it, and a plutil stand-in that answers the plist's two keys.
+ * Its stop and start, when given, write the mark when they run, and answer
+ * plutil's questions as plutil would (one is linked as plutil below).
+ */
+function plistInstall(m: InstallerMachine, scripts: { readonly stop?: string; readonly start?: string } = {}): { at: string; plist: string; mark: string; stop: string; start: string } {
+  const base = dirname(m.home)
+  const log = join(base, 'calls', 'calls.log')
+  const at = join(m.home, 'Code', 'Persistent-Memory-MCP')
+  mkdirSync(join(at, '.venv', 'bin'), { recursive: true })
+  mkdirSync(join(at, '.git'))
+  writeFileSync(join(at, 'pyproject.toml'), '[project]\nname = "persistent-memory-mcp"\n')
+  writeFileSync(join(at, '.venv', 'bin', 'pmmcp'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  writeFileSync(join(at, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/AiBot-Tools/persistent-memory-mcp.git\n')
+  const plist = join(m.home, 'Library', 'LaunchAgents', 'com.aibot.pmmcp.plist')
+  mkdirSync(dirname(plist), { recursive: true })
+  writeFileSync(plist, '<?xml version="1.0"?><plist version="1.0"><dict/></plist>\n')
+  const answers = [
+    'case "$*" in',
+    `  ${shQuote(`-extract WorkingDirectory raw -o - ${plist}`)}) echo ${shQuote(at)}; exit 0 ;;`,
+    `  ${shQuote(`-extract ProgramArguments.1 raw -o - ${plist}`)}) echo ${shQuote(join(at, '.venv', 'bin', 'pmmcp'))}; exit 0 ;;`,
+    'esac',
+    'exit 97',
+  ].join('\n')
+  writeFileSync(join(m.home, '.local', 'bin', 'plutil'), standIn(log, 'plutil', answers), { mode: 0o755 })
+  const mark = join(base, 'the-script-ran')
+  const stop = join(at, 'stop-pmmcp-server.sh')
+  const start = join(at, 'start-pmmcp-server.sh')
+  const body = (header: string): string => `#!/bin/sh\n${header}echo "$0 $*" >> ${shQuote(mark)}\n${answers}\n`
+  writeFileSync(stop, body(scripts.stop ?? ''), { mode: 0o755 })
+  writeFileSync(start, body(scripts.start ?? ''), { mode: 0o755 })
+  return { at, plist, mark, stop, start }
+}
+
+test("aos-install refuses with exit 2, as discovery reads the install from its launchd plist and before its next probe, a program on the child's PATH that is that install's script by identity, saying it has not run", async (t) => {
+  // The preflight compares each program's file with the default install's scripts (and --pmmcp-dir's): one found only by the plist,
+  // elsewhere, is compared as soon as plutil names its folder, before plutil's second read, lsof or the facts. Scripts whose headers
+  // name nothing (a changed copy), so only the folder tells them: ls a hard link of its stop; lsof, which discovery runs next, one
+  // of its start (the H4REV scenario, which ran the start script as lsof); uv, which pmmcp's scripts run, one of its stop.
+  for (const [name, script] of [
+    ['ls', 'stop'],
+    ['lsof', 'start'],
+    ['uv', 'stop'],
+  ] as const) {
+    const m = await installerMachine(t, { trap: false })
+    const p = plistInstall(m)
+    const file = join(m.home, '.local', 'bin', name)
+    rmSync(file, { force: true })
+    linkSync(script === 'stop' ? p.stop : p.start, file)
+    handOver(dirname(m.home))
+    const run = await installerAsync(m, [])
+    const printed = `${run.stdout}${run.stderr}\n${m.calls().join('\n')}`
+    assert.equal(run.status, 2, `${name}: ${printed}`)
+    const target = realpathSync(script === 'stop' ? p.stop : p.start)
+    const refusal =
+      name === 'uv'
+        ? `uv: pmmcp's own scripts run uv by that name, and uv on the child's PATH is ${file}, which is the same file as ${target} (a hard link): ` +
+          'it would run the stop or start script in its place. Remove or rename that file, then re-run; the installer has not run it'
+        : `${name}: ${script}-pmmcp-server.sh runs only by absolute path, and ${name} on the child's PATH is ${file}, which is the same file as ${target} (a hard link): ` +
+          'remove or rename that file, then re-run; the installer has not run it'
+    assert.ok(run.stdout.includes(`refused before any change:\n  - ${refusal}\n`), `${name}: ${printed}`)
+    assert.doesNotMatch(run.stdout, /nothing was run|already ran/, name)
+    assert.equal(run.stdout.trimEnd().split('\n').at(-1), 'aos-install: exit 2: refused before any change: see above', name)
+    // plutil's first read named the folder; nothing ran after it: not its second read, lsof, the facts, the TUI check, a question.
+    assert.deepEqual(m.calls().filter((l) => !l.startsWith('env ')), [`plutil -extract WorkingDirectory raw -o - ${p.plist}`], `${name}: ${printed}`)
+    assert.doesNotMatch(run.stdout, /^plan:$|\[y\/N\]/m)
+    assert.equal(existsSync(p.mark), false, `${name}: the ${script} ran`)
+    assert.equal(existsSync(join(m.checkout.root, '.env')), false)
+  }
+})
+
+test("aos-install refuses at the preflight, with exit 2, a program on the child's PATH that is pmmcp's stop or start script by its #! header, from an install no folder names, --aos-only included", async (t) => {
+  // The H4REV scenario: pmmcp installed outside ~/Github, at the plist's folder, and lsof a hard link of its start (pmmcp's real start
+  // ignores an argument it does not know, so lsof's would start a stopped pmmcp). Its header names it, so the preflight refuses it
+  // before plutil, lsof or anything else. And with --aos-only, ls a hard link of that install's start, which the run would have
+  // spawned on .env after the append.
+  const m = await installerMachine(t, { trap: false })
+  const p = plistInstall(m, { stop: STOP_HEADER, start: START_HEADER })
+  const lsof = join(m.home, '.local', 'bin', 'lsof')
+  rmSync(lsof)
+  linkSync(p.start, lsof)
+  handOver(dirname(m.home))
+  const byHeader = (name: string, file: string): string =>
+    `refused before any change:\n  - ${name}: start-pmmcp-server.sh runs only by absolute path, and ${name} on the child's PATH is ${file}, which is a #! script whose header names ` +
+    "start-pmmcp-server.sh, as pmmcp's own does (a link or copy of an install's script, wherever that install is): remove or rename that file, then re-run; nothing was run\n"
+  for (const args of [[], ['--dry-run']]) {
+    const run = installer(m, args)
+    const printed = `${run.stdout}${run.stderr}`
+    assert.equal(run.status, 2, `${JSON.stringify(args)}: ${printed}`)
+    assert.ok(run.stdout.includes(byHeader('lsof', lsof)), printed)
+    assert.equal(run.stdout.trimEnd().split('\n').at(-1), 'aos-install: exit 2: refused before any change: see above')
+    assert.deepEqual(m.calls(), [], `${JSON.stringify(args)}: a program ran`)
+    assert.deepEqual(runFolders(m.checkout.root), [])
+  }
+  rmSync(lsof)
+  writeFileSync(lsof, fakeProgram(join(dirname(m.home), 'calls', 'calls.log')), { mode: 0o755 })
+  handOver(lsof)
+
+  // --aos-only: ls the start of that install (named by no folder the run reads: --aos-only reads no plist), .env holding the control
+  // token alone, so a run past the preflight appends AOS_PMMCP_TOKEN, then spawns ls on .env.
+  const ls = join(m.home, '.local', 'bin', 'ls')
+  linkSync(p.start, ls)
+  const env = join(m.checkout.root, '.env')
+  writeFileSync(env, `AOS_CONTROL_TOKEN=${'c'.repeat(64)}\n`, { mode: 0o600 })
+  chmodSync(env, 0o600)
+  handOver(env)
+  handOver(dirname(m.home))
+  const before = readFileSync(env)
+  for (const args of [['--aos-only'], ['--aos-only', '--dry-run']]) {
+    const run = installer(m, args)
+    const printed = `${run.stdout}${run.stderr}`
+    assert.equal(run.status, 2, `${JSON.stringify(args)}: ${printed}`)
+    assert.match(run.stdout, /^ {2}programs {4}presence not checked \(--aos-only: pmmcp is not touched\); ls and ps held to the runner's rules$/m)
+    assert.ok(run.stdout.includes(byHeader('ls', ls)), printed)
+    assert.deepEqual(readFileSync(env), before, `${JSON.stringify(args)}: .env changed`)
+    assert.deepEqual(m.calls(), [], `${JSON.stringify(args)}: a program ran`)
+    assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false)
+  }
+  assert.equal(existsSync(p.mark), false, 'the start ran')
+})
+
+test("aos-install, when a file discovery refuses once the plist names its install had already run among its probes, says so on that line, the first and the last, never that nothing was run", async (t) => {
+  // plutil a hard link of that install's stop, a copy whose header names nothing: no rule can tell it before the plist names the
+  // folder, and plutil is what reads the plist. So it ran (its mark is there), and the refusal says it did and what to check.
+  const m = await installerMachine(t, { trap: false })
+  const p = plistInstall(m)
+  const plutil = join(m.home, '.local', 'bin', 'plutil')
+  rmSync(plutil)
+  linkSync(p.stop, plutil)
+  handOver(dirname(m.home))
+  const run = await installerAsync(m, [])
+  const printed = `${run.stdout}${run.stderr}`
+  assert.equal(run.status, 2, printed)
+  assert.ok(
+    run.stdout.includes(
+      "refused before the installer changed anything, but discovery's read-only probes had already run a file refused below:\n" +
+        `  - plutil: stop-pmmcp-server.sh runs only by absolute path, and plutil on the child's PATH is ${plutil}, which is the same file as ${realpathSync(p.stop)} (a hard link): ` +
+        "remove or rename that file, then re-run; it already ran, as plutil, among discovery's read-only probes before this install was known, so it may have stopped or started pmmcp: " +
+        'see whether pmmcp runs as you left it\n',
+    ),
+    printed,
+  )
+  assert.doesNotMatch(run.stdout, /nothing was run|refused before any change/)
+  assert.equal(
+    run.stdout.trimEnd().split('\n').at(-1),
+    "aos-install: exit 2: refused before the installer changed anything, but a file it refused had already run among discovery's probes: see above",
+  )
+  assert.equal(readFileSync(p.mark, 'utf8'), `${plutil} -extract WorkingDirectory raw -o - ${p.plist}\n`, 'it ran once, as plutil, and nothing after it')
+  assert.equal(existsSync(join(m.checkout.root, '.env')), false)
+})
+
+test("the preflight holds the log folder to the runner's rules and each program's file on the child's PATH to them, --pmmcp-dir's scripts included", (t) => {
+  const base = tmpdir(t)
+  const root = join(base, 'MrRobot')
+  mkdirSync(join(root, 'node_modules'), { recursive: true })
+  writeFileSync(join(root, 'package.json'), '{"engines":{"node":">=20.0.0"}}\n')
+  writeFileSync(join(root, '.gitignore'), '.env*\n!.env.example\n/.aos/\n')
+  const home = join(base, 'home')
+  const bin = join(home, '.local', 'bin')
+  mkdirSync(bin, { recursive: true })
+  const input = { aosOnly: true, root, home, env: {}, cwd: root, euid: 501, uid: 501, user: 'op' } as const
+  assert.deepEqual(preflight(input).refusals, [])
+
+  // .aos/install open to others, or (as root) another account's: the runner's first child would refuse it, so the preflight does.
+  mkdirSync(join(root, '.aos', 'install'), { recursive: true, mode: 0o700 })
+  chmodSync(join(root, '.aos'), 0o700)
+  chmodSync(join(root, '.aos', 'install'), 0o777)
+  assert.deepEqual(preflight(input).refusals, [`${join(root, '.aos', 'install')} is writable by group or others: chmod go-w ${join(root, '.aos', 'install')}, then re-run`])
+  chmodSync(join(root, '.aos', 'install'), 0o700)
+  if (process.geteuid?.() === 0) {
+    lchownSync(join(root, '.aos', 'install'), 65534, 65534)
+    assert.deepEqual(preflight(input).refusals, [`${join(root, '.aos', 'install')} belongs to uid 65534, not you (uid 0): fix its owner (chown) and re-run`])
+    lchownSync(join(root, '.aos', 'install'), 0, 0)
+  }
+  assert.deepEqual(preflight(input).refusals, [])
+
+  // ps a hard link of a stop script in a folder of its own: refused once that folder is --pmmcp-dir's, as a run of ps would be then.
+  const far = join(base, 'elsewhere', 'Persistent-Memory-MCP')
+  mkdirSync(far, { recursive: true })
+  writeFileSync(join(far, 'stop-pmmcp-server.sh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  linkSync(join(far, 'stop-pmmcp-server.sh'), join(bin, 'ps'))
+  assert.deepEqual(preflight(input).refusals, [])
+  const refused = preflight({ ...input, pmmcpDir: far }).refusals
+  assert.deepEqual(refused, [
+    `ps: stop-pmmcp-server.sh runs only by absolute path, and ps on the child's PATH is ${join(bin, 'ps')}, which is the same file as ${realpathSync(join(far, 'stop-pmmcp-server.sh'))} (a hard link): remove or rename that file, then re-run; nothing was run`,
+  ])
+  // With --aos-only only ls and ps are run: a pgrep of the same kind is the full run's to refuse.
+  rmSync(join(bin, 'ps'))
+  linkSync(join(far, 'stop-pmmcp-server.sh'), join(bin, 'pgrep'))
+  assert.deepEqual(preflight({ ...input, pmmcpDir: far }).refusals, [])
+  assert.ok(preflight({ ...input, aosOnly: false, pmmcpDir: far }).refusals.some((r) => r.startsWith('pgrep: stop-pmmcp-server.sh runs only by absolute path')))
+  rmSync(join(bin, 'pgrep'))
+
+  // The programs pmmcp's own scripts run (setup.sh on a fresh install: bash, curl, uv, python3, ollama), held to the rules unless
+  // --aos-only: curl a link to killall, bash a hard link of the default install's stop. Both are refused, each naming its file.
+  const install = join(home, 'Github', 'Persistent-Memory-MCP')
+  mkdirSync(install, { recursive: true })
+  writeFileSync(join(install, 'stop-pmmcp-server.sh'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  const tools = join(base, 'tools')
+  mkdirSync(tools)
+  writeFileSync(join(tools, 'killall'), '#!/bin/sh\n', { mode: 0o755 })
+  symlinkSync(join(tools, 'killall'), join(bin, 'curl'))
+  linkSync(join(install, 'stop-pmmcp-server.sh'), join(bin, 'bash'))
+  const full = preflight({ ...input, aosOnly: false }).refusals
+  assert.ok(
+    full.includes(
+      `bash: pmmcp's own scripts run bash by that name, and bash on the child's PATH is ${join(bin, 'bash')}, which is the same file as ${realpathSync(join(install, 'stop-pmmcp-server.sh'))} (a hard link): ` +
+        'it would run the stop or start script in its place. Remove or rename that file, then re-run; nothing was run',
+    ),
+    full.join('\n'),
+  )
+  assert.ok(
+    full.some((r) =>
+      r.startsWith(`curl: pmmcp's own scripts run curl by that name, and killall signals the processes it names or runs`) &&
+      r.endsWith(`. curl on the child's PATH is ${join(bin, 'curl')}, which leads to ${realpathSync(join(tools, 'killall'))}: remove or rename that link, then re-run; nothing was run`),
+    ),
+    full.join('\n'),
+  )
+  // --aos-only runs neither, and pmmcp's scripts do not run: its line says what was held, and neither is refused.
+  const only = preflight(input)
+  assert.deepEqual(only.refusals, [])
+  assert.ok(only.lines.includes("  programs    presence not checked (--aos-only: pmmcp is not touched); ls and ps held to the runner's rules"), only.lines.join('\n'))
+})
 
 test('aos-install at a terminal: a Ctrl-C after the stopped window is held until the end report, the probe it reached is asked again, and the run ends with the gate\'s code', async (t) => {
   // A fresh install whose stop does not stop, with "start pmmcp again?" answered n: the window opened (setup) and closed (the
@@ -1329,9 +1656,10 @@ test("aos-install at a terminal: for a found pmmcp whose ~/.local/bin/pgrep give
   assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false, 'the lock was left behind')
 })
 
-test("aos-install refuses, before any change and with exit 2, a ~/.local/bin/pgrep that is the found pmmcp's stop script by hard link: the TUI check names the file and the fix, never 'cannot be told'", async (t) => {
-  // Discovery's probes pass (none of them is pgrep); the TUI check after it is the first to run pgrep, which the runner refuses for
-  // the machine's state. That is a refusal with its fix (exit 2), as discovery's own would be, never read as pgrep giving no answer.
+test("aos-install refuses, before any change and with exit 2, a ~/.local/bin/pgrep that is the found pmmcp's stop script by hard link: the preflight names the file and the fix, never 'cannot be told'", async (t) => {
+  // None of discovery's probes is pgrep: the TUI check after it would be the first to run one. The preflight holds pgrep's file to the
+  // runner's rules first (H4), so the refusal comes before the lock or any program, with its fix (exit 2), never read as pgrep giving
+  // no answer. tuiPids' own throw of such a refusal is held in process (install-apply.test.ts).
   const m = await installerMachine(t, { trap: false })
   const { at, log } = foundInstall(m)
   const stop = join(at, 'stop-pmmcp-server.sh')
@@ -1346,16 +1674,17 @@ test("aos-install refuses, before any change and with exit 2, a ~/.local/bin/pgr
     assert.equal(run.status, 2, `${JSON.stringify(args)}: ${printed}`)
     assert.ok(
       run.stdout.includes(
-        `refused before any change: pgrep-tui: stop-pmmcp-server.sh runs only by absolute path, and pgrep on the child's PATH is ${pgrep}, which is the same file as ${realpathSync(stop)} (a hard link): ` +
-          'remove or rename that file, then re-run; nothing was run',
+        `refused before any change:\n  - pgrep: stop-pmmcp-server.sh runs only by absolute path, and pgrep on the child's PATH is ${pgrep}, which is the same file as ${realpathSync(stop)} (a hard link): ` +
+          'remove or rename that file, then re-run; nothing was run\n',
       ),
       printed,
     )
     assert.equal(run.stdout.trimEnd().split('\n').at(-1), 'aos-install: exit 2: refused before any change: see above', JSON.stringify(args))
     assert.doesNotMatch(printed, /a defect|cannot be told|plan:/)
-    // The stop script ran only as discovery's jobs count, by its own path: never as pgrep.
+    // Nothing ran at all: not the stop script, by its own path or as pgrep, and no probe of discovery's.
     const calls = existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter((l) => l !== '') : []
-    assert.deepEqual(calls.filter((c) => c.startsWith('stop-pmmcp-server.sh')), ['stop-pmmcp-server.sh --jobs'], printed)
+    assert.deepEqual(calls, [], printed)
+    assert.deepEqual(m.calls(), [], printed)
   }
 })
 

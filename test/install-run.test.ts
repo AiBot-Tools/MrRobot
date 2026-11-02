@@ -57,11 +57,16 @@ import {
   START_SCRIPT,
   STOP_SCRIPT,
   TAIL_BYTES,
+  INSTALLER_PROGRAMS,
+  PMMCP_PROGRAMS,
   activePath,
+  checkLogFolder,
   childEnv,
   childPath,
+  childPathRefusals,
   clearActive,
   installDir,
+  pathRefusals,
   readActive,
   readAt,
   readJobs,
@@ -75,6 +80,7 @@ import {
   type RunSpec,
   type SpawnFn,
 } from '../scripts/install/run.js'
+import { AS_ROOT, BOUND_UID, NOBODY, asNobody, handTo } from './helpers/as-nobody.js'
 import { CREDENTIAL_NAME } from './helpers/guard.js'
 import { bareStandIns, pythonStandIn, shWord } from './helpers/python-stand-in.js'
 import { tmpdir } from './helpers/tmpdir.js'
@@ -1736,7 +1742,12 @@ test("a bare name runs as the file the rules found on the child's PATH: one whos
   const real = new Runner({ repoRoot: repo(t), env: installerEnv(home), now: () => NOW })
   await assert.rejects(
     () => real.run(spec),
-    (e: unknown) => e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_SPAWN' && /print: launchctl could not be started \(ENOENT\)/.test(e.message),
+    (e: unknown) =>
+      e instanceof InstallRunError &&
+      e.code === 'AOS_INSTALL_RUN_SPAWN' &&
+      // The file it was spawned as, and why a file that is there gives ENOENT, with the fix.
+      e.message ===
+        `print: launchctl could not be started (ENOENT): launchctl is ${first}, the first on the child's PATH; that file is there, so its #! line names an interpreter that is not: fix or remove ${first}, then re-run`,
   )
   assert.equal(existsSync(mark), false, 'a file the rules never examined ran')
 
@@ -1750,6 +1761,49 @@ test("a bare name runs as the file the rules found on the child's PATH: one whos
   )
   assert.equal(none.calls.length, 0)
   assert.equal(existsSync(join(root, '.aos')), false)
+})
+
+test('a stop that cannot be started says why with its fix: not executable (EACCES), executable but not runnable from where it is, or not there (ENOENT)', async (t) => {
+  const home = tmpdir(t)
+  const pmmcp = checkout(t, { [STOP_SCRIPT]: '#!/bin/sh\necho stopped\n' })
+  const STOP = join(pmmcp, STOP_SCRIPT)
+  const stop: RunSpec = { step: 'stop', command: STOP, args: [], cwd: pmmcp }
+  // Its x bit lost (a copy, an unzip): execve's EACCES, with Node's own spawn, for root as for anyone.
+  chmodSync(STOP, 0o644)
+  const root = repo(t)
+  await assert.rejects(
+    () => new Runner({ repoRoot: root, env: installerEnv(home), now: () => NOW }).run(stop),
+    (e: unknown) =>
+      e instanceof InstallRunError &&
+      e.code === 'AOS_INSTALL_RUN_SPAWN' &&
+      !e.machine &&
+      e.message === `stop: ${STOP} could not be started (EACCES); it is not executable: chmod u+x ${STOP}, then re-run`,
+  )
+  // Nothing of the claim is left: a re-run is not kept waiting on a step that never started.
+  assert.equal(readActive(root).state, 'none')
+  // EACCES of a file whose x bit is on: what keeps it from running is above it, and is named as such.
+  chmodSync(STOP, 0o755)
+  const denied: SpawnFn = () => {
+    const child = new FakeChild(undefined, false)
+    setImmediate(() => child.emit('error', Object.assign(new Error('x'), { code: 'EACCES' })))
+    return child
+  }
+  await assert.rejects(
+    () => new Runner({ repoRoot: repo(t), env: installerEnv(home), spawn: denied, now: () => NOW }).run(stop),
+    (e: unknown) =>
+      e instanceof Error &&
+      e.message === `stop: ${STOP} could not be started (EACCES); ${STOP} is executable, so a folder above it is not searchable or its filesystem does not let it run (mounted noexec): fix that, then re-run`,
+  )
+  // Gone: ENOENT of a file that is not there, with what to put back.
+  rmSync(STOP)
+  await assert.rejects(
+    () => new Runner({ repoRoot: repo(t), env: installerEnv(home), now: () => NOW }).run(stop),
+    (e: unknown) =>
+      e instanceof InstallRunError &&
+      e.code === 'AOS_INSTALL_RUN_SPAWN' &&
+      e.message ===
+        `stop: ${STOP} could not be started (ENOENT); no file is at ${STOP}: put it back (a script of pmmcp's from its git, git -C <its checkout> checkout -- <file>; its .venv with its ./setup.sh), then re-run`,
+  )
 })
 
 test('the stop and start scripts are known by identity: a hard link of another name or a renamed copy runs by their rules, and is refused anywhere else', async (t) => {
@@ -2258,4 +2312,326 @@ test("active.json's record is held to its shape: a field that is not a step, a p
     )
   }
   assert.equal(fake.calls.length, 0)
+})
+
+test("before any child, the file each program finds on the child's PATH is held to the runner's rules: a stop or start script by link or identity, or a link to a program never run, is refused naming the file and its fix", (t) => {
+  const home = tmpdir(t)
+  const bin = bareStandIns(home)
+  const cwd = repo(t)
+  const install = join(home, 'Github', 'Persistent-Memory-MCP')
+  mkdirSync(install, { recursive: true })
+  const STOP = join(install, STOP_SCRIPT)
+  const START = join(install, START_SCRIPT)
+  writeFileSync(STOP, '#!/bin/sh\necho "the stop ran"\n', { mode: 0o755 })
+  writeFileSync(START, '#!/bin/sh\necho "the start ran"\n', { mode: 0o755 })
+  for (const name of PMMCP_PROGRAMS) writeFileSync(join(bin, name), `#!/bin/sh\n# ${name}\n`, { mode: 0o755 })
+  const all = [...INSTALLER_PROGRAMS, ...PMMCP_PROGRAMS]
+  assert.deepEqual(INSTALLER_PROGRAMS, ['ls', 'ps', 'pgrep', 'lsof', 'plutil', 'launchctl', 'docker', 'git'])
+  assert.deepEqual(PMMCP_PROGRAMS, ['bash', 'curl', 'uv', 'python3', 'ollama'])
+  // Plain files of their own: nothing to refuse, and nothing ran or was made.
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: all }), [])
+  assert.equal(existsSync(join(cwd, '.aos')), false)
+
+  // ls a hard link of the default install's stop: refused as a run of it would be, the file and its fix named.
+  const ls = join(bin, 'ls')
+  rmSync(ls)
+  linkSync(STOP, ls)
+  const lsRefusal = `ls: stop-pmmcp-server.sh runs only by absolute path, and ls on the child's PATH is ${ls}, which is the same file as ${realpathSync(STOP)} (a hard link): remove or rename that file, then re-run; nothing was run`
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: all }), [lsRefusal])
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: ['ls', 'ps'] }), [lsRefusal])
+  // A program not asked about is not looked at.
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: ['ps'] }), [])
+  rmSync(ls)
+  writeFileSync(ls, '#!/bin/sh\n', { mode: 0o755 })
+
+  // pmmcp's programs, which its scripts run by name: bash a hard link of the stop, uv a renamed copy of the start, curl a link to
+  // killall; python3 a link to a python, and bash one to another shell, are what such links are.
+  const bash = join(bin, 'bash')
+  rmSync(bash)
+  linkSync(STOP, bash)
+  const uv = join(bin, 'uv')
+  copyFileSync(START, uv)
+  chmodSync(uv, 0o755)
+  const tools = tmpdir(t)
+  for (const name of ['killall', 'python3.12', 'zsh']) writeFileSync(join(tools, name), '#!/bin/sh\n', { mode: 0o755 })
+  const curl = join(bin, 'curl')
+  rmSync(curl)
+  symlinkSync(join(tools, 'killall'), curl)
+  rmSync(join(bin, 'python3'))
+  symlinkSync(join(tools, 'python3.12'), join(bin, 'python3'))
+  const got = childPathRefusals({ home, cwd, programs: all })
+  assert.equal(got.length, 3, got.join('\n'))
+  assert.equal(
+    got[0],
+    `bash: pmmcp's own scripts run bash by that name, and bash on the child's PATH is ${bash}, which is the same file as ${realpathSync(STOP)} (a hard link): ` +
+      'it would run the stop or start script in its place. Remove or rename that file, then re-run; nothing was run',
+  )
+  assert.match(got[1] ?? '', new RegExp(`^curl: pmmcp's own scripts run curl by that name, and killall signals the processes it names or runs.*\\. curl on the child's PATH is ${curl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}, which leads to .*killall: remove or rename that link, then re-run; nothing was run$`))
+  assert.match(got[2] ?? '', new RegExp(`^uv: .*uv on the child's PATH is .*, which is a copy of ${realpathSync(START).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}: it would run the stop or start script in its place`))
+  rmSync(bash)
+  symlinkSync(join(tools, 'zsh'), bash)
+  rmSync(uv)
+  rmSync(curl)
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: all }), [], 'a python for python3, or a shell for bash, is what such a link is')
+  // A stop script beside the file found (~/.local/bin/stop-pmmcp-server.sh, a copy whose header names nothing), and bash a hard
+  // link of it: the folder the file is in is one its scripts are compared with.
+  const beside = join(bin, STOP_SCRIPT)
+  writeFileSync(beside, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  rmSync(bash)
+  linkSync(beside, bash)
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: ['bash'] }), [
+    `bash: pmmcp's own scripts run bash by that name, and bash on the child's PATH is ${bash}, which is the same file as ${realpathSync(beside)} (a hard link): ` +
+      'it would run the stop or start script in its place. Remove or rename that file, then re-run; nothing was run',
+  ])
+  rmSync(bash)
+  rmSync(beside)
+  symlinkSync(join(tools, 'zsh'), bash)
+
+  // An install the default place does not hold (the plist's folder): compared once it is named in dirs, as discovery's is.
+  const far = join(tmpdir(t), 'Persistent-Memory-MCP')
+  mkdirSync(far)
+  writeFileSync(join(far, STOP_SCRIPT), '#!/bin/sh\necho far\n', { mode: 0o755 })
+  const ps = join(bin, 'ps')
+  rmSync(ps)
+  linkSync(join(far, STOP_SCRIPT), ps)
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: ['ps'] }), [])
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: ['ps'], dirs: [far] }), [
+    `ps: stop-pmmcp-server.sh runs only by absolute path, and ps on the child's PATH is ${ps}, which is the same file as ${realpathSync(join(far, STOP_SCRIPT))} (a hard link): remove or rename that file, then re-run; nothing was run`,
+  ])
+  // A link of an installer program to one never run here (pgrep to tar) is refused as a run of it is.
+  rmSync(join(bin, 'pgrep'))
+  writeFileSync(join(tools, 'tar'), '#!/bin/sh\n', { mode: 0o755 })
+  symlinkSync(join(tools, 'tar'), join(bin, 'pgrep'))
+  assert.match(childPathRefusals({ home, cwd, programs: ['pgrep'] })[0] ?? '', /^pgrep: "pgrep" resolves to "tar", which is not a program the installer runs: .*remove or rename that link, then re-run; nothing was run$/)
+  // A program on no entry of the PATH is no refusal here; a name the installer runs by no rule here is a defect.
+  rmSync(join(bin, 'lsof'))
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: ['lsof'] }), [])
+  assert.throws(() => childPathRefusals({ home, cwd, programs: ['tar'] }), (e: unknown) => refusedCode(e) && !(e as InstallRunError).machine)
+})
+
+/** pmmcp's own script headers, as each names itself on the line after its #! (the operator's checkout at e646096, and every earlier one). */
+const STOP_HEADER = '#!/bin/sh\n# stop-pmmcp-server.sh \u2014 Stop all Persistent Memory MCP services.\n#\n# Usage:\n#   ./stop-pmmcp-server.sh --jobs\n'
+const START_HEADER = '#!/bin/sh\n# start-pmmcp-server.sh \u2014 Start the Persistent Memory MCP stack.\n#\n'
+
+test("a file on the child's PATH that is pmmcp's stop or start script by its #! header is refused whatever folder its install is in, and once probes ran each refusal says whether its file was one", async (t) => {
+  // Scenario H4-rev3: an install outside ~/Github (found from the plist, or present but not given with --pmmcp-dir), and ls or lsof a
+  // hard link or copy of its start. No folder the rules compare with holds it, so its identity says nothing: its header does.
+  const home = tmpdir(t)
+  const bin = bareStandIns(home)
+  const cwd = repo(t)
+  for (const name of PMMCP_PROGRAMS) writeFileSync(join(bin, name), `#!/bin/sh\n# ${name}\n`, { mode: 0o755 })
+  const all = [...INSTALLER_PROGRAMS, ...PMMCP_PROGRAMS]
+  const far = join(tmpdir(t), 'Code', 'Persistent-Memory-MCP')
+  mkdirSync(far, { recursive: true })
+  const mark = join(tmpdir(t), 'the-start-ran')
+  const START = join(far, START_SCRIPT)
+  const STOP = join(far, STOP_SCRIPT)
+  writeFileSync(START, `${START_HEADER}echo ran > ${shWord(mark)}\n`, { mode: 0o755 })
+  writeFileSync(STOP, `${STOP_HEADER}echo ran > ${shWord(mark)}\n`, { mode: 0o755 })
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: all }), [])
+
+  // ls a hard link of the far start, no folder of it named: refused by its header, as the preflight and --aos-only see it.
+  const ls = join(bin, 'ls')
+  rmSync(ls)
+  linkSync(START, ls)
+  const byHeader = (name: string, script: string, file: string): string =>
+    `${name}: ${script} runs only by absolute path, and ${name} on the child's PATH is ${file}, which is a #! script whose header names ${script}, as pmmcp's own does ` +
+    "(a link or copy of an install's script, wherever that install is): remove or rename that file, then re-run; nothing was run"
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: ['ls', 'ps'] }), [byHeader('ls', START_SCRIPT, ls)])
+  // A run of it is refused the same, as the machine's, and nothing is spawned or made.
+  const fake = recorder()
+  const runner = new Runner({ repoRoot: cwd, env: { HOME: home }, spawn: fake.spawn, now: () => NOW })
+  assert.throws(
+    () => runner.start({ step: 'ls-dotenv', command: 'ls', args: ['-lde', join(cwd, '.env')], cwd, timeoutMs: 5000 }),
+    (e: unknown) => machineRefusal(e) && (e as Error).message === byHeader('ls', START_SCRIPT, ls).replace(/^ls:/, 'ls-dotenv:'),
+  )
+  assert.equal(fake.calls.length, 0)
+  assert.equal(existsSync(join(cwd, '.aos')), false)
+  // lsof a renamed copy of the stop: its bytes are its own file's, and its header says what it is.
+  rmSync(ls)
+  writeFileSync(ls, '#!/bin/sh\n', { mode: 0o755 })
+  const lsof = join(bin, 'lsof')
+  rmSync(lsof)
+  copyFileSync(STOP, lsof)
+  chmodSync(lsof, 0o755)
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: all }), [byHeader('lsof', STOP_SCRIPT, lsof)])
+  rmSync(lsof)
+  writeFileSync(lsof, '#!/bin/sh\n', { mode: 0o755 })
+
+  // One of pmmcp's own programs, a symbolic link (of another name) to a copy of the start: the same.
+  const uv = join(bin, 'uv')
+  rmSync(uv)
+  const copy = join(tmpdir(t), 'uv-real')
+  copyFileSync(START, copy)
+  chmodSync(copy, 0o755)
+  symlinkSync(copy, uv)
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: all }), [
+    `uv: pmmcp's own scripts run uv by that name, and uv on the child's PATH is ${uv}, which is a #! script whose header names ${START_SCRIPT}, as pmmcp's own does ` +
+      "(a link or copy of an install's script, wherever that install is): it would run the stop or start script in its place. Remove or rename that file, then re-run; nothing was run",
+  ])
+  rmSync(uv)
+  writeFileSync(uv, '#!/bin/sh\n', { mode: 0o755 })
+
+  // Only the header counts, and only a #! script's: a name further down, or a file that does not start with #!, is no such script.
+  writeFileSync(join(bin, 'git'), '#!/bin/sh\n# a git wrapper\nexec /usr/bin/git "$@"\n# not stop-pmmcp-server.sh\n', { mode: 0o755 })
+  writeFileSync(join(bin, 'docker'), '\n# start-pmmcp-server.sh\n', { mode: 0o755 })
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: all }), [])
+  // In any case, as APFS runs the file whatever case its name is typed in.
+  writeFileSync(join(bin, 'curl'), '#!/bin/sh\n# Start-PMMCP-Server.sh, renamed\n', { mode: 0o755 })
+  assert.match(childPathRefusals({ home, cwd, programs: ['curl'] })[0] ?? '', /^curl: .* whose header names start-pmmcp-server\.sh, as pmmcp's own does/)
+  writeFileSync(join(bin, 'curl'), '#!/bin/sh\n', { mode: 0o755 })
+
+  // Once probes have run (discovery's), each refusal says whether its file was one of them, never that nothing was run: ps ran,
+  // then is found to be a hard link of the far install's stop (one whose header names nothing), pgrep never ran.
+  const changed = join(far, 'changed')
+  mkdirSync(changed)
+  const QUIET = join(changed, STOP_SCRIPT)
+  writeFileSync(QUIET, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  const ran = recorder((c) => setImmediate(() => c.child.emit('exit', 0, null)))
+  const probes = new Runner({ repoRoot: cwd, env: { HOME: home }, spawn: ran.spawn, now: () => NOW })
+  await probes.run({ step: 'ps', command: 'ps', args: ['-o', 'pid=', '-p', '1'], cwd, timeoutMs: 5000 })
+  await probes.run({ step: 'stop-abs', command: join(bin, 'lsof'), args: [], cwd, timeoutMs: 5000 })
+  assert.deepEqual([...probes.ranByName()].map(([name, files]) => [name, [...files]]), [['ps', [join(bin, 'ps')]]], 'a command by absolute path is no bare name')
+  for (const name of ['ps', 'pgrep']) {
+    rmSync(join(bin, name))
+    linkSync(QUIET, join(bin, name))
+  }
+  const hard = (name: string): string =>
+    `${name}: stop-pmmcp-server.sh runs only by absolute path, and ${name} on the child's PATH is ${join(bin, name)}, which is the same file as ${realpathSync(QUIET)} (a hard link): remove or rename that file, then re-run`
+  assert.deepEqual(pathRefusals({ home, cwd, programs: ['ps', 'pgrep'], dirs: [changed], ran: probes.ranByName() }), [
+    {
+      message: `${hard('ps')}; it already ran, as ps, among discovery's read-only probes before this install was known, so it may have stopped or started pmmcp: see whether pmmcp runs as you left it`,
+      ran: true,
+    },
+    { message: `${hard('pgrep')}; the installer has not run it`, ran: false },
+  ])
+  // Without `ran` (the preflight), the check's own words: nothing was run.
+  assert.deepEqual(childPathRefusals({ home, cwd, programs: ['ps'], dirs: [changed] }), [`${hard('ps')}; nothing was run`])
+  // A spawn that never started (no pid: ENOENT, EACCES) is no file that ran.
+  const unstarted: SpawnFn = () => {
+    const child = new FakeChild(undefined, false)
+    setImmediate(() => child.emit('error', Object.assign(new Error('x'), { code: 'EACCES' })))
+    return child
+  }
+  const none = new Runner({ repoRoot: cwd, env: { HOME: home }, spawn: unstarted, now: () => NOW })
+  await assert.rejects(none.run({ step: 'docker', command: 'docker', args: ['ps'], cwd, timeoutMs: 5000 }), (e: unknown) => e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_SPAWN')
+  assert.deepEqual([...none.ranByName()], [])
+  assert.equal(existsSync(mark), false, 'a script ran')
+})
+
+test("the log folder's refusals are the machine's, each naming its fix: another account's, not yours to write in, open to others, out of stamps, an active.json that cannot be made or removed", async (t) => {
+  const home = tmpdir(t)
+  const probe = (root: string): RunSpec => ({ step: 'ps', command: '/bin/ps', args: ['-o', 'etime=', '-p', '812'], cwd: root, timeoutMs: 5000 })
+  const own = (root: string): RunSpec => ({ step: 'merge', command: '/usr/bin/git', args: ['merge', '--ff-only', 'abc123'], cwd: root, ownSession: true })
+  const exits = (): ReturnType<typeof recorder> => recorder((c) => setImmediate(() => c.child.emit('exit', 0, null)))
+
+  // Another account's .aos/install: refused by its owner, with the chown, by the runner's first child and by checkLogFolder alike.
+  if (AS_ROOT) {
+    const theirs = repo(t)
+    mkdirSync(installDir(theirs), { recursive: true, mode: 0o700 })
+    chownSync(installDir(theirs), NOBODY, NOBODY)
+    const owner = new RegExp(`^${installDir(theirs).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} belongs to uid ${String(NOBODY)}, not you \\(uid 0\\): fix its owner \\(chown\\) and re-run$`)
+    const fake = recorder()
+    assert.throws(() => new Runner({ repoRoot: theirs, env: installerEnv(home), spawn: fake.spawn, now: () => NOW }).start(probe(theirs)), (e: unknown) => machineRefusal(e) && owner.test((e as Error).message))
+    assert.throws(() => checkLogFolder(theirs), (e: unknown) => machineRefusal(e) && owner.test((e as Error).message))
+    assert.equal(fake.calls.length, 0)
+  } else t.diagnostic('not root: no folder of another account can be made here, so the owner refusal is held by its message in the root run')
+
+  // Not its owner's to write in (0500), and writable by others: refused by its mode, whoever runs (the bits, not access()).
+  for (const [bits, fix] of [
+    [0o500, /is mode 0500, which keeps you from writing in it: chmod u\+rwx .*, then re-run$/],
+    [0o777, /is writable by group or others: chmod go-w .*, then re-run$/],
+  ] as const) {
+    const root = repo(t)
+    mkdirSync(installDir(root), { recursive: true, mode: 0o700 })
+    chmodSync(installDir(root), bits)
+    assert.throws(() => checkLogFolder(root), (e: unknown) => machineRefusal(e) && fix.test((e as Error).message), bits.toString(8))
+    assert.throws(() => new Runner({ repoRoot: root, env: installerEnv(home), spawn: recorder().spawn, now: () => NOW }).start(probe(root)), machineRefusal, bits.toString(8))
+    chmodSync(installDir(root), 0o700)
+  }
+  // Each level is held to it, .aos itself included, with no .aos/install yet: another account's .aos (as root; else one at 0000, met
+  // by its mode), and an .aos/install whose owner may write but not search it (0600) or not read it (0300): u+rwx, every bit.
+  const top = repo(t)
+  mkdirSync(join(top, '.aos'), { mode: 0o700 })
+  chmodSync(join(top, '.aos'), 0o700)
+  const aos = join(top, '.aos')
+  const topFix = AS_ROOT
+    ? `${aos} belongs to uid ${String(NOBODY)}, not you (uid 0): fix its owner (chown) and re-run`
+    : `${aos} is mode 0000, which keeps you from writing in it: chmod u+rwx ${aos}, then re-run`
+  if (AS_ROOT) chownSync(aos, NOBODY, NOBODY)
+  else chmodSync(aos, 0o000)
+  try {
+    assert.throws(() => checkLogFolder(top), (e: unknown) => machineRefusal(e) && (e as Error).message === topFix)
+  } finally {
+    chmodSync(aos, 0o700)
+    if (AS_ROOT) chownSync(aos, 0, 0)
+  }
+  for (const bits of [0o600, 0o300]) {
+    const root = repo(t)
+    mkdirSync(installDir(root), { recursive: true, mode: 0o700 })
+    chmodSync(join(root, '.aos'), 0o700)
+    chmodSync(installDir(root), bits)
+    const shown = bits.toString(8).padStart(4, '0')
+    try {
+      assert.throws(
+        () => checkLogFolder(root),
+        (e: unknown) => machineRefusal(e) && (e as Error).message === `${installDir(root)} is mode ${shown}, which keeps you from writing in it: chmod u+rwx ${installDir(root)}, then re-run`,
+        shown,
+      )
+    } finally {
+      chmodSync(installDir(root), 0o700)
+    }
+  }
+
+  // Not there yet: no refusal, and nothing made.
+  const bare = repo(t)
+  checkLogFolder(bare)
+  assert.equal(existsSync(join(bare, '.aos')), false)
+
+  // A hundred runs stamped the same second: the folder is the machine's to tidy.
+  const crowded = repo(t)
+  mkdirSync(installDir(crowded), { recursive: true, mode: 0o700 })
+  chmodSync(join(crowded, '.aos'), 0o700)
+  for (let n = 1; n <= 100; n += 1) mkdirSync(join(installDir(crowded), n === 1 ? STAMP : `${STAMP}-${String(n)}`), { mode: 0o700 })
+  assert.throws(
+    () => new Runner({ repoRoot: crowded, env: installerEnv(home), spawn: recorder().spawn, now: () => NOW }).start(probe(crowded)),
+    (e: unknown) => machineRefusal(e) && /already holds 100 runs stamped 20261029T054506Z: remove the ones you no longer need, then re-run$/.test((e as Error).message),
+  )
+
+  // An active.json that cannot be removed (a directory in its place): the machine's, with what to remove.
+  const dirActive = repo(t)
+  mkdirSync(activePath(dirActive), { recursive: true })
+  assert.throws(() => clearActive(dirActive), (e: unknown) => machineRefusal(e) && /^cannot remove .*active\.json \(E[A-Z]+\)$/.test((e as Error).message))
+
+  // The two that only a mode can make, met as an account modes bind (nobody, when the suite runs as root).
+  // A repository root no one may make .aos in: the mkdir.
+  const locked = repo(t)
+  handTo(locked)
+  chmodSync(locked, 0o555)
+  await asNobody(() => {
+    assert.throws(
+      () => new Runner({ repoRoot: locked, env: installerEnv(home), spawn: recorder().spawn, now: () => NOW }).start(probe(locked)),
+      (e: unknown) => machineRefusal(e) && /^cannot make .*\.aos \(EACCES\): make its folder yours to write in \(chown, chmod u\+rwx\), then re-run$/.test((e as Error).message),
+    )
+  })
+  chmodSync(locked, 0o755)
+  // An .aos/install the run's folder was made in, closed to writing since: active.json's claim.
+  const closed = repo(t)
+  handTo(closed)
+  await asNobody(async () => {
+    const fake = exits()
+    const runner = new Runner({ repoRoot: closed, env: installerEnv(home), spawn: fake.spawn, now: () => NOW })
+    await runner.run(probe(closed))
+    assert.equal(lstatSync(installDir(closed)).uid, BOUND_UID)
+    chmodSync(installDir(closed), 0o500)
+    try {
+      assert.throws(
+        () => runner.start(own(closed)),
+        (e: unknown) => machineRefusal(e) && /^merge: cannot create .*active\.json \(EACCES\): make .*\.aos\/install yours to write in \(chown, chmod u\+rwx\), then re-run; nothing was run$/.test((e as Error).message),
+      )
+    } finally {
+      chmodSync(installDir(closed), 0o700)
+    }
+    assert.equal(fake.calls.length, 1, 'the step in its own session was spawned')
+  })
 })

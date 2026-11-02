@@ -93,11 +93,19 @@ confirm a change. What it does, in order (`scripts/install.ts`; decisions
 D33, D35 and D36):
 
 - **Preflight**, read-only. It refuses root, a tree a falsify run holds, a Node
-  outside `engines`, a `.gitignore` that stops ignoring `.env` or `/.aos/`, and
+  outside `engines`, a `.gitignore` that stops ignoring `.env` or `/.aos/`, a
+  `.aos` or `.aos/install` that is not yours to write in ("belongs to uid N,
+  not you: fix its owner (chown) and re-run"), and
   a missing program that pmmcp or the installer runs (git, curl, uv, ollama,
   python3, bash, docker, lsof, ps, pgrep, launchctl, plutil, and Docker
   Desktop's credential helper when `~/.docker/config.json` names it; not
-  checked with `--aos-only`). It names the bash pmmcp's scripts run and its
+  checked with `--aos-only`). Every program the run will start (ls, ps, pgrep,
+  lsof, plutil, launchctl, docker, git; ls and ps alone with `--aos-only`,
+  whose programs line says so) and, unless `--aos-only`, every one pmmcp's
+  scripts run by name (bash, curl, uv, python3, ollama) is
+  looked up on the PATH a child gets and held to the installer's rules then,
+  without running it (below), so a file there that the rules refuse stops the
+  run before the lock, `.env` or any program. It names the bash pmmcp's scripts run and its
   version, read from that file and never by running it (macOS's own is 3.2).
   It names any of `DOCKER_CONFIG`, `DOCKER_HOST`,
   `DOCKER_CONTEXT` or `PMMCP_*` your shell exports: no program it starts sees
@@ -112,7 +120,9 @@ D33, D35 and D36):
   hex): a value of either
   token that is lowercase hex shorter than 64 characters is refused by its
   line, "looks cut short (a write that did not finish): delete that line and
-  re-run", and no digest of it is ever staged. The screen gives `.env`'s mode,
+  re-run", before pmmcp is looked at, and no digest of it is ever staged; so
+  is a last line, with no newline, that a write stopped inside the name
+  (`AOS_PMMCP_TOK`). The screen gives `.env`'s mode,
   link count and owner.
 - **pmmcp**: found from its launchd plist, the process on 8766, or
   `~/Github/Persistent-Memory-MCP`, with every fact read from pmmcp's own
@@ -126,9 +136,21 @@ D33, D35 and D36):
   into `.env`. Its bearer gate stays in warn mode: switching it to enforce is
   your later step. Every program it starts runs by the path its rules
   checked, never by a name looked up again; a file on that PATH that is
-  pmmcp's stop or start script by a link or by identity (a hard link, a copy),
-  or a link there to a program it never runs, is refused before any change,
-  exit 2, naming the file to remove or rename. A refusal of its own rules
+  pmmcp's stop or start script by a link, by identity (a hard link, a copy)
+  or by its `#!` header (each of pmmcp's two names itself on its second line,
+  so a link or copy of one is known wherever its install is), or a link there
+  to a program it never runs, is refused before any change, exit 2, naming
+  the file to remove or rename: at the preflight (by its header, or by
+  identity with the default install's and `--pmmcp-dir`'s scripts), and again,
+  by identity, as discovery reads an install's folder from its launchd plist
+  or from the server on 8766, before its next probe. A file refused only then
+  that one of discovery's read-only probes had already run (a changed copy of
+  that install's script linked as plutil, say) is said to have run, with
+  what to check, and the first and last lines say so too: never that nothing
+  ran. One that appears later, during the run, is still named with its fix,
+  and the run ends as a step that failed. A program that cannot be started is named with that file and why: a `#!` line
+  naming an interpreter that is not there (in discovery's notes), a file that
+  lost its execute bit (with the `chmod u+x`), or one that is gone. A refusal of its own rules
   that nothing on the machine causes is its defect: exit 1, said as one.
 - **Live pmmcp changes** (a restart to load the digest, the Qdrant key
   cutover, the dashboard token and curator secret, a fast-forward of its code,
@@ -177,20 +199,35 @@ including a pmmcp that is stopped while the last run that stopped it ran no
 start after it (it was killed or crashed inside the stopped window, or a stop
 did not stop and no start followed; its run folder shows it, and what you ran
 by hand since is not known to it): it then offers the start, behind the same
-warning and two typed confirmations. A run whose non-live steps ran (it
-staged the `aos-kernel` digest, or appended to `.env`) but that restarted
-nothing (you declined the restart, typed another word, or stopped at a
-question) says in its next steps to run it again and accept the restart:
-pmmcp loads the digest only when it starts. When the digest was on file
-already and nothing was applied, no end report is printed: the plan's notes
-say the running server may not have loaded it, and every run offers the
-restart until one has.
+warning and two typed confirmations. The end report's next steps say "run npm
+run aos-install again and accept the restart" exactly when the `aos-kernel`
+digest is on file but not known to be loaded by the running MCP server and
+this run neither stopped nor started pmmcp (you declined the restart, typed
+another word, or stopped at a question): pmmcp loads the digest only when it
+starts. Where the jobs check cannot run (an older stop script), no restart
+could be offered, and the line says pmmcp loads it at its next restart; for a
+pmmcp that is not running, its next start loads it. After a stop that refused
+its arguments or never ran, it never says to accept the restart: a stop that
+refused its arguments (exit 2: the installer gives it none, so pmmcp's stop
+script may have changed) and a refusal of the installer's own rules are to
+report, and when a file, a step still running, or a stop that cannot be
+started (its execute bit lost: the line names the `chmod u+x`) kept it from
+running, it says to fix what that line names and run the installer again. After a stop that did not stop and a start you accepted to
+restore service, it says to run the installer again, once the stop's problem
+is fixed, to finish what was not reached. When nothing was applied, no end
+report is printed: the plan's notes say the running server may not have
+loaded the digest, and each such run offers the restart again.
 After the stopped window the end report reads pmmcp's facts and Qdrant's
 `status --json` again, so what it shows is what holds after the start, never
 what discovery read while pmmcp was stopped; a read it cannot make (a Ctrl-C
 there reaches the probe, which it then asks again) is said as a check it could
 not make. A `pmmcp-qdrant` that holds its key and is only stopped, as it is
-while pmmcp is, is no failure: the start runs it again. Once everything is in place it says so and asks nothing. A
+while pmmcp is, is no failure: the start runs it again. The start's own check
+of a key this run made asks `status --json` once more before one failed read
+fails the start, and gives the cutover's `rollback` only for a verdict read and
+not `enforced`; a fresh install's key, which `init` made, has no rollback, and
+the advice is what to check and that its key file goes only with pmmcp
+stopped. Once everything is in place it says so and asks nothing. A
 `pmmcp-qdrant-prekey` kept from a Qdrant cutover counts as in place: it is not
 asked about on its own (the notes give its `qdrant_api_key.py cleanup` command,
 which also ends the cutover's rollback), and is offered, default no, only in a

@@ -1757,6 +1757,7 @@ test('a token cut short by a write that did not finish is named by its line, nev
   for (const [why, text] of [
     ['as the write left it, with no newline', torn],
     ['with a newline put after it since (an edit, or an append by an earlier installer)', `${torn}\n`],
+    ['cut to its first character', `${CREATED_HEADER}AOS_CONTROL_TOKEN=${control}\nAOS_PMMCP_TOKEN=${whole.slice(0, 1)}`],
     ['cut to the 8 characters the kernel still sends as a bearer', `${CREATED_HEADER}AOS_CONTROL_TOKEN=${control}\nAOS_PMMCP_TOKEN=${whole.slice(0, 8)}`],
     ['cut one character short of a whole one', `${CREATED_HEADER}AOS_CONTROL_TOKEN=${control}\nAOS_PMMCP_TOKEN=${whole.slice(0, GENERATED_LENGTH - 1)}`],
   ] as const) {
@@ -1836,6 +1837,63 @@ test('a token cut short by a write that did not finish is named by its line, nev
     assert.deepEqual(done.appended, [], why)
     assert.deepEqual(done.digests, [{ name: 'AOS_PMMCP_TOKEN', digest: digestOf(own) }], why)
     assert.equal(snapshot(join(repo, '.env')), before, why)
+  }
+})
+
+test('two tokens cut short are both named by their lines, with "delete those lines", no digest of either, and nothing appended', (t) => {
+  // An earlier run that appended both and stopped part way in each (two failed runs), or a file a later edit put a newline after.
+  const NAMES = ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY']
+  const digests = ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN']
+  const control = randomBytes(32).toString('hex')
+  const pmmcp = randomBytes(32).toString('hex')
+  const repo = repoWith(t, `${CREATED_HEADER}AOS_CONTROL_TOKEN=${control.slice(0, 1)}\nAOS_PMMCP_TOKEN=${pmmcp.slice(0, GENERATED_LENGTH - 1)}`)
+  const before = snapshot(join(repo, '.env'))
+  const seen = inspectIn(repo, NAMES, { digests, minted: GENERATABLE })
+  assert.deepEqual(seen.damaged, [
+    { name: 'AOS_CONTROL_TOKEN', line: 3 },
+    { name: 'AOS_PMMCP_TOKEN', line: 4 },
+  ])
+  assert.deepEqual(seen.digests, [])
+  const g = generators('AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN')
+  const message = untouched(() => appendIn(repo, g.generate, { digests }))
+  assert.equal(
+    message,
+    `${join(realpathSync(repo), '.env')} line 3: AOS_CONTROL_TOKEN looks cut short (a write that did not finish); line 4: AOS_PMMCP_TOKEN looks cut short (a write that did not finish): delete those lines and re-run. Nothing was written`,
+  )
+  for (const value of [control, pmmcp]) assert.equal(echoes(message, value), false)
+  assert.equal(g.calls(), 0)
+  assert.equal(snapshot(join(repo, '.env')), before)
+})
+
+test('a write cut short inside a minted name is refused by its line as cut short, never only as "not NAME=value"; a whole line or another name is the loader\'s to judge', (t) => {
+  // `writing .env failed after 23 of 81 bytes (EFBIG)` with the cut inside the name: the last line is AOS_PMMCP_TOK, no '=', no newline.
+  const NAMES = ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY']
+  const control = randomBytes(32).toString('hex')
+  for (const tail of ['A', 'AOS_PMMCP_TOK', 'AOS_PMMCP_TOKEN', 'AOS_CONTROL_']) {
+    const repo = repoWith(t, `${CREATED_HEADER}AOS_CONTROL_TOKEN=${control}\n${tail}`)
+    const before = snapshot(join(repo, '.env'))
+    const cut = `line 4: ${tail} looks cut short (a write that did not finish): delete that line and re-run`
+    const seen = refusal(() => inspectIn(repo, NAMES, { minted: GENERATABLE }))
+    assert.ok(seen.includes(cut), `${tail}: ${seen}`)
+    assert.doesNotMatch(seen, /not NAME=value/, tail)
+    const g = generators('AOS_PMMCP_TOKEN')
+    const message = untouched(() => appendIn(repo, g.generate))
+    assert.ok(message.includes(cut), `${tail}: ${message}`)
+    assert.match(message, /\. Nothing was written$/, tail)
+    assert.equal(g.calls(), 0, tail)
+    assert.equal(snapshot(join(repo, '.env')), before, tail)
+  }
+  // Not the last line, a line a newline ended since, no name the AOS mints, or an inspection told of none: the loader's own refusal.
+  for (const [why, text, minted] of [
+    ['a final newline after it', `${CREATED_HEADER}AOS_CONTROL_TOKEN=${control}\nAOS_PMMCP_TOK\n`, GENERATABLE],
+    ['a line after it', `${CREATED_HEADER}AOS_PMMCP_TOK\nAOS_CONTROL_TOKEN=${control}`, GENERATABLE],
+    ['the start of no name the AOS mints', `${CREATED_HEADER}AOS_CONTROL_TOKEN=${control}\nANTHROPIC_API`, GENERATABLE],
+    ['no minted name named', `${CREATED_HEADER}AOS_CONTROL_TOKEN=${control}\nAOS_PMMCP_TOK`, new Set<string>()],
+  ] as const) {
+    const repo = repoWith(t, text)
+    const seen = refusal(() => inspectIn(repo, NAMES, { minted }))
+    assert.match(seen, /not NAME=value/, why)
+    assert.doesNotMatch(seen, /looks cut short/, why)
   }
 })
 

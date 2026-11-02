@@ -14,7 +14,7 @@ import './helpers/guard.js'
 import assert from 'node:assert/strict'
 import { createHash, randomBytes } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import fs, { chmodSync, closeSync, constants, existsSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync, writeSync } from 'node:fs'
+import fs, { chmodSync, closeSync, constants, existsSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync, writeSync } from 'node:fs'
 import http, { createServer, type IncomingHttpHeaders } from 'node:http'
 import { syncBuiltinESMExports } from 'node:module'
 import type { AddressInfo } from 'node:net'
@@ -53,8 +53,9 @@ import {
   type Stop,
   type Stopped,
 } from '../scripts/install/discover.js'
-import { Runner, STOP_SCRIPT, activePath, type ChildOptions, type SpawnFn } from '../scripts/install/run.js'
+import { InstallRunError, Runner, STOP_SCRIPT, activePath, installDir, type ChildOptions, type SpawnFn } from '../scripts/install/run.js'
 import { foundScreen } from '../scripts/install.js'
+import { AS_ROOT, NOBODY, asNobody, handTo } from './helpers/as-nobody.js'
 import { parseKernelConfig, type KernelConfig } from '../src/config.js'
 import { FEATURE_COMMITS, FEATURE_NAMES, PmmcpDocumentError, featuresOf, keyedLoopbackOnly, missingFeatures, parseFacts, parseQdrantStatus } from '../src/install/facts.js'
 import { parseProviders, type ProvidersFile } from '../src/models/registry.js'
@@ -1824,6 +1825,41 @@ test('the HTTP probes ask loopback only, through no proxy, with no credential', 
   assert.equal(serverDirOf(`${odd}/.venv/bin/pmmcp`, (d) => d === odd), odd)
 })
 
+test("as the plist or the listener names an install, each program's file on the child's PATH is held to the runner's rules with its scripts before the next probe, and says whether it already ran", async (t) => {
+  // A changed copy of the stop (its header names nothing): only the install's folder tells it. The plist's: refused right after
+  // plutil's first read, before its second, lsof or anything else, and lsof has not run.
+  const a = new World(t, { under: ['Code', PMMCP_FOLDER], plist: true })
+  writeFileSync(join(a.dir, STOP_SCRIPT), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  const lsof = join(a.home, '.local', 'bin', 'lsof')
+  rmSync(lsof)
+  linkSync(join(a.dir, STOP_SCRIPT), lsof)
+  const byPlist = stopped(await a.run(t))
+  const hard = (name: string, dir: string): string =>
+    `${name}: stop-pmmcp-server.sh runs only by absolute path, and ${name} on the child's PATH is ${join(a.home, '.local', 'bin', name)}, which is the same file as ${realpathSync(join(dir, STOP_SCRIPT))} (a hard link): ` +
+    'remove or rename that file, then re-run'
+  assert.deepEqual(byPlist.stops, [{ code: 'path', message: `${hard('lsof', a.dir)}; the installer has not run it` }])
+  assert.deepEqual(a.calls.map((c) => [c.command, ...c.args].join(' ')), [`plutil -extract WorkingDirectory raw -o - ${a.plist}`])
+
+  // The listener's: lsof and ps found it, so ps, a hard link of its stop, already ran; docker, one too, had not. Neither the facts
+  // nor docker run after.
+  const b = new World(t, { under: ['work', PMMCP_FOLDER], listener: true })
+  writeFileSync(join(b.dir, STOP_SCRIPT), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  for (const name of ['ps', 'docker']) {
+    rmSync(join(b.home, '.local', 'bin', name))
+    linkSync(join(b.dir, STOP_SCRIPT), join(b.home, '.local', 'bin', name))
+  }
+  const byListener = stopped(await b.run(t))
+  const hardB = (name: string): string => hard(name, b.dir).replace(join(a.home, '.local', 'bin', name), join(b.home, '.local', 'bin', name))
+  assert.deepEqual(byListener.stops, [
+    {
+      code: 'path-ran',
+      message: `${hardB('ps')}; it already ran, as ps, among discovery's read-only probes before this install was known, so it may have stopped or started pmmcp: see whether pmmcp runs as you left it`,
+    },
+    { code: 'path', message: `${hardB('docker')}; the installer has not run it` },
+  ])
+  assert.deepEqual(b.calls.map((c) => c.command), ['lsof', 'ps'])
+})
+
 test('a pmmcp under a folder whose name holds a space is found by its MCP server on 8766', async (t) => {
   const w = new World(t, { under: ['My Projects', PMMCP_FOLDER], listener: true })
   assert.ok(w.dir.includes(' '))
@@ -1897,6 +1933,9 @@ test('an earlier run that stopped pmmcp and did not start it again is found from
   const d = found(await deaf.run(t))
   assert.equal(d.leftStopped, undefined)
   assert.equal(d.service.loaded, undefined)
+  // Named once, by the program that could not be started, with its file: not a second time as launchd that cannot be asked.
+  assert.equal(d.notes.filter((n) => n.includes('launchctl-print: launchctl could not be started (ENOENT)')).length, 1, d.notes.join('\n'))
+  assert.ok(d.notes.some((n) => n.startsWith('launchctl could not be started, so what it would have read is not known: ')), d.notes.join('\n'))
   // launchctl failing otherwise (an unusable gui domain, say) did not answer "no such service": not known to be unloaded, and noted so.
   for (const code of [1, 5, 125]) {
     const failing = new World(t)
@@ -1932,4 +1971,73 @@ test('an earlier run that stopped pmmcp and did not start it again is found from
   assert.equal(earlierStop(tmpdir(t), undefined), undefined, 'no .aos/install at all')
   // This run's own folder is never an earlier run.
   assert.equal(earlierStop(killed.root, folder)?.folder, undefined)
+})
+
+test("a git that cannot be started is named in the notes with its file and why, once, and no update is offered for want of a fast-forward check", async (t) => {
+  // A ~/.local/bin/git whose #! names no interpreter: the runner spawns that file alone, which fails with ENOENT.
+  const w = new World(t)
+  const git = join(w.home, '.local', 'bin', 'git')
+  for (const key of [
+    'git --no-optional-locks rev-parse --verify -q refs/remotes/origin/main^{commit}',
+    'git --no-optional-locks status --porcelain',
+    `git --no-optional-locks merge-base --is-ancestor HEAD ${ORIGIN_MAIN}`,
+    `git --no-optional-locks diff --quiet HEAD ${ORIGIN_MAIN} -- uv.lock pyproject.toml`,
+  ]) {
+    w.overrides.set(key, { spawnError: 'ENOENT' })
+  }
+  const f = found(await w.run(t))
+  assert.deepEqual(f.git, { head: HEAD, originMain: undefined, fastForward: false, lockUnchanged: undefined, trackedChanges: undefined, untracked: undefined })
+  const named = f.notes.filter((n) => n.startsWith('git could not be started, so what it would have read is not known: '))
+  assert.equal(named.length, 1, f.notes.join('\n'))
+  assert.match(
+    named[0] ?? '',
+    new RegExp(
+      `: git-origin-main: git could not be started \\(ENOENT\\): git is ${git.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}, the first on the child's PATH; that file is there, so its #! line names an interpreter that is not: fix or remove .*git, then re-run$`,
+    ),
+  )
+  assert.ok(f.notes.includes('git could not be started (above), so whether origin/main is a fast-forward of HEAD cannot be checked: no update is offered'), f.notes.join('\n'))
+  // A git that runs says nothing of the kind.
+  const fine = found(await new World(t).run(t))
+  assert.equal(fine.notes.some((n) => /could not be started/.test(n)), false)
+})
+
+test(".aos/install of another account's is refused by its owner before active.json is read, never taken for a record an earlier run left", async (t) => {
+  // The checkout and its .aos are the installer's account's; .aos/install is root's, 0700 (the scenario's p-install-owner). As root the
+  // suite takes nobody's part, for whom that folder's active.json cannot be opened (EACCES) though no run left one; as anyone else,
+  // its own folder at 0000 meets the same EACCES.
+  const w = new World(t)
+  await w.serve(t)
+  const aos = join(w.root, '.aos')
+  mkdirSync(installDir(w.root), { recursive: true, mode: 0o700 })
+  chmodSync(aos, 0o700)
+  handTo(w.root, aos)
+  let fault: RegExp
+  if (AS_ROOT) fault = new RegExp(`^${installDir(w.root).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} belongs to uid 0, not you \\(uid ${String(NOBODY)}\\): fix its owner \\(chown\\) and re-run$`)
+  else {
+    chmodSync(installDir(w.root), 0o000)
+    fault = /^.*\.aos\/install is mode 0000, which keeps you from writing in it: chmod u\+rwx .*, then re-run$/
+  }
+  // Only discovery's first, synchronous step runs as that account: the promise is awaited after the uid is put back.
+  const pending = await asNobody(() => ({
+    discovery: discover({
+      repoRoot: w.root,
+      home: w.home,
+      runner: new Runner({ repoRoot: w.root, env: w.env(), spawn: w.spawn, now: () => NOW }),
+      config: w.config,
+      providers: w.providers,
+      uid: OP_UID,
+      inspect: { euid: OP_UID },
+      http: w.http,
+      now: () => NOW,
+      sleep: () => Promise.resolve(),
+    }),
+  }))
+  await assert.rejects(pending.discovery, (e: unknown) => {
+    assert.ok(e instanceof InstallRunError && e.code === 'AOS_INSTALL_RUN_REFUSED' && e.machine, String(e))
+    assert.match(e.message, fault)
+    assert.doesNotMatch(e.message, /earlier installer run/)
+    return true
+  })
+  assert.equal(w.calls.length, 0, 'a probe ran')
+  chmodSync(installDir(w.root), 0o700)
 })

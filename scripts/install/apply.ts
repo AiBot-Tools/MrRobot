@@ -44,6 +44,14 @@
 //   step there runs in a session of its own (the stop and start scripts by
 //   the runner's rule, the fast-forward, the Qdrant cutover and auth init
 //   marked ownSession), with no timeout, and nothing here ever signals one.
+//   While L1's stop runs (and only then: not the start, the Qdrant enable,
+//   the fast-forward or auth init) the installer is told its pid and its
+//   stdout file (`stopping`), and told again (undefined) once it has
+//   exited: a Ctrl-C meanwhile offers the typed force-quit of the one
+//   service the stop's drain waits on (scripts/install/force-quit.ts, from
+//   the entry point; the operator's exception of 2026-11-04). A force-quit
+//   carried out is handed back (recordForceQuit) and the end report gives
+//   it, with what a SIGKILL may leave.
 //   A read-only probe (lsof, ps, docker, pgrep, git, the facts, a check) is
 //   the installer's own child, in its process group, so the terminal's
 //   Ctrl-C or hangup reaches it even while the installer traps it, or, after
@@ -234,6 +242,7 @@ import {
   type AppendResult,
   type InspectOptions,
 } from '../../src/secrets/dotenv-append.js'
+import { forceQuitLine, type ForceQuitRecord } from './drain.js'
 import { CURATOR_ADDRESS, LOOPBACK_HOSTS, PMMCP_FOLDER, PMMCP_PORTS, loopbackGet, parseEtime, startedAfter, type Absent, type Found, type HttpGet } from './discover.js'
 import {
   InstallRunError,
@@ -250,6 +259,7 @@ import {
   type RunResult,
   type RunSpec,
   type Runner,
+  type Started,
 } from './run.js'
 
 /** Where a fresh install is cloned from: what discovery accepts as the origin. */
@@ -347,6 +357,18 @@ export interface ApplyOptions {
   readonly window?: (open: boolean) => void
   /** Aborted when the operator presses Ctrl-C outside the window: ends the jobs count's wait. */
   readonly interrupt?: AbortSignal
+  /**
+   * Told when L1's stop starts (its pid and stdout file, <step>.out) and once
+   * it has exited (undefined): the installer offers the force-quit of the
+   * service it drains on a Ctrl-C meanwhile. Only the stop: no other step.
+   */
+  readonly stopping?: (stop: StopRunning | undefined) => void
+}
+
+/** L1's stop while it runs: its pid (and so its process group) and its stdout file. */
+export interface StopRunning {
+  readonly pid: number
+  readonly out: string
 }
 
 /** What the applier refuses to do: a defect in its caller, never a finding about pmmcp. */
@@ -632,6 +654,8 @@ export class Applier {
   readonly #undo: string[] = []
   /** What is left for the operator to do by hand: always in the report. */
   readonly #todo: string[] = []
+  /** The force-quits carried out while L1's stop waited (recordForceQuit). */
+  readonly #forceQuits: ForceQuitRecord[] = []
 
   constructor(options: ApplyOptions) {
     if (!isAbsolute(options.repoRoot) || !isAbsolute(options.home)) throw new ApplyError('the repository root and HOME must be absolute paths')
@@ -651,6 +675,11 @@ export class Applier {
     }
     // Before anything runs: a restart this run makes changes what the daemon reads only if the digest was not loaded already.
     this.#loadedBefore = this.#loaded
+  }
+
+  /** A force-quit the operator typed while L1's stop waited on a service (the entry point's SIGINT path): the end report gives it. */
+  recordForceQuit(record: ForceQuitRecord): void {
+    this.#forceQuits.push(record)
   }
 
   /** What has been done, skipped, failed or left inconclusive, in order. */
@@ -1068,7 +1097,10 @@ export class Applier {
   /** L1: the graceful stop, and the check that it stopped. A stop that did not stop ends the run, offering the start. */
   async #stopStep(step: Step, dir: string): Promise<void> {
     this.#liveBegun = true
-    const ran = await this.#exec({ step: 'stop', command: join(dir, STOP_SCRIPT), args: [], cwd: dir }, `L1 ${STOP_SCRIPT}`)
+    // The installer follows it while it runs, for a typed force-quit of the service its drain waits on (and only of that).
+    const ran = await this.#exec({ step: 'stop', command: join(dir, STOP_SCRIPT), args: [], cwd: dir }, `L1 ${STOP_SCRIPT}`, (started) =>
+      this.#o.stopping?.(started === undefined || started.pid === undefined ? undefined : { pid: started.pid, out: started.out }),
+    )
     if (!ran.ok && ran.result === undefined) {
       this.#stopNotRun = { why: 'did not run', by: ran.refused === 'defect' ? 'defect' : 'machine' }
       this.#item(step.short, 'failed', `${ran.why}: nothing was stopped`)
@@ -1864,11 +1896,21 @@ export class Applier {
    * writes is never run twice. Before the window ever opened a Ctrl-C ends
    * the installer, so a probe is never run again there.
    */
-  async #exec(spec: RunSpec, label?: string): Promise<Ran> {
+  async #exec(spec: RunSpec, label?: string, watch?: (started: Started | undefined) => void): Promise<Ran> {
     for (let rerun = 0; ; rerun += 1) {
       let result: RunResult
       try {
-        result = await this.#o.runner.run(spec)
+        if (watch === undefined) result = await this.#o.runner.run(spec)
+        else {
+          // Told the child once it runs, and again once it has exited: a refusal throws before either.
+          const started = this.#o.runner.start(spec)
+          watch(started)
+          try {
+            result = await started.done
+          } finally {
+            watch(undefined)
+          }
+        }
       } catch (e) {
         if (e instanceof InstallRunError && e.code !== 'AOS_INSTALL_RUN_LEAK' && e.code !== 'AOS_INSTALL_RUN_HALTED') {
           if (label !== undefined) this.#print(`${label}: not run: ${e.message}`)
@@ -2206,6 +2248,7 @@ export class Applier {
     const dir = plan.pmmcpDir
     for (const item of this.#items) out.push(`  ${item.state.padEnd(12)} ${item.what}${item.detail === '' ? '' : `: ${item.detail}`}`)
     for (const step of plan.steps) if (!this.#handed.has(step)) out.push(`  ${'skipped'.padEnd(12)} ${shownLine(step.short)}`)
+    for (const r of this.#forceQuits) out.push(forceQuitLine(r))
 
     const env = this.#env
     const failed = this.#envFailed
@@ -2296,6 +2339,13 @@ export class Applier {
     if (ways.length > 0 && this.#items.some((i) => i.state === 'failed')) {
       out.push('to go back on what this run changed:')
       for (const u of ways) out.push(`  ${u}`)
+    }
+
+    if (this.#forceQuits.length > 0) {
+      out.push('notes:')
+      out.push(
+        "  a SIGKILL ends a service with no drain: a job the worker was running is marked failed and re-run by pmmcp, and a service may leave work unfinished; check ~/.persistent-memory-mcp/logs/server.log",
+      )
     }
 
     out.push('next steps:')

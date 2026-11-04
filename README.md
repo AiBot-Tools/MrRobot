@@ -161,11 +161,40 @@ D33, D35 and D36):
   nothing ever sends it or the start script a signal or a timeout: inside that
   window neither Ctrl-C nor a closed terminal (SIGHUP) nor a SIGTERM ends the
   installer, which goes on to the start and its checks, and its steps run in
-  sessions of their own. From the window's first opening until the end report
-  is printed, a signal outside the window (at no question) is held as well:
-  the run finishes its last checks and prints the report (whether pmmcp is
-  left stopped, and what is left to do) first, and ends with its own code.
-  There is no `--yes` and no `--force`.
+  sessions of their own. One exception, typed (the operator's, 2026-11-04):
+  the stop's drain waits on a service with no upper bound and offers only a
+  Ctrl-C, which cannot reach it there, so a Ctrl-C while the stop runs names
+  the service it is waiting on (read from the stop's own output, then
+  confirmed with `ps`: alive, yours, a command line holding
+  `Persistent-Memory-MCP` or the install's folder, or one of pmmcp's own named
+  Ollama instances, outside the installer's and the stop's process groups) and
+  asks; only the typed word `force-quit` sends that one process SIGKILL, after
+  `ps` shows it is still the same process (start time, owner, command line).
+  The stop then sees it gone and goes on, and the installer goes on to the
+  start and its checks. Anything else typed, the input ending or a second
+  Ctrl-C keeps waiting; a stop that is not waiting on a service (counting
+  jobs, stopping Qdrant with `docker stop -t 60`, between services) has
+  nothing to force-quit, and says so. pmmcp's own named Ollama instances
+  (exactly the one the stop is draining, `PMMCP-TextQuery serve`,
+  `PMMCP-CodeQuery serve`, `PMMCP-TextIndex serve` or `PMMCP-CodeIndex serve`,
+  or `PMMCP-Ollama serve` for any of the four, yours, with no path before the
+  name) can be force-quit the same way; `ollama serve` and Ollama.app's or
+  Homebrew's server (`/Applications/Ollama.app/Contents/Resources/ollama
+  serve`, `<prefix>/bin/ollama serve`) cannot: only a PID file of the start
+  script vouches for an `ollama serve`, the installer reads none, and the
+  three look alike once a path is dropped. A Ctrl-C while the stop drains one
+  of those says why and how to end it yourself (check it with `ps` in another
+  terminal, and end it there if it is pmmcp's), and the stop goes on waiting
+  on it. A SIGHUP or SIGTERM then, and a Ctrl-C anywhere else in the window
+  (the start, the Qdrant cutover, the fast-forward, `auth init`), are trapped
+  as before. A force-quit is in the end report and in the run folder's
+  `force-quit.log`; a SIGKILL gives the service no drain, so a job the worker
+  was running is marked failed and re-run by pmmcp (check
+  `~/.persistent-memory-mcp/logs/server.log`). From the window's first opening
+  until the end report is printed, a signal outside the window (at no
+  question) is held as well: the run finishes its last checks and prints the
+  report (whether pmmcp is left stopped, and what is left to do) first, and
+  ends with its own code. There is no `--yes` and no `--force`.
 
 Flags: `--dry-run`; `--aos-only` (`.env` only, pmmcp is never touched);
 `--pmmcp-dir PATH` (use this install, still validated); `--no-install` (never
@@ -365,7 +394,7 @@ and outside this rule (decision D36, the last row).
 | `.aos/workspaces/{trusted,hostile}` | sandbox mount roots, one per Colima VM |
 | `.aos/docker` | `DOCKER_CONFIG` for the kernel's docker calls and `colima-up.sh`, never `~/.docker` |
 | `.env` | your credentials (`AOS_CONTROL_TOKEN`, `AOS_PMMCP_TOKEN`, `ANTHROPIC_API_KEY`): written by you, or created at 0600 and appended to by `npm run aos-install`, which generates the two tokens, never writes `ANTHROPIC_API_KEY` and never changes a line; mode 0600, git-ignored; read, never written, by the other npm entry scripts; deleted by `git clean -fdx` like `.aos/` |
-| `.aos/install/`, `.aos/install.lock` | the installer's logs: a 0700 folder per run, `<UTC stamp>/`, holding each program's `<step>.out` and `<step>.err` (0600), `installer.out` (what it said, when its own output went away mid-run), and `active.json` while a step it started in a session of its own runs; its lock, held while it runs and removed at its exit (one left by a killed run is taken over, even after a reboot gave its pid to another process) |
+| `.aos/install/`, `.aos/install.lock` | the installer's logs: a 0700 folder per run, `<UTC stamp>/`, holding each program's `<step>.out` and `<step>.err` (0600), `installer.out` (what it said, when its own output went away mid-run), `force-quit.log` (0600, a typed force-quit's record), and `active.json` while a step it started in a session of its own runs; its lock, held while it runs and removed at its exit (one left by a killed run is taken over, even after a reboot gave its pid to another process) |
 | `.aos/npm-cache` | npm's cache (`.npmrc`); run npm from the repo root, because npm resolves a relative path against the shell's directory |
 | `~/.colima` | Colima's VMs and sockets; `colima-up.sh` also sets `COLIMA_CACHE_HOME=~/.colima/_cache`, which would otherwise be `~/Library/Caches/colima` |
 | pmmcp (D36) | outside the rule: `~/Github/Persistent-Memory-MCP`, where `npm run aos-install` clones it when there is none, and what its `setup.sh` writes: `~/.persistent-memory-mcp`, `~/.ollama/models`, `~/.gemini/config/plugins/pmmcp-plugin`, `~/Library/LaunchAgents/com.aibot.pmmcp.plist`, uv and Python under `~/.local`, uv's cache `~/.cache/uv` (several GB), a macOS Keychain item (service `persistent-memory-mcp`, user `master_key`), and Docker Desktop's volume `pmmcp-qdrant-data` |

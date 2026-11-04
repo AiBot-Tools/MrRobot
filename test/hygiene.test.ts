@@ -513,6 +513,350 @@ test('the kernel never imports src/install: only src/install itself, the install
   }
 })
 
+/** node:process, as a module specifier names it. */
+const PROCESS_MODULE = /^(?:node:)?process$/
+
+/**
+ * A member of process that sends a signal, or reaches what does, other than
+ * by its name kill: `_kill` (the binding kill calls; on Node 22 it SIGKILLs
+ * with `process._kill(pid, 9)`), any other `_` member (Node's internals,
+ * `_linkedBinding` among them), `binding` and `dlopen` (a native binding or
+ * addon). Nothing in scripts/ or src/install reads one, so none is allowed.
+ */
+const reachesSignal = (member: string): boolean => member === 'kill' || member.startsWith('_') || member === 'binding' || member === 'dlopen'
+
+/**
+ * Every place in a file that can send a process a signal through
+ * process.kill, as `line  text`: a call whose signal is not the number 0 (no
+ * signal is SIGTERM; a name, another number or a variable is a signal), and
+ * any other reference to it (an alias, a destructuring, a named import of
+ * node:process's kill), whose signal cannot be read. process.kill(pid, 0)
+ * only asks whether pid runs. A member that reaches a signal beneath kill
+ * (reachesSignal: `process._kill`, `process.binding`, ...) is found however
+ * it is read. `process` is matched as the global, as globalThis.process (or
+ * global.process), and as any name a static import of node:process gives it
+ * (its default, `{ default as p }`, `* as p`). Any use of `process`,
+ * `globalThis` or `global` but a member (`process.env`, `globalThis.fetch`),
+ * `typeof`, or a destructuring that takes none of those members, nor process,
+ * nor the rest is found too: an alias (`const proc = process`, `const g =
+ * globalThis`), an argument, a computed member (`process[name]`), a local
+ * export (`export { proc }`). Through parentheses, `as`, `!` and
+ * `satisfies`. And node:process reached any other way is found where its
+ * name is spelled, as the child_process scan finds its module: any string in
+ * code that is `process` or `node:process` (a re-export, import(),
+ * require(), `import p = require()`, createRequire(import.meta.url)(...),
+ * process.getBuiltinModule(), a name held in a variable first, template
+ * text), but a static import's specifier, which is followed, a property's
+ * name and a computed member's, which the member rules read. It is a
+ * tripwire for natural code, not a proof: a name built from parts
+ * (`'pro' + 'cess'`), and what eval, new Function or vm run, are beyond any
+ * static scan, and a reviewer reads those by eye.
+ */
+function processKills(file: SourceFile): string[] {
+  const source = parsed(file)
+  const out: string[] = []
+  const at = (node: ts.Node): string => `${String(source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1)}  ${node.getText(source)}`
+  const names = new Set(['process'])
+  const globals = new Set(['globalThis', 'global'])
+  for (const st of source.statements) {
+    if (!ts.isImportDeclaration(st) || !ts.isStringLiteral(st.moduleSpecifier) || !PROCESS_MODULE.test(st.moduleSpecifier.text)) continue
+    const clause = st.importClause
+    if (clause?.name !== undefined) names.add(clause.name.text)
+    const bindings = clause?.namedBindings
+    if (bindings !== undefined && ts.isNamespaceImport(bindings)) names.add(bindings.name.text)
+    if (bindings !== undefined && ts.isNamedImports(bindings)) {
+      for (const el of bindings.elements) {
+        const imported = (el.propertyName ?? el.name).text
+        // `{ default as p }` is the process object, as a default import is.
+        if (imported === 'default') names.add(el.name.text)
+        else if (reachesSignal(imported)) out.push(at(st))
+      }
+    }
+  }
+  /** The outermost expression that is still `e`: through parentheses, `as`, `<T>`, `!` and `satisfies`. */
+  const outer = (e: ts.Expression): ts.Expression => {
+    let n = e
+    for (;;) {
+      const p = n.parent
+      const wraps = ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isTypeAssertionExpression(p) || ts.isNonNullExpression(p) || ts.isSatisfiesExpression(p)
+      if (!wraps || p.expression !== n) return n
+      n = p
+    }
+  }
+  /** `p`'s member name when it reads a member of `w`; null for a computed one; undefined when it is no member read of `w`. */
+  const memberOf = (p: ts.Node, w: ts.Expression): string | null | undefined => {
+    if (ts.isPropertyAccessExpression(p) && p.expression === w) return p.name.text
+    if (ts.isElementAccessExpression(p) && p.expression === w) return ts.isStringLiteralLike(p.argumentExpression) ? p.argumentExpression.text : null
+    return undefined
+  }
+  /** Whether a destructuring of `w` takes a key `wanted` holds, the rest, or a computed key. */
+  const takes = (p: ts.Node, w: ts.Expression, wanted: (key: string) => boolean): boolean | undefined => {
+    if (!ts.isVariableDeclaration(p) || p.initializer !== w || !ts.isObjectBindingPattern(p.name)) return undefined
+    return p.name.elements.some((el) => {
+      if (el.dotDotDotToken !== undefined) return true
+      const key = el.propertyName ?? el.name
+      if (ts.isComputedPropertyName(key)) return true
+      return ts.isIdentifier(key) || ts.isStringLiteralLike(key) ? wanted(key.text) : true
+    })
+  }
+  /** What `e`, an expression that is process, is used for. */
+  const useOfProcess = (e: ts.Expression): void => {
+    const w = outer(e)
+    const p = w.parent
+    const member = memberOf(p, w)
+    if (member === 'kill') {
+      const access = outer(p as ts.Expression)
+      const call = access.parent
+      if (ts.isCallExpression(call) && call.expression === access) {
+        const signal = call.arguments[1]
+        if (!(signal !== undefined && ts.isNumericLiteral(signal) && signal.text === '0')) out.push(at(call))
+      } else out.push(at(p))
+      return
+    }
+    if (member === null || (member !== undefined && reachesSignal(member))) return void out.push(at(p))
+    if (member !== undefined || ts.isTypeOfExpression(p)) return
+    const destructured = takes(p, w, reachesSignal)
+    if (destructured === false) return
+    out.push(at(p))
+  }
+  /** What `e`, an expression that is globalThis or global, is used for. */
+  const useOfGlobal = (e: ts.Expression): void => {
+    const w = outer(e)
+    const p = w.parent
+    const member = memberOf(p, w)
+    if (member === 'process') return useOfProcess(p as ts.Expression)
+    if (member === null) return void out.push(at(p))
+    if (member !== undefined || ts.isTypeOfExpression(p)) return
+    const destructured = takes(p, w, (key) => key === 'process')
+    if (destructured === false) return
+    out.push(at(p))
+  }
+  /** Whether an identifier is a value read by its name: not a member's or a declaration's name, an import's, or a type's. */
+  const isReference = (id: ts.Identifier): boolean => {
+    const p = id.parent
+    if (ts.isPropertyAccessExpression(p) && p.name === id) return false
+    if (ts.isImportSpecifier(p) || ts.isImportClause(p) || ts.isNamespaceImport(p) || ts.isExportSpecifier(p) || ts.isQualifiedName(p)) return false
+    if (ts.isBindingElement(p) && (p.propertyName === id || p.name === id)) return false
+    const named = ts.isVariableDeclaration(p) || ts.isParameter(p) || ts.isFunctionDeclaration(p) || ts.isClassDeclaration(p) || ts.isPropertyAssignment(p) || ts.isPropertyDeclaration(p) ||
+      ts.isPropertySignature(p) || ts.isMethodDeclaration(p) || ts.isMethodSignature(p) || ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p) || ts.isEnumMember(p) ||
+      ts.isInterfaceDeclaration(p) || ts.isTypeAliasDeclaration(p) || ts.isLabeledStatement(p)
+    if (named && (p as ts.NamedDeclaration).name === id) return false
+    for (let n: ts.Node = p; !ts.isSourceFile(n); n = n.parent) if (ts.isTypeNode(n)) return false
+    return true
+  }
+  /** Whether a string spells node:process where a loader may take it: anywhere in code but a property's name, a computed member's, or a literal type. */
+  const loads = (node: ts.Node): boolean => {
+    const text = ts.isStringLiteralLike(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node) ? node.text : undefined
+    if (text === undefined || !PROCESS_MODULE.test(text)) return false
+    const p = node.parent
+    if (ts.isElementAccessExpression(p) && p.argumentExpression === node) return false
+    if (ts.isLiteralTypeNode(p)) return false
+    const named = ts.isPropertyAssignment(p) || ts.isPropertyDeclaration(p) || ts.isPropertySignature(p) || ts.isMethodDeclaration(p) || ts.isEnumMember(p)
+    if (named && (p as ts.NamedDeclaration).name === node) return false
+    if (ts.isBindingElement(p) && p.propertyName === node) return false
+    return true
+  }
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportDeclaration(node)) return
+    if (loads(node)) out.push(at(node.parent))
+    // `export { proc }`: process handed to another module under a name its import of this one gives it, which is not followed.
+    if (ts.isExportSpecifier(node) && node.parent.parent.moduleSpecifier === undefined) {
+      const local = node.propertyName ?? node.name
+      if (ts.isIdentifier(local) && (names.has(local.text) || globals.has(local.text))) out.push(at(node))
+    }
+    if (ts.isIdentifier(node) && isReference(node)) {
+      if (names.has(node.text)) useOfProcess(node)
+      else if (globals.has(node.text)) useOfGlobal(node)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(source)
+  return out
+}
+
+test("within scripts/ and src/install a process is sent a signal (process.kill, any signal but 0) only by scripts/install/force-quit.ts, once, as SIGKILL; besides it only the mutation runner, at its own test runs", () => {
+  // The installer never signals pmmcp's stop or start script, and nothing
+  // pmmcp runs but the one service the operator types force-quit for while
+  // the stop waits on it: CLAUDE.md "Never" carries both, the second as its
+  // one exception (the operator's, 2026-11-04; D35, F1). The runner's H1 rule
+  // refuses kill, pkill and killall as programs; this holds Node's own way
+  // in: process.kill and the members beneath it, an alias of process or
+  // globalThis, and node:process loaded any way but a static import it
+  // follows (processKills says what is beyond any static scan).
+  // scripts/falsify/runner.ts, the mutation runner, is exempt by name: the one
+  // departure from F1's brief ("force-quit.ts alone within scripts/"), which
+  // the brief's owner accepted. It predates F1 and signals only children it
+  // spawned itself (the process group of a `node --test` run of its own,
+  // SIGKILLed at that run's timeout or at the runner's own signal exit),
+  // never a pmmcp process, and the installer never imports it. Its two kills
+  // are held to those forms below; any other file that signals fails the scan.
+  const pool = [...scriptSources(REPO, 'scripts'), ...SRC.filter((f) => f.path.startsWith('src/install/'))]
+  assert.ok(pool.some((f) => f.path === 'scripts/install/apply.ts') && pool.some((f) => f.path === 'src/install/gate.ts'), 'the scan sees no installer source')
+  const found = pool.flatMap((f) => processKills(f).map((h) => `${f.path}:${h}`))
+  assert.deepEqual(pathsOf(found), ['scripts/falsify/runner.ts', 'scripts/install/force-quit.ts'], found.join('\n'))
+  const falsify = found.filter((h) => h.startsWith('scripts/falsify/runner.ts:')).map((h) => h.replace(/^[^:]+:\d+ {2}/, ''))
+  assert.deepEqual(falsify, ["process.kill(-pid, 'SIGKILL')", "process.kill(-child.pid, 'SIGKILL')"], 'the mutation runner signals something besides the process groups of its own test runs')
+  const installer = found.filter((h) => /^(?:scripts\/install(?:\.ts|\/)|src\/install\/)/.test(h))
+  assert.equal(installer.length, 1, installer.join('\n'))
+  assert.match(installer[0] ?? '', /^scripts\/install\/force-quit\.ts:\d+ {2}process\.kill\(pid, 'SIGKILL'\)$/)
+  // lock.ts's liveness check asks with signal 0, and the runner's probe timeout is ChildProcess.kill, not process.kill: neither is found.
+  const scan = (text: string): string[] => processKills({ path: 'scripts/x.ts', text, lines: text.split('\n') })
+  assert.deepEqual(scan("process.kill(pid, 0)\nchild.kill('SIGKILL')\nconst p = { kill: 1 }\n// process.kill(pid, 'SIGKILL')"), [])
+  for (const text of [
+    'process.kill(pid)',
+    "process.kill(pid, 'SIGTERM')",
+    'process.kill(-pgid, 9)',
+    'process.kill(pid, signal)',
+    "process['kill'](pid, 'SIGKILL')",
+    "globalThis.process.kill(pid, 'SIGKILL')",
+    "(process).kill(pid, 'SIGINT')",
+    'const k = process.kill',
+    'const { kill } = process',
+    'const { kill: k } = process',
+    "import { kill } from 'node:process'",
+    "import p from 'node:process'\np.kill(pid, 'SIGKILL')",
+    "import * as p from 'process'\np.kill(pid, 'SIGHUP')",
+    // An alias of process, or of globalThis, is found where it is made: what it does next is not followed.
+    "const proc = process\nproc.kill(pid, 'SIGKILL')",
+    "const g = globalThis as unknown as { process: NodeJS.Process }\ng.process.kill(pid, 'SIGKILL')",
+    "const g = global\ng.process.kill(pid, 'SIGKILL')",
+    "const p = globalThis.process\np.kill(pid, 'SIGKILL')",
+    "const p = (globalThis['process'] as NodeJS.Process)\np.kill(pid, 'SIGKILL')",
+    "let p: typeof process | undefined\np = process\np.kill(pid, 'SIGKILL')",
+    "const { process: p } = globalThis\np.kill(pid, 'SIGKILL')",
+    "const { ...p } = process\np.kill(pid, 'SIGKILL')",
+    "signalWith(process, pid)",
+    "const holder = { process }\nholder.process.kill(pid, 'SIGKILL')",
+    "const k = 'kill'\nprocess[k](pid, 'SIGKILL')",
+    "const n = 'process'\nglobalThis[n].kill(pid, 'SIGKILL')",
+    "process!.kill(pid, 'SIGKILL')",
+    "process?.kill(pid, 'SIGKILL')",
+    "(process.kill as (pid: number, s: string) => void)(pid, 'SIGKILL')",
+    // node:process's default under its own name, which is the process object (H4).
+    "import { default as proc } from 'node:process'\nproc.kill(pid, 'SIGKILL')",
+    "import { 'default' as proc } from 'process'\nproc.kill(pid, 'SIGKILL')",
+    "import { default as proc, env } from 'node:process'\nconst k = proc.kill",
+    "import { _kill } from 'node:process'\n_kill(pid, 9)",
+    // node:process loaded by anything but a static import, which is not followed: found where it is named (H1, H2, H5, H6, H10, H15).
+    "const p = await import('node:process')\np.default.kill(pid, 'SIGKILL')",
+    "(await import('node:process')).default.kill(pid, 'SIGKILL')",
+    "const { kill } = await import('node:process')\nkill(pid, 'SIGKILL')",
+    "process.getBuiltinModule('node:process').kill(pid, 'SIGKILL')",
+    "import { createRequire } from 'node:module'\ncreateRequire(import.meta.url)('process').kill(pid, 'SIGKILL')",
+    "import { createRequire } from 'node:module'\nconst req = createRequire(import.meta.url)\nreq('node:process').kill(pid, 'SIGKILL')",
+    "const p = require('process')\np.kill(pid, 'SIGKILL')",
+    "import p = require('node:process')\np.kill(pid, 'SIGKILL')",
+    "export { kill as hk } from 'node:process'",
+    "export * as hproc from 'node:process'",
+    "export * from 'process'",
+    "const name = 'node:process'\nconst p = await import(name)",
+    'const p = await import(`node:${"process"}`)',
+    'const p = await import(`${"node:"}process`)',
+    "const p = await import(`node:process`)",
+    // An alias handed to another module, whose import of this one is not followed.
+    "import proc from 'node:process'\nexport { proc }",
+    "import proc from 'node:process'\nexport { proc as p }",
+    // Members of process that reach a signal beneath kill, however they are read (H3, H12).
+    'process._kill(pid, 9)',
+    '(process as unknown as { _kill: (p: number, s: number) => void })._kill(pid, 9)',
+    "process['_kill'](pid, 9)",
+    'const { _kill } = process',
+    "const { _kill: k } = globalThis.process",
+    "process.binding('process_methods')",
+    "process._linkedBinding('x')",
+    "process.dlopen(module, 'x.node')",
+    "import p from 'node:process'\np._kill(pid, 9)",
+  ]) {
+    assert.ok(scan(text).length >= 1, `${text}: not found`)
+  }
+  // Each of those is found where it is made, once, unless it is made in two places (an alias's string and its member).
+  assert.deepEqual(scan("const p = await import('node:process')\np.default.kill(pid, 'SIGKILL')"), ["1  import('node:process')"])
+  assert.deepEqual(scan("import { default as proc } from 'node:process'\nproc.kill(pid, 'SIGKILL')"), ["2  proc.kill(pid, 'SIGKILL')"])
+  assert.deepEqual(scan('process._kill(pid, 9)'), ['1  process._kill'])
+  assert.deepEqual(scan("export { kill as hk } from 'node:process'"), ["1  export { kill as hk } from 'node:process'"])
+  // Members of process and globalThis, typeof, a type, a destructuring that takes neither kill nor process: none is a way to process.kill.
+  assert.deepEqual(
+    scan(
+      [
+        'const { env, argv } = process',
+        "if (typeof process !== 'undefined') process.exitCode = 1",
+        'const e: typeof process.env = process.env',
+        "process.on('SIGINT', () => undefined)",
+        'const t = globalThis.setTimeout',
+        'const { setTimeout: later } = globalThis',
+        'obj.process = 1',
+        'const o = { process: 1, kill: 2 }',
+        'type P = { process: NodeJS.Process; global: number }',
+        'function f(process: number): number { return 1 }',
+        // Strings that name process where no loader takes them: a property's name, a computed member of something else, a literal type.
+        "const o = { 'process': 1 }",
+        "const v = holder['process']",
+        "type Q = 'process' | 'node:process'",
+        "const { 'process': n } = counts",
+        // Other modules' imports, loads and members, and process's own harmless members.
+        "import { spawn } from 'node:module'",
+        "const fs = await import('node:fs')",
+        "const s = 'the process group'",
+        "const m = process.memoryUsage()",
+        "import { env, argv } from 'node:process'",
+      ].join('\n'),
+    ),
+    [],
+  )
+})
+
+test("scripts/install/force-quit.ts is reached only from the stopped window's SIGINT path: scripts/install.ts alone imports it, offerForceQuit alone, called once from forceQuitOffered, which only the SIGINT handler's forceQuit effect calls", () => {
+  assert.deepEqual(importersOfModule([...SRC, ...scriptSources(REPO, 'scripts')], 'scripts/install/force-quit.ts'), ['scripts/install.ts'])
+  const entry = SCRIPTS.find((f) => f.path === 'scripts/install.ts')
+  assert.ok(entry !== undefined)
+  const source = parsed(entry)
+  const imports = source.statements.filter((st): st is ts.ImportDeclaration => ts.isImportDeclaration(st) && ts.isStringLiteral(st.moduleSpecifier) && st.moduleSpecifier.text === './install/force-quit.js')
+  assert.equal(imports.length, 1)
+  const bindings = imports[0]?.importClause?.namedBindings
+  assert.ok(bindings !== undefined && ts.isNamedImports(bindings) && imports[0]?.importClause?.name === undefined)
+  // Values: offerForceQuit alone (never offerForceQuitWith, its tests' kill); types are no way in.
+  assert.deepEqual(bindings.elements.filter((el) => !el.isTypeOnly).map((el) => (el.propertyName ?? el.name).text), ['offerForceQuit'])
+  assert.deepEqual(bindings.elements.filter((el) => !el.isTypeOnly).map((el) => el.name.text), ['offerForceQuit'])
+  const uses = (name: string): ts.Identifier[] => {
+    const out: ts.Identifier[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isImportDeclaration(node)) return
+      if (ts.isIdentifier(node) && node.text === name) out.push(node)
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+    return out
+  }
+  const enclosing = (node: ts.Node): ts.FunctionDeclaration | undefined => {
+    for (let n: ts.Node | undefined = node.parent; n !== undefined; n = n.parent) if (ts.isFunctionDeclaration(n)) return n
+    return undefined
+  }
+  // offerForceQuit: one use, the callee of a call in forceQuitOffered.
+  const offers = uses('offerForceQuit')
+  assert.equal(offers.length, 1, 'offerForceQuit is used more than once in scripts/install.ts')
+  const offer = offers[0]
+  assert.ok(offer !== undefined && ts.isCallExpression(offer.parent) && offer.parent.expression === offer)
+  assert.equal(enclosing(offer)?.name?.text, 'forceQuitOffered')
+  // forceQuitOffered: declared once, and called once: as the forceQuit effect handed to handleSignal, in a process.on(signal, ...) handler.
+  const refs = uses('forceQuitOffered').filter((id) => !(ts.isFunctionDeclaration(id.parent) && id.parent.name === id))
+  assert.equal(refs.length, 1, 'forceQuitOffered is reached from more than one place')
+  const call = refs[0]?.parent
+  assert.ok(call !== undefined && ts.isCallExpression(call) && call.expression === refs[0])
+  // `forceQuit: () => void forceQuitOffered(state, out)`: the effect's whole body.
+  const voided = call.parent
+  assert.ok(ts.isVoidExpression(voided) && voided.expression === call)
+  const arrow = voided.parent
+  assert.ok(ts.isArrowFunction(arrow) && arrow.body === voided && arrow.parameters.length === 0)
+  const prop = arrow.parent
+  assert.ok(ts.isPropertyAssignment(prop) && prop.name.getText(source) === 'forceQuit')
+  const effects = prop.parent
+  const handled = effects.parent
+  assert.ok(ts.isCallExpression(handled) && handled.expression.getText(source) === 'handleSignal' && handled.arguments[3] === effects)
+  let on: ts.Node | undefined = handled.parent
+  while (on !== undefined && !(ts.isCallExpression(on) && on.expression.getText(source) === 'process.on')) on = on.parent
+  assert.ok(on !== undefined, 'the forceQuit effect is not in a process.on handler')
+})
+
 /** Every TypeScript or JavaScript file under `root`/`dir`, whatever its extension: .ts, .mts, .cts, .tsx, .js, .mjs, .cjs, .jsx. */
 function scriptSources(root: string, dir: string, out: SourceFile[] = []): SourceFile[] {
   for (const entry of readdirSync(join(root, dir))) {

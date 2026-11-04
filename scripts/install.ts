@@ -91,8 +91,18 @@
 //   same one again within 100 ms is one delivered twice (npm forwards the
 //   terminal's Ctrl-C) and does nothing. At a prompt or the jobs wait it is
 //   that prompt's answer (the gate and the applier read it as a no or an
-//   abort). Inside the stopped window (the applier's `window`, from L1's
-//   start to L5's end) it is trapped: the installer says the window is
+//   abort). While L1's stop-pmmcp-server.sh runs inside the window (the
+//   applier's `stopping`), a Ctrl-C offers the typed force-quit of the one
+//   service the stop's drain waits on (scripts/install/force-quit.ts,
+//   reached only from forceQuitOffered, which only that SIGINT calls): the
+//   stop's stdout is read every second for its drain target
+//   (scripts/install/drain.ts), ps confirms the target, and only a typed
+//   force-quit SIGKILLs it; a second Ctrl-C before the question withdraws
+//   the offer, at the question it answers it (keep waiting), and the stop's
+//   end withdraws it too. A force-quit carried out goes to the run folder's
+//   force-quit.log and the end report. Otherwise inside the stopped window
+//   (the applier's `window`, from L1's start to L5's end), and for SIGHUP and
+//   SIGTERM during L1 too, it is trapped: the installer says the window is
 //   finishing and goes on, and says so again at the end; the steps there run
 //   in sessions of their own (A3), so neither a Ctrl-C nor a closed terminal
 //   reaches them. Once the window has opened, and until the end report is
@@ -144,9 +154,11 @@ import { runGate, type GateIO, type GateOutcome, type JobsAnswer } from '../src/
 import { credentialsMap, exportedNames, planInstall, shellWord } from '../src/install/plan.js'
 import { parseProviders, type ProvidersFile } from '../src/models/registry.js'
 import { DotenvWriteError, credentialNames, cutShortMessage, inspectCredentials, mintedCredentialNames, type InspectResult } from '../src/secrets/dotenv-append.js'
-import { Applier, tuiPids } from './install/apply.js'
+import { Applier, tuiPids, type StopRunning } from './install/apply.js'
 import { DiscoverError, PLIST_LABEL, discover, type Absent, type Found } from './install/discover.js'
+import { DrainWatch, POLL_MS } from './install/drain.js'
 import { defectEnding, exitLine, outcomeEnding, refusedEnding, signalEnded, signalEnding, stoppedEnding, type Ending } from './install/ending.js'
+import { offerForceQuit, type ForceQuitOptions } from './install/force-quit.js'
 import { startWithPs, takeLock } from './install/lock.js'
 import { Output } from './install/output.js'
 import { npmTookFlags, preflight } from './install/preflight.js'
@@ -347,14 +359,20 @@ export function stoppedBy(e: unknown): { readonly line: string; readonly ending:
   return undefined
 }
 
-/** What main shares with the signal handlers and the end of the run. */
-interface RunState {
+/** What main shares with the signal handlers and the end of the run. Exported for the test of stopChanged and forceQuitOffered. */
+export interface RunState {
   terminal: Terminal | undefined
   windowOpen: boolean
   windowOpened: boolean
   /** From the window's first opening until the end report is printed (signals.ts windowChanged). */
   reporting: boolean
   counting: boolean
+  /** L1's stop runs (the applier's `stopping`): a Ctrl-C offers the force-quit of what it drains. */
+  stopping: boolean
+  /** While L1's stop runs: what a force-quit needs, its drain read every POLL_MS. */
+  stop: StopFollowed | undefined
+  /** A force-quit being offered: a second Ctrl-C before its question, or the stop's end, withdraws it. */
+  offer: AbortController | undefined
   readonly interrupt: AbortController
   pmmcpDir: string | undefined
   /** The signal handled last, so the same one delivered twice is not read twice. */
@@ -367,6 +385,81 @@ interface RunState {
   logs: () => string | undefined
   /** Once the flags were taken (not --help, not a usage error): the run ends with its exit line. */
   exitLine: boolean
+}
+
+/** L1's stop as the entry point follows it: what offerForceQuit is handed, and where a force-quit carried out goes. */
+export interface StopFollowed {
+  readonly options: Omit<ForceQuitOptions, 'cancelled'>
+  readonly timer: ReturnType<typeof setInterval>
+  /** The end report's record of one carried out. */
+  readonly killed: (record: { readonly label: string; readonly pid: number; readonly seconds: number }) => void
+}
+
+/**
+ * L1's stop started (its pid and stdout file) or exited (undefined): while it
+ * runs, its drain target is read every POLL_MS; once it has exited, a
+ * force-quit still being offered is withdrawn and its question answered.
+ * Exported for its test.
+ */
+export function stopChanged(state: RunState, stop: StopRunning | undefined, base: Omit<ForceQuitOptions, 'cancelled' | 'stopPid' | 'target' | 'running'>, killed: StopFollowed['killed']): void {
+  const was = state.stop
+  if (was !== undefined) clearInterval(was.timer)
+  state.stop = undefined
+  state.stopping = false
+  if (stop === undefined) {
+    const offer = state.offer
+    if (offer !== undefined) {
+      offer.abort()
+      // The one question open while the stop runs is the force-quit's: it is answered, so nothing typed later is taken for it.
+      state.terminal?.interrupt()
+    }
+    return
+  }
+  const drain = new DrainWatch(stop.out)
+  drain.poll(Date.now())
+  const timer = setInterval(() => drain.poll(Date.now()), POLL_MS)
+  timer.unref()
+  const followed: StopFollowed = {
+    options: {
+      ...base,
+      stopPid: stop.pid,
+      target: () => {
+        drain.poll(Date.now())
+        return drain.target
+      },
+      running: () => state.stop === followed,
+    },
+    timer,
+    killed,
+  }
+  state.stop = followed
+  state.stopping = true
+}
+
+/**
+ * The window's SIGINT while L1's stop runs (signals.ts `force-quit`): the one
+ * way into scripts/install/force-quit.ts. A second one while an offer is
+ * made withdraws it; at its question it is that question's answer instead
+ * (signals.ts `answered`), which keeps waiting too. Exported for its test;
+ * scripts/install.ts calls it from the SIGINT handler alone (hygiene.test.ts).
+ */
+export function forceQuitOffered(state: RunState, out: Pick<Output, 'warn'>): Promise<void> | undefined {
+  const stop = state.stop
+  if (stop === undefined) return undefined
+  if (state.offer !== undefined) {
+    state.offer.abort()
+    return undefined
+  }
+  const offer = new AbortController()
+  state.offer = offer
+  return offerForceQuit({ ...stop.options, cancelled: offer.signal })
+    .then((outcome) => {
+      if (outcome.kind === 'killed') stop.killed(outcome.record)
+    })
+    .catch((e: unknown) => out.warn(`the force-quit failed (a defect, report it): ${e instanceof Error ? e.message : String(e)}; nothing more is signalled, and the stop goes on`))
+    .finally(() => {
+      if (state.offer === offer) state.offer = undefined
+    })
 }
 
 /** A usage error or --help: no run, so no exit line. */
@@ -529,6 +622,13 @@ async function main(argv: readonly string[], state: RunState, out: Output): Prom
     ask: (question) => terminal.ask(question),
     window: (open) => windowChanged(state, open),
     interrupt: state.interrupt.signal,
+    stopping: (stop) =>
+      stopChanged(
+        state,
+        stop,
+        { runner, cwd: root, dir: plan.pmmcpDir ?? '', ask: (question) => terminal.ask(question), print: say, logDir: runner.dir },
+        (record) => applier.recordForceQuit(record),
+      ),
   })
   const io: GateIO = {
     interactive: terminal.interactive,
@@ -593,6 +693,9 @@ if (entry !== undefined && fileURLToPath(import.meta.url) === resolve(entry)) {
     windowOpened: false,
     reporting: false,
     counting: false,
+    stopping: false,
+    stop: undefined,
+    offer: undefined,
     interrupt: new AbortController(),
     pmmcpDir: undefined,
     last: undefined,
@@ -610,6 +713,7 @@ if (entry !== undefined && fileURLToPath(import.meta.url) === resolve(entry)) {
       handleSignal(state, signal, Date.now(), {
         promptOpen: () => state.terminal?.promptOpen === true,
         answer: () => state.terminal?.interrupt(),
+        forceQuit: () => void forceQuitOffered(state, out),
         trapped: (s) => out.say(`${signalWords(s)} does not interrupt the stopped window: its steps run in sessions of their own. It is finishing; wait for the start and its checks.`),
         held: (s) =>
           out.say(`${signalWords(s)} does not end the run yet: the stopped window opened in this run, so the installer finishes its last checks and prints the end report (what was done, and what is left to do) first.`),

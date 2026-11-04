@@ -1627,6 +1627,53 @@ test('L2, L3 and L4 run in their own session, recorded in active.json, with no t
   assert.deepEqual(m.auth, { dashboard_token: 'present', curator_secret: 'present' })
 })
 
+test("the installer is told L1's stop pid and stdout file while the stop runs, and told again once it exited; never for the start, the update, the Qdrant enable or auth init", async (t) => {
+  // What a Ctrl-C there may force-quit is read from the stop's own stdout (F1): the entry point follows this file, and only the stop's.
+  const m = new Machine(t)
+  m.preEnv()
+  m.bearer = { state: 'matches' }
+  m.qdrantBefore = keyless()
+  edit(m.facts, 'features.curator_proof', false)
+  m.originMain = ORIGIN_MAIN
+  m.updatedFacts = factsDoc(m.dir, m.home)
+  const plan = m.plan()
+  const { live } = chosen(plan, ['qdrant', 'auth', 'update', 'auth-after-update'])
+  const told: { readonly stop: { readonly pid: number; readonly out: string } | undefined; readonly last: string | undefined; readonly window: boolean | undefined }[] = []
+  const applier = m.applier(plan, { stopping: (stop) => told.push({ stop, last: m.calls.at(-1)?.key, window: m.windows.at(-1) }) })
+  assert.deepEqual(await applier.apply('live', live), { ok: true }, JSON.stringify(applier.items))
+  const [stop] = m.ran(new RegExp(`${STOP_SCRIPT}$`))
+  assert.ok(stop?.child.pid !== undefined)
+  // Twice: when the stop had started (the last call spawned was the stop, inside the window), and once it had exited, before any check of it.
+  assert.equal(told.length, 2, JSON.stringify(told))
+  assert.deepEqual(told[0], { stop: { pid: stop.child.pid, out: join(m.runner.dir ?? '', 'stop.out') }, last: stop.key, window: true })
+  assert.deepEqual(told[1], { stop: undefined, last: stop.key, window: true })
+  // The start, the fast-forward, the cutover and auth init all ran in the window, and none was announced.
+  for (const pattern of [new RegExp(`${START_SCRIPT}$`), /^git merge --ff-only /, /qdrant_api_key\.py enable$/, /src\.dashboard\.auth init --only dashboard$/]) assert.equal(m.ran(pattern).length, 1, String(pattern))
+  // A force-quit the entry point carried out is in the end report, with what a SIGKILL may leave.
+  assert.equal(applier.report().some((l) => l.startsWith('force-quit:') || l === 'notes:'), false)
+  applier.recordForceQuit({ label: 'Worker', pid: 4242, seconds: 42 })
+  const report = applier.report()
+  assert.ok(report.includes('force-quit: Worker (PID 4242) SIGKILLed at your typed force-quit after 42s'), report.join('\n'))
+  const notes = report.indexOf('notes:')
+  assert.ok(notes > report.indexOf('force-quit: Worker (PID 4242) SIGKILLed at your typed force-quit after 42s') && notes < report.indexOf('next steps:'), report.join('\n'))
+  assert.match(report[notes + 1] ?? '', /a job the worker was running is marked failed and re-run by pmmcp.*check ~\/\.persistent-memory-mcp\/logs\/server\.log$/)
+})
+
+test("a stop the runner refuses to start is never announced as running", async (t) => {
+  const m = new Machine(t)
+  const plan = restartOnly(m)
+  const { live } = chosen(plan, ['restart'])
+  // An earlier run's record that discovery did not find stale: the runner refuses the stop (BUSY) before anything exists.
+  mkdirSync(join(m.root, '.aos', 'install'), { recursive: true, mode: 0o700 })
+  writeFileSync(activePath(m.root), JSON.stringify({ step: 'qdrant', pid: 4444, started: NOW.toISOString(), out: '/x/qdrant.out', err: '/x/qdrant.err' }), { mode: 0o600 })
+  const told: unknown[] = []
+  const applier = m.applier(plan, { stopping: (stop) => told.push(stop) })
+  const applied = await applier.apply('live', live)
+  assert.equal(applied.ok, false)
+  assert.equal(m.ran(new RegExp(`${STOP_SCRIPT}$`)).length, 0)
+  assert.deepEqual(told, [])
+})
+
 test('an active.json the runner could not remove after a step in its own session is reported, and no later step of the window runs past it', async (t) => {
   const m = new Machine(t)
   m.preEnv()

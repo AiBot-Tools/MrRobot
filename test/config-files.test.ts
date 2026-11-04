@@ -38,6 +38,7 @@ import {
 import { AgentRegistry } from '../src/agents/registry.js'
 import { loadSoul } from '../src/agents/souls.js'
 import { DENY_KEYS, TOKEN_PATTERNS } from '../src/events/redact.js'
+import { FORCE_QUIT_LOG, PMMCP_OLLAMA_NAMES } from '../scripts/install/force-quit.js'
 import { DOCKER_NAMES } from '../scripts/install/preflight.js'
 import { credentialNames, gitignoresDotenv, parseDotenv, PLACEHOLDER_PREFIX } from '../src/secrets/dotenv.js'
 import { ConfigError } from '../src/errors.js'
@@ -564,6 +565,62 @@ test("README's installer section and D35 say what the installer does: the export
   // D35's two typed confirmations, and the one exception the plan's Q24 makes.
   const d35 = read('docs/DECISIONS.md').split('\n').find((l) => l.startsWith('| D35 |')) ?? ''
   assert.match(d35, /a second typed `Persistent-Memory-MCP` \(one exception, the plan's Q24: on a fresh install the one typed `install` also covers the first stop and start/)
+})
+
+test("README and D35 say what the typed force-quit is, that pmmcp's own named Ollama instances can be force-quit and `ollama serve` and Ollama.app's or Homebrew's server cannot; CLAUDE.md \"Never\" carries the force-quit clause and D35 says so", () => {
+  const readme = read('README.md')
+  const start = readme.indexOf('### Install with npm run aos-install')
+  assert.notEqual(start, -1, 'README has no installer section')
+  const section = readme.slice(start, readme.indexOf('### The `.env` file', start)).replace(/\s+/g, ' ')
+  assert.match(section, /only the typed word `force-quit` sends that one process SIGKILL, after `ps` shows it is still the same process/)
+  // force-quit.ts's identity rule takes pmmcp's named Ollama instances (pmmcpOllama, the stop's _is_pmmcp_ollama) and refuses
+  // the rest (install-force-quit.test.ts holds both): README names each name it takes, and what it refuses.
+  const named = /pmmcp's own named Ollama instances \(exactly ([^)]*)\) can be force-quit the same way/.exec(section)
+  assert.ok(named, "README does not say pmmcp's own named Ollama instances can be force-quit")
+  assert.deepEqual([...(named[1] ?? '').matchAll(/`([^`]+) serve`/g)].map((m) => m[1]), [...PMMCP_OLLAMA_NAMES], 'README names other Ollama instances than force-quit.ts takes')
+  assert.match(named[1] ?? '', /^the one the stop is draining, `PMMCP-TextQuery serve`, .* or `PMMCP-Ollama serve` for any of the four, yours, with no path before the name$/)
+  assert.match(section, /`ollama serve` and Ollama\.app's or Homebrew's server \(`\/Applications\/Ollama\.app\/Contents\/Resources\/ollama serve`, `<prefix>\/bin\/ollama serve`\) cannot: only a PID file of the start script vouches for an `ollama serve`, the installer reads none/)
+  assert.match(section, /says why and how to end it yourself \(check it with `ps` in another terminal, and end it there if it is pmmcp's\), and the stop goes on waiting on it/)
+  assert.doesNotMatch(section, /are not force-quit/, 'README still says the Ollama instances are not force-quit')
+  const d35 = read('docs/DECISIONS.md').split('\n').find((l) => l.startsWith('| D35 |')) ?? ''
+  assert.ok(d35.includes('amended 2026-11-04, the operator: "yes, add the typed force-quit"'), 'D35 does not record the operator\'s word for the force-quit')
+  const d35Named = /pmmcp's own named Ollama instances, which the stop vouches for by `_is_pmmcp_ollama`[^|]*can be force-quit too[^|]*\(a command line of exactly two words, ([^)]*), case exact and with no path before it, then `serve`; none while the stop drains a service that is no Ollama instance\)/.exec(d35)
+  assert.ok(d35Named, "D35 does not say pmmcp's own named Ollama instances can be force-quit")
+  // As force-quit.ts takes them (pmmcpOllama): only for the role the stop is draining, or PMMCP-Ollama for any.
+  assert.match(d35Named[1] ?? '', /^the name of the role the stop is draining, one of `PMMCP-TextQuery`, .* or `PMMCP-CodeIndex`, or `PMMCP-Ollama` whatever the role$/)
+  assert.deepEqual([...(d35Named[1] ?? '').matchAll(/`([^`]+)`/g)].map((m) => m[1]), [...PMMCP_OLLAMA_NAMES], 'D35 names other Ollama instances than force-quit.ts takes')
+  assert.match(d35, /while `ollama serve` \(which only a PID file of the start script vouches for, and the installer reads none\) and Ollama\.app's or Homebrew's server \([^)]*\) cannot: the installer says why and how to end it from another terminal after checking it with `ps`/)
+  assert.doesNotMatch(d35, /is not force-quit|widening the rule to them/, 'D35 still says the Ollama instances are not force-quit')
+  // The clause F1 gives CLAUDE.md "Never", inside its parentheses right after the stop script's rule, and D35 saying, word for
+  // word, that CLAUDE.md carries it. D35 may not say the clause awaits the operator, nor that it is the operator's to add.
+  const clause = ', and no SIGKILL to a pmmcp service but the one the operator types `force-quit` for while the stop waits on it'
+  const claude = read('CLAUDE.md').replace(/\s+/g, ' ')
+  assert.ok(
+    claude.includes(`(never \`launchctl kickstart -k\`, never a timeout or signal sent to the stop script${clause});`),
+    'CLAUDE.md "Never" does not carry the force-quit clause inside its parentheses after the stop script\'s rule',
+  )
+  assert.ok(d35.includes(`CLAUDE.md "Never" carries the rule and its force-quit clause ("${clause}")`), 'D35 does not say, with the clause word for word, that CLAUDE.md "Never" carries it')
+  assert.doesNotMatch(d35, /awaits the operator/, 'D35 says something of the force-quit still awaits the operator')
+  assert.doesNotMatch(d35, /the operator's to add/, 'D35 says the force-quit clause is the operator\'s to add')
+})
+
+test("README's stopped-window paragraph, from its force-quit exception to the end of the bullet, is wrapped at 78 columns with no line broken early; \"Where things live\" names the run folder's force-quit.log", () => {
+  const lines = read('README.md').split('\n')
+  const from = lines.findIndex((l) => l.includes('One exception, typed'))
+  const to = lines.findIndex((l, i) => i > from && l.endsWith('There is no `--yes` and no `--force`.'))
+  assert.ok(from > 0 && to > from, 'README has no stopped-window paragraph with the force-quit exception')
+  for (let i = from; i <= to; i += 1) {
+    const line = lines[i] ?? ''
+    assert.ok(line.startsWith('  ') && line.length <= 78, `README.md:${String(i + 1)} is ${String(line.length)} columns, or not indented as the bullet: ${line}`)
+    // Reflowed: the next line's first word would not have fit on this one.
+    const next = lines[i + 1]
+    if (i < to && next !== undefined) {
+      const word = next.trim().split(' ')[0] ?? ''
+      assert.ok(line.length + 1 + word.length > 78, `README.md:${String(i + 1)} is broken early (${String(line.length)} columns, and \`${word}\` would fit): ${line}`)
+    }
+  }
+  const row = lines.find((l) => l.startsWith('| `.aos/install/`, `.aos/install.lock` |')) ?? ''
+  assert.ok(row.includes(`\`${FORCE_QUIT_LOG}\` (0600, a typed force-quit's record)`), `the .aos/install/ row does not name ${FORCE_QUIT_LOG}: ${row}`)
 })
 
 /** README's one-command capture: pmmcp's bearer from .env into that command's environment alone. */

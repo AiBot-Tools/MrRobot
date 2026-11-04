@@ -17,9 +17,23 @@
 //       Ctrl-C arrives twice, about a millisecond apart. A second one would
 //       find the prompt the first answered closed and end the run.
 //     A prompt or the jobs wait open: it is that prompt's answer (the gate
-//       and the applier read it as a no or an abort).
+//       and the applier read it as a no or an abort; the force-quit's own
+//       question reads it as "keep waiting").
+//     Inside the stopped window while L1's stop-pmmcp-server.sh runs (the
+//       applier's `stopping`), a SIGINT: the force-quit is offered
+//       (`force-quit`; scripts/install/force-quit.ts, through the entry
+//       point). The stop's drain waits on a service with no upper bound and
+//       offers only Ctrl+C, which cannot reach a stop in a session of its
+//       own; so the installer names the service the stop waits on, confirms
+//       it with ps, and SIGKILLs that one process only at the typed word
+//       force-quit. Anything else keeps waiting, and so does a second SIGINT
+//       while the offer is made (it withdraws it). The stop itself is never
+//       signalled, and the window goes on as below. SIGHUP and SIGTERM there
+//       are trapped: a closed terminal cannot answer a question.
 //     Inside the stopped window (the applier's `window`, from L1's start to
-//       L5's end): trapped, whatever the signal. The steps there run in
+//       L5's end) otherwise: trapped, whatever the signal (a SIGINT outside
+//       L1's stop included: the start, the Qdrant enable, the fast-forward
+//       and auth init are never force-quit). The steps there run in
 //       sessions of their own (A3), so neither a Ctrl-C nor a closed
 //       terminal reaches them, and the installer goes on to the start and
 //       its checks; it says so at once, and again at the end.
@@ -57,6 +71,8 @@ export interface SignalView {
   readonly promptOpen: boolean
   /** Inside the stopped window. */
   readonly windowOpen: boolean
+  /** L1's stop-pmmcp-server.sh runs (inside the window): a SIGINT offers the force-quit. */
+  readonly stopping: boolean
   /** The window opened in this run, and the end report is not printed yet. */
   readonly reporting: boolean
   /** stop-pmmcp-server.sh --jobs runs. */
@@ -68,6 +84,7 @@ export interface SignalView {
 export type SignalDecision =
   | { readonly kind: 'repeat' }
   | { readonly kind: 'answered' }
+  | { readonly kind: 'force-quit' }
   | { readonly kind: 'trapped' }
   | { readonly kind: 'held' }
   | { readonly kind: 'count-aborted' }
@@ -78,7 +95,7 @@ export function onSignal(view: SignalView, signal: HandledSignal, now: number): 
   const last = view.last
   if (last !== undefined && last.signal === signal && now >= last.at && now - last.at < REPEAT_MS) return { kind: 'repeat' }
   if (view.promptOpen) return { kind: 'answered' }
-  if (view.windowOpen) return { kind: 'trapped' }
+  if (view.windowOpen) return view.stopping && signal === 'SIGINT' ? { kind: 'force-quit' } : { kind: 'trapped' }
   if (view.reporting) return { kind: 'held' }
   if (view.counting) return { kind: 'count-aborted' }
   return { kind: 'exit', code: SIGNAL_EXIT[signal] }
@@ -113,6 +130,7 @@ export function windowChanged(marks: WindowMarks, open: boolean): void {
 /** The run's side of the decision, kept between signals. */
 export interface SignalState {
   readonly windowOpen: boolean
+  readonly stopping: boolean
   readonly reporting: boolean
   readonly counting: boolean
   last: { readonly signal: HandledSignal; readonly at: number } | undefined
@@ -127,6 +145,8 @@ export interface SignalEffects {
   promptOpen(): boolean
   /** Answer the open prompt or wait as interrupted. */
   answer(): void
+  /** Offer the force-quit of the service L1's stop is draining, or withdraw the one being offered. */
+  forceQuit(): void
   /** Say that the window goes on. */
   trapped(signal: HandledSignal): void
   /** Say that the run goes on to its end report. */
@@ -139,10 +159,15 @@ export interface SignalEffects {
 
 /** Decide what `signal` does and do it; returns the decision. */
 export function handleSignal(state: SignalState, signal: HandledSignal, now: number, effects: SignalEffects): SignalDecision {
-  const decision = onSignal({ promptOpen: effects.promptOpen(), windowOpen: state.windowOpen, reporting: state.reporting, counting: state.counting, last: state.last }, signal, now)
+  const decision = onSignal(
+    { promptOpen: effects.promptOpen(), windowOpen: state.windowOpen, stopping: state.stopping, reporting: state.reporting, counting: state.counting, last: state.last },
+    signal,
+    now,
+  )
   if (decision.kind === 'repeat') return decision
   state.last = { signal, at: now }
   if (decision.kind === 'answered') effects.answer()
+  else if (decision.kind === 'force-quit') effects.forceQuit()
   else if (decision.kind === 'trapped') {
     state.trapped.add(signal)
     effects.trapped(signal)

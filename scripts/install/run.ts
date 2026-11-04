@@ -229,7 +229,9 @@
 //   as unreadable, which keeps a re-run waiting.
 //
 //   What it reads and shows: machine output from the .out file only
-//   (readOut, readJobs); the .err file is shown, never parsed (one caller's
+//   (readOut, readJobs, and readLogFrom, which the force-quit's drain reader
+//   follows the stop's stdout with while it runs: scripts/install/drain.ts);
+//   the .err file is shown, never parsed (one caller's
 //   exception, stated in its contract: A6 reads an `invalid:` line from
 //   `http_auth check`'s stderr, where pmmcp's interface puts its refusal and
 //   prints nothing on stdout; nothing here parses it). Either is shown
@@ -1560,6 +1562,28 @@ export function tail(path: string, lines = 20): string[] {
     if (from > 0) all.shift()
     if (all.at(-1) === '') all.pop()
     return all.slice(-lines).map(shownLine)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/**
+ * Up to `max` bytes of a log file from `offset` on (none at or past its end),
+ * opened as every read here is: never through a link, non-blocking, and only
+ * this account's regular file. For a reader that follows a step's .out while
+ * the step still runs (scripts/install/drain.ts), from where it last stopped.
+ */
+export function readLogFrom(path: string, offset: number, max: number): Buffer {
+  let fd: number
+  try {
+    fd = openRegular(path)
+  } catch (e) {
+    throw new InstallRunError('AOS_INSTALL_RUN_OUTPUT', `cannot read ${path} (${errnoOf(e)})`)
+  }
+  try {
+    const size = fstatSync(fd).size
+    if (offset >= size || max <= 0) return Buffer.alloc(0)
+    return readAt(fd, Math.min(max, size - offset), offset)
   } finally {
     closeSync(fd)
   }

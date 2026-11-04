@@ -695,7 +695,15 @@ test('every live step needs both typed confirmations in order, with the jobs che
     "print   - Qdrant API key cutover: a new pmmcp-qdrant from the same image with the key and every port on 127.0.0.1, each collection checked; the old one kept, stopped, as pmmcp-qdrant-prekey; " +
       'rollback: cd /Users/op/Github/Persistent-Memory-MCP && .venv/bin/python scripts/qdrant_api_key.py rollback',
   )
-  const doNotClose = at('print Do not close this terminal. Ctrl-C will not interrupt a graceful stop.')
+  // The stop is never interrupted, and the one way out of a drain that hangs is said before the first confirmation: F1's typed force-quit.
+  const stopItem = at(
+    "print   - stop pmmcp gracefully: stop-pmmcp-server.sh, never --force, never interrupted (its job wait is up to 300 s; a service its drain hangs on is SIGKILLed only at your typed force-quit); " +
+      'rollback: cd /Users/op/Github/Persistent-Memory-MCP && ./start-pmmcp-server.sh',
+  )
+  const doNotClose = at(
+    "print Do not close this terminal. Ctrl-C will not interrupt a graceful stop; while it waits on one service's drain, Ctrl-C offers to SIGKILL that one service, only if you then type force-quit.",
+  )
+  assert.ok(downtime < stopItem && stopItem < rollback, io.transcript.join('\n'))
   const first = at(`ask Type \`${FIRST_CONFIRMATION}\` to continue`)
   const jobs = at('jobs')
   const now = at('print Now: the graceful stop (stop-pmmcp-server.sh), then the Qdrant key cutover, then the start (start-pmmcp-server.sh) and its checks, then the aos-kernel bearer check.')

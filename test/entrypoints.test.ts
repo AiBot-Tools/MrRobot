@@ -44,9 +44,10 @@ import { defectEnding, exitLine, outcomeEnding, refusedEnding, signalEnding, sto
 import { Output, TRANSCRIPT_FILE } from '../scripts/install/output.js'
 import { bashVersion, npmTookFlags, preflight, productVersion, stubRefusals } from '../scripts/install/preflight.js'
 import { HANDLED_SIGNALS, REPEAT_MS, SIGNAL_EXIT, defectExit, handleSignal, onSignal, windowChanged, type HandledSignal, type SignalState, type SignalView, type WindowMarks } from '../scripts/install/signals.js'
-import { afterRecheck, ranAPhase, stoppedBy } from '../scripts/install.js'
+import { afterRecheck, forceQuitOffered, ranAPhase, stopChanged, stoppedBy, type RunState } from '../scripts/install.js'
 import { DiscoverError } from '../scripts/install/discover.js'
-import { InstallRunError } from '../scripts/install/run.js'
+import { InstallRunError, Runner } from '../scripts/install/run.js'
+import { offerForceQuit } from '../scripts/install/force-quit.js'
 import { TYPE_AHEAD_MS, Terminal } from '../scripts/install/terminal.js'
 
 // The gate's outcome as main hands it on, named without importing src/install, which only the installer and its own tests import (hygiene.test.ts).
@@ -1481,6 +1482,210 @@ test('aos-install at a terminal: a Ctrl-C after the stopped window is held until
   assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false, 'the lock was left behind')
 })
 
+/** A child of this test's that ignores SIGTERM, in a process group of its own, as the installer's account: a hung pmmcp service by its command line. */
+function hungService(t: Parameters<typeof tmpdir>[0], name: string, cwd: string): ReturnType<typeof spawn> {
+  // Kept referenced: its exit (by the SIGKILL) is what the test waits for. t.after ends it when the test did not.
+  const child = spawn('/bin/sh', ['-c', 'trap "" TERM; while :; do sleep 0.2; done', name], { cwd, detached: true, stdio: 'ignore', ...INSTALLER_AS })
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+  })
+  return child
+}
+
+const alive = (child: ReturnType<typeof spawn>): boolean => child.exitCode === null && child.signalCode === null
+
+test('the force-quit SIGKILLs, through the runner and the real ps, only the child ps confirmed and the operator typed force-quit for; another word signals nothing', async (t) => {
+  // In process: the runner's real ps reads three children this test spawned, each in a group of its own: the hung service (it ignores
+  // SIGTERM), a bystander with a pmmcp command line too, and a stand-in for the stop. The kill is offerForceQuit's own (sigkill).
+  const repoRoot = tmpdir(t)
+  writeFileSync(join(repoRoot, '.gitignore'), '/.aos/\n.env\n')
+  const home = tmpdir(t)
+  const runner = new Runner({ repoRoot, env: { HOME: home, USER: 'op', LANG: 'C' } })
+  const target = hungService(t, 'Persistent-Memory-MCP-hung-worker', repoRoot)
+  const bystander = hungService(t, 'Persistent-Memory-MCP-bystander', repoRoot)
+  const stop = spawn('/bin/sh', ['-c', 'while :; do sleep 0.2; done'], { cwd: repoRoot, detached: true, stdio: 'ignore' })
+  t.after(() => {
+    if (alive(stop)) stop.kill('SIGKILL')
+  })
+  assert.ok(target.pid !== undefined && bystander.pid !== undefined && stop.pid !== undefined)
+  const killed = new Promise<NodeJS.Signals | null>((resolve) => target.once('exit', (_code, signal) => resolve(signal)))
+  const printed: string[] = []
+  const asked: string[] = []
+  const options = (answer: string): Parameters<typeof offerForceQuit>[0] => ({
+    runner,
+    cwd: repoRoot,
+    stopPid: stop.pid ?? 0,
+    target: () => ({ pid: target.pid ?? 0, label: 'Worker', upTo: 30, seenAt: Date.now() - 5000 }),
+    running: () => true,
+    dir: join(home, 'Github', 'Persistent-Memory-MCP'),
+    ask: (question) => {
+      asked.push(question)
+      return Promise.resolve({ kind: 'line', text: answer })
+    },
+    print: (line) => printed.push(line),
+    logDir: runner.dir,
+    // The installer's account: the children are this test's own, as the installer's account.
+    ...(INSTALLER_AS === undefined ? {} : { uid: INSTALLER_AS.uid }),
+  })
+  assert.deepEqual(await offerForceQuit(options('no')), { kind: 'kept-waiting' })
+  assert.match(asked[0] ?? '', new RegExp(`^pmmcp's stop is waiting on Worker \\(PID ${String(target.pid)}: /bin/sh -c trap .*Persistent-Memory-MCP-hung-worker\\) for \\d+s\\. Type force-quit to SIGKILL that one process`))
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.ok(alive(target) && alive(bystander) && alive(stop), 'another word signalled something')
+  const outcome = await offerForceQuit(options('force-quit'))
+  assert.equal(outcome.kind, 'killed', printed.join('\n'))
+  assert.equal(await Promise.race([killed, new Promise((resolve) => setTimeout(() => resolve('still running'), 5000))]), 'SIGKILL')
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.ok(alive(bystander) && alive(stop), 'the force-quit signalled more than its target')
+  // ps ran through the runner (three to confirm, for each offer; three again before the kill), and its files hold no other process's command line once read.
+  const logs = runner.dir ?? ''
+  const outs = readdirSync(logs).filter((n) => n.startsWith('force-quit-') && n.endsWith('.out'))
+  assert.equal(outs.length, 9, outs.join(', '))
+  for (const name of outs) assert.equal(readFileSync(join(logs, name), 'utf8'), '', name)
+  assert.match(readFileSync(join(logs, 'force-quit.log'), 'utf8'), new RegExp(`force-quit: Worker \\(PID ${String(target.pid)}\\) SIGKILLed at your typed force-quit after \\d+s\\n`))
+})
+
+test('aos-install at a terminal: a Ctrl-C while the stop waits on a hung service offers its force-quit; the typed word SIGKILLs that one process, the stop finishes, and the run goes on to the start and reports it', async (t) => {
+  // A fresh install whose stop drains for ever: it sends SIGTERM to a service that ignores it (a child of this test's, in a group of
+  // its own, with a pmmcp command line) and waits while it lives, as pmmcp's graceful_kill does, printing its lines. The Ctrl-C
+  // reaches the installer (the stop runs in a session of its own), which reads the stop's drain target from its stdout, confirms it
+  // with the real ps, and asks; force-quit SIGKILLs that child and nothing else. The stop then sees it gone and exits 0, and the run
+  // goes on: the key file, the digest, the start and its checks (which fail here, so exit 4), and the end report with the force-quit.
+  if (!terminalAvailable()) {
+    t.diagnostic('no python3 with its pty module here, so no terminal can be given to the installer')
+    return
+  }
+  const m = await installerMachine(t, { trap: false })
+  const base = dirname(m.home)
+  const log = join(base, 'calls', 'fresh.log')
+  const marks = join(base, 'marks')
+  mkdirSync(marks)
+  const at = join(m.home, 'Github', 'Persistent-Memory-MCP')
+  const hung = hungService(t, 'Persistent-Memory-MCP-hung-worker', base)
+  const bystander = hungService(t, 'Persistent-Memory-MCP-bystander', base)
+  assert.ok(hung.pid !== undefined)
+  const killed = new Promise<NodeJS.Signals | null>((resolve) => hung.once('exit', (_code, signal) => resolve(signal)))
+  const pidFile = join(base, 'hung.pid')
+  writeFileSync(pidFile, `${String(hung.pid)}\n`)
+  const draining = join(marks, 'draining')
+  // pmmcp's own ports on ::1: the start's HTTP probes then never reach whatever serves 127.0.0.1:8766 on this machine.
+  const facts = JSON.parse(freshFacts(m.home, at, [])) as { config: Record<'server' | 'dashboard' | 'curator', { host: string }> }
+  for (const svc of ['server', 'dashboard', 'curator'] as const) facts.config[svc].host = '::1'
+  writeFileSync(join(base, 'facts.json'), `${JSON.stringify(facts)}\n`)
+  const template = join(base, 'template')
+  mkdirSync(join(template, '.venv', 'bin'), { recursive: true })
+  const stopBody = [
+    `pid=$(cat ${shQuote(pidFile)})`,
+    "printf '   Stopping pmmcp services...\\n'",
+    "printf '   Sent SIGTERM to PID %s (Worker) — waiting for clean drain (up to 30s)\\n' \"$pid\"",
+    'kill -TERM "$pid" 2>/dev/null',
+    `: > ${shQuote(draining)}`,
+    'n=0',
+    'while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 900 ]; do sleep 0.2; n=$((n+1)); printf "\\r  waiting for Worker to drain... %ds  (Ctrl+C to force-quit)" $((n/5)); done',
+    "printf '\\r\\033[2K'",
+    'if kill -0 "$pid" 2>/dev/null; then echo "   Worker FAILED TO STOP" >&2; exit 1; fi',
+    "printf '   PID %s (Worker) exited cleanly after %ss total ✓\\n' \"$pid\" $((n/5))",
+    'exit 0',
+  ].join('\n')
+  const files: [string, string][] = [
+    ['setup.sh', standIn(log, 'setup.sh', 'exit 0')],
+    ['stop-pmmcp-server.sh', standIn(log, 'stop-pmmcp-server.sh', stopBody)],
+    ['start-pmmcp-server.sh', standIn(log, 'start-pmmcp-server.sh', 'exit 0')],
+    [
+      join('.venv', 'bin', 'python'),
+      standIn(
+        log,
+        'python',
+        [
+          'case "$*" in',
+          `  'scripts/pmmcp_facts.py --json') cat ${shQuote(join(base, 'facts.json'))}; exit 0 ;;`,
+          "  'scripts/qdrant_api_key.py init') exit 0 ;;",
+          "  'scripts/rotate_http_auth_token.py aos-kernel --create --digest-stdin') read -r digest; echo \"putting the digest from stdin on file for 'aos-kernel'\"; exit 0 ;;",
+          "  '-B -m src.transport.http_auth check --expect aos-kernel') read -r digest; echo 'aos-kernel: matches'; exit 0 ;;",
+          'esac',
+          'exit 97',
+        ].join('\n'),
+      ),
+    ],
+  ]
+  for (const [rel, body] of files) writeFileSync(join(template, rel), body, { mode: 0o755 })
+  const bin = join(m.home, '.local', 'bin')
+  writeFileSync(join(bin, 'git'), standIn(log, 'git', `if [ "$1" = clone ] && [ "$#" = 3 ]; then mkdir -p "$(dirname "$3")" && cp -Rp ${shQuote(template)} "$3"; exit $?; fi\nexit 97`), { mode: 0o755 })
+  // Nothing listens on pmmcp's ports, no pmmcp-qdrant runs: the stop's checks pass once it exits.
+  writeFileSync(join(bin, 'lsof'), standIn(log, 'lsof', 'exit 1'), { mode: 0o755 })
+  writeFileSync(
+    join(bin, 'docker'),
+    standIn(log, 'docker', ['case "$*" in', "  'context show') echo desktop-linux; exit 0 ;;", "  'info --format {{.ServerVersion}}') echo 29.5.2; exit 0 ;;", "  'ps --all --filter name=pmmcp-qdrant --format {{.Names}} {{.State}}') exit 0 ;;", 'esac', 'exit 97'].join('\n')),
+    { mode: 0o755 },
+  )
+  // ps is the system's, for the force-quit's two forms only: it reads the children this test spawned.
+  writeFileSync(
+    join(bin, 'ps'),
+    standIn(log, 'ps', ['case "$*" in', "  '-o lstart= -p '*|'-ww -o pid=,uid=,pgid=,args= -p '*) ;;", '  *) exit 97 ;;', 'esac', 'for p in /bin/ps /usr/bin/ps; do if [ -x "$p" ]; then exec "$p" "$@"; fi; done', 'exit 97'].join('\n')),
+    { mode: 0o755 },
+  )
+  handOver(base)
+
+  const child = spawnEntry(m.checkout, 'scripts/install.ts', [], {
+    env: installerEnv(m),
+    typed: [
+      { cue: 'Type `install` to begin', send: 'install\r', delayMs: 300 },
+      { file: draining, send: '\x03', delayMs: 300 },
+      { cue: 'Type force-quit to SIGKILL that one process', send: 'force-quit\r', delayMs: 300 },
+    ],
+    ...INSTALLER_AS,
+  })
+  let stdout = ''
+  let stderr = ''
+  child.stdout.on('data', (d: Buffer) => (stdout += d.toString('utf8')))
+  child.stderr.on('data', (d: Buffer) => (stderr += d.toString('utf8')))
+  const timer = setTimeout(() => child.kill('SIGKILL'), 150_000)
+  const status = await new Promise<number | null>((resolve) => child.on('close', (code) => resolve(code)))
+  clearTimeout(timer)
+  const text = stdout.replace(/\r\n/g, '\n')
+  const lines = text.trimEnd().split('\n')
+  const calls = existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter((l) => l !== '') : []
+  const said = `${text}${stderr}\n${calls.join('\n')}`
+  const pid = String(hung.pid)
+
+  // The hung service died by the SIGKILL, and only it: the bystander with a pmmcp command line runs on.
+  assert.equal(await Promise.race([killed, new Promise((resolve) => setTimeout(() => resolve('alive'), 5000))]), 'SIGKILL', said)
+  assert.ok(alive(bystander), 'the force-quit signalled more than its target')
+  // The question named it, by its label, pid and command line.
+  assert.match(text, new RegExp(`pmmcp's stop is waiting on Worker \\(PID ${pid}: /bin/sh -c trap .*Persistent-Memory-MCP-hung-worker\\) for \\d+s\\. Type force-quit to SIGKILL that one process \\(the stop then goes on\\); anything else keeps waiting:`), said)
+  assert.ok(text.includes(`SIGKILL sent to Worker (PID ${pid}) at your typed force-quit: the stop sees it gone and goes on`), said)
+  assert.equal(text.includes('does not interrupt the stopped window'), false, `the Ctrl-C was trapped rather than offered:\n${said}`)
+  // ps confirmed it twice, each time by its start time, its row and its start time again.
+  const rows = `ps -ww -o pid=,uid=,pgid=,args= -p ${pid},`
+  const lstart = `ps -o lstart= -p ${pid}`
+  assert.deepEqual(
+    calls.filter((c) => c.startsWith('ps ')).map((c) => (c.startsWith(rows) ? 'rows' : c)),
+    [lstart, 'rows', lstart, lstart, 'rows', lstart],
+    said,
+  )
+  // The stop went on and finished (exit 0), and the run went on to the key file, the digest and the start.
+  assert.ok(lines.some((l) => /^L1 stop-pmmcp-server\.sh: exit 0 after \d+ s$/.test(l)), said)
+  assert.ok(text.includes(`(Worker) exited cleanly after`), said)
+  const order = ['setup.sh --non-interactive', 'stop-pmmcp-server.sh', 'python scripts/qdrant_api_key.py init', 'start-pmmcp-server.sh'].map((c) => calls.indexOf(c))
+  assert.ok(order.every((i, k) => i >= 0 && (k === 0 || i > (order[k - 1] ?? -1))), `${JSON.stringify(order)}\n${said}`)
+  // The end report gives the force-quit, and its notes what a SIGKILL may leave.
+  const report = lines.slice(lines.indexOf('end report:'))
+  assert.ok(report.length > 1, said)
+  const line = report.find((l) => l.startsWith('force-quit: '))
+  assert.match(line ?? '', new RegExp(`^force-quit: Worker \\(PID ${pid}\\) SIGKILLed at your typed force-quit after \\d+s$`), said)
+  const notes = report.indexOf('notes:')
+  assert.ok(notes > report.indexOf(line ?? '') && notes < report.indexOf('next steps:'), said)
+  assert.match(report[notes + 1] ?? '', /marked failed and re-run by pmmcp/)
+  // And so does the run folder's log.
+  const folders = runFolders(m.checkout.root)
+  assert.equal(folders.length, 1)
+  const record = readFileSync(join(m.checkout.root, '.aos', 'install', folders[0] ?? '', 'force-quit.log'), 'utf8')
+  assert.ok(record.includes(line ?? '\0'), record)
+  // The start's checks fail here (nothing answers on ::1, no pmmcp-qdrant): the live step's code, never 130.
+  assert.equal(status, 4, said)
+  assert.equal(lines.at(-1), 'aos-install: exit 4: a live step failed, and pmmcp is not in its intended state: see the end report above', said)
+  assert.equal(existsSync(join(m.checkout.root, '.aos', 'install.lock')), false, 'the lock was left behind')
+})
+
 test("aos-install at a terminal: a registered value in what is read again for the end report stops the run there, and the report is still printed, with the defect, the emptied file and the manual start (exit 4)", async (t) => {
   // A fresh install whose stop refuses its arguments (exit 2: nothing more of the window runs, exit 1 so far). The facts are read
   // again for the report, and that read echoes the AOS_PMMCP_TOKEN this run appended to the shadow checkout's .env. main's recheck
@@ -2121,7 +2326,7 @@ test("the installer's last line says how this run ended: the input ending or an 
 })
 
 test('a signal answers an open prompt, is trapped inside the window, ends a jobs count, or ends the run with 128 + its number; the same one again within REPEAT_MS is one delivery; a defect exits 4 once the window opened', () => {
-  const view = (o: Partial<SignalView> = {}): SignalView => ({ promptOpen: false, windowOpen: false, reporting: false, counting: false, last: undefined, ...o })
+  const view = (o: Partial<SignalView> = {}): SignalView => ({ promptOpen: false, windowOpen: false, stopping: false, reporting: false, counting: false, last: undefined, ...o })
   assert.deepEqual(HANDLED_SIGNALS, ['SIGINT', 'SIGHUP', 'SIGTERM'])
   assert.deepEqual(SIGNAL_EXIT, { SIGINT: 130, SIGHUP: 129, SIGTERM: 143 })
   for (const signal of HANDLED_SIGNALS) {
@@ -2158,10 +2363,12 @@ test('handleSignal carries out the decision: a Ctrl-C delivered twice at "start 
     held: (s: HandledSignal): void => void done.push(`held ${s}`),
     abortCount: (): void => void done.push('abort'),
     exit: (code: number, s: HandledSignal): void => void done.push(`exit ${String(code)} ${s}`),
+    forceQuit: (): void => void done.push('force-quit'),
   }
   const state: SignalState & WindowMarks & { counting: boolean } = {
     windowOpen: false,
     windowOpened: false,
+    stopping: false,
     reporting: false,
     counting: false,
     last: undefined,
@@ -2339,6 +2546,92 @@ test('a write error on stdout never ends the installer: stdout is read as lost, 
   const quiet = tmpdir(t)
   assert.equal(fine.keep(quiet, 0), undefined)
   assert.deepEqual(readdirSync(quiet), [])
+})
+
+test("the entry point follows L1's stop for the force-quit: its drain read from the stop's stdout while it runs, an offer withdrawn by a second Ctrl-C before its question, and by the stop's end, whose question is then answered", async (t) => {
+  const dir = tmpdir(t)
+  const out = join(dir, 'stop.out')
+  writeFileSync(out, '   Sent SIGTERM to PID 4242 (Worker) — waiting for clean drain (up to 30s)\n', { mode: 0o600 })
+  // Every timer cleared, seen: the drain's poll stops with the stop (the original still clears it).
+  const cleared = t.mock.method(globalThis, 'clearInterval')
+  // ps, held until the test lets each answer go: the offer is then in progress, with no question open yet.
+  const held: (() => void)[] = []
+  let hold = true
+  let n = 0
+  const ps = {
+    run: (spec: { readonly step: string; readonly args: readonly string[] }) => {
+      n += 1
+      const file = join(dir, `${spec.step}-${String(n)}.out`)
+      const me = process.getuid?.() ?? 0
+      writeFileSync(
+        file,
+        spec.args[1] === 'lstart=' ? 'Wed Nov  4 09:00:00 2026\n' : `4242 ${String(me)} 4000 /x/Persistent-Memory-MCP/.venv/bin/python w.py\n${String(process.pid)} ${String(me)} 1 node\n777 ${String(me)} 777 bash\n`,
+        { mode: 0o600 },
+      )
+      const result = { step: spec.step, pid: 1, out: file, err: `${file}.err`, started: new Date(0), elapsedMs: 1, code: 0, signal: null, timedOut: false, exited: true, stdinError: undefined, childError: undefined, activeError: undefined }
+      return new Promise<typeof result>((resolve) => (hold ? held.push(() => resolve(result)) : resolve(result)))
+    },
+    discard: () => undefined,
+  }
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const printed: string[] = []
+  const terminal = new Terminal({ input, output, interactive: true, raw: false, outputWorks: () => true, print: (l) => printed.push(l) })
+  const state: RunState = {
+    terminal,
+    windowOpen: true,
+    windowOpened: true,
+    reporting: true,
+    counting: false,
+    stopping: false,
+    stop: undefined,
+    offer: undefined,
+    interrupt: new AbortController(),
+    pmmcpDir: '/x/Persistent-Memory-MCP',
+    last: undefined,
+    trapped: new Set(),
+    held: new Set(),
+    logs: () => undefined,
+    exitLine: true,
+  }
+  const killed: unknown[] = []
+  const base = { runner: ps, cwd: dir, dir: '/x/Persistent-Memory-MCP', ask: (q: string) => terminal.ask(q), print: (l: string) => printed.push(l), logDir: undefined }
+  const warned: string[] = []
+  const said = { warn: (l: string) => void warned.push(l) }
+  stopChanged(state, { pid: 777, out }, base, (r) => killed.push(r))
+  t.after(() => stopChanged(state, undefined, base, () => undefined))
+  assert.equal(state.stopping, true)
+  assert.deepEqual(state.stop?.options.target(), { pid: 4242, label: 'Worker', upTo: 30, seenAt: state.stop?.options.target()?.seenAt })
+  assert.equal(state.stop?.options.running(), true)
+  // A second Ctrl-C while ps confirms the target withdraws the offer: no question, nothing signalled.
+  const first = forceQuitOffered(state, said)
+  assert.ok(first !== undefined && state.offer !== undefined)
+  const offer = state.offer
+  assert.equal(forceQuitOffered(state, said), undefined)
+  assert.equal(offer.signal.aborted, true)
+  hold = false
+  for (const go of held.splice(0)) go()
+  await first
+  assert.equal(state.offer, undefined)
+  assert.equal(terminal.promptOpen, false)
+  assert.equal(printed.at(-1), 'the force-quit was withdrawn (Ctrl-C again): nothing was signalled, and the stop goes on waiting on Worker (PID 4242)')
+  // Offered again, its question open: the stop exits, so the question is answered, the offer withdrawn, and nothing typed later counts.
+  const second = forceQuitOffered(state, said)
+  assert.ok(second !== undefined)
+  for (let i = 0; i < 50 && !terminal.promptOpen; i += 1) await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(terminal.promptOpen, true)
+  const timer = state.stop?.timer
+  assert.ok(timer !== undefined)
+  assert.equal(cleared.mock.calls.some((c) => c.arguments[0] === timer), false)
+  stopChanged(state, undefined, base, () => undefined)
+  assert.ok(cleared.mock.calls.some((c) => c.arguments[0] === timer), "the stop's drain is still read every POLL_MS once it exited")
+  assert.equal(terminal.promptOpen, false)
+  assert.equal(state.stopping, false)
+  assert.equal(state.stop, undefined)
+  await second
+  assert.equal(printed.at(-1), 'the stop has finished meanwhile: nothing was signalled')
+  assert.equal(forceQuitOffered(state, said), undefined, 'an offer once the stop exited')
+  assert.deepEqual([killed, warned], [[], []])
 })
 
 test("a line typed before a question was shown is dropped, not taken as its answer; a stdin that is not a terminal is never asked", async () => {

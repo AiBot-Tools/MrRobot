@@ -790,7 +790,7 @@ class Planner {
       {
         id: 'stop',
         tag: 'live',
-        title: 'stop pmmcp gracefully: stop-pmmcp-server.sh, never --force, never interrupted (its job wait is up to 300 s)',
+        title: 'stop pmmcp gracefully: stop-pmmcp-server.sh, never --force, never interrupted (its job wait is up to 300 s; a service its drain hangs on is SIGKILLed only at your typed force-quit)',
         short: 'the graceful stop (stop-pmmcp-server.sh)',
         commands: [inDir(dir, 'stop-pmmcp-server.sh')],
         rollback: within(dir, './start-pmmcp-server.sh'),
@@ -1321,7 +1321,9 @@ export function warning(plan: Plan, live: readonly Step[]): string[] {
   }
   out.push('The live items, and how each is undone:')
   for (const step of live) out.push(`  - ${step.title}${step.rollback === undefined ? '' : `; rollback: ${step.rollback}`}`)
-  out.push('Do not close this terminal. Ctrl-C will not interrupt a graceful stop.')
+  out.push(
+    "Do not close this terminal. Ctrl-C will not interrupt a graceful stop; while it waits on one service's drain, Ctrl-C offers to SIGKILL that one service, only if you then type force-quit.",
+  )
   return out
 }
 

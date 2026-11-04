@@ -105,8 +105,12 @@ D33, D35 and D36):
   scripts run by name (bash, curl, uv, python3, ollama) is
   looked up on the PATH a child gets and held to the installer's rules then,
   without running it (below), so a file there that the rules refuse stops the
-  run before the lock, `.env` or any program. It names the bash pmmcp's scripts run and its
-  version, read from that file and never by running it (macOS's own is 3.2).
+  run before the lock, `.env` or any program. Its `pmmcp's scripts` line names
+  the bash their `#!/usr/bin/env bash` finds on that PATH and its version when
+  the file's bytes spell it out (read, never run: bash composes the version it
+  prints when it runs, so a build may hold none, and the line then says the
+  version is not readable), and says your login shell (`$SHELL`, zsh on a Mac)
+  is not used, because the installer runs every program itself.
   It names any of `DOCKER_CONFIG`, `DOCKER_HOST`,
   `DOCKER_CONTEXT` or `PMMCP_*` your shell exports: no program it starts sees
   them, nor any other `DOCKER_*`, `AOS_*` or credential name.

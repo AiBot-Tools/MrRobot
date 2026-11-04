@@ -26,7 +26,7 @@ import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, existsSync, lchownSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, constants, existsSync, lchownSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { createServer, type IncomingHttpHeaders } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -42,7 +42,7 @@ import { CEO_SUITE } from '../src/eval/suite.js'
 import { BOOT_SLACK_MS, lockPath, takeLock, type LockOptions } from '../scripts/install/lock.js'
 import { defectEnding, exitLine, outcomeEnding, refusedEnding, signalEnding, stoppedEnding } from '../scripts/install/ending.js'
 import { Output, TRANSCRIPT_FILE } from '../scripts/install/output.js'
-import { bashVersion, npmTookFlags, preflight, productVersion, stubRefusals } from '../scripts/install/preflight.js'
+import { BASH_READ_CAP, BASH_READ_CHUNK, bashVersion, loginShell, npmTookFlags, preflight, productVersion, scriptsLine, stubRefusals } from '../scripts/install/preflight.js'
 import { HANDLED_SIGNALS, REPEAT_MS, SIGNAL_EXIT, defectExit, handleSignal, onSignal, windowChanged, type HandledSignal, type SignalState, type SignalView, type WindowMarks } from '../scripts/install/signals.js'
 import { afterRecheck, forceQuitOffered, ranAPhase, stopChanged, stoppedBy, type RunState } from '../scripts/install.js'
 import { DiscoverError } from '../scripts/install/discover.js'
@@ -2792,19 +2792,181 @@ test("the preflight refuses root and a current directory that is not the checkou
   assert.deepEqual(npmTookFlags({ PATH: '/usr/bin', npm_config_cache: '/x', npm_config_local_prefix: '/r' }), [], "npm's own settings are no trace")
   assert.deepEqual(npmTookFlags({ npm_config_install: '', npm_config_dry_run: 'true' }), ['--dry-run', '--no-install'])
 
-  // S1 names the bash pmmcp's scripts run (#!/usr/bin/env bash: the first on the child's PATH) and its version, read from the file's own
-  // version string and never by running it. A stand-in carries macOS's, amid bytes that are not UTF-8, as in a binary.
+  // S1 names the bash pmmcp's scripts run (#!/usr/bin/env bash: the first on the child's PATH) and its version, read from the file's
+  // bytes and never by running it, and says the operator's login shell is not the one used. A stand-in carries the $BASH_VERSION
+  // form, amid bytes that are not UTF-8, as in a binary.
   const bin = join(home, '.local', 'bin')
   mkdirSync(bin, { recursive: true })
   const bash = join(bin, 'bash')
-  writeFileSync(bash, Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x00, 0xff]), Buffer.from('\0@(#)Bash version 3.2.57(1) release GNU\0'), Buffer.from([0xfe, 0x00])]), { mode: 0o755 })
+  writeFileSync(bash, Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x00, 0xff]), Buffer.from('\x003.2.57(1)-release\x00'), Buffer.from([0xfe, 0x00])]), { mode: 0o755 })
   chmodSync(bash, 0o755)
-  assert.equal(bashVersion(bash), '3.2.57(1)')
-  const checked = preflight({ ...input, aosOnly: false })
-  assert.ok(checked.lines.includes(`  bash        ${bash}, version 3.2.57(1) (the one pmmcp's scripts run)`), checked.lines.join('\n'))
-  // A bash whose file holds no version string, or that cannot be read: said so, and nothing is run to find out.
+  const checked = preflight({ ...input, aosOnly: false, env: { SHELL: '/bin/zsh' } })
+  assert.ok(
+    checked.lines.includes(`  pmmcp's scripts  ${bash} (their #!/usr/bin/env bash), version 3.2.57; your login shell (zsh) is not used: the installer runs every program itself`),
+    checked.lines.join('\n'),
+  )
+  assert.ok(!checked.lines.some((l) => l.startsWith('  bash ')), 'no line names bash as if it were the operator\'s shell')
+  // A bash whose file holds no version string: said so, and nothing is run to find out; no SHELL is "not set".
   writeFileSync(bash, '#!/bin/sh\nexit 0\n')
-  assert.equal(bashVersion(bash), undefined)
-  assert.ok(preflight({ ...input, aosOnly: false }).lines.includes(`  bash        ${bash}, version not readable from the file (the one pmmcp's scripts run)`))
-  assert.equal(bashVersion(join(bin, 'nowhere')), undefined)
+  assert.ok(
+    preflight({ ...input, aosOnly: false }).lines.includes(
+      `  pmmcp's scripts  ${bash} (their #!/usr/bin/env bash), version not readable from the file (it is read, never run); your login shell (not set) is not used: the installer runs every program itself`,
+    ),
+  )
+})
+
+test("S1's pmmcp's-scripts line reads bash's version from the file's bytes, never running it, and names the login shell as not used, control characters stripped", (t) => {
+  const dir = tmpdir(t)
+  const bash = join(dir, 'bash')
+  const holding = (text: string | Buffer): string => {
+    writeFileSync(bash, Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x07, 0x00, 0x00, 0x01]), Buffer.from(text), Buffer.from([0x00, 0xff])]), { mode: 0o755 })
+    return bashVersion(bash) ?? 'none'
+  }
+  // The first form, `<x.y.z>(<build>)-release`, the one $BASH_VERSION gives, for a 3.2 and a 5.x.
+  assert.equal(holding('\x003.2.57(1)-release\x00'), '3.2.57')
+  assert.equal(holding('\x00GNU bash, version 5.2.37(1)-release\x00'), '5.2.37')
+  // A GNU build may carry only version.c's SCCSVERSION, the second form (Ubuntu's 5.2.21 does); a bash that is no release says
+  // which it is, in either form, by bash's own RELSTATUS words: maint, devel, and the pre-releases' alpha, beta2, rc1 (as in
+  // bash-5.3-alpha, bash-5.0-beta2, bash-5.2-rc1), up to two digits.
+  assert.equal(holding('\x00@(#)Bash version 5.2.21(1) release GNU\x00'), '5.2.21')
+  assert.equal(holding('\x005.3.0(1)-beta\x00'), '5.3.0-beta')
+  assert.equal(holding('\x005.3.1(1)-maint\x00'), '5.3.1-maint')
+  assert.equal(holding('\x00@(#)Bash version 5.3.0(1) beta GNU\x00'), '5.3.0-beta')
+  assert.equal(holding('\x00@(#)Bash version 5.3.1(1) maint GNU\x00'), '5.3.1-maint')
+  for (const [status, form] of [['rc1', 'first'], ['rc2', 'SCCS'], ['alpha', 'first'], ['alpha', 'SCCS'], ['beta2', 'first'], ['beta2', 'SCCS'], ['devel', 'first'], ['devel', 'SCCS'], ['rc12', 'first']] as const) {
+    const text = form === 'first' ? `\x005.3.0(1)-${status}\x00` : `\x00@(#)Bash version 5.3.0(1) ${status} GNU\x00`
+    assert.equal(holding(text), `5.3.0-${status}`, `${status} in the ${form} form`)
+  }
+  // A status word that goes on is none: three digits, or a letter after the digits.
+  for (const status of ['rc123', 'beta100', 'alpha999', 'rc1x', 'develop']) {
+    assert.equal(holding(`\x005.3.0(1)-${status}\x00`), 'none', status)
+    assert.equal(holding(`\x00@(#)Bash version 5.3.0(1) ${status} GNU\x00`), 'none', `SCCS ${status}`)
+  }
+  // Neither form: none. Nor a near miss: a longer word, a longer number, no build, or the SCCS words without their prefix.
+  assert.equal(holding('#!/bin/sh\nexit 0\n'), 'none')
+  assert.equal(holding('\x003.2.57(1)-releases\x00'), 'none')
+  assert.equal(holding('\x001.3.2.57(1)-release\x00'), 'none')
+  assert.equal(holding('\x00 12345.2.57(1)-release\x00'), 'none')
+  assert.equal(holding('\x003.2.57-release\x00'), 'none')
+  assert.equal(holding('\x003.2.57(1) release GNU\x00'), 'none')
+  // The SCCS form's tail is held as tightly: its status word ends there, and no number runs past four digits (which keeps
+  // its longest match at 45 characters, the bound BASH_OVERLAP is set by). The first form's fields are held the same way.
+  assert.equal(holding('\x00@(#)Bash version 5.2.21(1) releases\x00'), 'none')
+  // What parts its build from its status is one space and nothing else. (A `-` there is no test of it: `5.2.21(1)-release` is
+  // the first form, which such a file then holds.)
+  assert.equal(holding('\x00@(#)Bash version 5.2.21(1)_release GNU\x00'), 'none')
+  assert.equal(holding('\x00@(#)Bash version 5.2.21(1)\trelease GNU\x00'), 'none')
+  assert.equal(holding('\x00@(#)Bash version 5.2.21(1)  release GNU\x00'), 'none')
+  for (const fields of ['12345.2.21(1)', '5.12345.21(1)', '5.2.12345(1)', '5.2.21(12345)']) {
+    assert.equal(holding(`\x00@(#)Bash version ${fields} release GNU\x00`), 'none', `SCCS ${fields}`)
+    assert.equal(holding(`\x00${fields}-release\x00`), 'none', fields)
+  }
+  // A version is found wherever it lies in what a read takes, not only near its end: one followed by more than BASH_OVERLAP bytes,
+  // and one in the middle of a file larger than a read (a file the size of macOS's 1.3 MB /bin/bash).
+  assert.equal(holding(`\x003.2.57(1)-release\x00${'\x00'.repeat(200)}`), '3.2.57')
+  assert.equal(holding(`\x00@(#)Bash version 5.2.21(1) release GNU\x00${'\x00'.repeat(200)}`), '5.2.21')
+  assert.equal(holding(Buffer.concat([Buffer.alloc(500_000), Buffer.from('3.2.57(1)-release'), Buffer.alloc(800_000)])), '3.2.57')
+
+  // Read, never run: a stand-in that would leave a mark if anything ran it holds the version in a comment.
+  const mark = join(dir, 'ran')
+  writeFileSync(bash, `#!/bin/sh\ntouch '${mark}'\n# 5.2.37(1)-release\n`, { mode: 0o755 })
+  chmodSync(bash, 0o755)
+  assert.equal(bashVersion(bash), '5.2.37')
+  assert.equal(scriptsLine(bash, { SHELL: '/bin/zsh' }), `  pmmcp's scripts  ${bash} (their #!/usr/bin/env bash), version 5.2.37; your login shell (zsh) is not used: the installer runs every program itself`)
+  assert.equal(existsSync(mark), false, 'the file was read, not run')
+
+  // The file is read in chunks and searched after each: a version cut by a read is found whole; one whose last letter ends a read
+  // waits for the next ("-rc" then "1" is rc1, and "-rc" then "s" is no version); one that ends the file is found.
+  const at = (offset: number, text: string, after = '\x00'): string => {
+    writeFileSync(bash, Buffer.concat([Buffer.alloc(offset), Buffer.from(text), Buffer.from(after)]))
+    return bashVersion(bash) ?? 'none'
+  }
+  // The longest match each form admits (four digits in every number), cut one character before its end, and the SCCS one ending
+  // a read exactly (so it waits, and the next search must go back over all 45 characters): the overlap is held at 45 or more.
+  const longest = '1234.5678.9012(3456)-release'
+  const longestSccs = '@(#)Bash version 1234.5678.9012(3456) release'
+  assert.equal(longestSccs.length, 45)
+  // The other seven-letter status, a pre-release's with two digits, is as long, and is held the same way.
+  const longestAlpha = '@(#)Bash version 1234.5678.9012(3456) alpha99'
+  assert.equal(longestAlpha.length, 45)
+  assert.equal(at(BASH_READ_CHUNK - longestAlpha.length, longestAlpha, ' GNU\x00'), '1234.5678.9012-alpha99')
+  assert.equal(at(BASH_READ_CHUNK - (longestAlpha.length - 1), longestAlpha, ' GNU\x00'), '1234.5678.9012-alpha99')
+  assert.equal(at(BASH_READ_CHUNK - (longest.length - 1), longest), '1234.5678.9012')
+  assert.equal(at(BASH_READ_CHUNK - (longestSccs.length - 1), longestSccs, ' GNU\x00'), '1234.5678.9012')
+  assert.equal(at(BASH_READ_CHUNK - longestSccs.length, longestSccs, ' GNU\x00'), '1234.5678.9012')
+  assert.equal(at(BASH_READ_CHUNK - 8, '3.2.57(1)-release'), '3.2.57')
+  assert.equal(at(BASH_READ_CHUNK - 30, '@(#)Bash version 3.2.57(1) release GNU'), '3.2.57')
+  assert.equal(at(BASH_READ_CHUNK - '5.2.37(1)-rc'.length, '5.2.37(1)-rc', '1\x00'), '5.2.37-rc1', 'a status cut by a read is read whole')
+  assert.equal(at(BASH_READ_CHUNK - '5.2.37(1)-rc'.length, '5.2.37(1)-rc', 's\x00'), 'none')
+  assert.equal(at(BASH_READ_CHUNK - '5.2.37(1)-rc1'.length, '5.2.37(1)-rc1', ''), '5.2.37-rc1', 'a file that ends with the version, at a read\'s end')
+  assert.equal(at(100, '5.2.37(1)-release', ''), '5.2.37', 'a file that ends with the version')
+  // Bounded: what lies past BASH_READ_CAP is not read, and a version that ends at the cap is not taken, since what follows is unread.
+  const version = '3.2.57(1)-release'
+  assert.equal(at(BASH_READ_CAP - version.length - 1, version), '3.2.57', 'the last whole version inside the cap')
+  assert.equal(at(BASH_READ_CAP, version), 'none')
+  assert.equal(at(BASH_READ_CAP - version.length, version, 's'), 'none')
+
+  // Links are followed as exec follows them; a directory, a FIFO or a missing file is not read.
+  writeFileSync(bash, '\x003.2.57(1)-release\x00')
+  const link = join(dir, 'bash-link')
+  symlinkSync(bash, link)
+  assert.equal(bashVersion(link), '3.2.57')
+  assert.equal(bashVersion(dir), undefined)
+  assert.equal(bashVersion(join(dir, 'nowhere')), undefined)
+  const fifo = join(dir, 'fifo-bash')
+  if (spawnSync('mkfifo', [fifo]).status === 0) {
+    // The FIFO holds a version and has a writer, so a read of it would find one at once: it is refused for what it is.
+    const reader = openSync(fifo, constants.O_RDONLY | constants.O_NONBLOCK)
+    const writer = openSync(fifo, constants.O_WRONLY | constants.O_NONBLOCK)
+    try {
+      writeSync(writer, '\x005.2.37(1)-release\x00')
+      assert.equal(bashVersion(fifo), undefined)
+    } finally {
+      closeSync(writer)
+      closeSync(reader)
+    }
+    // Opened without blocking: a FIFO with no writer (one put in place after the PATH lookup's stat) would hang a blocking open
+    // for good. A writer turns up after 3 s, from a shell of this test's own in a process group of its own, so an open that
+    // blocked is seen to: it ends late. (`exec 3>` opens the FIFO for writing, which waits for a reader; the group is ended after.)
+    const lone = join(dir, 'fifo-lone')
+    assert.equal(spawnSync('mkfifo', [lone]).status, 0)
+    const releaser = spawn('/bin/sh', ['-c', 'sleep 3; exec 3>"$1"', 'releaser', lone], { detached: true, stdio: 'ignore' })
+    const began = Date.now()
+    try {
+      assert.equal(bashVersion(lone), undefined)
+      assert.ok(Date.now() - began < 2000, 'the open blocked on a FIFO with no writer until one came')
+    } finally {
+      // The shell and its sleep, by their group; a shell that already ended (its open found a reader) leaves no group to end.
+      if (releaser.pid !== undefined && alive(releaser)) {
+        try {
+          process.kill(-releaser.pid, 'SIGKILL')
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+        }
+      }
+    }
+  } else {
+    t.diagnostic('mkfifo is unavailable here; the FIFO cases are not run')
+  }
+
+  // The login shell: $SHELL's last part, or "not set"; control characters stripped (escape sequences, bidi controls, line breaks), cut.
+  assert.equal(loginShell({ SHELL: '/bin/zsh' }), 'zsh')
+  assert.equal(loginShell({}), 'not set')
+  assert.equal(loginShell({ SHELL: '' }), 'not set')
+  assert.equal(loginShell({ SHELL: '  ' }), 'not set')
+  assert.equal(loginShell({ SHELL: '/bin/\x1b[31mz\u202esh\x07\r\n' }), 'zsh')
+  assert.equal(loginShell({ SHELL: '\x1b[2J\x1b[H' }), 'one with no name to show')
+  assert.equal(loginShell({ SHELL: `/opt/${'x'.repeat(60)}` }), `${'x'.repeat(29)}...`)
+  // Cut past 32 code points, never through a surrogate pair: 32 kept whole (one an emoji, 33 UTF-16 units), 33 cut to 29 and "...".
+  assert.equal(loginShell({ SHELL: `/opt/${'x'.repeat(32)}` }), 'x'.repeat(32))
+  assert.equal(loginShell({ SHELL: `/opt/${'x'.repeat(33)}` }), `${'x'.repeat(29)}...`)
+  assert.equal(loginShell({ SHELL: `/opt/${'x'.repeat(31)}\u{1f41a}` }), `${'x'.repeat(31)}\u{1f41a}`)
+  const cut = loginShell({ SHELL: `/bin/${'a'.repeat(28)}\u{1f41a}${'b'.repeat(10)}` })
+  assert.equal(cut, `${'a'.repeat(28)}\u{1f41a}...`)
+  assert.equal(Buffer.from(cut, 'utf8').toString('utf8'), cut, 'no lone surrogate, which would print as U+FFFD')
+  const odd = join(dir, 'ba\x07sh')
+  writeFileSync(odd, '\x005.2.37(1)-release\x00')
+  const line = scriptsLine(odd, { SHELL: '/bin/z\x1b[2Ksh\u2028\x1b]done' })
+  assert.doesNotMatch(line, /[\x00-\x08\x0a-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\u2028\u2029]/)
+  assert.equal(line, `  pmmcp's scripts  ${join(dir, 'bash')} (their #!/usr/bin/env bash), version 5.2.37; your login shell (zshdone) is not used: the installer runs every program itself`)
 })

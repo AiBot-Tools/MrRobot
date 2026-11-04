@@ -42,10 +42,16 @@
 //   Command Line Tools (or Xcode) behind it: without them the stub opens an
 //   install dialog and the probe that ran it fails, so that is a refusal
 //   too. The bash pmmcp's scripts run (`#!/usr/bin/env bash` takes the first
-//   on that PATH) is named with its version, read from its own file (the
-//   `@(#)Bash version` string every bash carries), never by running it: a
-//   shell runs nothing here (scripts/install/run.ts), and macOS's /bin/bash
-//   is 3.2, which pmmcp's setup.sh had to be fixed for (plan P2b). The system
+//   on that PATH) is named with its version when its own file's bytes spell
+//   it out (the `<x.y.z>(<build>)-<status>` string $BASH_VERSION gives, or
+//   version.c's `@(#)Bash version` one; a build may hold neither, since
+//   version.c composes the first at run time, and is then shown as not
+//   readable), never by running it: a shell runs nothing
+//   here (scripts/install/run.ts), and macOS's /bin/bash is 3.2, which
+//   pmmcp's setup.sh had to be fixed for (plan P2b). The same line names the
+//   login shell ($SHELL's last part, zsh on a Mac) as not used, since the
+//   installer starts every program itself; that line is display text, its
+//   control characters stripped and scrubbed (shownLine). The system
 //   line names the macOS version (SystemVersion.plist) and the Darwin
 //   release. Last, with HOME usable, every program the run will start
 //   (scripts/install/run.ts INSTALLER_PROGRAMS, or with --aos-only ls and ps
@@ -63,7 +69,7 @@
 
 import { accessSync, closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from 'node:fs'
 import { arch, release, type, userInfo } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { basename, isAbsolute, join } from 'node:path'
 import { z } from 'zod'
 
 import { assertAosEntry, gitignoresAos } from '../../src/config.js'
@@ -72,7 +78,7 @@ import { falsifyRefusal } from '../../src/falsify-hold.js'
 import { rootGitignoreIgnores } from '../../src/gitignore.js'
 import { shellWord } from '../../src/install/plan.js'
 import { readRegular } from './discover.js'
-import { INSTALLER_PROGRAMS, InstallRunError, PMMCP_PROGRAMS, checkLogFolder, childPath, childPathRefusals } from './run.js'
+import { INSTALLER_PROGRAMS, InstallRunError, PMMCP_PROGRAMS, checkLogFolder, childPath, childPathRefusals, shownLine } from './run.js'
 
 /** The names a shell may export that would point pmmcp's commands elsewhere: shown, never passed on (the runner's allowlist). */
 export const DOCKER_NAMES: readonly string[] = ['DOCKER_CONFIG', 'DOCKER_HOST', 'DOCKER_CONTEXT']
@@ -156,17 +162,57 @@ function namesDesktopHelper(home: string): boolean | undefined {
   }
 }
 
-/** The most of a bash binary read for its version string (macOS's /bin/bash is about 1.3 MB, a universal binary). */
-const BASH_CAP = 16 * 1024 * 1024
+/** The most of a bash binary searched for its version (a bash is a few MB at most: macOS's /bin/bash, a universal binary, is about 1.3 MB). */
+export const BASH_READ_CAP = 8 * 1024 * 1024
 
-/** The version string bash's version.c compiles in (SCCSVERSION): `@(#)Bash version 3.2.57(1) release GNU`. */
-const BASH_VERSION = /@\(#\)Bash version ([0-9]{1,3}\.[0-9]{1,3}(?:\.[0-9]{1,4})?\([0-9]{1,4}\))/
+/** How much of it one read takes. */
+export const BASH_READ_CHUNK = 1024 * 1024
+
+/**
+ * What a search after a read goes back over: at least the longest match
+ * (45 characters, the SCCS form with four digits in every number and a
+ * seven-letter status, release or alpha with two digits), since a match cut
+ * by a read, or one that ends a read and so waits for the next, must be
+ * found again whole. The tests hold it at 45 or more.
+ */
+const BASH_OVERLAP = 64
+
+/**
+ * The version a bash carries in its own bytes, in either of two forms,
+ * whichever comes first in the file. The first is the one $BASH_VERSION and
+ * `bash --version` give, `<major>.<minor>.<patch>(<build>)-<status>`, which
+ * a file holds only if something other than version.c spells it out:
+ * version.c composes it at run time (shell_version_string, from DISTVERSION,
+ * PATCHLEVEL, BUILDVERSION and RELSTATUS), and Apple's bash-3.2 does the
+ * same, so macOS's /bin/bash need not hold it. The second is version.c's
+ * SCCSVERSION, `@(#)Bash version 5.2.21(1) release GNU`, its one whole
+ * literal, kept in a global nothing reads, which a linker may strip
+ * (Ubuntu's 5.2.21 holds only this one). A file with neither is shown as
+ * not readable. The status is bash's RELSTATUS: release, maint, devel, or
+ * alpha, beta or rc with up to two digits (bash-5.3-alpha, bash-5.0-beta2,
+ * bash-5.2-rc1), so a pre-release is named, and a longer word reads as none.
+ * Each number is bounded, and the first may not follow a digit or a dot, so
+ * a longer number is read as no version rather than as part of one.
+ */
+const BASH_VERSION =
+  /(?<![0-9.])([0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4})\([0-9]{1,4}\)-(release|maint|devel|alpha[0-9]{0,2}|beta[0-9]{0,2}|rc[0-9]{0,2})\b|@\(#\)Bash version ([0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4})\([0-9]{1,4}\) (release|maint|devel|alpha[0-9]{0,2}|beta[0-9]{0,2}|rc[0-9]{0,2})\b/
+
+/** A match as the preflight names it: `5.2.37`, or `5.3.0-rc1` for a bash that is no release. */
+function versionOf(m: RegExpExecArray): string {
+  const triple = m[1] ?? m[3] ?? ''
+  const status = m[2] ?? m[4] ?? 'release'
+  return status === 'release' ? triple : `${triple}-${status}`
+}
 
 /**
  * The version of the bash at `path`, read from its own bytes, never by
- * running it: links followed as exec follows them, a regular file only,
- * opened without blocking, to a cap. Undefined when it cannot be read or
- * holds no such string.
+ * running it: links followed as exec follows them, a regular file only
+ * (a FIFO, a device or a directory is not read), opened without blocking
+ * (a FIFO with no writer, put in place after the PATH lookup's stat, would
+ * hang a blocking open for good), read to BASH_READ_CAP and searched after
+ * each read. A match that ends what has been read waits for the next read
+ * (`-rc` may go on as `-rc1`, or as `-rcs`, which is none), unless the file
+ * ended there. Undefined when it cannot be read or holds no such string.
  */
 export function bashVersion(path: string): string | undefined {
   let real: string
@@ -182,21 +228,54 @@ export function bashVersion(path: string): string | undefined {
     return undefined
   }
   try {
-    const st = fstatSync(fd)
-    if (!st.isFile() || st.size > BASH_CAP) return undefined
-    const buf = Buffer.alloc(st.size)
-    let read = 0
-    while (read < st.size) {
-      const got = readSync(fd, buf, read, st.size - read, read)
-      if (got === 0) break
-      read += got
+    if (!fstatSync(fd).isFile()) return undefined
+    const chunk = Buffer.alloc(BASH_READ_CHUNK)
+    const search = new RegExp(BASH_VERSION.source, 'g')
+    let text = ''
+    for (;;) {
+      const room = BASH_READ_CAP - text.length
+      // Read where the last read ended (no position): the file's size is not trusted to say where it ends.
+      const got = room === 0 ? 0 : readSync(fd, chunk, 0, Math.min(BASH_READ_CHUNK, room), null)
+      search.lastIndex = Math.max(0, text.length - BASH_OVERLAP)
+      text += chunk.toString('latin1', 0, got)
+      const m = search.exec(text)
+      const ended = got === 0 && room > 0
+      if (m !== null && (m.index + m[0].length < text.length || ended)) return versionOf(m)
+      if (got === 0) return undefined
     }
-    return BASH_VERSION.exec(buf.subarray(0, read).toString('latin1'))?.[1]
   } catch {
     return undefined
   } finally {
     closeSync(fd)
   }
+}
+
+/** The longest login shell name the preflight shows, in code points. */
+const SHELL_SHOWN = 32
+
+/**
+ * The login shell as the preflight names it: the last part of $SHELL,
+ * control characters stripped and scrubbed (shownLine), cut; "not set" when
+ * $SHELL is unset or blank. Only named, so the operator knows it is not the
+ * one pmmcp's scripts run: nothing here runs it.
+ */
+export function loginShell(env: Readonly<Record<string, string | undefined>>): string {
+  const raw = env['SHELL']
+  if (raw === undefined || raw.trim() === '') return 'not set'
+  const name = basename(shownLine(raw).trim()).trim()
+  if (name === '') return 'one with no name to show'
+  // Counted and cut by code point, not UTF-16 unit, so a cut never leaves half a surrogate pair (shown as U+FFFD).
+  const points = Array.from(name)
+  return points.length <= SHELL_SHOWN ? name : `${points.slice(0, SHELL_SHOWN - 3).join('')}...`
+}
+
+/** S1's line for the bash pmmcp's scripts run, found at `path`, and the login shell that is not used: display text, control characters stripped. */
+export function scriptsLine(path: string, env: Readonly<Record<string, string | undefined>>): string {
+  const version = bashVersion(path)
+  return shownLine(
+    `  pmmcp's scripts  ${path} (their #!/usr/bin/env bash), ${version === undefined ? 'version not readable from the file (it is read, never run)' : `version ${version}`}; ` +
+      `your login shell (${loginShell(env)}) is not used: the installer runs every program itself`,
+  )
 }
 
 /** Does `version` (x.y.z) meet an engines range of `^a.b.c` and `>=a.b.c` alternatives? Undefined for a range this does not read. */
@@ -424,10 +503,7 @@ export function preflight(input: PreflightInput): Preflight {
     const found = wanted.filter(([name]) => at.has(name)).map(([name]) => name)
     lines.push(`  programs    ${found.length === 0 ? 'none found' : list(found)} on the PATH pmmcp's commands get`)
     const bash = at.get('bash')
-    if (bash !== undefined) {
-      const version = bashVersion(bash)
-      lines.push(`  bash        ${bash}, ${version === undefined ? 'version not readable from the file' : `version ${version}`} (the one pmmcp's scripts run)`)
-    }
+    if (bash !== undefined) lines.push(scriptsLine(bash, env))
     if (helper === undefined) lines.push(`  docker      ~/.docker/config.json cannot be read, so whether it names ${CREDENTIAL_HELPER} is not known`)
     if (missing.length > 0) {
       lines.push(`  PATH        ${path}`)

@@ -58,7 +58,7 @@ import type { ModelCard } from '../src/models/registry.js'
 
 // ── zod introspection ──────────────────────────────────────────────────────
 //
-// Verified against zod 4.6.5: `.shape` gives an object's keys, `.def.type`
+// Verified against zod 4.6.7: `.shape` gives an object's keys, `.def.type`
 // names the node, `.def.innerType` unwraps optional/nullable, `.def.element`
 // an array, `.def.options` a union, and `z.number().int()` carries a check
 // whose `def.format` is 'safeint' (a plain z.number() has none).

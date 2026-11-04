@@ -190,6 +190,27 @@ test('more than three operator questions is refused', () => {
   assert.throws(() => parsePlan(wrap(plan)), /questionsForOperator/)
 })
 
+test('an oversized questionsForOperator list fails on its size alone, before any element is parsed (zod 4.6.6+, GHSA-mrhx-c7xc-m3w5)', () => {
+  // The plan is model output. Before 4.6.6 zod parsed every element of a capped
+  // array before it read the cap, so a list far past the bound cost memory and
+  // issues in proportion to its length; from 4.6.6 the leading size check fails
+  // the array first. Every element here is invalid, so an element that is
+  // parsed shows up as an issue of its own.
+  const plan = good()
+  plan['questionsForOperator'] = Array.from({ length: 50_000 }, () => 0)
+  const parsed = ProposedPlan.safeParse(plan)
+  if (parsed.success) assert.fail('an oversized questionsForOperator list parsed')
+  assert.deepEqual(
+    parsed.error.issues.map((i) => [i.code, i.path.join('.')]),
+    [['too_big', 'questionsForOperator']],
+  )
+  // parsePlan reports the first issue, so the refusal names the bound, not element 0.
+  assert.throws(
+    () => parsePlan(wrap(plan)),
+    (e: unknown) => e instanceof PlanInvalid && / at questionsForOperator$/.test(e.message) && /<=3/.test(e.message),
+  )
+})
+
 test('a plan with no milestones, or a milestone with no tasks, is refused', () => {
   const empty = good()
   empty['milestones'] = []

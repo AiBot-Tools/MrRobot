@@ -17,6 +17,9 @@
 //   scan reads every byte under config/, agents/ and souls/.
 //   Let the CEO's tools.allow name something the tool views withhold and the
 //   manifest grants reach the policy denies.
+//   Merge an older package-lock.json and `npm ci` installs a release an
+//   advisory was fixed after; range-pin a dependency and `npm install` moves it
+//   on its own. The lockfile tests read every copy, nested ones included.
 
 import './helpers/guard.js'
 
@@ -540,6 +543,94 @@ test('package.json names the installer aos-install, never install/preinstall/pos
   // No other script runs it, by its file or by its name (`npm run aos-install` from a script npm runs on its own).
   const runners = Object.entries(scripts).filter(([, command]) => /\bscripts\/install(?:\.ts|\/)/.test(command) || /\baos-install\b/.test(command))
   assert.deepEqual(runners.map(([name]) => name), ['aos-install'], 'another script runs the installer')
+})
+
+interface Lockfile {
+  readonly lockfileVersion: number
+  readonly packages: Record<string, { readonly version?: string; readonly dev?: boolean; readonly dependencies?: Record<string, string>; readonly devDependencies?: Record<string, string> }>
+}
+interface PackageJson {
+  readonly dependencies: Record<string, string>
+  readonly devDependencies: Record<string, string>
+}
+const lockfile = (): Lockfile => JSON.parse(read('package-lock.json')) as Lockfile
+const packageJson = (): PackageJson => JSON.parse(read('package.json')) as PackageJson
+/** Every installed copy in the lockfile, the root excluded: hoisted or nested. */
+const lockEntries = (lock: Lockfile): [string, Lockfile['packages'][string]][] =>
+  Object.entries(lock.packages).filter(([path]) => path !== '')
+
+/** x.y.z only: a prerelease or a range here is something to compare by hand, not by this test. */
+function plainVersion(version: string | undefined, where: string): [number, number, number] {
+  const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(version ?? '')
+  assert.ok(m, `${where} is at ${String(version)}, which is not a plain x.y.z`)
+  return [Number(m[1]), Number(m[2]), Number(m[3])]
+}
+function atLeast(a: readonly number[], b: readonly number[]): boolean {
+  for (let i = 0; i < 3; i++) if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0)
+  return true
+}
+
+// The advisories `npm audit` reported on 3c6b430, each with the first release
+// that fixed it. Every one but zod's sits in the MCP SDK's server tree, which is
+// installed and never loaded; the lockfile is still what `npm ci` installs, so a
+// merge that brings an older lockfile back brings the advisory back with it.
+const ADVISORY_FLOORS: readonly { readonly name: string; readonly fixedIn: string; readonly advisories: readonly string[] }[] = [
+  { name: 'zod', fixedIn: '4.6.6', advisories: ['GHSA-mrhx-c7xc-m3w5'] },
+  { name: '@hono/node-server', fixedIn: '2.1.3', advisories: ['GHSA-rmxm-3fg6-px4f'] },
+  { name: 'body-parser', fixedIn: '2.4.0', advisories: ['GHSA-27r3-jxmh-p828'] },
+  { name: 'fast-uri', fixedIn: '3.1.9', advisories: ['GHSA-w74x-v6f9-j3xg', 'GHSA-xhq7-xmqj-769h', 'GHSA-wjr9-j795-jxcr', 'GHSA-333x-w4r6-6crp'] },
+  { name: 'ip-address', fixedIn: '10.7.4', advisories: ['GHSA-rxp7-6hxx-x8q5'] },
+  { name: 'qs', fixedIn: '6.16.1', advisories: ['GHSA-6pq8-jhm2-2vcw'] },
+]
+
+test('the lockfile resolves every copy of each package an advisory named at or above the release that fixed it', () => {
+  const lock = lockfile()
+  assert.equal(lock.lockfileVersion, 3)
+  const entries = lockEntries(lock)
+  for (const { name, fixedIn, advisories } of ADVISORY_FLOORS) {
+    const copies = entries.filter(([path]) => path === `node_modules/${name}` || path.endsWith(`/node_modules/${name}`))
+    // A row whose package left the tree guards nothing: drop it rather than let it pass by finding no copy.
+    assert.ok(copies.length > 0, `${name} is no longer in the lockfile: remove its row from ADVISORY_FLOORS`)
+    for (const [path, entry] of copies) {
+      assert.ok(
+        atLeast(plainVersion(entry.version, path), plainVersion(fixedIn, `${name}'s floor`)),
+        `${path} is at ${String(entry.version)}, below ${fixedIn}, the release that fixed ${advisories.join(', ')}`,
+      )
+    }
+  }
+})
+
+test('package.json pins every dependency exactly, and the lockfile root and its installed copy hold the same versions', () => {
+  // A range would let `npm install` move a dependency on its own, and the
+  // lockfile's root records are what `npm ci` checks package.json against.
+  const pkg = packageJson()
+  const lock = lockfile()
+  const root = lock.packages['']
+  for (const kind of ['dependencies', 'devDependencies'] as const) {
+    assert.deepEqual(root?.[kind], pkg[kind], `the lockfile's root ${kind} are not package.json's`)
+    for (const [name, pin] of Object.entries(pkg[kind])) {
+      plainVersion(pin, `package.json's ${name}`)
+      assert.equal(lock.packages[`node_modules/${name}`]?.version, pin, `the lockfile installs ${name} at another version than the pin ${pin}`)
+    }
+  }
+})
+
+test("README's dependency footprint is the lockfile's: the runtime dependencies by name and number, and the installed, dev-only and total counts", () => {
+  const readme = read('README.md')
+  const start = readme.indexOf('### Dependency footprint')
+  assert.notEqual(start, -1, 'README has no Dependency footprint section')
+  const section = readme.slice(start, readme.indexOf('\n#', start + 1)).replace(/\s+/g, ' ')
+  const m = /(\w+) runtime dependencies \(([^)]*)\) expand to \*\*(\d+) installed packages\*\*, plus (\d+) dev-only, (\d+) in the lockfile\./.exec(section)
+  assert.ok(m, `README's footprint sentence no longer reads as this test expects: ${section}`)
+  const WORDS = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve']
+  const named = [...(m[2] ?? '').matchAll(/`([^`]+)`/g)].map((n) => n[1] ?? '')
+  const runtime = Object.keys(packageJson().dependencies)
+  assert.deepEqual([...named].sort(), [...runtime].sort(), "README's runtime dependencies are not package.json's")
+  assert.equal(WORDS.indexOf((m[1] ?? '').toLowerCase()), runtime.length, `README says ${String(m[1])} runtime dependencies`)
+  const entries = lockEntries(lockfile())
+  assert.equal(Number(m[3]), entries.filter(([, e]) => e.dev !== true).length, 'the installed (runtime) count is not the lockfile\'s')
+  assert.equal(Number(m[4]), entries.filter(([, e]) => e.dev === true).length, 'the dev-only count is not the lockfile\'s')
+  assert.equal(Number(m[5]), entries.length, 'the lockfile total is not the lockfile\'s')
 })
 
 test("README's installer section and D35 say what the installer does: the exports it names, the dry run's writes, the declared bearer's digest alone, flags after --, and the fresh install's one typed word", () => {

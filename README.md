@@ -1158,6 +1158,40 @@ Two results the Phase 2 design has to carry:
   switch, so the hostile VM can reach the trusted one. Neither Lima 2.2.1 nor
   Colima 0.10.3 has a setting that turns the gateway rewrite off.
 
+## Installer checks on the Mac (2026-11-05)
+
+The operator ran `npm run aos-install` twice from a fresh clone on the Mac (macOS
+15.6.1, arm64, Node v26.9.0), the first time at `3c6b430` and the second at
+`b91482c`. Both ran against a configured pmmcp at `e646096`, with local changes to
+five tracked files. That pmmcp was loaded by launchd, its bearer gate in warn mode,
+and its Qdrant key enforced. `.env` already held `AOS_CONTROL_TOKEN`,
+`AOS_PMMCP_TOKEN` and `ANTHROPIC_API_KEY`. Both runs ended `aos-install: exit 0:
+done`.
+
+| Check | Result |
+|---|---|
+| Preflight | every program found on the PATH a child gets, and an exported `DOCKER_CONFIG` named and withheld from pmmcp's commands. At `b91482c` the bash line reads `pmmcp's scripts  /bin/bash (their #!/usr/bin/env bash), version not readable from the file (it is read, never run); your login shell (zsh) is not used`: Apple's bash 3.2 composes its version string when it runs, so its bytes hold none |
+| `.env` | 0600, one link, the operator's, and not written by either run (every name was present). It has no ACL: `ls -le` lists none, and its `@` is an extended attribute, which the loader does not read |
+| Discovery | pmmcp was found from its launchd plist, the `aos-kernel` digest matched `.env`, and the jobs were counted with `stop-pmmcp-server.sh --jobs` |
+| Run 1 (`3c6b430`): the dashboard token | the graceful stop exited 0 after 9 s. `auth init --only dashboard` made `dashboard_token` (0600), and the start exited 0 after 24 s. The start's checks passed: `/health` 200, a new MCP server started after `http_auth.yaml` last changed, Qdrant, the worker and the scraper running, and the dashboard refusing a request without its token (401). The curator secret was skipped, as designed, because a `monitor_tui.py` was running |
+| Run 2 (`b91482c`): the curator secret | the TUI was quit first. The stop waited for one running `curator_health` job and exited 0 after 154 s. `auth init --only curator` made `curator_secret` (0600), and the start exited 0 after 20 s. The same checks passed, and the curator refused a request without a proof (401) |
+| Bearer | in both runs the running server had loaded the `aos-kernel` digest. After `npm run dev`, pmmcp's `server.log` holds `http auth: first request with token` for `aos-kernel`, mode `warn` |
+| Event log | `npm run cli -- verify-chain`: `ok`, 117 events |
+
+No drain hung, so the typed force-quit was not exercised. Two things stay as they
+were, by the operator's choice: the `pmmcp-qdrant-prekey` the cutover kept
+(`qdrant_api_key.py cleanup` removes it and ends the rollback), and warn mode
+(switching to enforce is the operator's later step). Findings to carry forward:
+
+- At run 2's discovery, the MCP server run 1 had started did not answer
+  `/health`. Run 2's restart cleared it, and the cause is not known.
+- The installer's warning still says the stop signals a port's listener
+  without checking its command line. pmmcp's stop script stopped doing that at
+  `0a452c6`, so the warning overstates what the stop can reach.
+- The AOS provider `ollama/qwen3:8b` points at 11434, one of pmmcp's four Ollama
+  instances, which every pmmcp stop stops. Both end reports say to move it to a
+  port of its own.
+
 ## Still needs validation
 
 Facts this repository cannot check from Linux, and how each gets settled. The

@@ -1178,10 +1178,18 @@ done`.
 | Bearer | in both runs the running server had loaded the `aos-kernel` digest. After `npm run dev`, pmmcp's `server.log` holds `http auth: first request with token` for `aos-kernel`, mode `warn` |
 | Event log | `npm run cli -- verify-chain`: `ok`, 117 events |
 
-No drain hung, so the typed force-quit was not exercised. Two things stay as they
-were, by the operator's choice: the `pmmcp-qdrant-prekey` the cutover kept
-(`qdrant_api_key.py cleanup` removes it and ends the rollback), and warn mode
-(switching to enforce is the operator's later step). Findings to carry forward:
+No drain hung, so the typed force-quit was not exercised. Both runs left the
+`pmmcp-qdrant-prekey` the cutover kept, by the operator's choice. The operator
+removed it afterwards, with pmmcp running. First, `qdrant_api_key.py status`
+gave the verdict "Qdrant enforces the key, and the key file holds it" (401 without
+the key, 200 with it, published on `127.0.0.1:6333` only), and pmmcp's logs held no
+refused Qdrant request. Then `qdrant_api_key.py cleanup` reported "removed
+pmmcp-qdrant-prekey; its volumes are untouched". A second `status` showed
+`pmmcp-qdrant-prekey: none` with the same verdict, and `docker volume ls` still
+listed `pmmcp-qdrant-data`. The cutover can no longer be rolled back, and Qdrant's
+snapshots under `~/.persistent-memory-mcp/backups` are its safety net. Warn mode
+stays as it was (switching to enforce is the operator's later step). Findings to
+carry forward:
 
 - At run 2's discovery, the MCP server run 1 had started did not answer
   `/health`. Run 2's restart cleared it, and the cause is not known.

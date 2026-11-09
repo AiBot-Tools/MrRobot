@@ -30,7 +30,7 @@ import { ConfigError } from './errors.js'
 import { rootGitignoreIgnores } from './gitignore.js'
 import { entryProblem, homeDirectory, identify, isSpelledUnder, isUnder, realpathNearest, type Identify } from './agents/protected.js'
 import { DENY_KEYS } from './events/redact.js'
-import { isUnprivilegedUser, memoryBytes } from './sandbox/limits.js'
+import { isDockerNetworkMode, isNetworkName, isUnprivilegedUser, memoryBytes } from './sandbox/limits.js'
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
 
@@ -257,7 +257,21 @@ const Goals = z
 const SandboxDomain = z
   .object({
     dockerHost: z.string().startsWith('unix://'),
-    network: z.string().min(1),
+    // A plain name: docker reads `name=host` as host (sandbox/limits.ts), and
+    // probe() would inspect a network of that literal name. Nor one docker
+    // keeps for itself: host, bridge and default are never internal, and
+    // probe() could only advise recreating one, which docker refuses. The
+    // run-args audit refuses all of these again, with container:<id>. `none`
+    // passes.
+    network: z.string().refine(isNetworkName, {
+      message:
+        'a sandbox domain network must be a plain network name (a letter or digit, then letters, digits, _, . or -): ' +
+        'docker reads a value holding = as key=value fields, whose name= can be host',
+    }).refine((value) => !isDockerNetworkMode(value), {
+      message:
+        'a sandbox domain network may not be host, bridge or default, in any case: docker keeps those names for ' +
+        'networks of its own, none of them internal, and refuses to recreate one --internal',
+    }),
     // Absolute, a ~ path, or RELATIVE TO THE REPOSITORY ROOT (resolved in
     // parseKernelConfig) — never relative to whatever directory the daemon
     // started in, which would put a container's mount somewhere nobody chose.

@@ -7,9 +7,14 @@
 // function and then AUDITED by that same function before it is returned —
 // exactly one bind mount, read as docker reads it, no --privileged, no docker
 // socket, no home directory, a --user that is not root and resource caps that
-// are not 0, and nothing before the image that the builder did not emit — and
-// a future edit that widens any of those throws rather than producing a
-// container.
+// are not 0, nothing before the image that the builder did not emit, nothing
+// there that widens the container by name (an environment, a published port, a
+// terminal, a detached client, an extra host or resolver, a shared namespace,
+// an unconfined security option, a device, another runtime, kernel parameters
+// or cgroup parent, a supplementary group, a log driver, a writable root
+// filesystem, another mount or network) in any spelling docker reads, and
+// exactly one --network, the domain's, by a plain name — and a future edit
+// that widens any of those throws rather than producing a container.
 //
 // The spawn environment is exactly { DOCKER_CONFIG, DOCKER_HOST, PATH }, and that
 // is a security property rather than a tidiness one. DOCKER_CONFIG is a
@@ -41,7 +46,7 @@ const execFileAsync = promisify(execFile)
 import { ConfigError } from '../errors.js'
 import { homeDirectory, realpathNearest } from '../agents/protected.js'
 import { confineWorkspace } from './confine.js'
-import { isCpus, isPidsLimit, isUnprivilegedUser, memoryBytes } from './limits.js'
+import { isCpus, isNetworkName, isPidsLimit, isUnprivilegedUser, memoryBytes } from './limits.js'
 import {
   CAPTURE_MAX_BYTES,
   type ProbeResult,
@@ -99,6 +104,225 @@ const RUN_OPTIONS: ReadonlyMap<string, 'flag' | 'value'> = new Map([
 const MOUNT_QUOTING = /["\p{Cc}]/u
 /** And in a path written into that value, a comma starts a field of its own. */
 const MOUNT_STRUCTURE = /[,"\p{Cc}]/u
+
+/**
+ * docker run's one-letter options (docker CLI 29) and whether each takes a
+ * value. Docker's flag parser (pflag) reads a group such as `-it` as `-i -t`,
+ * and `-eKEY` or `-e=KEY` as `-e KEY`: the first letter that takes a value
+ * ends the group, and the rest of it is that value. A letter not listed is no
+ * option of docker's, which then refuses the command; the group is read on
+ * past it, so that a refused letter after it is still named.
+ */
+const SHORT_OPTIONS: ReadonlyMap<string, readonly [long: string, takesValue: boolean]> = new Map([
+  ['a', ['--attach', true]],
+  ['c', ['--cpu-shares', true]],
+  ['d', ['--detach', false]],
+  ['e', ['--env', true]],
+  ['h', ['--hostname', true]],
+  ['i', ['--interactive', false]],
+  ['l', ['--label', true]],
+  ['m', ['--memory', true]],
+  ['p', ['--publish', true]],
+  ['P', ['--publish-all', false]],
+  ['q', ['--quiet', false]],
+  ['t', ['--tty', false]],
+  ['u', ['--user', true]],
+  ['v', ['--volume', true]],
+  ['w', ['--workdir', true]],
+])
+
+/**
+ * Why an option widens the container, judged on the value it carries
+ * (undefined when there is none) and whether that value shares its element
+ * (`--flag=value`). Undefined passes it on to RUN_OPTIONS, which still
+ * refuses anything the builder does not emit.
+ */
+type Widens = (value: string | undefined, inline: boolean) => string | undefined
+
+/** --pid, --ipc, --uts, --cgroupns, --userns: `host`, or `container:<id>`. */
+function sharesNamespace(what: string): Widens {
+  return (value) => {
+    const v = (value ?? '').toLowerCase()
+    if (v === 'host') return `shares the VM's ${what} namespace with the container`
+    if (v.startsWith('container:')) return `shares another container's ${what} namespace with this one`
+    return undefined
+  }
+}
+
+/**
+ * What docker makes of a --network value other than the network of that name:
+ * the modes it gives a name of its own (host, container:<id>, bridge,
+ * default), none of them internal, and any value that is not a plain network
+ * name (sandbox/limits.ts), which its CLI may read as key=value fields whose
+ * `name=` can say host. `none` is a plain name and no network at all.
+ */
+function networkMode(value: string): string | undefined {
+  const v = value.toLowerCase()
+  if (v === 'host') return "puts the container on the VM's own network stack, which reaches the Mac at 192.168.5.2"
+  if (v.startsWith('container:')) return "puts the container in another container's network namespace"
+  if (v === 'bridge' || v === 'default') return "puts the container on docker's default bridge, which has a route off the VM"
+  if (!isNetworkName(value)) {
+    return (
+      'names no plain network (a letter or digit, then letters, digits, _, . or -), and docker reads a value ' +
+      "holding = as key=value fields, whose name= can be host: the VM's own network stack"
+    )
+  }
+  return undefined
+}
+
+/**
+ * --security-opt, read as docker's CLI reads it: split at the first `=`, or
+ * at the first `:` in the older spelling. The builder sets no-new-privileges
+ * and nothing else, so every other key takes a confinement away or replaces
+ * it — and `seccomp=<file>` has the CLI read that file on the Mac and send it
+ * as the filter.
+ */
+function unconfines(value: string | undefined): string | undefined {
+  const opt = value ?? ''
+  let at = opt.indexOf('=')
+  if (at === -1 && opt !== 'no-new-privileges') at = opt.indexOf(':')
+  const key = (at === -1 ? opt : opt.slice(0, at)).toLowerCase()
+  const v = at === -1 ? '' : opt.slice(at + 1).toLowerCase()
+  if (key === 'no-new-privileges') return v === '' || v === 'true' ? undefined : 'turns no-new-privileges off'
+  const unconfined = v === 'unconfined'
+  if (key === 'seccomp') return unconfined ? 'removes the seccomp filter' : 'replaces the default seccomp filter'
+  if (key === 'apparmor') return unconfined ? 'removes the AppArmor profile' : 'replaces the default AppArmor profile'
+  if (key === 'systempaths') return 'unmasks the /proc and /sys paths docker hides'
+  if (key === 'label') return 'changes or disables the SELinux labels'
+  return 'sets a security option the builder never sets'
+}
+
+/**
+ * --read-only, a boolean. Docker's flag parser (pflag) gives a boolean a value
+ * only in its own element, `--read-only=<v>`, and reads it with Go's
+ * strconv.ParseBool, for which 0, f and false (in upper or title case too) are
+ * off. A value it cannot read is refused by docker, and by RUN_OPTIONS.
+ */
+function writableRoot(value: string | undefined, inline: boolean): string | undefined {
+  if (!inline) return undefined
+  return ['0', 'f', 'false'].includes((value ?? '').toLowerCase())
+    ? "makes the container's root filesystem writable"
+    : undefined
+}
+
+/**
+ * Options refused before the image, in every spelling docker reads:
+ * `--flag value`, `--flag=value`, and a letter in a group. A string refuses
+ * the option whatever its value; a function judges the value. RUN_OPTIONS,
+ * above, is what the builder emits and refuses each of these anyway: this
+ * list is what stays refused when an edit widens RUN_OPTIONS and the builder
+ * together, and the reason the refusal gives. `--env`, `--dns` and
+ * `--publish` stand for their families: `--env-file` (which also has the
+ * docker CLI read a file on the Mac, `.env` among them), `--dns-search`,
+ * `--dns-option`, `--dns-opt` and `--publish-all`. The `--env` family is
+ * matched by prefix rather than spelled out because hygiene.test.ts refuses
+ * Node's env-file flag written in any line of src/ code. `--privileged`,
+ * `--cap-add` and `--device` are refused anywhere in the argv by
+ * FORBIDDEN_FLAGS, above; `--device-cgroup-rule` and `--gpus` reach devices
+ * past that exact match, and so are named here. `--detach` is here because
+ * the run's hard wallclock lives as long as the docker client does: a client
+ * that returns at once clears it. `--group-add`, the log options and
+ * `--read-only=false` undo, by another route, what --user, the internal
+ * network and --read-only give. A second `--network` or `--mount` written as
+ * the builder writes its own is caught by the count of each option, and the
+ * one --network value is then held to the domain's. A domain that names
+ * host, bridge or `name=host` is refused before this list is read
+ * (auditRunArgs), as the domain's network rather than as an option the
+ * builder never emits, though this rule would refuse the builder's own
+ * `--network` carrying it too.
+ */
+const WIDENING: ReadonlyMap<string, string | Widens> = new Map<string, string | Widens>([
+  ['--env', "sets variables in the container's environment, where no credential may be (invariant 2)"],
+  [
+    '--network',
+    (value, inline) =>
+      networkMode(value ?? '') ?? (inline ? 'attaches a second network, and docker attaches every network it is given' : undefined),
+  ],
+  ['--net', 'is --network under another name, and docker attaches every network it is given'],
+  ['--add-host', "writes a name into the container's /etc/hosts, host.lima.internal for the Mac among them"],
+  ['--dns', "sets the container's resolver configuration"],
+  ['--publish', 'publishes a container port on the VM'],
+  ['--link', "joins another container's network and copies its environment into this one"],
+  ['--tty', "allocates a pseudo-terminal, which merges the container's stderr into its stdout and rewrites its bytes"],
+  ['--ipc', sharesNamespace('IPC')],
+  ['--uts', sharesNamespace('UTS')],
+  ['--cgroupns', sharesNamespace('cgroup')],
+  ['--pid', sharesNamespace('PID')],
+  ['--userns', sharesNamespace('user')],
+  ['--security-opt', unconfines],
+  ['--volumes-from', 'mounts every volume another container has'],
+  ['--volume', 'binds a path or a volume beside the one workspace mount'],
+  [
+    '--mount',
+    (_value, inline) =>
+      inline ? 'adds a mount beside the one workspace mount, which the builder writes as --mount <value>' : undefined,
+  ],
+  ['--use-api-socket', "mounts the docker API socket, and with it the VM's daemon"],
+  [
+    '--detach',
+    "returns as soon as the container starts, and the run's hard wallclock is cleared when the docker client exits, so the container outlives it",
+  ],
+  ['--device-cgroup-rule', 'lets the container use device nodes the default device cgroup denies'],
+  ['--gpus', "gives the container the VM's GPUs, devices that --device would have to name"],
+  ['--runtime', 'runs the container under an OCI runtime the builder never chose, with whatever confinement that one has'],
+  ['--sysctl', "sets kernel parameters in the container's namespaces, its network stack's among them"],
+  ['--cgroup-parent', "puts the container's cgroup under a parent the builder never chose"],
+  ['--group-add', "gives the container's user a supplementary group, root's (0) as readily as any, though --user may not name root's group"],
+  [
+    '--log-driver',
+    "has the VM's dockerd ship the container's output through a driver the builder never chose: syslog, gelf, fluentd " +
+      'or splunk send it to an address such as 192.168.5.2, the Mac, off the internal network',
+  ],
+  ['--log-opt', "configures the container's log driver, the address it ships the container's output to among them"],
+  ['--read-only', writableRoot],
+])
+
+/** Options whose family shares their refusal: `--dns-search` is `--dns`'s. */
+const WIDENING_FAMILIES = ['--env', '--dns', '--publish']
+
+function widensAs(name: string): string | Widens | undefined {
+  const family = WIDENING_FAMILIES.find((f) => name.startsWith(`${f}-`))
+  return WIDENING.get(name) ?? (family === undefined ? undefined : WIDENING.get(family))
+}
+
+/**
+ * What one element before the image widens, read as docker reads it, with
+ * `next` the element after it (the value of `--flag value`), and the option as
+ * the refusal names it. An option refused whatever its value is named without
+ * one, because the value of `--env` is what must not be printed; one refused
+ * for its value is named with the value that decided it.
+ */
+function widening(arg: string, next: string | undefined): { readonly named: string; readonly why: string } | undefined {
+  const judge = (option: string, value: string | undefined, inline: boolean): string | undefined => {
+    const rule = widensAs(option)
+    return typeof rule === 'function' ? rule(value, inline) : rule
+  }
+  const valued = (option: string): boolean => typeof widensAs(option) === 'function'
+  if (arg.startsWith('--')) {
+    const eq = arg.indexOf('=')
+    const name = eq === -1 ? arg : arg.slice(0, eq)
+    const value = eq === -1 ? next : arg.slice(eq + 1)
+    const why = judge(name, value, eq !== -1)
+    if (why === undefined) return undefined
+    if (!valued(name)) return { named: name, why }
+    return { named: eq === -1 ? `${name} ${JSON.stringify(value ?? '')}` : JSON.stringify(arg), why }
+  }
+  for (let i = 1; i < arg.length; i++) {
+    const letter = arg.charAt(i)
+    const short = SHORT_OPTIONS.get(letter)
+    if (short === undefined) continue
+    const [long, takesValue] = short
+    const rest = arg.slice(i + 1)
+    const value = takesValue ? (rest === '' ? next : rest.replace(/^=/, '')) : undefined
+    const why = judge(long, value, takesValue && rest !== '')
+    if (why !== undefined) {
+      const named = `-${letter} (${long})`
+      return { named: valued(long) ? `${named} ${JSON.stringify(value ?? '')}` : named, why }
+    }
+    if (takesValue) break
+  }
+  return undefined
+}
 
 export interface DomainConfig {
   readonly dockerHost: string
@@ -191,7 +415,7 @@ export function buildRunArgs(input: BuildArgsInput): string[] {
     ...spec.command,
   ]
 
-  auditRunArgs(args, home, workspace)
+  auditRunArgs(args, home, workspace, domain.network)
   return args
 }
 
@@ -202,7 +426,7 @@ export function buildRunArgs(input: BuildArgsInput): string[] {
  * set of conditions spread through the builder: it catches a widening
  * introduced anywhere above, including in `spec.command`.
  */
-export function auditRunArgs(args: readonly string[], home: string, workspace: string): void {
+export function auditRunArgs(args: readonly string[], home: string, workspace: string, network: string): void {
   for (const arg of args) {
     for (const bad of FORBIDDEN_FLAGS) {
       if (arg === bad || arg.startsWith(`${bad}=`)) {
@@ -255,15 +479,51 @@ export function auditRunArgs(args: readonly string[], home: string, workspace: s
   // `--read-only=false`, `--network=container:<id>` — none of which the
   // exact-string checks above see. So every element there must be one the
   // builder emits, each exactly once (docker keeps the LAST `--user`), and
-  // the image is the first element that is not an option.
+  // the image is the first element that is not an option. Before that, each
+  // element is read for what it widens (WIDENING), so that the refusal names
+  // it and holds whatever RUN_OPTIONS comes to admit. After the image, every
+  // element is the command's, which docker passes on unread: `grep -e`,
+  // `ls -t` and `ssh -p` are not docker's -e, -t and -p, and nothing from here
+  // on reads them so.
+  //
+  // The whole-argv scans above still do: FORBIDDEN_FLAGS, the --mount and -v
+  // count and the home check read the command too, so `grep -v x` is refused
+  // as a second mount, `python train.py --device cpu` as a device and
+  // `--privileged` as a command argument as the flag. That over-refusal is
+  // kept on purpose until the operator decides otherwise (it narrows an
+  // invariant 9 check), and the decision is one for the count and
+  // FORBIDDEN_FLAGS together, both of which read what docker obeys: when
+  // sandbox.exec commands are exposed (S3), they may move before the image,
+  // where WIDENING and RUN_OPTIONS already read every element. Until then
+  // FORBIDDEN_FLAGS stays whole-argv like the count. FORBIDDEN_SUBSTRINGS and
+  // the home check stay whole-argv in either case: what they refuse is a path
+  // the command itself could name, the docker socket or the operator's home.
   if (args[0] !== 'run') {
     throw new ConfigError(`docker args must start with run (found ${JSON.stringify(args[0] ?? '')})`)
+  }
+  // The builder writes the domain's network into its own --network. A domain
+  // that names a network docker reads as no network of that name (host,
+  // bridge, `name=host`) is refused here, as the domain's: the walk below
+  // would refuse it too, but as an option the builder never emits.
+  const domainMode = networkMode(network)
+  if (domainMode !== undefined) {
+    throw new ConfigError(
+      `the domain network ${JSON.stringify(network)} is not a network docker reads by that name: as --network it ` +
+        `${domainMode}; invariant 9 needs the domain's own internal network`,
+    )
   }
   const seen = new Map<string, number>()
   const values = new Map<string, string>()
   let mount: string | undefined
   let at = 1
   for (let arg = args[at]; arg !== undefined && arg.startsWith('-'); arg = args[at]) {
+    const widened = widening(arg, args[at + 1])
+    if (widened !== undefined) {
+      throw new ConfigError(
+        `docker args carry ${widened.named} before the image, which the builder never emits, and docker would obey it: ` +
+          `it ${widened.why}, which invariant 9 refuses in any spelling`,
+      )
+    }
     const kind = RUN_OPTIONS.get(arg)
     if (kind === undefined) {
       throw new ConfigError(
@@ -290,9 +550,31 @@ export function auditRunArgs(args: readonly string[], home: string, workspace: s
     throw new ConfigError('docker args name no image after their options')
   }
 
-  // Each once, by the count above, so this is the value docker uses.
+  // Each once, by the count above, so this is the value docker uses — and,
+  // for --network, the one network it attaches.
   for (const option of CAP_VALUES.keys()) assertCapValue(option, values.get(option) ?? '')
   assertTheMount(mount ?? '', workspace)
+  assertTheNetwork(values.get('--network') ?? '', network)
+}
+
+/**
+ * The one --network value must be the domain's network as the builder was
+ * handed it. probe() proves THAT network internal (`docker network inspect`),
+ * so a container put on any other is on a network nobody checked.
+ *
+ * What docker makes of the value is not judged here: auditRunArgs has
+ * already refused a domain network of host, container:<id>, bridge, default
+ * or anything but a plain network name, and WIDENING's --network rule has
+ * refused the same in every --network before the image, whatever the domain
+ * says. This holds the value that is left to the one network it must be.
+ */
+function assertTheNetwork(value: string, network: string): void {
+  if (value !== network) {
+    throw new ConfigError(
+      `docker args put the container on network ${JSON.stringify(value)}; invariant 9 needs the domain's internal network ` +
+        JSON.stringify(network),
+    )
+  }
 }
 
 /**
@@ -559,6 +841,22 @@ export class DockerDriver implements SandboxDriver {
     // route; a network created by hand without it looks identical by name.
     for (const domain of DOMAINS) {
       const network = this.#options.domains[domain].network
+      // A name docker keeps for a network of its own (host, bridge, default),
+      // or reads as more than a name, is not a network `inspect` can vouch
+      // for, and docker refuses to remove or create the predefined ones, so
+      // the advice below would be a command that cannot run. kernel.yaml
+      // refuses these names; a driver handed its domains by another path
+      // meets this.
+      const notByName = networkMode(network)
+      if (notByName !== undefined) {
+        return {
+          ok: false,
+          why:
+            `${domain}: network ${JSON.stringify(network)} is not a network docker reads by that name: as --network it ` +
+            `${notByName}. Name the domain's own internal network in kernel.yaml ` +
+            `(docker network create --internal aos-${domain})`,
+        }
+      }
       let internal: string
       try {
         const { stdout } = await this.#options.execFile(

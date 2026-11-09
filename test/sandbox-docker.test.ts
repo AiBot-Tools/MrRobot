@@ -35,6 +35,18 @@
 //   hundred bytes for every byte kept.
 //   Admit --user 0:0 or a cap of 0, both well-formed to docker, and the run is
 //   root or has no limit.
+//   Refuse the options that widen a container (--env, -p, -t, --add-host,
+//   --dns, --pid host, seccomp=unconfined, --group-add 0, --log-driver
+//   syslog, --read-only=false) only because RUN_OPTIONS does not list them,
+//   and the edit that lists one reaches docker with it; read docker's options
+//   past the image and `grep -e` is refused as an environment; take any
+//   --network value and a container sits on a network probe() never proved
+//   internal; take the domain's value without reading it as docker does and
+//   `name=host` is the VM's own network stack. Refuse a domain of host as an
+//   option the builder never emits, or advise recreating it --internal, and
+//   the operator is sent after a smuggled flag or a command docker refuses.
+//   Build a hostile run against the trusted domain's config and it goes on a
+//   network its own VM never checked.
 
 import './helpers/guard.js'
 
@@ -75,6 +87,14 @@ interface Fixture {
   readonly realWorkspace: string
   readonly repoRoot: string
   readonly domain: DomainConfig
+  /**
+   * The hostile domain, with its own socket, network and mountRoot, as
+   * kernel.yaml gives it: one sharing the trusted domain's would let a run
+   * built against the wrong domain pass every check.
+   */
+  readonly hostile: DomainConfig
+  readonly hostileWorkspace: string
+  readonly realHostileWorkspace: string
 }
 
 /**
@@ -84,9 +104,11 @@ interface Fixture {
 function fixture(t: TestContext): Fixture {
   const root = tmpdir(t)
   const mountRoot = join(root, 'work')
+  const hostileRoot = join(root, 'hostile-work')
   const repoRoot = join(root, 'repo')
 
   mkdirSync(join(mountRoot, 'proj'), { recursive: true })
+  mkdirSync(join(hostileRoot, 'proj'), { recursive: true })
   // A sibling whose name has the allowed root as a prefix.
   mkdirSync(join(root, 'work-evil'), { recursive: true })
   mkdirSync(join(root, 'outside'), { recursive: true })
@@ -108,6 +130,9 @@ function fixture(t: TestContext): Fixture {
     realWorkspace: realpathSync(join(mountRoot, 'proj')),
     repoRoot,
     domain: { dockerHost: 'unix:///tmp/colima-trusted.sock', network: 'aos-internal', mountRoot },
+    hostile: { dockerHost: 'unix:///tmp/colima-hostile.sock', network: 'aos-hostile', mountRoot: hostileRoot },
+    hostileWorkspace: join(hostileRoot, 'proj'),
+    realHostileWorkspace: realpathSync(join(hostileRoot, 'proj')),
   }
 }
 
@@ -119,7 +144,8 @@ function spec(f: Fixture, over: Partial<SandboxSpec> = {}): SandboxSpec {
     domain: 'trusted',
     image: 'aos/worker:0.0.1',
     command: ['node', '--version'],
-    workspace: f.workspace,
+    // Each domain's own: a workspace is confined to its domain's mountRoot.
+    workspace: over.domain === 'hostile' ? f.hostileWorkspace : f.workspace,
     limits: { memoryMb: 2_048, cpus: 2, pids: 256, wallclockMs: 600_000 },
     ...over,
   }
@@ -290,7 +316,7 @@ test('the audit reads the --mount value as docker does and admits only type=bind
   const args = argsFor(f)
   const at = args.indexOf('--mount') + 1
   const withMount = (value: string): string[] => args.map((a, i) => (i === at ? value : a))
-  assert.doesNotThrow(() => auditRunArgs(args, home, ws))
+  assert.doesNotThrow(() => auditRunArgs(args, home, ws, f.domain.network))
 
   const bad = [
     `type=bind,source=${ws},source=/etc,target=${WORKSPACE_TARGET}`, // docker keeps the last source
@@ -309,12 +335,12 @@ test('the audit reads the --mount value as docker does and admits only type=bind
     '',
   ]
   for (const value of bad) {
-    assert.throws(() => auditRunArgs(withMount(value), home, ws), ConfigError, JSON.stringify(value))
+    assert.throws(() => auditRunArgs(withMount(value), home, ws, f.domain.network), ConfigError, JSON.stringify(value))
   }
   // And the case a template comparison misses: the workspace carries the tail.
   const tail = `${ws},source=/etc`
   assert.throws(
-    () => auditRunArgs(withMount(`type=bind,source=${tail},target=${WORKSPACE_TARGET}`), home, tail),
+    () => auditRunArgs(withMount(`type=bind,source=${tail},target=${WORKSPACE_TARGET}`), home, tail, f.domain.network),
     /names source twice/,
   )
 })
@@ -370,12 +396,270 @@ test('the image slot cannot carry a docker option: everything before the image i
   const args = argsFor(f)
   for (const dropped of ['--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--init']) {
     assert.throws(
-      () => auditRunArgs(args.filter((a) => a !== dropped), home, f.realWorkspace),
+      () => auditRunArgs(args.filter((a) => a !== dropped), home, f.realWorkspace, f.domain.network),
       new RegExp(`carry ${dropped} 0 time\\(s\\)`),
       dropped,
     )
   }
-  assert.throws(() => auditRunArgs(args.slice(0, args.indexOf('aos/worker:0.0.1')), home, f.realWorkspace), /name no image/)
+  assert.throws(() => auditRunArgs(args.slice(0, args.indexOf('aos/worker:0.0.1')), home, f.realWorkspace, f.domain.network), /name no image/)
+})
+
+test('the audit refuses every env, publish, tty, extra-host, dns, namespace-widening and unconfined flag, and a second or unexpected --network', (t) => {
+  // Egress plan P3. Each row is a spec field docker would read as an option
+  // of its own: the image slot holds the option and, where it takes a value,
+  // the command supplies the value and then an image. RUN_OPTIONS refuses all
+  // of them already; each row asserts the refusal that NAMES what the option
+  // widens, which is the one still standing when an edit widens RUN_OPTIONS
+  // and the builder together.
+  const f = fixture(t)
+  const home = join(f.root, 'home')
+  const named =
+    (option: string) =>
+    (e: unknown): boolean =>
+      e instanceof ConfigError &&
+      e.message.startsWith(`docker args carry ${option} before the image, which the builder never emits, and docker would obey it: it `) &&
+      e.message.endsWith(', which invariant 9 refuses in any spelling')
+
+  const rows: readonly (readonly [image: string, command: readonly string[], named: string])[] = [
+    // The environment: no credential is ever put there (invariant 2), and
+    // --env-file has the CLI read a file on the Mac, .env included.
+    ['-e', ['ANTHROPIC_API_KEY', 'alpine'], '-e (--env)'],
+    ['-eANTHROPIC_API_KEY', ['alpine'], '-e (--env)'],
+    ['-e=ANTHROPIC_API_KEY', ['alpine'], '-e (--env)'],
+    ['-ie', ['ANTHROPIC_API_KEY', 'alpine'], '-e (--env)'],
+    ['--env', ['ANTHROPIC_API_KEY', 'alpine'], '--env'],
+    ['--env=ANTHROPIC_API_KEY', ['alpine'], '--env'],
+    ['--env-file', ['/Users/op/MrRobot/.env', 'alpine'], '--env-file'],
+    ['--env-file=.env', ['alpine'], '--env-file'],
+    // Published ports.
+    ['-p', ['8080:80', 'alpine'], '-p (--publish)'],
+    ['-p127.0.0.1:8080:80', ['alpine'], '-p (--publish)'],
+    ['-P', ['alpine'], '-P (--publish-all)'],
+    ['-iP', ['alpine'], '-P (--publish-all)'],
+    ['--publish', ['8080:80', 'alpine'], '--publish'],
+    ['--publish=8080:80', ['alpine'], '--publish'],
+    ['--publish-all', ['alpine'], '--publish-all'],
+    // A terminal.
+    ['-t', ['alpine'], '-t (--tty)'],
+    ['-it', ['alpine'], '-t (--tty)'],
+    ['-ti', ['alpine'], '-t (--tty)'],
+    ['--tty', ['alpine'], '--tty'],
+    ['--tty=true', ['alpine'], '--tty'],
+    // A client that returns at once, and the hard wallclock, which lasts as
+    // long as the client does, goes with it.
+    ['-d', ['alpine'], '-d (--detach)'],
+    ['-dP', ['alpine'], '-d (--detach)'],
+    ['--detach', ['alpine'], '--detach'],
+    ['--detach=true', ['alpine'], '--detach'],
+    // Names and resolvers: host.lima.internal is the Mac, where pmmcp listens.
+    ['--add-host', ['host.lima.internal:192.168.5.2', 'alpine'], '--add-host'],
+    ['--add-host=pmmcp:192.168.5.2', ['alpine'], '--add-host'],
+    ['--dns', ['192.168.5.3', 'alpine'], '--dns'],
+    ['--dns=1.1.1.1', ['alpine'], '--dns'],
+    ['--dns-search=lima.internal', ['alpine'], '--dns-search'],
+    ['--dns-option', ['ndots:0', 'alpine'], '--dns-option'],
+    ['--dns-opt=ndots:0', ['alpine'], '--dns-opt'],
+    ['--link', ['other:db', 'alpine'], '--link'],
+    // A second network in another spelling, and the networks docker gives a
+    // meaning of its own, in every spelling.
+    ['--net', ['aos-internal', 'alpine'], '--net'],
+    ['--net=host', ['alpine'], '--net'],
+    ['--network=aos-internal', ['alpine'], '"--network=aos-internal"'],
+    ['--network=host', ['alpine'], '"--network=host"'],
+    ['--network', ['host', 'alpine'], '--network "host"'],
+    ['--network', ['HOST', 'alpine'], '--network "HOST"'],
+    ['--network', ['container:abc', 'alpine'], '--network "container:abc"'],
+    ['--network', ['bridge', 'alpine'], '--network "bridge"'],
+    ['--network=default', ['alpine'], '"--network=default"'],
+    ['--network', ['name=host', 'alpine'], '--network "name=host"'],
+    ['--network=NAME=HOST', ['alpine'], '"--network=NAME=HOST"'],
+    // Namespaces shared with the VM or with another container.
+    ['--pid', ['host', 'alpine'], '--pid "host"'],
+    ['--pid=container:abc', ['alpine'], '"--pid=container:abc"'],
+    ['--ipc=host', ['alpine'], '"--ipc=host"'],
+    ['--ipc', ['container:abc', 'alpine'], '--ipc "container:abc"'],
+    ['--uts=host', ['alpine'], '"--uts=host"'],
+    ['--uts', ['host', 'alpine'], '--uts "host"'],
+    ['--cgroupns=host', ['alpine'], '"--cgroupns=host"'],
+    ['--cgroupns', ['host', 'alpine'], '--cgroupns "host"'],
+    ['--userns', ['host', 'alpine'], '--userns "host"'],
+    // Confinements taken away, in docker's = and older : spellings, and a
+    // seccomp file, which the CLI reads on the Mac and sends as the filter.
+    ['--security-opt=seccomp=unconfined', ['alpine'], '"--security-opt=seccomp=unconfined"'],
+    ['--security-opt', ['seccomp=unconfined', 'alpine'], '--security-opt "seccomp=unconfined"'],
+    ['--security-opt', ['seccomp:unconfined', 'alpine'], '--security-opt "seccomp:unconfined"'],
+    ['--security-opt', ['seccomp=/Users/op/allow-all.json', 'alpine'], '--security-opt "seccomp=/Users/op/allow-all.json"'],
+    ['--security-opt=apparmor=unconfined', ['alpine'], '"--security-opt=apparmor=unconfined"'],
+    ['--security-opt', ['apparmor:unconfined', 'alpine'], '--security-opt "apparmor:unconfined"'],
+    ['--security-opt=systempaths=unconfined', ['alpine'], '"--security-opt=systempaths=unconfined"'],
+    ['--security-opt=label=disable', ['alpine'], '"--security-opt=label=disable"'],
+    ['--security-opt', ['no-new-privileges=false', 'alpine'], '--security-opt "no-new-privileges=false"'],
+    ['--security-opt=no-new-privileges:false', ['alpine'], '"--security-opt=no-new-privileges:false"'],
+    // Docker reads the value with Go's strconv.ParseBool, for which 0 and f
+    // are off as much as false is.
+    ['--security-opt', ['no-new-privileges=0', 'alpine'], '--security-opt "no-new-privileges=0"'],
+    ['--security-opt=no-new-privileges=f', ['alpine'], '"--security-opt=no-new-privileges=f"'],
+    ['--security-opt=no-new-privileges=F', ['alpine'], '"--security-opt=no-new-privileges=F"'],
+    // A profile of any name replaces the default one, docker-default included.
+    ['--security-opt', ['apparmor=docker-default', 'alpine'], '--security-opt "apparmor=docker-default"'],
+    ['--security-opt=apparmor:unconfined-ish', ['alpine'], '"--security-opt=apparmor:unconfined-ish"'],
+    // Any other key, refused by name too: writable-cgroups makes the cgroup
+    // filesystem writable, and a bare disable turns the SELinux labels off.
+    ['--security-opt', ['writable-cgroups=true', 'alpine'], '--security-opt "writable-cgroups=true"'],
+    ['--security-opt=disable', ['alpine'], '"--security-opt=disable"'],
+    // Devices past FORBIDDEN_FLAGS' exact --device, another runtime, kernel
+    // parameters and another cgroup parent.
+    ['--device-cgroup-rule', ['c 1:3 rwm', 'alpine'], '--device-cgroup-rule'],
+    ['--device-cgroup-rule=b 8:0 rwm', ['alpine'], '--device-cgroup-rule'],
+    ['--gpus', ['all', 'alpine'], '--gpus'],
+    ['--gpus=all', ['alpine'], '--gpus'],
+    ['--runtime', ['runc-unconfined', 'alpine'], '--runtime'],
+    ['--runtime=io.containerd.runc.v2', ['alpine'], '--runtime'],
+    ['--sysctl', ['net.ipv4.ip_forward=1', 'alpine'], '--sysctl'],
+    ['--sysctl=kernel.shm_rmid_forced=1', ['alpine'], '--sysctl'],
+    ['--cgroup-parent', ['/', 'alpine'], '--cgroup-parent'],
+    ['--cgroup-parent=/system.slice', ['alpine'], '--cgroup-parent'],
+    // Mounts beside the one, and the daemon itself.
+    ['--volumes-from', ['other', 'alpine'], '--volumes-from'],
+    ['--volumes-from=other:ro', ['alpine'], '--volumes-from'],
+    ['--volume=/:/host', ['alpine'], '--volume'],
+    ['-v/:/host', ['alpine'], '-v (--volume)'],
+    ['--mount=type=bind,source=/,target=/host', ['alpine'], '"--mount=type=bind,source=/,target=/host"'],
+    ['--use-api-socket', ['alpine'], '--use-api-socket'],
+    // Root's group by another route than --user x:0, which the audit refuses.
+    ['--group-add', ['0', 'alpine'], '--group-add'],
+    ['--group-add=root', ['alpine'], '--group-add'],
+    // The VM's dockerd ships the container's output wherever the log options
+    // say, 192.168.5.2 (the Mac) among them, off the internal network.
+    ['--log-driver', ['syslog', 'alpine'], '--log-driver'],
+    ['--log-driver=gelf', ['alpine'], '--log-driver'],
+    ['--log-opt', ['syslog-address=udp://192.168.5.2:514', 'alpine'], '--log-opt'],
+    ['--log-opt=gelf-address=udp://192.168.5.2:12201', ['alpine'], '--log-opt'],
+    // A writable root filesystem, in every spelling ParseBool reads as off.
+    ['--read-only=false', ['alpine'], '"--read-only=false"'],
+    ['--read-only=0', ['alpine'], '"--read-only=0"'],
+    ['--read-only=F', ['alpine'], '"--read-only=F"'],
+    ['--read-only=False', ['alpine'], '"--read-only=False"'],
+  ]
+  for (const [image, command, option] of rows) {
+    assert.throws(() => argsFor(f, { image, command }), named(option), `${image} ${command.join(' ')}`)
+  }
+
+  // An option refused whatever its value is named without it: the value of
+  // --env is the one thing the refusal must not repeat.
+  assert.throws(
+    () => argsFor(f, { image: '--env=AOS_CONTROL_TOKEN=the-value', command: ['alpine'] }),
+    (e: unknown) => named('--env')(e) && !(e as Error).message.includes('the-value'),
+  )
+  // A letter that takes a value ends its group, as in docker: the t in -u0t
+  // is part of --user's value, not a terminal (and -u is refused anyway).
+  assert.throws(
+    () => argsFor(f, { image: '-u0t', command: ['alpine'] }),
+    (e: unknown) => e instanceof ConfigError && !named('-t (--tty)')(e) && /carry "-u0t" before the image/.test(e.message),
+  )
+  // The spellings an earlier check meets first are refused there.
+  for (const [image, command] of [
+    ['--pid=host', ['alpine']],
+    ['--userns=host', ['alpine']],
+    ['-v', ['/:/host', 'alpine']],
+    ['--volume', ['/:/host', 'alpine']],
+  ] as const) {
+    assert.throws(() => argsFor(f, { image, command }), /invariant 9 forbids|exactly one --mount and no -v/, image)
+  }
+
+  // After the image every element is the command's, and docker passes it on
+  // unread: none of this is docker's -e, -t, -p or --network.
+  const command = [
+    'sh', '-c', 'grep -e TODO -r . && ls -t && ssh -p 22 x', '--',
+    '-e', 'K=V', '--env', 'K', '-it', '-t', '--tty', '-p', '22', '-P', '--publish=1:1',
+    '--add-host', 'a:1.2.3.4', '--dns', '1.1.1.1', '--link', 'y', '--net=host',
+    '--network', 'host', '--network=container:abc', '--pid', 'host', '--ipc=host', '--uts=host', '--cgroupns=host',
+    '--security-opt', 'seccomp=unconfined', '--volumes-from', 'x', '--env-file', 'f', '--use-api-socket',
+    '-d', '--detach', '--gpus', 'all', '--runtime=x', '--sysctl', 'a=b', '--cgroup-parent', 'p',
+    '--device-cgroup-rule', 'r', '--network', 'name=host', '--security-opt=disable',
+    '--group-add', '0', '--log-driver', 'syslog', '--log-opt=syslog-address=udp://192.168.5.2:514', '--read-only=false',
+  ]
+  assert.deepEqual(argsFor(f, { command }).slice(-command.length - 1), ['aos/worker:0.0.1', ...command])
+  // Except to the whole-argv scans, which still read the command: kept until
+  // the operator decides, for the count and FORBIDDEN_FLAGS together
+  // (docker.ts, before the option walk), so `grep -v` is refused as a second
+  // mount and `--device cpu` as a device.
+  assert.throws(
+    () => argsFor(f, { command: ['grep', '-v', 'x'] }),
+    /exactly one --mount and no -v \(found 1 and 1\)/,
+  )
+  assert.throws(
+    () => argsFor(f, { command: ['python', 'train.py', '--device', 'cpu'] }),
+    /docker args contain --device, which invariant 9 forbids/,
+  )
+
+  // Exactly one --network: a second as the builder writes its own is counted.
+  assert.throws(
+    () => argsFor(f, { image: '--network', command: ['aos-other', 'alpine'] }),
+    /carry --network 2 time\(s\) before the image/,
+  )
+  // And the one there is the network the builder was handed, which probe()
+  // proved internal: not merely a well-formed name.
+  const args = argsFor(f)
+  const onNetwork = (value: string): string[] => args.map((a, i) => (args[i - 1] === '--network' ? value : a))
+  assert.doesNotThrow(() => auditRunArgs(args, home, f.realWorkspace, 'aos-internal'))
+  for (const value of ['aos-hostile', 'aos-internal2', 'AOS-INTERNAL', 'none']) {
+    assert.throws(
+      () => auditRunArgs(onNetwork(value), home, f.realWorkspace, 'aos-internal'),
+      (e: unknown) =>
+        e instanceof ConfigError &&
+        e.message === `docker args put the container on network ${JSON.stringify(value)}; invariant 9 needs the domain's internal network "aos-internal"`,
+      JSON.stringify(value),
+    )
+  }
+  assert.throws(
+    () => auditRunArgs(args, home, f.realWorkspace, 'aos-hostile'),
+    /put the container on network "aos-internal"; invariant 9 needs the domain's internal network "aos-hostile"/,
+  )
+  // No value at all is no plain network name, and is refused as one.
+  assert.throws(() => auditRunArgs(onNetwork(''), home, f.realWorkspace, 'aos-internal'), named('--network ""'))
+  // A domain that names a network docker gives a meaning of its own is
+  // refused although the value matches what the builder was handed: the
+  // modes, and anything but a plain name, which docker may read as its
+  // key=value syntax (name=host is host, its fields lower-cased). The refusal
+  // names the domain's network: the --network carrying it is the builder's
+  // own, which the walk's refusal would call one the builder never emits.
+  const domainNamed =
+    (network: string) =>
+    (e: unknown): boolean =>
+      e instanceof ConfigError &&
+      e.message.startsWith(
+        `the domain network ${JSON.stringify(network)} is not a network docker reads by that name: as --network it `,
+      ) &&
+      e.message.endsWith("; invariant 9 needs the domain's own internal network") &&
+      !e.message.includes('never emits')
+  assert.throws(
+    () => auditRunArgs(onNetwork('host'), home, f.realWorkspace, 'host'),
+    (e: unknown) =>
+      domainNamed('host')(e) &&
+      (e as Error).message.includes("it puts the container on the VM's own network stack, which reaches the Mac at 192.168.5.2;"),
+  )
+  for (const network of [
+    'host',
+    'bridge',
+    'default',
+    'container:abc',
+    'name=host',
+    'NAME=HOST',
+    'name=bridge',
+    'name=aos-internal,alias=x',
+    'name=aos-internal,driver-opt=com.docker.network.x=y',
+    'aos internal',
+    'aos-internal,',
+    '-aos-internal',
+    '',
+  ]) {
+    assert.throws(
+      () => buildRunArgs({ spec: spec(f), domain: { ...f.domain, network }, defaults: DEFAULTS, repoRoot: f.repoRoot, home }),
+      domainNamed(network),
+      network,
+    )
+  }
 })
 
 test('the audit refuses a root --user and a --memory, --pids-limit or --cpus that docker reads as no limit', (t) => {
@@ -446,11 +730,11 @@ test('the audit refuses a root --user and a --memory, --pids-limit or --cpus tha
   // the flag, wherever it came from.
   const args = argsFor(f)
   const swapped = (flag: string, value: string): string[] => args.map((a, i) => (args[i - 1] === flag ? value : a))
-  assert.doesNotThrow(() => auditRunArgs(swapped('--user', '1000:1000'), home, f.realWorkspace))
-  assert.throws(() => auditRunArgs(swapped('--user', '0:0'), home, f.realWorkspace), /--user "0:0"; invariant 9/)
-  assert.throws(() => auditRunArgs(swapped('--memory', '0'), home, f.realWorkspace), /--memory "0"; invariant 9/)
-  assert.throws(() => auditRunArgs(swapped('--pids-limit', '-1'), home, f.realWorkspace), /--pids-limit "-1"; invariant 9/)
-  assert.throws(() => auditRunArgs(swapped('--cpus', '0.0'), home, f.realWorkspace), /--cpus "0.0"; invariant 9/)
+  assert.doesNotThrow(() => auditRunArgs(swapped('--user', '1000:1000'), home, f.realWorkspace, f.domain.network))
+  assert.throws(() => auditRunArgs(swapped('--user', '0:0'), home, f.realWorkspace, f.domain.network), /--user "0:0"; invariant 9/)
+  assert.throws(() => auditRunArgs(swapped('--memory', '0'), home, f.realWorkspace, f.domain.network), /--memory "0"; invariant 9/)
+  assert.throws(() => auditRunArgs(swapped('--pids-limit', '-1'), home, f.realWorkspace, f.domain.network), /--pids-limit "-1"; invariant 9/)
+  assert.throws(() => auditRunArgs(swapped('--cpus', '0.0'), home, f.realWorkspace, f.domain.network), /--cpus "0.0"; invariant 9/)
 })
 
 // ── confinement ────────────────────────────────────────────────────────────
@@ -626,7 +910,7 @@ function driverFor(f: Fixture, streams?: ChildStreams): Spied {
       execs.push({ args, env: options.env })
       return exec(args, options.env)
     },
-    domains: { trusted: f.domain, hostile: { ...f.domain, dockerHost: HOSTILE_HOST } },
+    domains: { trusted: f.domain, hostile: f.hostile },
     defaults: DEFAULTS,
     repoRoot: f.repoRoot,
     path: '/usr/bin:/bin',
@@ -675,6 +959,33 @@ test('spawn env keys are exactly [DOCKER_CONFIG, DOCKER_HOST, PATH] with a poiso
   // Each domain reaches its own VM, not a shared one.
   d.driver.run(spec(f, { domain: 'hostile', name: `${CONTAINER_PREFIX}def456` }))
   assert.equal(d.spawns[1]?.env['DOCKER_HOST'], 'unix:///tmp/colima-hostile.sock')
+})
+
+test('each run is built against its own domain: a hostile run goes on --network aos-hostile once, from the hostile mountRoot', (t) => {
+  // probe() proves each domain's network internal on that domain's VM. A run
+  // built against the other domain's config goes on a network its own VM
+  // never had checked, and the audit cannot see it: it compares the network
+  // with whatever domain the builder was handed.
+  const f = fixture(t)
+  const d = driverFor(f)
+  d.driver.run(spec(f, { domain: 'hostile', name: `${CONTAINER_PREFIX}h1` }))
+  d.driver.run(spec(f, { domain: 'trusted', name: `${CONTAINER_PREFIX}t1` }))
+  const networks = (args: readonly string[] = []): string[] =>
+    args.flatMap((a, i) => (a === '--network' ? [args[i + 1] ?? ''] : a.startsWith('--net') ? [a] : []))
+
+  const [hostile, trusted] = d.spawns.map((s) => s.args)
+  assert.deepEqual(networks(hostile), ['aos-hostile'])
+  assert.equal(valueOf(hostile ?? [], '--mount'), `type=bind,source=${f.realHostileWorkspace},target=${WORKSPACE_TARGET}`)
+  assert.deepEqual(networks(trusted), ['aos-internal'])
+  assert.equal(valueOf(trusted ?? [], '--mount'), `type=bind,source=${f.realWorkspace},target=${WORKSPACE_TARGET}`)
+
+  // And a hostile run is confined to the hostile mountRoot: the trusted
+  // domain's workspace is outside it.
+  assert.throws(
+    () => d.driver.run(spec(f, { domain: 'hostile', name: `${CONTAINER_PREFIX}h2`, workspace: f.workspace })),
+    /outside the domain mountRoot/,
+  )
+  assert.equal(d.spawns.length, 2)
 })
 
 test('wallclock fires docker kill by name', async (t) => {
@@ -733,12 +1044,12 @@ test('probe refuses a domain whose network is not internal, and checks each doma
 
   const refused = await d.driver.probe()
   assert.equal(refused.ok, false)
-  assert.match(refused.ok ? '' : refused.why, /^hostile: network aos-internal is not internal \(Internal=false\)/)
-  assert.match(refused.ok ? '' : refused.why, /docker network create --internal aos-internal/)
-  // Each domain was asked through its OWN socket.
+  assert.match(refused.ok ? '' : refused.why, /^hostile: network aos-hostile is not internal \(Internal=false\)/)
+  assert.match(refused.ok ? '' : refused.why, /docker network create --internal aos-hostile/)
+  // Each domain was asked through its OWN socket, about its OWN network.
   assert.deepEqual(seen, [
     'unix:///tmp/colima-trusted.sock network inspect --format {{.Internal}} aos-internal',
-    'unix:///tmp/colima-hostile.sock network inspect --format {{.Internal}} aos-internal',
+    'unix:///tmp/colima-hostile.sock network inspect --format {{.Internal}} aos-hostile',
   ])
 
   internalOn.add('unix:///tmp/colima-hostile.sock')
@@ -752,6 +1063,38 @@ test('probe refuses a domain whose network is not internal, and checks each doma
   )
   const missing = await d.driver.probe()
   assert.match(missing.ok ? '' : missing.why, /^trusted: network aos-internal could not be inspected: .*not found/)
+})
+
+test('probe names a domain network docker reads as no network of that name, and never advises recreating it', async (t) => {
+  // host reports Internal=false, so probe used to advise `docker network rm
+  // host && docker network create --internal host`, which docker refuses for
+  // a predefined network. kernel.yaml refuses these names
+  // (test/config.test.ts); a driver handed its domains another way meets this.
+  const f = fixture(t)
+  for (const network of ['host', 'HOST', 'bridge', 'default', 'container:abc', 'name=host']) {
+    const d = driverFor({ ...f, hostile: { ...f.hostile, network } })
+    const inspected: string[] = []
+    d.setExec((args) => {
+      if (args[0] !== 'network') return Promise.resolve({ stdout: '27.3.1\n', stderr: '' })
+      const name = args[args.length - 1] ?? ''
+      inspected.push(name)
+      // The trusted domain's network is internal; anything else answers as
+      // docker answers for host and bridge.
+      return Promise.resolve({ stdout: name === 'aos-internal' ? 'true\n' : 'false\n', stderr: '' })
+    })
+    const result = await d.driver.probe()
+    const why = result.ok ? '' : result.why
+    assert.ok(
+      why.startsWith(
+        `hostile: network ${JSON.stringify(network)} is not a network docker reads by that name: as --network it `,
+      ),
+      why,
+    )
+    assert.ok(why.endsWith("Name the domain's own internal network in kernel.yaml (docker network create --internal aos-hostile)"), why)
+    assert.equal(why.includes('docker network rm'), false, why)
+    // The trusted domain's network was inspected, and the hostile one never.
+    assert.deepEqual(inspected, ['aos-internal'], network)
+  }
 })
 
 test('kill is idempotent and sweepOrphans reaps only our containers', async (t) => {

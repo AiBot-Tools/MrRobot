@@ -542,6 +542,65 @@ test('sandbox.defaults.user is never root or its group, and memory is a positive
   assert.doesNotThrow(() => parse(written))
 })
 
+test('a sandbox domain network must be a plain network name: name=host and the like are refused at boot', () => {
+  // Invariant 9's internal network. The docker CLI reads a --network value
+  // holding = as key=value fields, lower-cased, whose name= is the network,
+  // so `name=host` is the VM's own network stack, while probe() inspects a
+  // network of that literal name. The run-args audit refuses it again
+  // (test/sandbox-docker.test.ts).
+  for (const network of ['name=host', 'NAME=HOST', 'name=aos-trusted,alias=x', 'container:abc', 'aos trusted', '-aos', '']) {
+    for (const domain of ['trusted', 'hostile'] as const) {
+      const doc = fixture('valid.yaml') as { sandbox: { domains: Record<string, { network: string }> } }
+      const entry = doc.sandbox.domains[domain]
+      assert.ok(entry !== undefined)
+      entry.network = network
+      assert.throws(
+        () => parse(doc),
+        /a sandbox domain network must be a plain network name/,
+        `${domain}: ${JSON.stringify(network)}`,
+      )
+    }
+  }
+  // A plain name passes, `none` among them (the egress plan's S1 runs on it).
+  for (const network of ['aos-trusted', 'aos_hostile.2', 'none', '0net']) {
+    const doc = fixture('valid.yaml') as { sandbox: { domains: Record<string, { network: string }> } }
+    const entry = doc.sandbox.domains['trusted']
+    assert.ok(entry !== undefined)
+    entry.network = network
+    assert.equal(parse(doc).sandbox.domains.trusted.network, network)
+  }
+})
+
+test('a sandbox domain network may not be host, bridge or default, in any case; none still passes', () => {
+  // Plain names, but docker's own, and not one of them internal: probe()
+  // would degrade the kernel and advise `docker network rm host && docker
+  // network create --internal host`, which docker refuses for a predefined
+  // network. Refused without regard to case, as the run-args audit refuses
+  // them (test/sandbox-docker.test.ts), so no name boots that every run
+  // refuses.
+  for (const network of ['host', 'HOST', 'bridge', 'Bridge', 'default', 'DEFAULT']) {
+    for (const domain of ['trusted', 'hostile'] as const) {
+      const doc = fixture('valid.yaml') as { sandbox: { domains: Record<string, { network: string }> } }
+      const entry = doc.sandbox.domains[domain]
+      assert.ok(entry !== undefined)
+      entry.network = network
+      assert.throws(
+        () => parse(doc),
+        /a sandbox domain network may not be host, bridge or default, in any case/,
+        `${domain}: ${JSON.stringify(network)}`,
+      )
+    }
+  }
+  // Names that hold one of them pass: only the whole name is docker's.
+  for (const network of ['none', 'host-net', 'aos-bridge', 'defaults']) {
+    const doc = fixture('valid.yaml') as { sandbox: { domains: Record<string, { network: string }> } }
+    const entry = doc.sandbox.domains['hostile']
+    assert.ok(entry !== undefined)
+    entry.network = network
+    assert.equal(parse(doc).sandbox.domains.hostile.network, network)
+  }
+})
+
 test('secrets.source defaults to env; envFallback defaults to false and needs source: vault', () => {
   // pmmcp's get_secret never returns plaintext, so the environment is the
   // working credential path and the vault is dormant.

@@ -11,11 +11,18 @@
 //   would let runtime code call the sandbox more times than intended — or
 //   for the wrong run — and still pass.
 //
+// Where the real driver refuses or reports something, so does this: a second
+// run under a name still running is refused, and a kill reports
+// `killedBy: 'requested'` with SIGKILL. test/sandbox-docker.test.ts drives
+// both through the same steps for these two. (The exit code still differs: the
+// real one reports what the docker CLI exits with, 137 for a killed container.)
+//
 // Nothing here executes anything. It never spawns a process, never touches
 // docker, and never reads the filesystem.
 
 import './guard.js'
 
+import { ConfigError } from '../../src/errors.js'
 import type {
   ProbeResult,
   RunningSandbox,
@@ -79,6 +86,14 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
 
     run(spec: SandboxSpec): RunningSandbox {
       specs.push(spec)
+      // As the real driver does (SandboxDriver.run): a name still running is
+      // refused before anything starts, and no scripted exit is spent on it.
+      if (pending.has(spec.name)) {
+        throw new ConfigError(
+          `container ${spec.name} is already running on the ${started.get(spec.name)?.domain ?? '?'} domain; ` +
+            'a second one under that name could not be killed by name',
+        )
+      }
       const scripted = script[index]
       index++
       if (scripted === undefined) {

@@ -21,6 +21,13 @@
 //   Pass the process environment and every provider key the operator exported
 //   lands inside a worker (invariant 2), which is exactly what the Phase 2
 //   egress proxy exists to prevent and must not be possible before it ships.
+//   Send a kill to any socket but the one whose daemon holds the container
+//   and the answer is "No such container", swallowed as the normal race: the
+//   run outlives its hard wallclock and nobody is told. Ask the VMs one after
+//   the other and a daemon that never answers stops the other's kill.
+//   Write a workspace path holding a comma into --mount, or read that value
+//   other than as docker's CSV, and a second source= mounts what it names.
+//   Let the image slot hold an option, in any spelling, and docker obeys it.
 
 import './helpers/guard.js'
 
@@ -34,6 +41,7 @@ import { tmpdir } from './helpers/tmpdir.js'
 import { ConfigError, NotImplementedError } from '../src/errors.js'
 import { confineWorkspace } from '../src/sandbox/confine.js'
 import {
+  auditRunArgs,
   buildRunArgs,
   CONTAINER_PREFIX,
   DockerDriver,
@@ -43,7 +51,8 @@ import {
   type DomainConfig,
 } from '../src/sandbox/docker.js'
 import { AppleContainerDriver } from '../src/sandbox/apple-container.js'
-import type { SandboxSpec } from '../src/sandbox/driver.js'
+import type { SandboxDriver, SandboxSpec } from '../src/sandbox/driver.js'
+import { fakeSandbox } from './helpers/fake-sandbox.js'
 
 const DEFAULTS: DockerDefaults = { user: '65534:65534', pidsLimit: 256, memory: '2g', cpus: 2 }
 
@@ -232,6 +241,131 @@ test('run args contain exactly one --mount and no -v, and it is the confined wor
   assert.throws(() => argsFor(f, { command: ['-v', '/etc:/etc'] }), ConfigError)
 })
 
+test('a workspace whose real path holds a comma, a double quote or a control character never reaches --mount', (t) => {
+  // Found in the Phase 2 egress review. Docker reads the --mount value as CSV
+  // and keeps the LAST source=, so a real directory `x,source=` under the
+  // mountRoot, holding `etc`, passed every containment check and became
+  // `type=bind,source=<root>/x,source=/etc,target=/workspace`: the VM's /etc,
+  // read-write. The same shape names any VM path, the whole mountRoot, or a
+  // named volume.
+  const f = fixture(t)
+  const refused = /mount confinement: the workspace .* holds a comma, a double quote or a control character/
+  const attempts = [join('x,source=', 'etc'), 'x,type=volume', 'a"b', 'line\nbreak', 'tab\there']
+  for (const rel of attempts) {
+    const dir = join(f.mountRoot, rel)
+    mkdirSync(dir, { recursive: true })
+    assert.throws(() => argsFor(f, { workspace: dir }), refused, JSON.stringify(rel))
+  }
+  // Judged on the resolved path, so a harmless-looking link is no way round it.
+  symlinkSync(join(f.mountRoot, 'x,source=', 'etc'), join(f.mountRoot, 'innocent'))
+  assert.throws(() => argsFor(f, { workspace: join(f.mountRoot, 'innocent') }), refused)
+  // Characters with no meaning to docker's CSV reader are paths like any other.
+  mkdirSync(join(f.mountRoot, 'a=b c'))
+  assert.equal(
+    valueOf(argsFor(f, { workspace: join(f.mountRoot, 'a=b c') }), '--mount'),
+    `type=bind,source=${realpathSync(join(f.mountRoot, 'a=b c'))},target=${WORKSPACE_TARGET}`,
+  )
+})
+
+test('the audit reads the --mount value as docker does and admits only type=bind, source=<workspace>, target=/workspace', (t) => {
+  // The builder refuses a workspace docker would read as structure; the audit
+  // must not depend on that. It is handed the same workspace string the value
+  // was built from, so comparing against a filled-in template would pass
+  // `source=<ws>,source=/etc` whenever the workspace itself carried the tail.
+  const f = fixture(t)
+  const home = join(f.root, 'home')
+  const ws = f.realWorkspace
+  const args = argsFor(f)
+  const at = args.indexOf('--mount') + 1
+  const withMount = (value: string): string[] => args.map((a, i) => (i === at ? value : a))
+  assert.doesNotThrow(() => auditRunArgs(args, home, ws))
+
+  const bad = [
+    `type=bind,source=${ws},source=/etc,target=${WORKSPACE_TARGET}`, // docker keeps the last source
+    `type=bind,source=${ws},target=${WORKSPACE_TARGET},SOURCE=/etc`, // keys in any case
+    `type=bind,source=${ws},src=/etc,target=${WORKSPACE_TARGET}`, // an alias of source
+    `type=bind,source=${ws},target=${WORKSPACE_TARGET},dst=/etc`, // an alias of target
+    `type=volume,source=${ws},target=${WORKSPACE_TARGET}`,
+    `type=bind,source=${ws},target=${WORKSPACE_TARGET},bind-create-src=true`,
+    `type=bind,source=${ws},target=${WORKSPACE_TARGET},readonly=false`,
+    `type=bind,source=${ws},target=${WORKSPACE_TARGET},ro`, // a field without a value
+    `type=bind,source=/etc,target=${WORKSPACE_TARGET}`,
+    `type=bind,source=${ws},target=/etc`,
+    `type=bind,source=${ws}`,
+    `type=bind,"source=${ws},x",target=${WORKSPACE_TARGET}`, // a quoted field may hold a comma
+    `type=bind,source=${ws},target=${WORKSPACE_TARGET}\nsource=/etc`, // a line break ends the record
+    '',
+  ]
+  for (const value of bad) {
+    assert.throws(() => auditRunArgs(withMount(value), home, ws), ConfigError, JSON.stringify(value))
+  }
+  // And the case a template comparison misses: the workspace carries the tail.
+  const tail = `${ws},source=/etc`
+  assert.throws(
+    () => auditRunArgs(withMount(`type=bind,source=${tail},target=${WORKSPACE_TARGET}`), home, tail),
+    /names source twice/,
+  )
+})
+
+test('the image slot cannot carry a docker option: everything before the image is exactly what the builder emits', (t) => {
+  // Found in the Phase 2 egress review. Docker reads its own options up to the
+  // image, so an image of `--volume=/:/host` with a command of `alpine sh` ran
+  // alpine with the VM's root mounted, and the audit, which matched exact
+  // spellings of a few flags anywhere, let it through. The image comes from
+  // operator config today; the audit does not rely on that.
+  const f = fixture(t)
+  const foreign = /before the image, which the builder never emits, and docker would obey it/
+  for (const image of [
+    '--volume=/:/host',
+    '-v/:/host',
+    '--mount=type=bind,source=/,target=/host',
+    '--volumes-from=other',
+    '--user=0:0',
+    '-u0',
+    '--read-only=false',
+    '--network=container:abc',
+    '--network=host',
+    '--security-opt=seccomp=unconfined',
+    '--cap-drop=NONE',
+    '--env=ANTHROPIC_API_KEY',
+    '-eANTHROPIC_API_KEY',
+    '--publish=8080:80',
+    '--',
+    '-',
+  ]) {
+    assert.throws(() => argsFor(f, { image, command: ['alpine', 'sh'] }), foreign, image)
+  }
+
+  // A builder option in the image slot is a second copy, and docker keeps the
+  // last `--user`, `--tmpfs` over /workspace, `--workdir`: each exactly once.
+  for (const [image, value] of [
+    ['--user', '0:0'],
+    ['--tmpfs', `${WORKSPACE_TARGET}:exec`],
+    ['--workdir', '/'],
+    ['--network', 'aos-internal'],
+  ] as const) {
+    assert.throws(
+      () => argsFor(f, { image, command: [value, 'alpine', 'sh'] }),
+      new RegExp(`carry ${image} 2 time\\(s\\) before the image`),
+      image,
+    )
+  }
+  assert.throws(() => argsFor(f, { image: '--rm', command: ['alpine'] }), /carry --rm 2 time\(s\)/)
+
+  // A flag the builder stops emitting is caught by the same count, rather
+  // than only by the flag-by-flag test above.
+  const home = join(f.root, 'home')
+  const args = argsFor(f)
+  for (const dropped of ['--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--init']) {
+    assert.throws(
+      () => auditRunArgs(args.filter((a) => a !== dropped), home, f.realWorkspace),
+      new RegExp(`carry ${dropped} 0 time\\(s\\)`),
+      dropped,
+    )
+  }
+  assert.throws(() => auditRunArgs(args.slice(0, args.indexOf('aos/worker:0.0.1')), home, f.realWorkspace), /name no image/)
+})
+
 // ── confinement ────────────────────────────────────────────────────────────
 
 test('symlink escaping mountRoot, sibling prefix, .. and /etc are refused; proj/../proj allowed', (t) => {
@@ -364,26 +498,39 @@ interface Spied {
   readonly spawns: { args: readonly string[]; env: Record<string, string> }[]
   readonly execs: { args: readonly string[]; env: Record<string, string> }[]
   readonly child: FakeChild
-  setExec(fn: (args: readonly string[]) => Promise<{ stdout: string; stderr: string }>): void
+  setExec(fn: ScriptedExec): void
+  /** The next spawn throws this, as Node's spawn does for an argument it refuses. */
+  failNextSpawn(error: Error): void
 }
+
+type ScriptedExec = (
+  args: readonly string[],
+  env: Record<string, string>,
+) => Promise<{ stdout: string; stderr: string }>
+
+const TRUSTED_HOST = 'unix:///tmp/colima-trusted.sock'
+const HOSTILE_HOST = 'unix:///tmp/colima-hostile.sock'
 
 function driverFor(f: Fixture): Spied {
   const spawns: Spied['spawns'] = []
   const execs: Spied['execs'] = []
   const child = fakeChild()
-  let exec: (args: readonly string[]) => Promise<{ stdout: string; stderr: string }> = () =>
-    Promise.resolve({ stdout: '', stderr: '' })
+  let exec: ScriptedExec = () => Promise.resolve({ stdout: '', stderr: '' })
+  let spawnFailure: Error | undefined
 
   const driver = new DockerDriver({
     spawn: (_cmd, args, options) => {
+      const failure = spawnFailure
+      spawnFailure = undefined
+      if (failure !== undefined) throw failure
       spawns.push({ args, env: options.env })
       return child
     },
     execFile: (_cmd, args, options) => {
       execs.push({ args, env: options.env })
-      return exec(args)
+      return exec(args, options.env)
     },
-    domains: { trusted: f.domain, hostile: { ...f.domain, dockerHost: 'unix:///tmp/colima-hostile.sock' } },
+    domains: { trusted: f.domain, hostile: { ...f.domain, dockerHost: HOSTILE_HOST } },
     defaults: DEFAULTS,
     repoRoot: f.repoRoot,
     path: '/usr/bin:/bin',
@@ -398,6 +545,9 @@ function driverFor(f: Fixture): Spied {
     child,
     setExec(fn) {
       exec = fn
+    },
+    failNextSpawn(error) {
+      spawnFailure = error
     },
   }
 }
@@ -530,6 +680,207 @@ test('kill is idempotent and sweepOrphans reaps only our containers', async (t) 
     `${CONTAINER_PREFIX}bbb`,
   ])
   assert.equal(killed.includes('someone-elses-container'), false)
+})
+
+/** Each `docker kill` the driver sent, as "<DOCKER_HOST> <name>". */
+function killsSent(d: Spied): string[] {
+  return d.execs
+    .filter((e) => e.args[0] === 'kill')
+    .map((e) => {
+      assert.deepEqual(e.args.slice(0, 2), ['kill', '--signal=KILL'])
+      return `${e.env['DOCKER_HOST'] ?? '?'} ${e.args[2] ?? '?'}`
+    })
+}
+
+test('the wallclock kill of a hostile container is sent to the hostile DOCKER_HOST', async (t) => {
+  // Found in the Phase 2 egress review: kill() always used the trusted VM's
+  // socket, so a hostile run's wallclock kill reached a daemon that had never
+  // heard of it, its "No such container" was swallowed as the normal race, and
+  // the container ran on past its hard wallclock.
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = fixture(t)
+  const d = driverFor(f)
+  const limits = (wallclockMs: number): SandboxSpec['limits'] => ({ memoryMb: 1, cpus: 1, pids: 1, wallclockMs })
+  const hostile = `${CONTAINER_PREFIX}hostile1`
+  const trusted = `${CONTAINER_PREFIX}trusted1`
+
+  const running = d.driver.run(spec(f, { domain: 'hostile', name: hostile, limits: limits(5_000) }))
+  d.driver.run(spec(f, { domain: 'trusted', name: trusted, limits: limits(7_000) }))
+  assert.deepEqual(killsSent(d), [])
+
+  t.mock.timers.tick(5_000)
+  // Once, and only on the VM that runs it.
+  assert.deepEqual(killsSent(d), [`${HOSTILE_HOST} ${hostile}`])
+
+  // And the trusted one on its own, so neither VM is a hard-coded default.
+  t.mock.timers.tick(2_000)
+  assert.deepEqual(killsSent(d), [`${HOSTILE_HOST} ${hostile}`, `${TRUSTED_HOST} ${trusted}`])
+
+  // A kill asked after the wallclock fired does not rewrite why the run ended.
+  await d.driver.kill(hostile)
+  d.child.close(137, null)
+  const result = await running.result
+  assert.equal(result.killedBy, 'wallclock')
+  assert.equal(result.signal, 'SIGKILL')
+})
+
+test('sweepOrphans kills each orphan on the domain that listed it', async (t) => {
+  // A kernel that crashed mid-run leaves containers on both VMs. Each name is
+  // known only to the daemon that holds it, so the kill goes back to the socket
+  // whose `ps` reported it, never to a default one.
+  const f = fixture(t)
+  const d = driverFor(f)
+  const listed: Record<string, string> = {
+    [TRUSTED_HOST]: `${CONTAINER_PREFIX}t1\n`,
+    [HOSTILE_HOST]: `${CONTAINER_PREFIX}h1\n${CONTAINER_PREFIX}h2\n`,
+  }
+  d.setExec((args, env) =>
+    args[0] === 'ps'
+      ? Promise.resolve({ stdout: listed[env['DOCKER_HOST'] ?? ''] ?? '', stderr: '' })
+      : Promise.resolve({ stdout: '', stderr: '' }),
+  )
+
+  const killed = await d.driver.sweepOrphans()
+  assert.deepEqual(killed, [`${CONTAINER_PREFIX}t1`, `${CONTAINER_PREFIX}h1`, `${CONTAINER_PREFIX}h2`])
+  // One kill per orphan, each on its own VM: none sent twice, none sent wide.
+  assert.deepEqual(killsSent(d), [
+    `${TRUSTED_HOST} ${CONTAINER_PREFIX}t1`,
+    `${HOSTILE_HOST} ${CONTAINER_PREFIX}h1`,
+    `${HOSTILE_HOST} ${CONTAINER_PREFIX}h2`,
+  ])
+})
+
+test('kill(name) goes only to the domain of a container this driver is running, and to every domain for a name it does not know', async (t) => {
+  // The map is in-memory: after a restart, or once a run has exited, the
+  // driver cannot prove where a name lives, and a kill refused for that reason
+  // is a container left running. So an unknown name is asked of each daemon,
+  // which costs one "No such container" from the one that lacks it.
+  const f = fixture(t)
+  const d = driverFor(f)
+  const hostile = `${CONTAINER_PREFIX}hostile1`
+  const trusted = `${CONTAINER_PREFIX}trusted1`
+  const stranger = `${CONTAINER_PREFIX}from-before-a-restart`
+  d.setExec((args) =>
+    args[0] === 'kill' ? Promise.reject(new Error('No such container')) : Promise.resolve({ stdout: '', stderr: '' }),
+  )
+
+  d.driver.run(spec(f, { domain: 'hostile', name: hostile }))
+  d.driver.run(spec(f, { domain: 'trusted', name: trusted }))
+  await d.driver.kill(hostile)
+  await d.driver.kill(trusted)
+  assert.deepEqual(killsSent(d), [`${HOSTILE_HOST} ${hostile}`, `${TRUSTED_HOST} ${trusted}`])
+
+  d.execs.length = 0
+  await d.driver.kill(stranger)
+  assert.deepEqual(killsSent(d), [`${TRUSTED_HOST} ${stranger}`, `${HOSTILE_HOST} ${stranger}`])
+
+  // Once a run has exited its entry is gone: no stale record can aim a later
+  // kill at one VM only, and the map does not grow for the daemon's lifetime.
+  d.child.close(0, null)
+  d.execs.length = 0
+  await d.driver.kill(hostile)
+  assert.deepEqual(killsSent(d), [`${TRUSTED_HOST} ${hostile}`, `${HOSTILE_HOST} ${hostile}`])
+})
+
+test('run refuses a second container under a name the driver is already running, on either domain', (t) => {
+  // One name on both VMs at once would leave kill(name) unable to say which
+  // daemon to ask, so it would reach one of them and miss the other.
+  const f = fixture(t)
+  const d = driverFor(f)
+  const name = `${CONTAINER_PREFIX}twice`
+
+  d.driver.run(spec(f, { domain: 'trusted', name }))
+  for (const domain of ['hostile', 'trusted'] as const) {
+    assert.throws(
+      () => d.driver.run(spec(f, { domain, name })),
+      (e: unknown) => e instanceof ConfigError && /already running on the trusted domain/.test(e.message),
+      domain,
+    )
+  }
+  // Refused before anything was spawned.
+  assert.equal(d.spawns.length, 1)
+
+  // Free again once the first has exited.
+  d.child.close(0, null)
+  d.driver.run(spec(f, { domain: 'hostile', name }))
+  assert.equal(d.spawns[1]?.env['DOCKER_HOST'], HOSTILE_HOST)
+})
+
+test('kill(name) of a name it does not know asks every VM at once, so a daemon that never answers holds up no other', async (t) => {
+  // A socket that accepts and never replies has no execFile timeout behind
+  // it. Asked one VM after the other, a hung trusted daemon would mean the
+  // hostile kill was never sent. Hung on each side in turn, so the order the
+  // domains are listed in decides nothing.
+  for (const hung of [TRUSTED_HOST, HOSTILE_HOST]) {
+    const f = fixture(t)
+    const d = driverFor(f)
+    const stranger = `${CONTAINER_PREFIX}from-before-a-restart`
+    d.setExec((args, env) =>
+      args[0] === 'kill' && env['DOCKER_HOST'] === hung
+        ? new Promise<never>(() => undefined)
+        : Promise.reject(new Error('No such container')),
+    )
+    void d.driver.kill(stranger)
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.deepEqual(killsSent(d).sort(), [`${HOSTILE_HOST} ${stranger}`, `${TRUSTED_HOST} ${stranger}`], hung)
+  }
+})
+
+test('a spawn that throws leaves no record: the name runs again, and a kill of it still asks every VM', async (t) => {
+  // Node's spawn refuses some arguments synchronously (a NUL byte, for one),
+  // and then nothing started. A record made before that throw would refuse
+  // the name for the driver's lifetime and aim every later kill of it at one
+  // VM only.
+  const f = fixture(t)
+  const d = driverFor(f)
+  const name = `${CONTAINER_PREFIX}never-started`
+  const refused = new TypeError("The argument 'args[25]' must be a string without null bytes")
+  d.failNextSpawn(refused)
+  assert.throws(() => d.driver.run(spec(f, { domain: 'hostile', name })), (e: unknown) => e === refused)
+  assert.equal(d.spawns.length, 0)
+
+  await d.driver.kill(name)
+  assert.deepEqual(killsSent(d), [`${TRUSTED_HOST} ${name}`, `${HOSTILE_HOST} ${name}`])
+
+  d.driver.run(spec(f, { domain: 'hostile', name }))
+  assert.equal(d.spawns.length, 1)
+  assert.equal(d.spawns[0]?.env['DOCKER_HOST'], HOSTILE_HOST)
+})
+
+test('the fake and the real driver agree: a name still running is refused, and a requested kill reports killedBy requested with SIGKILL', async (t) => {
+  // Runtime code is tested against the fake. Had the fake let a name run twice,
+  // or the real driver said nothing of who ended a run, code that passed
+  // against one would meet different behaviour from the other.
+  const f = fixture(t)
+  const real = driverFor(f)
+  const fake = fakeSandbox({ script: [{ hangs: true }, { exitCode: 0 }] })
+  const name = `${CONTAINER_PREFIX}parity`
+  // The docker CLI exits 137 when its container is killed; the fake settles on its own.
+  const drivers: readonly (readonly [string, SandboxDriver, () => void])[] = [
+    ['real', real.driver, () => real.child.close(137, null)],
+    ['fake', fake, () => undefined],
+  ]
+
+  for (const [label, driver, exitAfterKill] of drivers) {
+    const running = driver.run(spec(f, { name }))
+    assert.throws(
+      () => driver.run(spec(f, { domain: 'hostile', name })),
+      (e: unknown) => e instanceof ConfigError && /already running on the trusted domain/.test(e.message),
+      label,
+    )
+
+    await driver.kill(name)
+    exitAfterKill()
+    const result = await running.result
+    assert.equal(result.killedBy, 'requested', label)
+    assert.equal(result.signal, 'SIGKILL', label)
+
+    // Free again once that run has ended.
+    assert.doesNotThrow(() => driver.run(spec(f, { name })), label)
+  }
+  // The refused call is recorded, as every call is, and spent no scripted exit:
+  // the third call ran on the fake's second entry rather than finding none.
+  assert.equal(fake.specs.length, 3)
 })
 
 test('a container name without the kernel prefix is refused', (t) => {

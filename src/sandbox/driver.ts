@@ -71,7 +71,16 @@ export interface SandboxDriver {
   readonly name: string
   /** Availability, never a throw: a missing runtime is a degraded boot. */
   probe(): Promise<ProbeResult>
+  /**
+   * Throws, before starting anything, while a run under `spec.name` from an
+   * earlier call has not finished: the name is how kill() and the wallclock
+   * reach a container, so it must name exactly one.
+   */
   run(spec: SandboxSpec): RunningSandbox
-  /** Idempotent: killing an unknown or already-dead container is not an error. */
+  /**
+   * Idempotent: killing an unknown or already-dead container is not an error.
+   * A run it ends reports `killedBy: 'requested'` and SIGKILL, unless its
+   * wallclock had already fired.
+   */
   kill(name: string): Promise<void>
 }

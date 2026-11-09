@@ -95,6 +95,14 @@
 //     into the request, or destroyed on any refusal, so a refused request
 //     never leaves the caller's stream paused (see UpstreamCallOptions.body
 //     for what that means for a caller that answers a refusal).
+//   * A refusal says whether the request left. Before the exchange nothing
+//     of the request is written; in it, node:http takes the head to send on
+//     the first body chunk or at end(), the injected credential with it, and
+//     a failure after that (the host going quiet, the connection closing, an
+//     abort, a body breaking its length) refuses a request the host may have
+//     read and acted on. `sent` says which, read from node:http
+//     (ClientRequest.headersSent), so the log never calls a sent request a
+//     deny.
 //
 // What this does not detect, and every one is global unicast and dialled:
 // on an IPv6 network, every LAN peer's global address in an on-link prefix
@@ -115,9 +123,10 @@
 // Nothing here logs or decides: decide() (E3) judges the request and mints
 // the EgressAllow this takes, and the session (E8) appends proxy.decision
 // before calling request(). A refusal carries a reason from
-// UPSTREAM_REFUSALS and a clause that never holds the host, an answer or a
-// header; the answer, when one is the reason, is in `address`, and an
-// error's code in `code`, for the caller to bound and log.
+// UPSTREAM_REFUSALS, whether the request was sent, and a clause that never
+// holds the host, an answer or a header; the answer, when one is the reason,
+// is in `address`, and an error's code in `code`, for the caller to bound and
+// log.
 //
 // The resolver, the dialer and the interface list are injected
 // (systemUpstreamDeps builds the real ones), so the tests drive every step
@@ -165,6 +174,16 @@ export const UPSTREAM_REFUSALS = Object.freeze([
   'idle-timeout',
 ] as const)
 export type UpstreamRefusal = (typeof UPSTREAM_REFUSALS)[number]
+
+/**
+ * The refusals that can land after node:http took the request's head to send
+ * (UpstreamRefused.sent): the connection failing or the host going quiet
+ * before a response, an abort, and the body breaking its length or carrying
+ * a chunk that is not bytes. Each of them can land before the head too. Every
+ * other refusal is met before anything of the request is written, so its
+ * `sent` is always false. Stable: proxy.decision rows are held to it.
+ */
+export const UPSTREAM_REFUSALS_AFTER_SEND = Object.freeze(['head', 'aborted', 'upstream-failed', 'body-length', 'idle-timeout'] as const satisfies readonly UpstreamRefusal[])
 
 /**
  * Headers the upstream sets itself (host, connection, and the body's framing,
@@ -245,6 +264,16 @@ export interface UpstreamResponse {
 export interface UpstreamRefused {
   readonly ok: false
   readonly reason: UpstreamRefusal
+  /**
+   * Whether the request may have reached the host: true once node:http took
+   * its head to send (ClientRequest.headersSent), the injected credential
+   * with it, so the host may have read it and acted on it; false when no
+   * byte of it was written. Read from node:http, never guessed, and true
+   * only with a refusal in UPSTREAM_REFUSALS_AFTER_SEND. A caller logs a
+   * refusal with `sent` true as a request that left and failed, never as
+   * one that was refused.
+   */
+  readonly sent: boolean
   /** A clause; never holds the host, an answer or a header. */
   readonly why: string
   /** The answer that is the reason (denied-address, host-address); set only when it is an address. */
@@ -319,11 +348,13 @@ const NO_RECORD: ReadonlySet<string> = new Set(['ENODATA', 'ENOTFOUND'])
 function refused(
   reason: UpstreamRefusal,
   why: string,
-  extra: { readonly address?: string | undefined; readonly denial?: AddressDenial; readonly code?: string | undefined } = {},
+  extra: { readonly address?: string | undefined; readonly denial?: AddressDenial; readonly code?: string | undefined; readonly sent?: boolean } = {},
 ): UpstreamRefused {
   return Object.freeze({
     ok: false as const,
     reason,
+    // Only the exchange can say true: everything before it writes nothing of the request.
+    sent: extra.sent === true,
     why,
     ...(extra.address === undefined ? {} : { address: extra.address }),
     ...(extra.denial === undefined ? {} : { denial: extra.denial }),
@@ -331,11 +362,20 @@ function refused(
   })
 }
 
-/** An error's code when it is one (upper-case, bounded), never its message, which may hold a host or an address. */
+/**
+ * What an error's code may be to be passed on (UpstreamRefused.code): upper
+ * case and bounded, as ETIMEOUT, ECONNREFUSED and CERT_HAS_EXPIRED are.
+ * proxy.decision's `code` takes exactly this shape (src/events/types.ts
+ * EGRESS_ERROR_CODE, held equal by test/events-types.test.ts), so every code
+ * passed on can be recorded.
+ */
+export const ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/
+
+/** An error's code when it is one (ERROR_CODE), never its message, which may hold a host or an address. */
 function errorCode(e: unknown): string | undefined {
   if (typeof e !== 'object' || e === null || !('code' in e)) return undefined
   const { code } = e
-  return typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : undefined
+  return typeof code === 'string' && ERROR_CODE.test(code) ? code : undefined
 }
 
 function checkTarget(target: unknown): { readonly ok: true; readonly allow: EgressAllow; readonly host: EgressHost } | UpstreamRefused {
@@ -506,6 +546,16 @@ interface Progress {
   stream: Readable | undefined
   /** The dialled socket, once the dialer returned one. */
   socket: UpstreamSocket | undefined
+  /**
+   * The request, once node:http made one: whether it took the head to send is
+   * what a throw in the exchange reports as sent. Defensive: nothing that can
+   * throw synchronously follows the head being taken today (req.end() and
+   * pipeline() are the last calls the exchange makes, and node:http stores
+   * the head inside them), so this reads false on every path the suite can
+   * reach, and a mutant of it is equivalent. It is kept so that a later step
+   * after the head cannot record a request that left as one that never did.
+   */
+  request: ClientRequest | undefined
 }
 
 /**
@@ -774,7 +824,7 @@ function beginsWith(leading: Buffer, differs: () => void): Transform {
 type Ended = 'idle-timeout' | 'aborted' | 'body-length' | 'body-chunk' | 'not-judged'
 
 /** One request over the handshaken socket, and its response. */
-function exchange(socket: UpstreamSocket, address: string, call: Call, idleTimeoutMs: number): Promise<UpstreamResult> {
+function exchange(socket: UpstreamSocket, address: string, call: Call, idleTimeoutMs: number, at: Progress): Promise<UpstreamResult> {
   const { prepared, leading, signal } = call
   return new Promise((resolve) => {
     let ended: Ended | undefined
@@ -784,20 +834,28 @@ function exchange(socket: UpstreamSocket, address: string, call: Call, idleTimeo
       settled = true
       resolve(result)
     }
+    let req: ClientRequest | undefined
+    // node:http stores the head on the first body chunk or at end(), and
+    // writes nothing of the request before: from then on the host may have
+    // it, the injected credential with it, so a failure past this point is
+    // one the host may have acted on. A body held by beginsWith or heldTo
+    // before its first chunk passes is never sent.
+    const sent = (): boolean => req?.headersSent === true
     const failed = (code?: string): UpstreamRefused => {
+      const after = { sent: sent() }
       switch (ended) {
         case undefined:
-          return refused('upstream-failed', 'the connection failed or closed before a response arrived', { code })
+          return refused('upstream-failed', 'the connection failed or closed before a response arrived', { code, ...after })
         case 'aborted':
-          return refused('aborted', 'the request was aborted')
+          return refused('aborted', 'the request was aborted', after)
         case 'idle-timeout':
-          return refused('idle-timeout', 'the connection carried no byte for the idle timeout')
+          return refused('idle-timeout', 'the connection carried no byte for the idle timeout', after)
         case 'body-length':
-          return refused('body-length', 'the body did not match its declared length, so the request was destroyed before any byte past it was written')
+          return refused('body-length', 'the body did not match its declared length, so the request was destroyed before any byte past it was written', after)
         case 'body-chunk':
-          return refused('head', 'the body carried a chunk that is not bytes, so the request was destroyed')
+          return refused('head', 'the body carried a chunk that is not bytes, so the request was destroyed', after)
         case 'not-judged':
-          return refused('not-decided', 'the body does not begin with the bytes decide() judged, so the request was destroyed before its head or any of them was written')
+          return refused('not-decided', 'the body does not begin with the bytes decide() judged, so the request was destroyed before its head or any of them was written', after)
       }
     }
 
@@ -821,7 +879,6 @@ function exchange(socket: UpstreamSocket, address: string, call: Call, idleTimeo
       setImmediate(() => settle(failed()))
     })
 
-    let req: ClientRequest
     try {
       req = httpRequest({
         method: prepared.method,
@@ -840,6 +897,7 @@ function exchange(socket: UpstreamSocket, address: string, call: Call, idleTimeo
       settle(refused('head', 'node:http refused the request head', { code: errorCode(e) }))
       return
     }
+    at.request = req
     // With no agent the request is never kept alive: node:http ends the
     // socket when the response ends or is destroyed, and a response that
     // stalls is the idle timeout's.
@@ -963,14 +1021,14 @@ async function attempt(
       return refused('upstream-failed', 'the connection failed or closed after the handshake, before the request', { code: errorCode(failure) })
     }
     at.stage = 'exchange'
-    return await exchange(socket, dialled.address, call, deps.idleTimeoutMs)
+    return await exchange(socket, dialled.address, call, deps.idleTimeoutMs, at)
   } finally {
     stop.clear()
   }
 }
 
-/** A throw, refused for where it landed. */
-function thrownAt(stage: Progress['stage'], code: string | undefined): UpstreamRefused {
+/** A throw, refused for where it landed; `sent` is whether node:http had taken the request's head to send. */
+function thrownAt(stage: Progress['stage'], code: string | undefined, sent: boolean): UpstreamRefused {
   switch (stage) {
     case 'call':
       return refused('head', 'the target, head or options could not be read: one is not a record, or a field of it threw', { code })
@@ -979,12 +1037,12 @@ function thrownAt(stage: Progress['stage'], code: string | undefined): UpstreamR
     case 'dial':
       return refused('connect-failed', 'the dialled socket threw before the request was made', { code })
     case 'exchange':
-      return refused('upstream-failed', 'the request threw while it was being sent', { code })
+      return refused('upstream-failed', 'the request threw while it was being sent', { code, sent })
   }
 }
 
 async function send(deps: UpstreamDeps, target: UpstreamTarget, head: UpstreamHead, options: UpstreamCallOptions): Promise<UpstreamResult> {
-  const at: Progress = { stage: 'call', stream: undefined, socket: undefined }
+  const at: Progress = { stage: 'call', stream: undefined, socket: undefined, request: undefined }
   let result: UpstreamResult
   try {
     // Everything the call is checked by is read in attempt's first, awaitless
@@ -997,7 +1055,7 @@ async function send(deps: UpstreamDeps, target: UpstreamTarget, head: UpstreamHe
     // not await would end the kernel, so a throw is a refusal, named for the
     // stage it landed in, and a socket already dialled goes with it.
     at.socket?.destroy()
-    result = thrownAt(at.stage, errorCode(e))
+    result = thrownAt(at.stage, errorCode(e), at.request?.headersSent === true)
   }
   // The body is the upstream's from the call on: a refused request leaves no
   // stream paused for the life of the caller's flow. One already piped is

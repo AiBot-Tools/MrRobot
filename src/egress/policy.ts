@@ -13,8 +13,10 @@
 //   * A CONNECT is denied 'use-route', whatever it names: egress has no
 //     tunnel mode, and a tunnel's bytes are opaque to every check below.
 //   * The target must be absolute-form, its host an EgressHost, its port none
-//     or 443, its path one spelling (routes.ts parseTarget). A Host header
-//     naming another host, or userinfo, is a second host.
+//     or 443, its path one spelling (routes.ts parseTarget), judged in that
+//     order: a target whose host is none is 'not-a-host' whatever port it
+//     names, and a deny for the port or the path names the host it read. A
+//     Host header naming another host, or userinfo, is a second host.
 //   * The body's framing is read from the headers as node:http read it: one
 //     Content-Length, or Transfer-Encoding: chunked, never both, never two.
 //     Content-Type and Content-Encoding are each sent once or not at all.
@@ -415,7 +417,7 @@ function judgeHead(grant: unknown, method: unknown, target: unknown, headersGive
   }
   if (!/^[A-Z]{1,16}$/.test(method)) return denied(deny('method', 'the method is not an upper-case token'))
   const parsed = parseTarget(target)
-  if (!parsed.ok) return denied(deny(parsed.reason, parsed.why, { hostRefusal: parsed.hostRefusal }))
+  if (!parsed.ok) return denied(deny(parsed.reason, parsed.why, { host: parsed.host, hostRefusal: parsed.hostRefusal }))
   const host = parsed.host
   const headers = readHeaders(headersGiven)
   if (headers === undefined) return denied(deny('malformed', 'the headers are not a record of text', { host }))

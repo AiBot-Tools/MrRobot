@@ -56,6 +56,7 @@ import {
   systemUpstreamDeps,
   UPSTREAM_OWNED_HEADERS,
   UPSTREAM_REFUSALS,
+  UPSTREAM_REFUSALS_AFTER_SEND,
   type DialOptions,
   type UpstreamCallOptions,
   type UpstreamDeps,
@@ -268,6 +269,10 @@ function refusedAs(result: UpstreamResult, reason: UpstreamRefusal, label = ''):
   assert.equal(result.reason, reason, `${label}: ${result.why}`)
   assert.ok(UPSTREAM_REFUSALS.includes(result.reason))
   assert.equal(Object.isFrozen(result), true, `${label}: a refusal is not frozen`)
+  // Every refusal says whether the request left, and only one the exchange
+  // can meet after the head says it did.
+  assert.equal(typeof result.sent, 'boolean', `${label}: a refusal does not say whether the request was sent`)
+  if (result.sent) assert.ok((UPSTREAM_REFUSALS_AFTER_SEND as readonly string[]).includes(result.reason), `${label}: ${result.reason} claims the request was sent`)
   return result
 }
 
@@ -646,6 +651,7 @@ test("a body whose leading bytes decide() judged is sent only if it begins with 
     const stream = Readable.from(chunks.map((c) => Buffer.from(c, 'latin1')))
     const refusal = refusedAs(await within(label, 2_000, createUpstream(w.deps).request(judged(length), PUSH, { body: length === undefined ? { stream } : { stream, length } })), 'not-decided', label)
     assert.match(refusal.why, /does not begin with the bytes decide\(\) judged/, label)
+    assert.equal(refusal.sent, false, `${label}: a body held before its head is reported as sent`)
     const [d] = w.dialled
     assert.ok(d !== undefined, label)
     await closed(d.socket)
@@ -1739,6 +1745,114 @@ test('after the handshake the idle timeout ends a quiet socket, and an abort end
     },
   })
   refusedAs(await createUpstream(lateWorld.deps).request(allow(), GET, { signal: late.signal }), 'aborted')
+})
+
+test('a refusal says whether the request left: false while nothing of it was written, true once node:http took its head, the credential with it', async () => {
+  // E4's proxy.decision row records an upstream refusal as a deny only when
+  // the request never left. A credentialed push the host stopped answering
+  // after its head and pack went out may have been applied, so it must not
+  // read as refused. Each refusal the exchange can meet is driven on both
+  // sides of the head.
+  type Case = readonly [label: string, reason: UpstreamRefusal, sent: boolean, run: () => Promise<{ readonly result: UpstreamResult; readonly d: Dialled | undefined }>]
+  /** A body that never yields a byte: the head waits on its first chunk. */
+  const silent = (): Readable => new Readable({ read: () => undefined })
+  const quietHost = (): World => world({ serve: () => undefined })
+  const cases: readonly Case[] = [
+    // Before the exchange: nothing of the request exists yet.
+    ['an answer that is not global unicast', 'denied-address', false, async () => {
+      const w = world({ v4: ['192.168.5.2'] })
+      return { result: await createUpstream(w.deps).request(allow(), GET), d: w.dialled[0] }
+    }],
+    ['a close between the handshake and the request', 'upstream-failed', false, async () => {
+      const w = world({ handshake: 'verified-then-closed' })
+      return { result: await within('the closed socket', 2_000, createUpstream(w.deps).request(allow(), GET)), d: w.dialled[0] }
+    }],
+    // In the exchange, the head still waiting on the body's first chunk.
+    ['a chunked body that never began, then the idle timeout', 'idle-timeout', false, async () => {
+      const w = quietHost()
+      const pending = createUpstream(w.deps).request(allowFor(POST, {}), POST, { body: { stream: silent() } })
+      await until('the exchange', () => w.dialled[0]?.idle !== undefined)
+      w.dialled[0]?.idle?.fire()
+      return { result: await within('the idle refusal', 2_000, pending), d: w.dialled[0] }
+    }],
+    ['a chunked body that never began, then an abort', 'aborted', false, async () => {
+      const w = quietHost()
+      const abort = new AbortController()
+      const pending = createUpstream(w.deps).request(allowFor(POST, {}), POST, { body: { stream: silent() }, signal: abort.signal })
+      await until('the exchange', () => w.dialled[0]?.idle !== undefined)
+      abort.abort()
+      return { result: await within('the abort', 2_000, pending), d: w.dialled[0] }
+    }],
+    ['a declared body that ends before its first byte', 'body-length', false, async () => {
+      const w = world()
+      return { result: await within('the empty body', 2_000, createUpstream(w.deps).request(allowFor(POST, { length: 10 }), POST, { body: { stream: bodyStream(), length: 10 } })), d: w.dialled[0] }
+    }],
+    ['a first chunk that is not bytes', 'head', false, async () => {
+      const w = world()
+      const stream = new Readable({ objectMode: true, read: () => undefined })
+      const pending = createUpstream(w.deps).request(allowFor(POST, {}), POST, { body: { stream } })
+      await until('the exchange', () => w.dialled[0]?.idle !== undefined)
+      stream.push({ not: 'bytes' })
+      return { result: await within('the object chunk', 2_000, pending), d: w.dialled[0] }
+    }],
+    // In the exchange, after node:http took the head.
+    ['a GET the host took and never answered, then the idle timeout', 'idle-timeout', true, async () => {
+      const w = quietHost()
+      const pending = createUpstream(w.deps).request(allow(), GET)
+      await until('the request to arrive', () => w.seen.length === 1)
+      w.dialled[0]?.idle?.fire()
+      return { result: await within('the idle refusal', 2_000, pending), d: w.dialled[0] }
+    }],
+    ['a GET the host took, then an abort before its response', 'aborted', true, async () => {
+      const w = quietHost()
+      const abort = new AbortController()
+      const pending = createUpstream(w.deps).request(allow(), GET, { signal: abort.signal })
+      await until('the request to arrive', () => w.seen.length === 1)
+      abort.abort()
+      return { result: await within('the abort', 2_000, pending), d: w.dialled[0] }
+    }],
+    ['a host that closes once it has read the head', 'upstream-failed', true, async () => {
+      const w = world({
+        raw: (far) => {
+          let head = ''
+          far.on('data', (chunk: Buffer) => {
+            head += chunk.toString('latin1')
+            // The far end of a duplexPair ends; the client reads the end as a hang-up before any response.
+            if (head.includes('\r\n\r\n')) far.end()
+          })
+        },
+      })
+      return { result: await within('the close', 2_000, createUpstream(w.deps).request(allow(), GET)), d: w.dialled[0] }
+    }],
+    ['a declared body that sent some bytes and ended short', 'body-length', true, async () => {
+      const w = quietHost()
+      return { result: await within('the short body', 2_000, createUpstream(w.deps).request(allowFor(POST, { length: 10 }), POST, { body: { stream: bodyStream('hello'), length: 10 } })), d: w.dialled[0] }
+    }],
+    ['bytes, then a chunk that is not bytes', 'head', true, async () => {
+      const w = quietHost()
+      const stream = new Readable({ objectMode: true, read: () => undefined })
+      const pending = createUpstream(w.deps).request(allowFor(POST, {}), POST, { body: { stream } })
+      stream.push(Buffer.from('ab'))
+      await until('the first chunk to arrive', () => wire(w.dialled[0]).includes('ab'))
+      stream.push({ not: 'bytes' })
+      return { result: await within('the object chunk', 2_000, pending), d: w.dialled[0] }
+    }],
+  ]
+  for (const [label, reason, sent, run] of cases) {
+    const { result, d } = await run()
+    const refusal = refusedAs(result, reason, label)
+    assert.equal(refusal.sent, sent, `${label}: sent`)
+    if (d !== undefined) await closed(d.socket)
+    await turn()
+    // Not sent means not a byte: the host has nothing to act on.
+    if (!sent) assert.equal(wire(d), '', `${label}: bytes reached the host of a request reported as not sent`)
+  }
+  // Every refusal that can be sent was met here on both sides of the head.
+  const seenSent = new Set(cases.filter(([, , s]) => s).map(([, reason]) => reason))
+  const seenHeld = new Set(cases.filter(([, , s]) => !s).map(([, reason]) => reason))
+  for (const reason of UPSTREAM_REFUSALS_AFTER_SEND) {
+    assert.ok(seenSent.has(reason) && seenHeld.has(reason), `${reason} is not driven on both sides of the head`)
+  }
 })
 
 // ── the real dependencies, and what the module may reach ──────────────────────

@@ -27,7 +27,10 @@
 // The request target is read here too, and refused rather than normalised:
 // whatever a peer might read another way is not sent at all. Only absolute
 // form (http:// or https://, lower-case) is a target; userinfo is a second
-// host; an explicit port other than 443 names another service than the one
+// host; the host is read before the port, so a target naming an address or a
+// special-use name (192.168.5.2:8766, host.lima.internal:8766) is refused for
+// its host whatever port it names, and only an egress host on a port other
+// than 443 is refused for the port, which names another service than the one
 // dialled; and the path may hold no backslash, no empty segment (a double
 // slash), no dot segment, no percent-encoded slash, dot, backslash, percent or
 // control character, and nothing that does not decode to UTF-8 (an overlong
@@ -75,10 +78,15 @@ export interface RouteRefused {
   readonly why: string
   /** host.ts's reason, when the target's host is no EgressHost. */
   readonly hostRefusal?: HostRefusal
+  /** The target's host, when parseTarget read one before it refused the port or the path. */
+  readonly host?: EgressHost
 }
 
-function refused(reason: RouteRefusal, why: string, hostRefusal?: HostRefusal): RouteRefused {
-  return Object.freeze(hostRefusal === undefined ? { ok: false as const, reason, why } : { ok: false as const, reason, why, hostRefusal })
+/** What a refusal knows of the target beyond its reason: why its host was none, or the host it read. */
+type RefusedAt = { readonly hostRefusal: HostRefusal } | { readonly host: EgressHost }
+
+function refused(reason: RouteRefusal, why: string, at?: RefusedAt): RouteRefused {
+  return Object.freeze(at === undefined ? { ok: false as const, reason, why } : { ok: false as const, reason, why, ...at })
 }
 
 /** The one port egress dials (upstream.ts); a target naming any other names another service. */
@@ -88,7 +96,7 @@ export const ROUTE_PORT = '443'
 export const MAX_PATH = 8192
 
 /** A target longer than this is no request a route has a use for: a path at MAX_PATH and the longest DNS name, with room for the scheme and a port. */
-const MAX_TARGET = MAX_PATH + 300
+export const MAX_TARGET = MAX_PATH + 300
 
 /** The most a push's command list may take, flush included: the bytes the session reads and decide() judges before the pack. */
 export const MAX_COMMAND_LIST = 65_536
@@ -232,30 +240,35 @@ export function parseTarget(target: string): ParsedTarget | RouteRefused {
     const colon = authority.indexOf(':')
     hostText = authority.slice(0, colon)
     port = authority.slice(colon + 1)
-    if (port !== ROUTE_PORT) {
-      return refused('port', `the target names a port other than ${ROUTE_PORT}, the only one egress dials, so it names another service`)
-    }
   }
-  const host = parseEgressHost(hostText)
-  if (!host.ok) return refused('not-a-host', `the target's host is not an egress host: it ${host.why}`, host.reason)
+  // The host before the port: 192.168.5.2:8766 is refused for its host, as
+  // 192.168.5.2 is, not as a typo of a port, so the log tells a probe of the
+  // Mac's loopback from a wrong-port request to a real host.
+  const parsed = parseEgressHost(hostText)
+  if (!parsed.ok) return refused('not-a-host', `the target's host is not an egress host: it ${parsed.why}`, { hostRefusal: parsed.reason })
+  const host = parsed.host
+  if (port !== undefined && port !== ROUTE_PORT) {
+    return refused('port', `the target names a port other than ${ROUTE_PORT}, the only one egress dials, so it names another service`, { host })
+  }
   const queryAt = rest.indexOf('?')
   const path = (queryAt === -1 ? rest : rest.slice(0, queryAt)) || '/'
   const query = queryAt === -1 ? undefined : rest.slice(queryAt + 1)
   if (!path.startsWith('/')) return refused('target', 'the target has no path after its host')
   const originForm = query === undefined ? path : `${path}?${query}`
-  if (originForm.length > MAX_PATH) return refused('path', `the path and query are longer than the ${String(MAX_PATH)} characters the upstream sends`)
-  if (path.includes('\\')) return refused('path', 'the path holds a backslash, which some servers read as a slash')
-  if (path.includes('//')) return refused('path', 'the path holds an empty segment (a double slash), which servers collapse differently')
+  if (originForm.length > MAX_PATH) return refused('path', `the path and query are longer than the ${String(MAX_PATH)} characters the upstream sends`, { host })
+  if (path.includes('\\')) return refused('path', 'the path holds a backslash, which some servers read as a slash', { host })
+  if (path.includes('//')) return refused('path', 'the path holds an empty segment (a double slash), which servers collapse differently', { host })
   if (path.split('/').some((segment) => segment === '.' || segment === '..')) {
-    return refused('path', 'the path holds a dot segment, which a peer resolves to another path')
+    return refused('path', 'the path holds a dot segment, which a peer resolves to another path', { host })
   }
   if (!checkEncodings(path)) {
     return refused(
       'path',
       'the path percent-encodes a slash, a dot, a backslash, a percent or a control character, or does not decode to UTF-8: a second spelling of another path',
+      { host },
     )
   }
-  return Object.freeze({ ok: true as const, host: host.host, port, path, query, originForm })
+  return Object.freeze({ ok: true as const, host, port, path, query, originForm })
 }
 
 // ── route shapes ────────────────────────────────────────────────────────────

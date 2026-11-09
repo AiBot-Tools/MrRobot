@@ -883,25 +883,24 @@ Run it after changing delegation, crash recovery, tool-call replay, the memory
 namespace pin, goal tracking, anchor trust, the eval checks, the chain /
 canonicalizer / triggers (`integrity`), redaction, the cron scheduler, the agent
 registry, restart recovery of approvals and holds, the container audit and path
-containment (`sandbox`), the egress host normaliser, address classifier and
-upstream (`egress`), the `.env` loader and the credential checks around it (`dotenv`, and
-`dotenvDefault` for how an entry point picks its file), the `.env` writer
-(`dotenvAppend`), the installer's plan and confirmation gate (`installPlan`), the
-`.gitignore` reading (`gitignore`), or the runner itself (`runner`) — the
-twenty suites — and add a mutant
-whenever a new test exists to catch a specific bug. No test may let a mutant
-reach your real `.env`: `test/entrypoints.test.ts` runs every entry point from a
-temporary copy of the checkout holding a trap `.env`, through `runEntry` /
-`spawnEntry`, which set that copy as the cwd themselves (and `hygiene.test.ts`
-reads every test's syntax tree to hold each entry-point run to them),
-in-process loader tests are told their
-repository is a trap directory, and the live helper opens `<repo>/.env` only
-from a live test's own process. `test/falsify.test.ts` also refuses a catalog
-that puts an entry-point or `.env`-path mutant beside the entry-point spawns, as
-a second line. The `integrity` and
-`redaction` suites edit change-controlled files (chain hashing, the triggers,
-the redaction pass) and restore them; the operator approved keeping them in the
-catalog on that basis.
+containment (`sandbox`), the egress host normaliser, address classifier,
+upstream, binding routes and decide() (`egress`), the `.env` loader and the
+credential checks around it (`dotenv`, and `dotenvDefault` for how an entry
+point picks its file), the `.env` writer (`dotenvAppend`), the installer's plan
+and confirmation gate (`installPlan`), the `.gitignore` reading (`gitignore`),
+or the runner itself (`runner`) — the twenty suites — and add a mutant whenever
+a new test exists to catch a specific bug. No test may let a mutant reach your
+real `.env`: `test/entrypoints.test.ts` runs every entry point from a temporary
+copy of the checkout holding a trap `.env`, through `runEntry` / `spawnEntry`,
+which set that copy as the cwd themselves (and `hygiene.test.ts` reads every
+test's syntax tree to hold each entry-point run to them), in-process loader
+tests are told their repository is a trap directory, and the live helper opens
+`<repo>/.env` only from a live test's own process. `test/falsify.test.ts` also
+refuses a catalog that puts an entry-point or `.env`-path mutant beside the
+entry-point spawns, as a second line. The `integrity` and `redaction` suites
+edit change-controlled files (chain hashing, the triggers, the redaction pass)
+and restore them; the operator approved keeping them in the catalog on that
+basis.
 
 Last full run, against commit `184576e`, in two batches (the first eight suites,
 then the other nine, each exit 0): 295 of 295 mutants killed (delegation 20,

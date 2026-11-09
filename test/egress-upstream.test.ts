@@ -79,9 +79,23 @@ const OWN_V4 = '81.2.69.160'
 const OWN_V4_HEX = '5102:45a0'
 const OWN_V6 = '2a02:8010::1'
 
-/** The allow decide() would mint over `head`, with `body` as it judged it; the upstream takes nothing else, and each one once. */
+/** A head's one value of a header, by lower-case name, as decide() would have read it from the worker's. */
+const headerOf = (head: UpstreamHead, lower: string): string | undefined =>
+  Object.entries(head.headers).find(([name]) => name.toLowerCase() === lower)?.[1]
+/**
+ * The allow decide() would mint over `head`, with its content headers and
+ * `body` as it judged them; the upstream takes nothing else, and each one
+ * once.
+ */
 const allowFor = (head: UpstreamHead, body?: JudgedBody, host: EgressHost = GITHUB, port = 443): UpstreamTarget =>
-  mintEgressAllow({ host, port, method: head.method, path: head.path, body })
+  mintEgressAllow({
+    host,
+    port,
+    method: head.method,
+    path: head.path,
+    content: { type: headerOf(head, 'content-type'), encoding: headerOf(head, 'content-encoding') },
+    body,
+  })
 /** The allow for GET, the request most cases send. */
 const allow = (host: EgressHost = GITHUB, port = 443): UpstreamTarget => allowFor(GET, undefined, host, port)
 /** What a caller that skipped decide() would hand over: the shape of an allow, with no proof. */
@@ -382,6 +396,16 @@ test('an allow is an EgressAllow decide() minted over one request: frozen with i
   assert.equal(minted.path, '/aos/fixture.git/git-receive-pack')
   assert.deepEqual(minted.body, { length: undefined, leadingBytes: leading.length })
   assert.equal(allow().body, undefined)
+  // No content headers judged is none of either, which the head must match.
+  assert.deepEqual(minted.content, { type: undefined, encoding: undefined })
+  const typed = mintEgressAllow({ host: GITHUB, port: 443, method: 'POST', path: '/x', content: { type: 'application/json', encoding: 'gzip' } })
+  assert.deepEqual(typed.content, { type: 'application/json', encoding: 'gzip' })
+  assert.equal(Object.isFrozen(typed.content), true)
+  assert.throws(() => { (typed.content as { encoding: string | undefined }).encoding = undefined }, TypeError)
+  // Text or none: a value coerced at comparison could match a head it should not.
+  for (const content of [{ type: 5 }, { encoding: ['gzip'] }, { type: null }]) {
+    assert.throws(() => mintEgressAllow({ host: GITHUB, port: 443, method: 'POST', path: '/x', content: content as unknown as { type?: string } }), TypeError)
+  }
   // Frozen: the request the upstream checks is the one decide() allowed, for
   // as long as the allow lives. Modules are strict, so a write throws rather
   // than being dropped.
@@ -521,6 +545,53 @@ test('an allow carries one request, the one decide() judged: a second request, a
     assert.match(refusal.why, why, label)
     assert.deepEqual(each.steps, [], `${label}: something was asked before the refusal`)
     if (stream !== undefined) assert.equal(stream.destroyed, true, `${label}: the body was left undisposed`)
+  }
+})
+
+test("a head whose Content-Type or Content-Encoding is not the one decide() judged is refused as not decided: one added, dropped, changed or respelled, in any case of its name, before anything is resolved", async () => {
+  // How the host decodes the body is in these two: a push judged plain and
+  // sent with Content-Encoding: gzip has the host gunzip it into a command
+  // list nobody read. The allow carries the values decide() read, and the
+  // head must carry exactly them.
+  const push: UpstreamHead = { method: 'POST', path: '/aos/fixture.git/git-receive-pack', headers: { 'content-type': 'application/x-git-receive-pack-request' } }
+  const gzipped: UpstreamHead = { ...push, headers: { ...push.headers, 'content-encoding': 'gzip' } }
+  const plain = (): UpstreamTarget => allowFor(push, { length: 4 })
+  const encoded = (): UpstreamTarget => allowFor(gzipped, { length: 4 })
+  const cases: ReadonlyArray<readonly [string, () => UpstreamTarget, UpstreamHead, RegExp]> = [
+    ['Content-Encoding added where decide() judged none', plain, gzipped, /Content-Encoding/],
+    ['Content-Encoding added, its name in another case', plain, { ...push, headers: { ...push.headers, 'Content-Encoding': 'gzip' } }, /Content-Encoding/],
+    ['Content-Encoding: identity added', plain, { ...push, headers: { ...push.headers, 'content-encoding': 'identity' } }, /Content-Encoding/],
+    ['Content-Encoding dropped where decide() judged gzip', encoded, push, /Content-Encoding/],
+    ['another Content-Encoding than the one judged', encoded, { ...push, headers: { ...push.headers, 'content-encoding': 'br' } }, /Content-Encoding/],
+    ['the judged Content-Encoding respelled', encoded, { ...push, headers: { ...push.headers, 'content-encoding': 'GZIP' } }, /Content-Encoding/],
+    ['Content-Type dropped', plain, { ...push, headers: {} }, /Content-Type/],
+    ['another Content-Type', plain, { ...push, headers: { 'content-type': 'application/x-git-upload-pack-request' } }, /Content-Type/],
+    ['the judged Content-Type respelled', plain, { ...push, headers: { 'Content-Type': 'Application/X-Git-Receive-Pack-Request' } }, /Content-Type/],
+    ['Content-Type added where decide() judged none', () => allowFor(GET), { ...GET, headers: { ...GET.headers, 'content-type': 'text/plain' } }, /Content-Type/],
+  ]
+  for (const [label, target, head, why] of cases) {
+    const each = world()
+    const stream = bodyStream('0000')
+    const options = head.method === 'GET' ? {} : { body: { stream, length: 4 } }
+    const refusal = refusedAs(await createUpstream(each.deps).request(target(), head, options), 'not-decided', label)
+    assert.match(refusal.why, why, label)
+    assert.deepEqual(each.steps, [], `${label}: something was asked before the refusal`)
+    if (head.method !== 'GET') assert.equal(stream.destroyed, true, `${label}: the body was left undisposed`)
+  }
+  // The control: the same values, a name in another case included, are sent.
+  for (const [label, target, head] of [
+    ['plain, as judged', plain, push],
+    ['gzip, as judged', encoded, gzipped],
+    ['the names in another case', encoded, { ...push, headers: { 'Content-Type': 'application/x-git-receive-pack-request', 'Content-Encoding': 'gzip' } }],
+  ] as const) {
+    const each = world()
+    const sent = await createUpstream(each.deps).request(target(), head, { body: { stream: bodyStream('0000'), length: 4 } })
+    assert.equal(sent.ok, true, label)
+    if (sent.ok) await bodyOf(sent.response)
+    assert.equal(each.dials.length, 1, label)
+    // Sent as the head named them: the upstream holds the head to the allow and rewrites nothing.
+    assert.equal(each.seen[0]?.headers['content-type'], 'application/x-git-receive-pack-request', label)
+    assert.equal(each.seen[0]?.headers['content-encoding'], headerOf(head, 'content-encoding'), label)
   }
 })
 

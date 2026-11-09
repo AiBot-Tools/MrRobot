@@ -14,12 +14,17 @@
 //     Object.create(EgressAllow.prototype) all fail EgressAllow.is. The
 //     instance, the class and its prototype are frozen, so neither the fields
 //     the upstream checks nor `is` itself can be replaced after the fact.
-//   * Which request it is for: the host and port, the method and path, and
-//     the body as decide() saw it (none, a declared length or chunked, and the
-//     leading bytes it read and judged, such as git-push's command list, held
-//     as a private copy). The upstream sends only that request: a head with
-//     another method or path, a body declared otherwise, or a body that does
-//     not begin with the bytes judged is refused as not decided.
+//   * Which request it is for: the host and port, the method and path, the
+//     Content-Type and Content-Encoding the request was sent with (each as
+//     decide() read it, or none), and the body as decide() saw it (none, a
+//     declared length or chunked, and the leading bytes it read and judged,
+//     such as git-push's command list, held as a private copy). The upstream
+//     sends only that request: a head with another method or path, another
+//     Content-Type or Content-Encoding (one added, dropped or changed), a body
+//     declared otherwise, or a body that does not begin with the bytes judged
+//     is refused as not decided. The content headers are in the allow because
+//     they say how the host decodes the body: a push judged plain and sent
+//     gzip-encoded would have the host apply a command list nobody read.
 //   * That it is spent once used. The upstream spends an allow when request()
 //     is called, before it checks or awaits anything, and refuses a spent one,
 //     so an allow the session keeps cannot carry a second request, to the
@@ -32,14 +37,14 @@
 //     allow says (an EgressHost in its one spelling, port 443, a head and a
 //     body it will send), so a decide() that minted a malformed one is
 //     refused, not dialled, but a request decide()'s policy wrongly admitted
-//     is sent, and E3's tests are where that is caught.
+//     is sent, and test/egress-policy.test.ts is where that is caught.
 //   * Anything about the bytes past the leading ones decide() judged (a
 //     push's pack), which nothing read.
 //   * Who called mintEgressAllow. Nothing at run time can say; a hygiene
 //     test pins the files that name mintEgressAllow and the files that import
-//     this module, because the guarantee is only as good as that list. Until
-//     E3 lands it is this file for the name, and upstream.ts, for the check,
-//     as the one importer.
+//     this module, because the guarantee is only as good as that list: this
+//     file and policy.ts (decide()) for the name, and policy.ts, for the
+//     mint, and upstream.ts, for the check, as the importers.
 //
 // Pure: no I/O, no imports but a type.
 
@@ -53,14 +58,28 @@ export interface JudgedBody {
   readonly leading?: Uint8Array | undefined
 }
 
+/** The headers that say how the host decodes the body, each as decide() read it: one value, or none when the request sent none. */
+export interface JudgedContent {
+  readonly type?: string | undefined
+  readonly encoding?: string | undefined
+}
+
 /** The request decide() judged, as it mints the allow for it. */
 export interface JudgedRequest {
   readonly host: EgressHost
   readonly port: number
   readonly method: string
   readonly path: string
+  /** None: the request sent neither Content-Type nor Content-Encoding, and the head the upstream sends may name neither. */
+  readonly content?: JudgedContent | undefined
   /** None: decide() judged a request with no body. */
   readonly body?: JudgedBody | undefined
+}
+
+/** The content headers an allow holds the head to: each the one value decide() read, or none. */
+export interface AllowedContent {
+  readonly type: string | undefined
+  readonly encoding: string | undefined
 }
 
 /** What anyone may read of the judged body. The leading bytes themselves stay private (EgressAllow.leadingOf). */
@@ -81,6 +100,8 @@ export class EgressAllow {
   readonly port: number
   readonly method: string
   readonly path: string
+  /** The head the upstream sends carries exactly these, and no other Content-Type or Content-Encoding. */
+  readonly content: AllowedContent
   /** None: decide() judged a request with no body, and the upstream sends one with none. */
   readonly body: AllowedBody | undefined
 
@@ -89,7 +110,14 @@ export class EgressAllow {
     if (key !== MINT) {
       throw new TypeError('EgressAllow cannot be constructed directly; decide() mints it')
     }
-    const { host, port, method, path, body } = judged
+    const { host, port, method, path, content, body } = judged
+    const type: unknown = content?.type
+    const encoding: unknown = content?.encoding
+    // A value is text or none: anything else would compare unequal to every
+    // head, or equal to one it should not, depending on how it is coerced.
+    if ((type !== undefined && typeof type !== 'string') || (encoding !== undefined && typeof encoding !== 'string')) {
+      throw new TypeError('EgressAllow: a judged content header must be a string or none')
+    }
     let leading: Uint8Array | undefined
     if (body !== undefined) {
       const given: unknown = body.leading
@@ -105,6 +133,7 @@ export class EgressAllow {
     this.port = port
     this.method = method
     this.path = path
+    this.content = Object.freeze({ type, encoding })
     this.body = body === undefined ? undefined : Object.freeze({ length: body.length, leadingBytes: leading?.length ?? 0 })
     Object.freeze(this)
   }

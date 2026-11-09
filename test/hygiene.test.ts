@@ -347,18 +347,18 @@ test('dependency direction: src/runtime, src/models, src/mcp, src/agents, src/po
   assert.deepEqual(importersOf(SRC, './secrets/broker.js'), ['src/kernel.ts'])
 })
 
-test('only decide() mints an egress allow: mintEgressAllow is named in src/egress/decision.ts alone, and only upstream.ts imports it', () => {
+test('only decide() mints an egress allow: mintEgressAllow is named in src/egress/decision.ts and policy.ts alone, and only policy.ts and upstream.ts import it', () => {
   // The upstream resolves and dials only an EgressAllow, and the brand is the
   // proof that decide() judged the request. Anywhere else mintEgressAllow is
   // a way past the allowlist: a subsystem that can mint one can send a
-  // worker's request to any host it names. E3's src/egress/policy.ts, where
-  // decide() lives, joins both lists and nothing else does.
-  assert.deepEqual(pathsOf(hits(SRC, /\bmintEgressAllow\b/)), ['src/egress/decision.ts'])
+  // worker's request to any host it names. src/egress/policy.ts, where
+  // decide() lives, is on both lists and nothing else joins them.
+  assert.deepEqual(pathsOf(hits(SRC, /\bmintEgressAllow\b/)), ['src/egress/decision.ts', 'src/egress/policy.ts'])
   // The name is not the only way to it: a namespace import or re-export of
   // decision.ts reaches the mint as d['mint' + 'EgressAllow'] without ever
   // spelling it. So the module's importers are pinned too, resolved and
   // parsed (import, re-export, import()), type-only imports included.
-  assert.deepEqual(importersOfModule(SRC, 'src/egress/decision.ts'), ['src/egress/upstream.ts'])
+  assert.deepEqual(importersOfModule(SRC, 'src/egress/decision.ts'), ['src/egress/policy.ts', 'src/egress/upstream.ts'])
 })
 
 /** A path with a `secrets` directory in it, in either separator. */

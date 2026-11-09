@@ -14,14 +14,16 @@
 //     spent one is refused: one allow carries one request. Its host must be
 //     an EgressHost in its one spelling (a caller that cast the brand away is
 //     caught) and its port 443. The head must name the method and path the
-//     allow was minted over, and the body must be declared as decide() judged
-//     it (none, chunked, or the same length) and begin with the leading bytes
-//     decide() read, if it read any: anything else is refused as not
-//     decided. All of that is refused before any resolver is made, and so is
-//     a head or a body the upstream will not send. The name is resolved
-//     through a fresh node:dns Resolver per request, which queries the
-//     configured DNS servers directly (c-ares): never /etc/hosts, never mDNS,
-//     never a search domain.
+//     allow was minted over, and exactly the Content-Type and
+//     Content-Encoding decide() read (none where it read none), since they
+//     say how the host decodes the body decide() judged; and the body must be
+//     declared as decide() judged it (none, chunked, or the same length) and
+//     begin with the leading bytes decide() read, if it read any: anything
+//     else is refused as not decided. All of that is refused before any
+//     resolver is made, and so is a head or a body the upstream will not
+//     send. The name is resolved through a fresh node:dns Resolver per
+//     request, which queries the configured DNS servers directly (c-ares):
+//     never /etc/hosts, never mDNS, never a search domain.
 //   * Every answer is checked, in both families, before anything is dialled.
 //     A and AAAA are always both asked, and the request is refused when any
 //     answer is denied by addr.ts (loopback, RFC 1918 and with it
@@ -190,9 +192,11 @@ export type UpstreamTarget = EgressAllow
 
 /**
  * The request as the session will send it: the worker's headers already
- * stripped and the credential already injected. Host, Connection and the
- * body's framing are the upstream's (UPSTREAM_OWNED_HEADERS); the body and its
- * length go in UpstreamCallOptions.
+ * stripped and the credential already injected, and Content-Type and
+ * Content-Encoding exactly as decide() read them (EgressAllow.content), or
+ * absent where it read none. Host, Connection and the body's framing are the
+ * upstream's (UPSTREAM_OWNED_HEADERS); the body and its length go in
+ * UpstreamCallOptions.
  */
 export interface UpstreamHead {
   readonly method: string
@@ -443,14 +447,31 @@ function checkHead(head: UpstreamHead, host: EgressHost, taken: TakenBody | unde
   })
 }
 
+/** A header's value in a checked head, by lower-case name: checkHead admits each name in one case only. */
+function headerValue(headers: Readonly<Record<string, string>>, lower: string): string | undefined {
+  for (const [name, value] of Object.entries(headers)) if (name.toLowerCase() === lower) return value
+  return undefined
+}
+
 /**
  * The request as checked is the one the allow was minted over: its method
- * and path, and its body declared as decide() judged it. Then the leading
- * bytes decide() judged, if any, which the exchange holds the body to.
+ * and path, its content headers, and its body declared as decide() judged
+ * it. Then the leading bytes decide() judged, if any, which the exchange
+ * holds the body to.
  */
 function matchAllow(allow: EgressAllow, prepared: Prepared): { readonly ok: true; readonly leading: Buffer | undefined } | UpstreamRefused {
   if (prepared.method !== allow.method || prepared.path !== allow.path) {
     return refused('not-decided', 'the head is not the request the allow was minted over: decide() judged another method or path')
+  }
+  // Exactly the values decide() read, and none where it read none: a
+  // Content-Encoding added after the judging would have the host decode the
+  // body into bytes nobody judged, and another Content-Type would have it
+  // read them as another kind of request.
+  if (headerValue(prepared.headers, 'content-type') !== allow.content.type) {
+    return refused('not-decided', "the head's Content-Type is not the one decide() judged (or it names one where decide() judged none, or the reverse)")
+  }
+  if (headerValue(prepared.headers, 'content-encoding') !== allow.content.encoding) {
+    return refused('not-decided', "the head's Content-Encoding is not the one decide() judged (or it names one where decide() judged none, or the reverse)")
   }
   const judged = allow.body
   const { body } = prepared

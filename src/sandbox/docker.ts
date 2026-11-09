@@ -6,9 +6,10 @@
 // was writable until something uses it. So the flag set is built in one pure
 // function and then AUDITED by that same function before it is returned —
 // exactly one bind mount, read as docker reads it, no --privileged, no docker
-// socket, no home directory, and nothing before the image that the builder
-// did not emit — and a future edit that widens any of those throws rather
-// than producing a container.
+// socket, no home directory, a --user that is not root and resource caps that
+// are not 0, and nothing before the image that the builder did not emit — and
+// a future edit that widens any of those throws rather than producing a
+// container.
 //
 // The spawn environment is exactly { DOCKER_CONFIG, DOCKER_HOST, PATH }, and that
 // is a security property rather than a tidiness one. DOCKER_CONFIG is a
@@ -40,13 +41,15 @@ const execFileAsync = promisify(execFile)
 import { ConfigError } from '../errors.js'
 import { homeDirectory, realpathNearest } from '../agents/protected.js'
 import { confineWorkspace } from './confine.js'
-import type {
-  ProbeResult,
-  RunningSandbox,
-  SandboxDomain,
-  SandboxDriver,
-  SandboxResult,
-  SandboxSpec,
+import { isCpus, isPidsLimit, isUnprivilegedUser, memoryBytes } from './limits.js'
+import {
+  CAPTURE_MAX_BYTES,
+  type ProbeResult,
+  type RunningSandbox,
+  type SandboxDomain,
+  type SandboxDriver,
+  type SandboxResult,
+  type SandboxSpec,
 } from './driver.js'
 
 /** Prefix for every container the kernel creates, so orphans are findable. */
@@ -257,6 +260,7 @@ export function auditRunArgs(args: readonly string[], home: string, workspace: s
     throw new ConfigError(`docker args must start with run (found ${JSON.stringify(args[0] ?? '')})`)
   }
   const seen = new Map<string, number>()
+  const values = new Map<string, string>()
   let mount: string | undefined
   let at = 1
   for (let arg = args[at]; arg !== undefined && arg.startsWith('-'); arg = args[at]) {
@@ -270,6 +274,7 @@ export function auditRunArgs(args: readonly string[], home: string, workspace: s
     if (kind === 'value') {
       at++
       if (arg === '--mount') mount = args[at]
+      values.set(arg, args[at] ?? '')
     }
     at++
   }
@@ -285,7 +290,31 @@ export function auditRunArgs(args: readonly string[], home: string, workspace: s
     throw new ConfigError('docker args name no image after their options')
   }
 
+  // Each once, by the count above, so this is the value docker uses.
+  for (const option of CAP_VALUES.keys()) assertCapValue(option, values.get(option) ?? '')
   assertTheMount(mount ?? '', workspace)
+}
+
+/**
+ * The values that make a container non-root and capped, and what each must be.
+ * Each is well-formed to docker in a spelling that removes the property:
+ * `--user 0:0` runs as root, and `--memory 0`, `--pids-limit 0` and `--cpus 0`
+ * are no limit. The config schema refuses them too (sandbox/limits.ts), but a
+ * driver can be handed its defaults by another path, and this audit is what
+ * every argv meets.
+ */
+const CAP_VALUES: ReadonlyMap<string, readonly [admits: (value: string) => boolean, needs: string]> = new Map([
+  ['--user', [isUnprivilegedUser, 'a numeric <uid>:<gid> with neither 0 (root)']],
+  ['--memory', [(value: string) => memoryBytes(value) !== undefined, 'a positive whole number with a unit, k, m or g']],
+  ['--pids-limit', [isPidsLimit, 'a positive whole number']],
+  ['--cpus', [isCpus, 'a positive number']],
+])
+
+function assertCapValue(option: string, value: string): void {
+  const cap = CAP_VALUES.get(option)
+  if (cap !== undefined && !cap[0](value)) {
+    throw new ConfigError(`docker args carry ${option} ${JSON.stringify(value)}; invariant 9 needs ${cap[1]}`)
+  }
 }
 
 /**
@@ -332,9 +361,13 @@ function assertTheMount(value: string, workspace: string): void {
 
 // ── the driver ─────────────────────────────────────────────────────────────
 
+/**
+ * The output streams' chunks are what Node's child pipes emit: a Buffer each,
+ * or a string had an encoding been set on the stream (the driver sets none).
+ */
 export interface ChildLike {
-  readonly stdout: { on(event: 'data', cb: (chunk: unknown) => void): void } | null
-  readonly stderr: { on(event: 'data', cb: (chunk: unknown) => void): void } | null
+  readonly stdout: { on(event: 'data', cb: (chunk: Buffer | string) => void): void } | null
+  readonly stderr: { on(event: 'data', cb: (chunk: Buffer | string) => void): void } | null
   on(event: 'close', cb: (code: number | null, signal: string | null) => void): unknown
   on(event: 'error', cb: (error: Error) => void): unknown
 }
@@ -367,6 +400,98 @@ export interface DockerDriverOptions {
    * neither controls nor wants.
    */
   readonly dockerConfig?: string
+}
+
+/**
+ * The size of each block a Capture owns. A pipe hands the kernel at most 64 KiB
+ * a read, so a stream that arrives in large chunks fills a block or two per
+ * chunk, and a short output costs one block.
+ */
+const CAPTURE_BLOCK_BYTES = 64 * 1024
+
+/**
+ * One output stream of a run: its first CAPTURE_MAX_BYTES kept, the rest read
+ * and dropped. It never stops reading, because a pipe nobody drains fills and
+ * the container then blocks on its next write until the wallclock kills it.
+ *
+ * Bytes until the end rather than text per chunk: a chunk boundary can fall
+ * inside a multi-byte character, and decoding each chunk on its own turns both
+ * halves into U+FFFD.
+ *
+ * Every chunk is COPIED into blocks the capture owns, never kept. A container
+ * decides how its output is cut: one that writes a byte at a time, paced,
+ * reaches the kernel as one-byte pipe chunks, and a Buffer kept per chunk
+ * costs a few hundred bytes of the kernel's memory for each byte it holds. So
+ * what a capture holds is the bytes it keeps, rounded up to one block, however
+ * the stream arrived.
+ */
+class Capture {
+  /** Every block is full but the last, so the blocks in order are the bytes. */
+  readonly #blocks: Buffer[] = []
+  /**
+   * Bytes held. Up to one past the cap, so that a stream which carried more is
+   * told apart from one that filled it exactly.
+   */
+  #held = 0
+
+  add(chunk: Buffer | string): void {
+    const room = CAPTURE_MAX_BYTES + 1 - this.#held
+    if (room <= 0) return
+    const bytes = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk
+    let rest = bytes.length > room ? bytes.subarray(0, room) : bytes
+    while (rest.length > 0) {
+      const offset = this.#held % CAPTURE_BLOCK_BYTES
+      let block = this.#blocks.at(-1)
+      if (block === undefined || offset === 0) {
+        block = Buffer.alloc(CAPTURE_BLOCK_BYTES)
+        this.#blocks.push(block)
+      }
+      const copied = rest.copy(block, offset)
+      this.#held += copied
+      rest = rest.subarray(copied)
+    }
+  }
+
+  get truncated(): boolean {
+    return this.#held > CAPTURE_MAX_BYTES
+  }
+
+  text(): string {
+    const all = Buffer.concat(this.#blocks, this.#held)
+    if (!this.truncated) return all.toString('utf8')
+    // The last byte held is the first one past the cap, there only to say that
+    // the stream carried more: add() is the one place the cap is applied. What
+    // is kept must not end inside a character, so the cut moves back to the
+    // lead byte of a character the cap splits: the last lead in the final three
+    // bytes kept (a character is at most four), and only when it declares more
+    // bytes than are left before the cap. Nothing else moves the cut. Not a
+    // whole character followed by a stray continuation byte (10xxxxxx) past the
+    // cap: that character is kept. Not continuation bytes with no lead in
+    // reach: they are not UTF-8, there is no character to keep whole, and the
+    // cut stays at the cap. (Walking on until some lead byte would drop all of
+    // a binary stream.)
+    const cap = all.length - 1
+    let end = cap
+    for (let at = cap - 1; at >= cap - 3; at--) {
+      const byte = all[at] ?? 0
+      if ((byte & 0xc0) === 0x80) continue
+      if (at + declaredLength(byte) > cap) end = at
+      break
+    }
+    return all.subarray(0, end).toString('utf8')
+  }
+}
+
+/**
+ * The bytes of the UTF-8 character a lead byte starts, as the lead declares
+ * them: 110xxxxx two, 1110xxxx three, 11110xxx four. Any other byte that is
+ * not a continuation stands alone: ASCII, or a byte no character starts with.
+ */
+function declaredLength(lead: number): number {
+  if ((lead & 0xe0) === 0xc0) return 2
+  if ((lead & 0xf0) === 0xe0) return 3
+  if ((lead & 0xf8) === 0xf0) return 4
+  return 1
 }
 
 /** A run this driver is holding, by name. */
@@ -483,8 +608,8 @@ export class DockerDriver implements SandboxDriver {
     }
 
     const startedAt = Date.now()
-    let stdout = ''
-    let stderr = ''
+    const stdout = new Capture()
+    const stderr = new Capture()
     let killedBy: SandboxResult['killedBy'] | undefined
     let settled = false
 
@@ -499,11 +624,12 @@ export class DockerDriver implements SandboxDriver {
         killedBy ??= 'requested'
       },
     })
+    // Bounded, and drained past the bound: see Capture.
     child.stdout?.on('data', (chunk) => {
-      stdout += String(chunk)
+      stdout.add(chunk)
     })
     child.stderr?.on('data', (chunk) => {
-      stderr += String(chunk)
+      stderr.add(chunk)
     })
 
     const result = new Promise<SandboxResult>((resolve) => {
@@ -538,8 +664,9 @@ export class DockerDriver implements SandboxDriver {
           exitCode,
           signal: signal === 'SIGKILL' || signal === 'SIGTERM' ? signal : null,
           ...(killedBy === undefined ? {} : { killedBy }),
-          stdout,
-          stderr,
+          stdout: stdout.text(),
+          stderr: stderr.text(),
+          truncated: stdout.truncated || stderr.truncated,
           durationMs: Date.now() - startedAt,
         })
       }
@@ -550,7 +677,7 @@ export class DockerDriver implements SandboxDriver {
         finish(code, killedBy === undefined ? signal : 'SIGKILL')
       })
       child.on('error', (error) => {
-        stderr += error.message
+        stderr.add(error.message)
         finish(null, null)
       })
     })

@@ -511,6 +511,37 @@ test('budgets cannot be zero or negative', () => {
   assert.throws(() => parse(lanes), /invalid/)
 })
 
+test('sandbox.defaults.user is never root or its group, and memory is a positive size with a unit', () => {
+  // Invariant 9: non-root, and a memory cap. A shape check alone admits both
+  // failures, because docker reads 0:0 as root and a memory of 0 as no limit.
+  // The run-args audit refuses them again (test/sandbox-docker.test.ts).
+  for (const user of ['0:0', '0:65534', '65534:0', '00:00', '0', 'root', '4294967296:4294967296', '2147483648:1']) {
+    const doc = fixture('valid.yaml') as { sandbox: { defaults: Record<string, unknown> } }
+    doc.sandbox.defaults['user'] = user
+    assert.throws(() => parse(doc), /sandbox\.defaults\.user must be <uid>:<gid>, both numeric and neither 0/, `user: ${user}`)
+  }
+  for (const memory of ['0', '0g', '512', '0.5g', '-1g', '1t', '2gb', '9999999999999999g', '']) {
+    const doc = fixture('valid.yaml') as { sandbox: { defaults: Record<string, unknown> } }
+    doc.sandbox.defaults['memory'] = memory
+    assert.throws(() => parse(doc), /sandbox\.defaults\.memory must be a positive whole number with a unit/, `memory: ${memory}`)
+  }
+
+  const ok = fixture('valid.yaml') as { sandbox: { defaults: Record<string, unknown> } }
+  ok.sandbox.defaults['user'] = '501:20'
+  ok.sandbox.defaults['memory'] = '512M'
+  const parsed = parse(ok)
+  assert.equal(parsed.sandbox.defaults.user, '501:20')
+  assert.equal(parsed.sandbox.defaults.memory, '512M')
+  // The schema's defaults pass its rule when written out. (A zod default is
+  // returned as given, not parsed, so only writing it out checks it.)
+  const defaults = parse(fixture('minimal.yaml')).sandbox.defaults
+  const written = fixture('valid.yaml') as { sandbox: { defaults: Record<string, unknown> } }
+  written.sandbox.defaults['user'] = defaults.user
+  written.sandbox.defaults['memory'] = defaults.memory
+  assert.deepEqual([defaults.user, defaults.memory], ['65534:65534', '2g'])
+  assert.doesNotThrow(() => parse(written))
+})
+
 test('secrets.source defaults to env; envFallback defaults to false and needs source: vault', () => {
   // pmmcp's get_secret never returns plaintext, so the environment is the
   // working credential path and the vault is dormant.

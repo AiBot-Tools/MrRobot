@@ -30,6 +30,7 @@ import { ConfigError } from './errors.js'
 import { rootGitignoreIgnores } from './gitignore.js'
 import { entryProblem, homeDirectory, identify, isSpelledUnder, isUnder, realpathNearest, type Identify } from './agents/protected.js'
 import { DENY_KEYS } from './events/redact.js'
+import { isUnprivilegedUser, memoryBytes } from './sandbox/limits.js'
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
 
@@ -271,9 +272,20 @@ const Sandbox = z
     domains: z.object({ trusted: SandboxDomain, hostile: SandboxDomain }).strict(),
     defaults: z
       .object({
-        user: z.string().regex(/^\d+:\d+$/).default('65534:65534'),
+        // Shape alone admits root (0:0, or 65534:0 for root's group) and no
+        // memory limit at all (0): docker reads both as well-formed. See
+        // sandbox/limits.ts; the run-args audit checks them again.
+        user: z
+          .string()
+          .refine(isUnprivilegedUser, { message: 'sandbox.defaults.user must be <uid>:<gid>, both numeric and neither 0 (root)' })
+          .default('65534:65534'),
         pidsLimit: posInt().default(256),
-        memory: z.string().min(1).default('2g'),
+        memory: z
+          .string()
+          .refine((value) => memoryBytes(value) !== undefined, {
+            message: 'sandbox.defaults.memory must be a positive whole number with a unit, k, m or g (2g, 512m)',
+          })
+          .default('2g'),
         cpus: posInt().default(2),
         wallclockMs: posInt().default(600_000),
       })

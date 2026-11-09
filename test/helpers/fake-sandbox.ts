@@ -17,18 +17,24 @@
 // both through the same steps for these two. (The exit code still differs: the
 // real one reports what the docker CLI exits with, 137 for a killed container.)
 //
+// And a script may not describe a result the real driver cannot return: a
+// stream longer than its capture keeps, or a cut with no stream near the cap
+// (assertDriverShaped). Runtime code is tested against this fake, and could
+// otherwise come to rely on a result shape it will never meet.
+//
 // Nothing here executes anything. It never spawns a process, never touches
 // docker, and never reads the filesystem.
 
 import './guard.js'
 
 import { ConfigError } from '../../src/errors.js'
-import type {
-  ProbeResult,
-  RunningSandbox,
-  SandboxDriver,
-  SandboxResult,
-  SandboxSpec,
+import {
+  CAPTURE_MAX_BYTES,
+  type ProbeResult,
+  type RunningSandbox,
+  type SandboxDriver,
+  type SandboxResult,
+  type SandboxSpec,
 } from '../../src/sandbox/driver.js'
 
 export interface ScriptedExit {
@@ -36,6 +42,11 @@ export interface ScriptedExit {
   readonly signal?: SandboxResult['signal']
   readonly stdout?: string
   readonly stderr?: string
+  /**
+   * As the real driver reports a stream cut at CAPTURE_MAX_BYTES, so only
+   * with a stream that reaches within three bytes of the cap.
+   */
+  readonly truncated?: boolean
   readonly durationMs?: number
   /** Do not resolve on its own: the run ends only by kill or overrun. */
   readonly hangs?: boolean
@@ -60,10 +71,49 @@ const UNAVAILABLE: ProbeResult = {
   why: 'fake driver: no container runtime configured for this test',
 }
 
+/**
+ * The fewest stream bytes the real driver could have decoded to `text`: each
+ * character's own UTF-8 bytes, but one byte for a U+FFFD, which a byte that is
+ * not UTF-8 decodes to. The most is the text's own UTF-8 length, since a
+ * U+FFFD stands for at most three.
+ */
+function fewestBytes(text: string): number {
+  return Buffer.byteLength(text) - 2 * (text.match(/\uFFFD/g)?.length ?? 0)
+}
+
+/**
+ * Refuse a scripted exit the real driver cannot return (DockerDriver.run,
+ * docker.ts Capture). It keeps at most CAPTURE_MAX_BYTES of each stream; and it
+ * reports a cut only for a stream that carried more, which it cuts at most
+ * three bytes short of the cap, on a character boundary.
+ */
+function assertDriverShaped(scripted: ScriptedExit, index: number): void {
+  const streams = [
+    ['stdout', scripted.stdout ?? ''],
+    ['stderr', scripted.stderr ?? ''],
+  ] as const
+  for (const [label, text] of streams) {
+    if (fewestBytes(text) > CAPTURE_MAX_BYTES) {
+      throw new Error(
+        `scripted exit ${String(index)}: its ${label} is ${String(fewestBytes(text))} bytes or more, and the real driver ` +
+          `keeps at most CAPTURE_MAX_BYTES (${String(CAPTURE_MAX_BYTES)}) and reports truncated. Script the first ` +
+          'CAPTURE_MAX_BYTES with truncated: true.',
+      )
+    }
+  }
+  if (scripted.truncated === true && streams.every(([, text]) => Buffer.byteLength(text) < CAPTURE_MAX_BYTES - 3)) {
+    throw new Error(
+      `scripted exit ${String(index)}: truncated with no stream within three bytes of CAPTURE_MAX_BYTES ` +
+        `(${String(CAPTURE_MAX_BYTES)}), which the real driver never reports. Script the stream that was cut at its cap.`,
+    )
+  }
+}
+
 export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
   const specs: SandboxSpec[] = []
   const kills: string[] = []
   const script = options.script ?? []
+  script.forEach(assertDriverShaped)
   const pending = new Map<string, (result: SandboxResult) => void>()
   const started = new Map<string, SandboxSpec>()
   let index = 0
@@ -113,6 +163,7 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
             signal: scripted.signal ?? null,
             stdout: scripted.stdout ?? '',
             stderr: scripted.stderr ?? '',
+            truncated: scripted.truncated ?? false,
             durationMs: scripted.durationMs ?? 1,
           })
           pending.delete(spec.name)
@@ -131,6 +182,7 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
         killedBy: 'requested',
         stdout: '',
         stderr: '',
+        truncated: false,
         durationMs: 0,
       })
     },
@@ -144,6 +196,7 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
         killedBy: 'wallclock',
         stdout: '',
         stderr: '',
+        truncated: false,
         durationMs: spec?.limits.wallclockMs ?? 0,
       })
     },

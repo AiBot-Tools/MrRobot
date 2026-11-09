@@ -28,6 +28,13 @@
 //   Write a workspace path holding a comma into --mount, or read that value
 //   other than as docker's CSV, and a second source= mounts what it names.
 //   Let the image slot hold an option, in any spelling, and docker obeys it.
+//   Keep everything a container writes and one that writes without end grows
+//   the kernel's memory until its wallclock, or past it; stop reading at the
+//   cap instead and the container blocks on a full pipe; keep each chunk as
+//   its own Buffer and one that writes a byte at a time costs the kernel a few
+//   hundred bytes for every byte kept.
+//   Admit --user 0:0 or a cap of 0, both well-formed to docker, and the run is
+//   root or has no limit.
 
 import './helpers/guard.js'
 
@@ -36,9 +43,14 @@ import assert from 'node:assert/strict'
 import { mkdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { userInfo } from 'node:os'
 import { join } from 'node:path'
+import { PassThrough } from 'node:stream'
+import { finished } from 'node:stream/promises'
+import { setFlagsFromString } from 'node:v8'
+import { runInNewContext } from 'node:vm'
 
 import { tmpdir } from './helpers/tmpdir.js'
 import { ConfigError, NotImplementedError } from '../src/errors.js'
+import { MAX_LOGGED_OUTPUT } from '../src/events/bound.js'
 import { confineWorkspace } from '../src/sandbox/confine.js'
 import {
   auditRunArgs,
@@ -51,7 +63,7 @@ import {
   type DomainConfig,
 } from '../src/sandbox/docker.js'
 import { AppleContainerDriver } from '../src/sandbox/apple-container.js'
-import type { SandboxDriver, SandboxSpec } from '../src/sandbox/driver.js'
+import { CAPTURE_MAX_BYTES, type SandboxDriver, type SandboxResult, type SandboxSpec } from '../src/sandbox/driver.js'
 import { fakeSandbox } from './helpers/fake-sandbox.js'
 
 const DEFAULTS: DockerDefaults = { user: '65534:65534', pidsLimit: 256, memory: '2g', cpus: 2 }
@@ -366,6 +378,81 @@ test('the image slot cannot carry a docker option: everything before the image i
   assert.throws(() => auditRunArgs(args.slice(0, args.indexOf('aos/worker:0.0.1')), home, f.realWorkspace), /name no image/)
 })
 
+test('the audit refuses a root --user and a --memory, --pids-limit or --cpus that docker reads as no limit', (t) => {
+  // Each is well-formed to docker, so the shape of the argv says nothing: 0:0
+  // is root, 65534:0 is root's group, and 0 of any cap is no cap. The config
+  // schema refuses these too (test/config.test.ts), but a driver can be handed
+  // its defaults another way, and the audit is what every argv meets.
+  const f = fixture(t)
+  const home = join(f.root, 'home')
+  const build = (defaults: Partial<DockerDefaults>): string[] =>
+    buildRunArgs({ spec: spec(f), domain: f.domain, defaults: { ...DEFAULTS, ...defaults }, repoRoot: f.repoRoot, home })
+
+  const refused: readonly (readonly [keyof DockerDefaults, string | number])[] = [
+    ['user', '0:0'],
+    ['user', '0:65534'],
+    ['user', '65534:0'],
+    ['user', '00:00'],
+    ['user', '0'],
+    ['user', '65534'],
+    ['user', 'root'],
+    ['user', '-1:-1'],
+    // Past what runc admits, and 2^32 is 0 to any reader that wraps it.
+    ['user', '4294967296:4294967296'],
+    ['user', '2147483648:1'],
+    ['user', ''],
+    ['memory', '0'],
+    ['memory', '0g'],
+    ['memory', '0k'],
+    // A bare number is bytes to docker, and a fraction of one is 0.
+    ['memory', '512'],
+    ['memory', '0.5g'],
+    ['memory', '-1g'],
+    ['memory', '1t'],
+    ['memory', '2gb'],
+    ['memory', '9999999999999999g'],
+    ['memory', ''],
+    ['pidsLimit', 0],
+    ['pidsLimit', -1],
+    ['pidsLimit', 1.5],
+    ['cpus', 0],
+    ['cpus', -1],
+  ]
+  for (const [field, value] of refused) {
+    const flag = { user: '--user', memory: '--memory', pidsLimit: '--pids-limit', cpus: '--cpus' }[field]
+    assert.throws(
+      () => build({ [field]: value }),
+      (e: unknown) => e instanceof ConfigError && e.message.startsWith(`docker args carry ${flag} ${JSON.stringify(String(value))}; invariant 9 needs`),
+      `${field}: ${JSON.stringify(value)}`,
+    )
+  }
+
+  for (const [field, value] of [
+    ['user', '1:1'],
+    ['user', '501:20'],
+    ['user', '2147483647:2147483647'],
+    ['memory', '6m'],
+    ['memory', '512M'],
+    ['memory', '64k'],
+    ['memory', '2G'],
+    ['pidsLimit', 1],
+    ['cpus', 0.5],
+    ['cpus', 2],
+  ] as const) {
+    assert.doesNotThrow(() => build({ [field]: value }), `${field}: ${JSON.stringify(value)}`)
+  }
+
+  // And in an argv the builder did not make: the audit reads the value after
+  // the flag, wherever it came from.
+  const args = argsFor(f)
+  const swapped = (flag: string, value: string): string[] => args.map((a, i) => (args[i - 1] === flag ? value : a))
+  assert.doesNotThrow(() => auditRunArgs(swapped('--user', '1000:1000'), home, f.realWorkspace))
+  assert.throws(() => auditRunArgs(swapped('--user', '0:0'), home, f.realWorkspace), /--user "0:0"; invariant 9/)
+  assert.throws(() => auditRunArgs(swapped('--memory', '0'), home, f.realWorkspace), /--memory "0"; invariant 9/)
+  assert.throws(() => auditRunArgs(swapped('--pids-limit', '-1'), home, f.realWorkspace), /--pids-limit "-1"; invariant 9/)
+  assert.throws(() => auditRunArgs(swapped('--cpus', '0.0'), home, f.realWorkspace), /--cpus "0.0"; invariant 9/)
+})
+
 // ── confinement ────────────────────────────────────────────────────────────
 
 test('symlink escaping mountRoot, sibling prefix, .. and /etc are refused; proj/../proj allowed', (t) => {
@@ -474,20 +561,29 @@ test('resolved real path, not the request string, is passed to docker', (t) => {
 
 interface FakeChild extends ChildLike {
   close(code: number | null, signal: string | null): void
+  /** As Node's child emits 'error', for a spawn that started no process. */
+  fail(error: Error): void
 }
 
-function fakeChild(): FakeChild {
+type ChildStreams = Pick<ChildLike, 'stdout' | 'stderr'>
+
+const SILENT: ChildStreams = { stdout: { on: () => undefined }, stderr: { on: () => undefined } }
+
+function fakeChild(streams: ChildStreams = SILENT): FakeChild {
   const handlers: Record<string, ((...a: never[]) => void)[]> = {}
   const on = (event: string, cb: (...a: never[]) => void): FakeChild => {
     ;(handlers[event] ??= []).push(cb)
     return child
   }
   const child: FakeChild = {
-    stdout: { on: () => undefined },
-    stderr: { on: () => undefined },
+    stdout: streams.stdout,
+    stderr: streams.stderr,
     on: on as ChildLike['on'],
     close(code, signal) {
       for (const cb of handlers['close'] ?? []) (cb as (c: number | null, s: string | null) => void)(code, signal)
+    },
+    fail(error) {
+      for (const cb of handlers['error'] ?? []) (cb as (e: Error) => void)(error)
     },
   }
   return child
@@ -511,10 +607,10 @@ type ScriptedExec = (
 const TRUSTED_HOST = 'unix:///tmp/colima-trusted.sock'
 const HOSTILE_HOST = 'unix:///tmp/colima-hostile.sock'
 
-function driverFor(f: Fixture): Spied {
+function driverFor(f: Fixture, streams?: ChildStreams): Spied {
   const spawns: Spied['spawns'] = []
   const execs: Spied['execs'] = []
-  const child = fakeChild()
+  const child = fakeChild(streams)
   let exec: ScriptedExec = () => Promise.resolve({ stdout: '', stderr: '' })
   let spawnFailure: Error | undefined
 
@@ -881,6 +977,324 @@ test('the fake and the real driver agree: a name still running is refused, and a
   // The refused call is recorded, as every call is, and spent no scripted exit:
   // the third call ran on the fake's second entry rather than finding none.
   assert.equal(fake.specs.length, 3)
+})
+
+// ── what a run writes ──────────────────────────────────────────────────────
+
+const MiB = 1024 * 1024
+
+/**
+ * One run whose streams are real streams: write to them, end them, and return
+ * the result once both have been read to the end.
+ *
+ * A driver must never stop reading, or the container blocks on a full pipe. A
+ * driver that pauses a stream fails here at once, by name (a Readable emits
+ * 'pause' when paused); one that stops reading any other way leaves `finished`
+ * waiting, and the test's timeout says so.
+ */
+async function capture(
+  t: TestContext,
+  write: (stdout: PassThrough, stderr: PassThrough) => void,
+): Promise<SandboxResult> {
+  const f = fixture(t)
+  const stdout = new PassThrough()
+  const stderr = new PassThrough()
+  const d = driverFor(f, { stdout, stderr })
+  const running = d.driver.run(spec(f))
+  const paused = new Promise<never>((_resolve, reject) => {
+    for (const [label, stream] of [['stdout', stdout], ['stderr', stderr]] as const) {
+      stream.once('pause', () => {
+        reject(new Error(`the driver paused ${label}: a container writing to it would block on a full pipe`))
+      })
+    }
+  })
+  try {
+    write(stdout, stderr)
+    stdout.end()
+    stderr.end()
+    await Promise.race([Promise.all([finished(stdout), finished(stderr)]), paused])
+  } finally {
+    d.child.close(0, null)
+  }
+  return running.result
+}
+
+test('run keeps at most the capture cap of stdout and stderr and reports truncation', { timeout: 30_000 }, async (t) => {
+  // More than the log stores, so the log's own cut, made after redaction,
+  // decides what it keeps (events/bound.ts); and far less than 10 MiB, or this
+  // test would prove nothing.
+  assert.ok(CAPTURE_MAX_BYTES > MAX_LOGGED_OUTPUT)
+  assert.ok(10 * MiB > 2 * CAPTURE_MAX_BYTES)
+
+  // 10 MiB on each stream, in pipe-sized chunks. The bytes past the cap differ
+  // from the ones before it, so a result holding any of them shows.
+  const chunk = 64 * 1024
+  const result = await capture(t, (stdout, stderr) => {
+    for (let at = 0; at < 10 * MiB; at += chunk) {
+      const kept = at < CAPTURE_MAX_BYTES
+      stdout.write(Buffer.alloc(chunk, kept ? 'o' : 'z'))
+      stderr.write(Buffer.alloc(chunk, kept ? 'e' : 'z'))
+    }
+  })
+
+  // Both streams were read to their end (capture() awaited it), and of each
+  // only its first CAPTURE_MAX_BYTES were kept.
+  assert.equal(Buffer.byteLength(result.stdout), CAPTURE_MAX_BYTES)
+  assert.ok(result.stdout === 'o'.repeat(CAPTURE_MAX_BYTES), 'stdout is not its first CAPTURE_MAX_BYTES')
+  assert.equal(Buffer.byteLength(result.stderr), CAPTURE_MAX_BYTES)
+  assert.ok(result.stderr === 'e'.repeat(CAPTURE_MAX_BYTES), 'stderr is not its first CAPTURE_MAX_BYTES')
+  assert.equal(result.truncated, true)
+  assert.equal(result.exitCode, 0)
+})
+
+test('a small output is returned whole and not marked truncated, nor is a stream that fills the cap exactly', { timeout: 30_000 }, async (t) => {
+  // A character split across two chunks, as a pipe may split it. Decoded a
+  // chunk at a time, it would come back as two U+FFFD.
+  const line = Buffer.from('ok é\n', 'utf8')
+  const split = line.indexOf(0xc3) + 1
+  const result = await capture(t, (stdout, stderr) => {
+    stdout.write(line.subarray(0, split))
+    stdout.write(line.subarray(split))
+    stderr.write(Buffer.alloc(CAPTURE_MAX_BYTES, 'e'))
+  })
+  assert.equal(result.stdout, 'ok é\n')
+  assert.ok(result.stderr === 'e'.repeat(CAPTURE_MAX_BYTES), 'a stream exactly at the cap lost bytes')
+  assert.equal(result.truncated, false)
+
+  // One byte more is a cut, and either stream's cut alone sets the flag.
+  const over = await capture(t, (stdout, stderr) => {
+    stdout.write('ok\n')
+    stderr.write(Buffer.alloc(CAPTURE_MAX_BYTES + 1, 'e'))
+  })
+  assert.equal(over.stdout, 'ok\n')
+  assert.ok(over.stderr === 'e'.repeat(CAPTURE_MAX_BYTES), 'stderr is not its first CAPTURE_MAX_BYTES')
+  assert.equal(over.truncated, true)
+})
+
+test('the cut never splits a character, and a stream that is not UTF-8 still keeps the cap', { timeout: 30_000 }, async (t) => {
+  // A two-byte character one short of the cap, and a four-byte one two short.
+  const result = await capture(t, (stdout, stderr) => {
+    stdout.write(Buffer.concat([Buffer.alloc(CAPTURE_MAX_BYTES - 1, 'a'), Buffer.from('é and more')]))
+    stderr.write(Buffer.concat([Buffer.alloc(CAPTURE_MAX_BYTES - 2, 'a'), Buffer.from('\u{1F600} and more')]))
+  })
+  assert.ok(result.stdout === 'a'.repeat(CAPTURE_MAX_BYTES - 1), 'stdout was not cut before the split character')
+  assert.ok(result.stderr === 'a'.repeat(CAPTURE_MAX_BYTES - 2), 'stderr was not cut before the split character')
+  assert.equal(result.truncated, true)
+
+  // A four-byte character three short of the cap: all three of its
+  // continuation bytes are kept and the first one dropped is its last, so the
+  // walk back goes the full three. A walk bounded at two would keep F0 9F 98,
+  // and the text would end in U+FFFD.
+  const longest = await capture(t, (stdout) => {
+    stdout.write(Buffer.concat([Buffer.alloc(CAPTURE_MAX_BYTES - 3, 'a'), Buffer.from('\u{1F600} and more')]))
+  })
+  assert.ok(longest.stdout === 'a'.repeat(CAPTURE_MAX_BYTES - 3), 'stdout was not cut before the split character')
+
+  // Continuation bytes with no character to belong to, after one that is
+  // ASCII: the cut stays at the cap, each continuation byte decodes to U+FFFD,
+  // and the stream is not walked back to the last lead it can find (here to
+  // its first byte, keeping one).
+  const binary = await capture(t, (stdout) => {
+    stdout.write(Buffer.concat([Buffer.from('x'), Buffer.alloc(CAPTURE_MAX_BYTES + 15, 0x80)]))
+  })
+  assert.equal(binary.stdout.length, CAPTURE_MAX_BYTES)
+  assert.ok(/^x\uFFFD*$/.test(binary.stdout))
+  assert.equal(binary.truncated, true)
+})
+
+test('a stray continuation byte past the cap costs no character that the cap does not split', { timeout: 30_000 }, async (t) => {
+  // The first byte dropped continues nothing kept: what ends at the cap is a
+  // whole character, an ASCII x or a complete é, € or 😀, and it is kept. Only
+  // a lead whose character runs past the cap moves the cut, so a byte that is
+  // not UTF-8 costs the text nothing before it.
+  const stray = Buffer.from([0x80, 0x80, 0x41])
+  const before = (n: number, text: string): Buffer =>
+    Buffer.concat([Buffer.alloc(CAPTURE_MAX_BYTES - n, 'a'), Buffer.from(text), stray])
+  const short = await capture(t, (stdout, stderr) => {
+    stdout.write(before(1, 'x'))
+    stderr.write(before(2, 'é'))
+  })
+  assert.ok(short.stdout === `${'a'.repeat(CAPTURE_MAX_BYTES - 1)}x`, 'the x before a stray continuation byte was dropped')
+  assert.ok(short.stderr === `${'a'.repeat(CAPTURE_MAX_BYTES - 2)}é`, 'the é before a stray continuation byte was dropped')
+  assert.equal(short.truncated, true)
+
+  const long = await capture(t, (stdout, stderr) => {
+    stdout.write(before(3, '€'))
+    stderr.write(before(4, '\u{1F600}'))
+  })
+  assert.ok(long.stdout === `${'a'.repeat(CAPTURE_MAX_BYTES - 3)}€`, 'the € before a stray continuation byte was dropped')
+  assert.ok(long.stderr === `${'a'.repeat(CAPTURE_MAX_BYTES - 4)}\u{1F600}`, 'the 😀 before a stray continuation byte was dropped')
+  assert.equal(long.truncated, true)
+})
+
+/**
+ * A full collection, for the one test that measures what a capture holds: the
+ * process's own gc when it was started with --expose-gc, and otherwise one
+ * exposed at runtime through V8's flag, which Node 20 and 22 honour. Should a
+ * later V8 stop honouring it, this says so and fails, rather than skipping:
+ * a skip passes npm test, and this is the only check of the memory bound.
+ */
+function exposedGc(): () => void {
+  const own: unknown = (globalThis as { gc?: unknown }).gc
+  if (typeof own === 'function') return own as () => void
+  setFlagsFromString('--expose-gc')
+  const exposed: unknown = runInNewContext("typeof gc === 'function' ? gc : undefined")
+  assert.ok(
+    typeof exposed === 'function',
+    `Node ${process.version} did not expose gc at runtime, so what a capture holds cannot be measured; ` +
+      'run this file with node --expose-gc --import tsx --test',
+  )
+  return exposed as () => void
+}
+
+test('a stream that arrives a byte at a time, then far past the cap, costs the kernel about the bytes kept', { timeout: 60_000 }, async (t) => {
+  // A container decides how its output is cut: one that writes a byte per
+  // write, paced, reaches the kernel as one-byte pipe chunks. Kept a chunk at a
+  // time, each byte would cost the kernel a Buffer, about a hundred bytes of
+  // heap with pooled one-byte Buffers like these (measured: 114 MiB a stream at
+  // the cap). Copied into blocks the capture owns, they cost what they hold.
+  //
+  // And one that writes on for its whole wallclock must cost nothing more once
+  // its cap is reached, so each stream is then fed 8 MiB past the cap inside
+  // the measured window. Only the kernel's memory shows that: a capture that
+  // copied or kept those bytes and still returned only its first
+  // CAPTURE_MAX_BYTES would pass every other test here.
+  //
+  // Measured across full collections, so only what is still reachable counts;
+  // gc is exposed to this process for that and nothing else. Each reading
+  // collects until the heap stops shrinking, and at least twice: after one,
+  // Buffers already freed still count in external (measured: 16 MiB of 64 KiB
+  // Buffers). Before the run those are the earlier tests' garbage, which made
+  // this reading 11 MB low in file order; after it they are the 16 MiB fed
+  // past the caps, which made it 7 to 11 MB high. Either way the figure
+  // depended on what ran before, not on what the captures hold.
+  const gc = exposedGc()
+  const used = (): number => {
+    const m = process.memoryUsage()
+    return m.heapUsed + m.external
+  }
+  const settled = (): number => {
+    gc()
+    let last = used()
+    for (let i = 0; i < 8; i++) {
+      gc()
+      const now = used()
+      if (now >= last) return now
+      last = now
+    }
+    return last
+  }
+
+  const f = fixture(t)
+  const feeds: ((chunk: Buffer | string) => void)[] = []
+  const stream = (): NonNullable<ChildLike['stdout']> => ({
+    on: (_event, cb) => {
+      feeds.push(cb)
+    },
+  })
+  const d = driverFor(f, { stdout: stream(), stderr: stream() })
+  const before = settled()
+  const running = d.driver.run(spec(f))
+  assert.equal(feeds.length, 2, 'the driver reads both streams')
+  const pipe = 64 * 1024
+  for (const feed of feeds) {
+    for (let i = 0; i <= CAPTURE_MAX_BYTES; i++) feed(Buffer.from('a'))
+    for (let fed = 0; fed < 8 * MiB; fed += pipe) feed(Buffer.alloc(pipe, 'z'))
+  }
+  // While the run is live, which is when a capture holds what it keeps.
+  const held = settled() - before
+  // In the test output, so a run on another Node can be set beside the figure
+  // below.
+  t.diagnostic(`held ${String(held)} bytes`)
+  d.child.close(0, null)
+  const result = await running.result
+
+  // Two streams at the cap hold 2 MiB and a block each (measured: 2.4 MB,
+  // alone or in this file's order, on Node 22). Twice that allows for
+  // collector noise, and is a quarter of the 16 MiB fed past the caps and
+  // about a fiftieth of what a Buffer per byte costs.
+  assert.ok(
+    held < 4 * CAPTURE_MAX_BYTES,
+    `two streams of ${String(CAPTURE_MAX_BYTES + 1)} one-byte chunks and 8 MiB more held ${String(held)} bytes`,
+  )
+  assert.ok(result.stdout === 'a'.repeat(CAPTURE_MAX_BYTES), 'stdout is not its first CAPTURE_MAX_BYTES')
+  assert.ok(result.stderr === 'a'.repeat(CAPTURE_MAX_BYTES), 'stderr is not its first CAPTURE_MAX_BYTES')
+  assert.equal(result.truncated, true)
+})
+
+test('the fake and the real driver agree: a run whose output was cut reports truncated, and one whose output was not does not', async (t) => {
+  // Runtime code is tested against the fake (sandbox.exec, plan S3). Had the
+  // fake dropped the flag, code that passed against it would never have met a cut.
+  const f = fixture(t)
+  const fake = fakeSandbox({ script: [{ stdout: 'o'.repeat(CAPTURE_MAX_BYTES), truncated: true }, { stdout: 'ok\n' }] })
+  const results: readonly (readonly [string, SandboxResult, SandboxResult])[] = [
+    [
+      'real',
+      await capture(t, (stdout) => stdout.write(Buffer.alloc(CAPTURE_MAX_BYTES + 1, 'o'))),
+      await capture(t, (stdout) => stdout.write('ok\n')),
+    ],
+    ['fake', await fake.run(spec(f)).result, await fake.run(spec(f)).result],
+  ]
+  for (const [label, cut, whole] of results) {
+    assert.equal(cut.truncated, true, label)
+    assert.ok(cut.stdout === 'o'.repeat(CAPTURE_MAX_BYTES), `${label}: the cut stdout is not its first CAPTURE_MAX_BYTES`)
+    assert.equal(whole.truncated, false, label)
+    assert.equal(whole.stdout, 'ok\n', label)
+  }
+})
+
+test('the fake refuses a scripted result the real driver cannot return, and accepts each one it does', { timeout: 30_000 }, async (t) => {
+  // A stream over the cap, which the real driver never returns whole, counted
+  // in bytes as the driver counts it: CAPTURE_MAX_BYTES / 2 + 1 é is one
+  // character past half the cap, and two bytes past the cap.
+  const over = ['o'.repeat(CAPTURE_MAX_BYTES + 1), 'o'.repeat(2 * CAPTURE_MAX_BYTES), 'é'.repeat(CAPTURE_MAX_BYTES / 2 + 1)]
+  for (const text of over) {
+    for (const scripted of [{ stdout: text }, { stderr: text }, { stdout: text, truncated: true }]) {
+      assert.throws(() => fakeSandbox({ script: [{ stdout: 'ok\n' }, scripted] }), /scripted exit 1: its std(out|err) is \d+ bytes or more/)
+    }
+  }
+  // A cut with no stream near the cap, which the real driver never reports.
+  for (const scripted of [{ truncated: true }, { stdout: 'ok\n', stderr: 'e'.repeat(CAPTURE_MAX_BYTES - 4), truncated: true }]) {
+    assert.throws(() => fakeSandbox({ script: [scripted] }), /scripted exit 0: truncated with no stream within three bytes/)
+  }
+
+  // What the real driver returns is accepted as a script, the shapes the
+  // refusals sit next to among them: a stream at the cap, one cut three short
+  // of it before a split character, and one that is not UTF-8, whose U+FFFD
+  // each stand for one byte.
+  const f = fixture(t)
+  const real = [
+    await capture(t, (stdout) => stdout.write(Buffer.alloc(CAPTURE_MAX_BYTES, 'o'))),
+    await capture(t, (stdout) => stdout.write(Buffer.concat([Buffer.alloc(CAPTURE_MAX_BYTES - 3, 'a'), Buffer.from('\u{1F600}')]))),
+    await capture(t, (stdout, stderr) => {
+      stdout.write('ok\n')
+      stderr.write(Buffer.concat([Buffer.from('x'), Buffer.alloc(CAPTURE_MAX_BYTES + 15, 0x80)]))
+    }),
+  ]
+  assert.deepEqual(
+    real.map((r) => r.truncated),
+    [false, true, true],
+  )
+  const fake = fakeSandbox({ script: real.map(({ stdout, stderr, truncated }) => ({ stdout, stderr, truncated })) })
+  for (const scripted of real) {
+    const result = await fake.run(spec(f)).result
+    assert.ok(result.stdout === scripted.stdout && result.stderr === scripted.stderr, 'the fake did not return the scripted streams')
+    assert.equal(result.truncated, scripted.truncated)
+  }
+})
+
+test("a spawn error's message reaches stderr, through the same capture", async (t) => {
+  const f = fixture(t)
+  const d = driverFor(f)
+  const running = d.driver.run(spec(f))
+  // A configured docker binary under a home whose name is not ASCII: the
+  // message is a string, not pipe bytes, and must be encoded as UTF-8 to come
+  // back as it was.
+  d.child.fail(new Error('spawn /Users/josé/bin/docker ENOENT'))
+  const result = await running.result
+  assert.equal(result.stderr, 'spawn /Users/josé/bin/docker ENOENT')
+  assert.equal(result.exitCode, null)
+  assert.equal(result.truncated, false)
 })
 
 test('a container name without the kernel prefix is refused', (t) => {

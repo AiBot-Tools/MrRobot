@@ -260,17 +260,21 @@ const SandboxDomain = z
     // A plain name: docker reads `name=host` as host (sandbox/limits.ts), and
     // probe() would inspect a network of that literal name. Nor one docker
     // keeps for itself: host, bridge and default are never internal, and
-    // probe() could only advise recreating one, which docker refuses. The
-    // run-args audit refuses all of these again, with container:<id>. `none`
-    // passes.
+    // docker refuses to recreate one --internal. Nor any of those in another
+    // case: a plain HOST names a network of that name, but docker's key=value
+    // spelling lower-cases (name=HOST is host). probe() refuses every such
+    // name without inspecting it, and the run-args audit refuses each run on
+    // one, with container:<id>; this refuses them earlier, so that no kernel
+    // boots on a domain whose every run would be refused. `none` passes.
     network: z.string().refine(isNetworkName, {
       message:
         'a sandbox domain network must be a plain network name (a letter or digit, then letters, digits, _, . or -): ' +
         'docker reads a value holding = as key=value fields, whose name= can be host',
     }).refine((value) => !isDockerNetworkMode(value), {
       message:
-        'a sandbox domain network may not be host, bridge or default, in any case: docker keeps those names for ' +
-        'networks of its own, none of them internal, and refuses to recreate one --internal',
+        'a sandbox domain network may not be host, bridge or default, nor any of them in another case: docker keeps ' +
+        'those names for networks of its own, none of them internal, and refuses to recreate one --internal; a plain ' +
+        "HOST names a separate network called HOST, but docker's key=value spelling lower-cases (name=HOST is host)",
     }),
     // Absolute, a ~ path, or RELATIVE TO THE REPOSITORY ROOT (resolved in
     // parseKernelConfig) — never relative to whatever directory the daemon

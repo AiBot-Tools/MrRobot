@@ -478,11 +478,16 @@ export function parseTap(stdout: string): { failing: string[]; passing: string[]
   return { failing, passing }
 }
 
-/** The real test process: node:test under tsx, in its own process group. */
+/**
+ * The real test process: node:test under tsx, in its own process group, with
+ * gc exposed as npm test exposes it (package.json), so that the one test which
+ * measures memory (sandbox-docker.test.ts) need not rely on V8 honouring the
+ * flag set at runtime.
+ */
 export function nodeTestRunner(root: string, extraEnv: Readonly<Record<string, string>> = {}): RunTests {
   return (tests, timeoutMs) =>
     new Promise((resolve) => {
-      const child = spawn(process.execPath, ['--import', 'tsx', '--test', '--test-reporter=tap', ...tests], {
+      const child = spawn(process.execPath, ['--expose-gc', '--import', 'tsx', '--test', '--test-reporter=tap', ...tests], {
         cwd: root,
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],

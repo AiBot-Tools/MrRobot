@@ -46,9 +46,10 @@ const execFileAsync = promisify(execFile)
 import { ConfigError } from '../errors.js'
 import { homeDirectory, realpathNearest } from '../agents/protected.js'
 import { confineWorkspace } from './confine.js'
-import { isCpus, isNetworkName, isPidsLimit, isUnprivilegedUser, memoryBytes } from './limits.js'
+import { isCpus, isDockerNetworkMode, isNetworkName, isPidsLimit, isUnprivilegedUser, memoryBytes } from './limits.js'
 import {
   CAPTURE_MAX_BYTES,
+  CONTAINER_PREFIX,
   type ProbeResult,
   type RunningSandbox,
   type SandboxDomain,
@@ -57,8 +58,9 @@ import {
   type SandboxSpec,
 } from './driver.js'
 
-/** Prefix for every container the kernel creates, so orphans are findable. */
-export const CONTAINER_PREFIX = 'aos-run-'
+// The prefix every kernel container's name carries: the interface's rule
+// (driver.ts), re-exported for the callers that build names for this driver.
+export { CONTAINER_PREFIX }
 
 /** Every domain, each its own VM with its own daemon. */
 const DOMAINS: readonly SandboxDomain[] = ['trusted', 'hostile']
@@ -139,12 +141,20 @@ const SHORT_OPTIONS: ReadonlyMap<string, readonly [long: string, takesValue: boo
  */
 type Widens = (value: string | undefined, inline: boolean) => string | undefined
 
-/** --pid, --ipc, --uts, --cgroupns, --userns: `host`, or `container:<id>`. */
-function sharesNamespace(what: string): Widens {
+/**
+ * --pid, --ipc, --uts, --cgroupns, --userns, as docker reads them, which is
+ * case-sensitively (PidMode.IsHost is n == "host"): `host` for each, and
+ * `container:<id>` for the two that have a container mode, --pid and --ipc.
+ * --uts, --cgroupns and --userns have none, and docker refuses one. Any other
+ * value (`HOST`, `Container:<id>`, a `container:<id>` for --uts) is no mode
+ * docker reads, so it widens nothing and is left to RUN_OPTIONS, which
+ * refuses it as an option the builder never emits.
+ */
+function sharesNamespace(what: string, joinsContainers: boolean): Widens {
   return (value) => {
-    const v = (value ?? '').toLowerCase()
+    const v = value ?? ''
     if (v === 'host') return `shares the VM's ${what} namespace with the container`
-    if (v.startsWith('container:')) return `shares another container's ${what} namespace with this one`
+    if (joinsContainers && v.startsWith('container:')) return `shares another container's ${what} namespace with this one`
     return undefined
   }
 }
@@ -155,12 +165,24 @@ function sharesNamespace(what: string): Widens {
  * default), none of them internal, and any value that is not a plain network
  * name (sandbox/limits.ts), which its CLI may read as key=value fields whose
  * `name=` can say host. `none` is a plain name and no network at all.
+ *
+ * Docker compares the plain mode names case-sensitively (NetworkMode.IsHost is
+ * n == "host"), so a plain `HOST` names a network called HOST. Only the
+ * key=value spelling is lower-cased, and `name=HOST` is host. So host, bridge
+ * and default are refused in any case, and the reason a case variant gets says
+ * that, not that it is the mode.
  */
 function networkMode(value: string): string | undefined {
+  if (value === 'host') return "puts the container on the VM's own network stack, which reaches the Mac at 192.168.5.2"
+  if (value.startsWith('container:')) return "puts the container in another container's network namespace"
+  if (value === 'bridge' || value === 'default') return "puts the container on docker's default bridge, which has a route off the VM"
   const v = value.toLowerCase()
-  if (v === 'host') return "puts the container on the VM's own network stack, which reaches the Mac at 192.168.5.2"
-  if (v.startsWith('container:')) return "puts the container in another container's network namespace"
-  if (v === 'bridge' || v === 'default') return "puts the container on docker's default bridge, which has a route off the VM"
+  if (isDockerNetworkMode(v)) {
+    return (
+      `spells ${v} in another case, which docker reads as a network of that name, but docker's key=value ` +
+      `spelling lower-cases (name=${value} is ${v}), so no case of ${v} is admitted`
+    )
+  }
   if (!isNetworkName(value)) {
     return (
       'names no plain network (a letter or digit, then letters, digits, _, . or -), and docker reads a value ' +
@@ -171,38 +193,88 @@ function networkMode(value: string): string | undefined {
 }
 
 /**
+ * What Go's strconv.ParseBool reads as true, and as false, exactly as it
+ * spells them: docker's flag parser (pflag) reads a boolean flag's value with
+ * it, and its daemon a --security-opt boolean. Any other spelling (`fALSE`,
+ * `yes`) is one ParseBool refuses, and so docker.
+ */
+const PARSE_BOOL_TRUE: readonly string[] = ['1', 't', 'T', 'TRUE', 'true', 'True']
+const PARSE_BOOL_FALSE: readonly string[] = ['0', 'f', 'F', 'FALSE', 'false', 'False']
+
+/**
+ * The --security-opt keys docker reads (docker CLI and daemon 29), spelled as
+ * it spells them: it compares a key case-sensitively, so `SECCOMP` is none.
+ */
+const SECURITY_KEYS: readonly string[] = ['no-new-privileges', 'seccomp', 'apparmor', 'label', 'writable-cgroups', 'systempaths']
+
+/**
  * --security-opt, read as docker's CLI reads it: split at the first `=`, or
- * at the first `:` in the older spelling. The builder sets no-new-privileges
- * and nothing else, so every other key takes a confinement away or replaces
- * it — and `seccomp=<file>` has the CLI read that file on the Mac and send it
- * as the filter.
+ * at the first `:` in the older spelling, and compared case-sensitively, key
+ * and value. The builder sets no-new-privileges and nothing else, so every
+ * other key takes a confinement away or replaces it — and `seccomp=<file>`
+ * has the CLI read that file on the Mac and send it as the filter. That is
+ * what `seccomp=UNCONFINED` and `seccomp=BUILTIN` do, since the CLI takes only
+ * `unconfined` and `builtin`, as spelled, for profiles of docker's own; and a
+ * profile name is case-sensitive, so `apparmor=UNCONFINED` names an AppArmor
+ * profile of its own, as `apparmor=DOCKER-DEFAULT` does. `seccomp=builtin`
+ * replaces too: the daemon then applies docker's built-in profile in place of
+ * the one it was configured with (daemon.json's seccomp-profile), which may be
+ * stricter. scripts/colima-up.sh configures no daemon profile, so on the VMs
+ * it starts this changes nothing; it is named all the same, since the
+ * daemon's configuration is not this file's to know.
+ *
+ * What takes nothing away is left to RUN_OPTIONS, which refuses it as an
+ * option the builder never emits. no-new-privileges and writable-cgroups are
+ * ParseBool booleans: no-new-privileges is turned off only by a value it reads
+ * as false, and the cgroups made writable only by one it reads as true; any
+ * other value keeps the default, or is one docker refuses.
+ * `apparmor=docker-default` names docker's own default profile, the one it
+ * applies anyway: AppArmor has no daemon-level profile for it to replace.
+ * Only `systempaths=unconfined`, as spelled, unmasks /proc and /sys: the CLI
+ * acts on that string alone and sends any other systempaths on to the daemon,
+ * which reads no such key. And one of these keys in another case is no key
+ * docker reads, which it refuses.
+ *
+ * A key outside them is refused by name all the same, over-named on purpose:
+ * docker 29 refuses it, but a later docker may read it, and this list must
+ * hold if RUN_OPTIONS ever admits a --security-opt beyond the builder's.
  */
 function unconfines(value: string | undefined): string | undefined {
   const opt = value ?? ''
   let at = opt.indexOf('=')
   if (at === -1 && opt !== 'no-new-privileges') at = opt.indexOf(':')
-  const key = (at === -1 ? opt : opt.slice(0, at)).toLowerCase()
-  const v = at === -1 ? '' : opt.slice(at + 1).toLowerCase()
-  if (key === 'no-new-privileges') return v === '' || v === 'true' ? undefined : 'turns no-new-privileges off'
-  const unconfined = v === 'unconfined'
-  if (key === 'seccomp') return unconfined ? 'removes the seccomp filter' : 'replaces the default seccomp filter'
-  if (key === 'apparmor') return unconfined ? 'removes the AppArmor profile' : 'replaces the default AppArmor profile'
-  if (key === 'systempaths') return 'unmasks the /proc and /sys paths docker hides'
-  if (key === 'label') return 'changes or disables the SELinux labels'
+  const key = at === -1 ? opt : opt.slice(0, at)
+  const v = at === -1 ? '' : opt.slice(at + 1)
+  switch (key) {
+    case 'no-new-privileges':
+      return PARSE_BOOL_FALSE.includes(v) ? 'turns no-new-privileges off' : undefined
+    case 'seccomp':
+      if (v === 'unconfined') return 'removes the seccomp filter'
+      if (v === 'builtin') return "replaces the daemon's own seccomp profile, if it was configured with one, with docker's built-in one"
+      return 'replaces the default seccomp filter'
+    case 'apparmor':
+      if (v === 'unconfined') return 'removes the AppArmor profile'
+      return v === 'docker-default' ? undefined : 'replaces the default AppArmor profile'
+    case 'label':
+      return 'changes or disables the SELinux labels'
+    case 'writable-cgroups':
+      return PARSE_BOOL_TRUE.includes(v) ? "makes the container's cgroup filesystem writable" : undefined
+    case 'systempaths':
+      return opt === 'systempaths=unconfined' ? 'unmasks the /proc and /sys paths docker hides' : undefined
+  }
+  if (SECURITY_KEYS.includes(key.toLowerCase())) return undefined
   return 'sets a security option the builder never sets'
 }
 
 /**
  * --read-only, a boolean. Docker's flag parser (pflag) gives a boolean a value
  * only in its own element, `--read-only=<v>`, and reads it with Go's
- * strconv.ParseBool, for which 0, f and false (in upper or title case too) are
- * off. A value it cannot read is refused by docker, and by RUN_OPTIONS.
+ * strconv.ParseBool: only a value it reads as false makes the root writable.
+ * A value it cannot read (`fALSE`) is refused by docker, and by RUN_OPTIONS.
  */
 function writableRoot(value: string | undefined, inline: boolean): string | undefined {
   if (!inline) return undefined
-  return ['0', 'f', 'false'].includes((value ?? '').toLowerCase())
-    ? "makes the container's root filesystem writable"
-    : undefined
+  return PARSE_BOOL_FALSE.includes(value ?? '') ? "makes the container's root filesystem writable" : undefined
 }
 
 /**
@@ -244,11 +316,11 @@ const WIDENING: ReadonlyMap<string, string | Widens> = new Map<string, string | 
   ['--publish', 'publishes a container port on the VM'],
   ['--link', "joins another container's network and copies its environment into this one"],
   ['--tty', "allocates a pseudo-terminal, which merges the container's stderr into its stdout and rewrites its bytes"],
-  ['--ipc', sharesNamespace('IPC')],
-  ['--uts', sharesNamespace('UTS')],
-  ['--cgroupns', sharesNamespace('cgroup')],
-  ['--pid', sharesNamespace('PID')],
-  ['--userns', sharesNamespace('user')],
+  ['--ipc', sharesNamespace('IPC', true)],
+  ['--uts', sharesNamespace('UTS', false)],
+  ['--cgroupns', sharesNamespace('cgroup', false)],
+  ['--pid', sharesNamespace('PID', true)],
+  ['--userns', sharesNamespace('user', false)],
   ['--security-opt', unconfines],
   ['--volumes-from', 'mounts every volume another container has'],
   ['--volume', 'binds a path or a volume beside the one workspace mount'],
@@ -427,6 +499,20 @@ export function buildRunArgs(input: BuildArgsInput): string[] {
  * introduced anywhere above, including in `spec.command`.
  */
 export function auditRunArgs(args: readonly string[], home: string, workspace: string, network: string): void {
+  // The builder writes the domain's network into its own --network. A domain
+  // that names a network docker reads as no network of that name (host,
+  // bridge, `name=host`), or any other value a domain may not name, is refused
+  // first, as the domain's: every check below would refuse one too, but as
+  // what it reads like in the argv (a --privileged, a second mount, an option
+  // the builder never emits) rather than as the config that put it there.
+  const domainMode = networkMode(network)
+  if (domainMode !== undefined) {
+    throw new ConfigError(
+      `the domain network ${JSON.stringify(network)} is not one a domain may name: as --network it ` +
+        `${domainMode}; invariant 9 needs the domain's own internal network`,
+    )
+  }
+
   for (const arg of args) {
     for (const bad of FORBIDDEN_FLAGS) {
       if (arg === bad || arg.startsWith(`${bad}=`)) {
@@ -501,17 +587,6 @@ export function auditRunArgs(args: readonly string[], home: string, workspace: s
   if (args[0] !== 'run') {
     throw new ConfigError(`docker args must start with run (found ${JSON.stringify(args[0] ?? '')})`)
   }
-  // The builder writes the domain's network into its own --network. A domain
-  // that names a network docker reads as no network of that name (host,
-  // bridge, `name=host`) is refused here, as the domain's: the walk below
-  // would refuse it too, but as an option the builder never emits.
-  const domainMode = networkMode(network)
-  if (domainMode !== undefined) {
-    throw new ConfigError(
-      `the domain network ${JSON.stringify(network)} is not a network docker reads by that name: as --network it ` +
-        `${domainMode}; invariant 9 needs the domain's own internal network`,
-    )
-  }
   const seen = new Map<string, number>()
   const values = new Map<string, string>()
   let mount: string | undefined
@@ -563,10 +638,11 @@ export function auditRunArgs(args: readonly string[], home: string, workspace: s
  * so a container put on any other is on a network nobody checked.
  *
  * What docker makes of the value is not judged here: auditRunArgs has
- * already refused a domain network of host, container:<id>, bridge, default
- * or anything but a plain network name, and WIDENING's --network rule has
- * refused the same in every --network before the image, whatever the domain
- * says. This holds the value that is left to the one network it must be.
+ * already refused a domain network of host, bridge or default in any case,
+ * container:<id>, or anything but a plain network name, and WIDENING's
+ * --network rule has refused the same in every --network before the image,
+ * whatever the domain says. This holds the value that is left to the one
+ * network it must be.
  */
 function assertTheNetwork(value: string, network: string): void {
   if (value !== network) {
@@ -779,7 +855,10 @@ function declaredLength(lead: number): number {
 /** A run this driver is holding, by name. */
 interface Held {
   readonly domain: SandboxDomain
-  /** Mark the run as ended by kill(name), unless its wallclock already fired. */
+  /**
+   * Mark the run as one kill(name) was sent for, unless its wallclock already
+   * fired. Whether that kill ended it is the CLI's exit to say (run()).
+   */
   requested(): void
 }
 
@@ -844,15 +923,17 @@ export class DockerDriver implements SandboxDriver {
       // A name docker keeps for a network of its own (host, bridge, default),
       // or reads as more than a name, is not a network `inspect` can vouch
       // for, and docker refuses to remove or create the predefined ones, so
-      // the advice below would be a command that cannot run. kernel.yaml
-      // refuses these names; a driver handed its domains by another path
-      // meets this.
+      // the advice below would be a command that cannot run. Any other name
+      // the audit refuses as a domain's (auditRunArgs), a case variant of
+      // those among them, is refused here too, without inspecting it.
+      // kernel.yaml refuses these names; a driver handed its domains by
+      // another path meets this.
       const notByName = networkMode(network)
       if (notByName !== undefined) {
         return {
           ok: false,
           why:
-            `${domain}: network ${JSON.stringify(network)} is not a network docker reads by that name: as --network it ` +
+            `${domain}: network ${JSON.stringify(network)} is not one a domain may name: as --network it ` +
             `${notByName}. Name the domain's own internal network in kernel.yaml ` +
             `(docker network create --internal aos-${domain})`,
         }
@@ -908,7 +989,10 @@ export class DockerDriver implements SandboxDriver {
     const startedAt = Date.now()
     const stdout = new Capture()
     const stderr = new Capture()
-    let killedBy: SandboxResult['killedBy'] | undefined
+    /** Who sent a kill: whether it ended the run is the CLI's exit to say (finish). */
+    let killSentBy: SandboxResult['killedBy'] | undefined
+    /** The wallclock fired, whatever its kill then did. */
+    let overran = false
     let settled = false
 
     const child = this.#options.spawn(this.#binary, args, { env: this.#env(spec.domain) })
@@ -919,7 +1003,7 @@ export class DockerDriver implements SandboxDriver {
     this.#running.set(spec.name, {
       domain: spec.domain,
       requested: () => {
-        killedBy ??= 'requested'
+        killSentBy ??= 'requested'
       },
     })
     // Bounded, and drained past the bound: see Capture.
@@ -944,9 +1028,14 @@ export class DockerDriver implements SandboxDriver {
       // expected to leave its container running (the kill-by-name row of
       // docs/plan/phase-0-bootstrap.md; README, "Still needs validation"). The
       // deadline should stay armed until a kill by name succeeds or the daemon
-      // says the container is gone.
+      // says the container is gone. Until then, a wallclock kill that ends
+      // nothing (it reached no daemon, and the container later exited on its
+      // own) leaves the result no killedBy (finish, below): `overran` is then
+      // the only trace of the breach, and W1 must log the run from it, not
+      // from killedBy.
       const timer = setTimeout(() => {
-        killedBy = 'wallclock'
+        killSentBy = 'wallclock'
+        overran = true
         void this.#killOn(spec.name, spec.domain)
       }, spec.limits.wallclockMs)
       timer.unref?.()
@@ -957,11 +1046,34 @@ export class DockerDriver implements SandboxDriver {
         clearTimeout(timer)
         // Duplicates are refused while this entry stands, so it is this run's.
         this.#running.delete(spec.name)
+        // A kill the kernel sent ended the run only when the CLI's exit shows
+        // one, and the CLI exits 137 when its container is killed: the kernel
+        // sends only KILL, so a 143 (a container SIGTERMed) is never its kill.
+        // A CLI that dies by a signal shows nothing of its container: it
+        // forwards every signal it can catch to the container (sig-proxy) and
+        // exits with the container's status, so one that dies by a signal met
+        // one it cannot catch, a SIGKILL from outside, or one that came before
+        // it had installed its handlers, and its container is expected to run
+        // on (the wallclock note above). It reports that signal, and no
+        // killedBy. Any other exit means the kill ended nothing: it reached no
+        // daemon, or landed after the container had exited on its own, and
+        // the run reports that exit, as the fake does for a script whose kill
+        // ends nothing (ignoresKill); so does a spawn that started no process
+        // ('error' below), even after a kill. A run the kernel did end says
+        // so, with SIGKILL, and credits the last kill sent before it ended: a
+        // wallclock that fires after a requested kill reached no daemon is the
+        // one whose kill a 137 shows. (A 137 the container came to by another
+        // route, the OOM killer, after a kill that reached no daemon, is
+        // credited to the kill: the CLI's exit cannot tell the two apart; the
+        // fake refuses to script one, ignoresKill with exitCode 137.) A 137
+        // with no kill sent is the run's own, and reports no killedBy.
+        const endedBy = exitCode === 137 ? killSentBy : undefined
         resolve({
           name: spec.name,
           exitCode,
-          signal: signal === 'SIGKILL' || signal === 'SIGTERM' ? signal : null,
-          ...(killedBy === undefined ? {} : { killedBy }),
+          signal: endedBy !== undefined ? 'SIGKILL' : signal === 'SIGKILL' || signal === 'SIGTERM' ? signal : null,
+          ...(endedBy === undefined ? {} : { killedBy: endedBy }),
+          ...(overran ? { overran: true as const } : {}),
           stdout: stdout.text(),
           stderr: stderr.text(),
           truncated: stdout.truncated || stderr.truncated,
@@ -970,9 +1082,7 @@ export class DockerDriver implements SandboxDriver {
       }
 
       child.on('close', (code, signal) => {
-        // The CLI exits 137 rather than by signal when its container is
-        // killed; the kernel knows it sent KILL, so it says so.
-        finish(code, killedBy === undefined ? signal : 'SIGKILL')
+        finish(code, signal)
       })
       child.on('error', (error) => {
         stderr.add(error.message)
@@ -994,10 +1104,20 @@ export class DockerDriver implements SandboxDriver {
    * that lacks the name costs one "No such container". Both attempts start at
    * once, so a daemon that never answers cannot hold up the other VM's kill.
    *
-   * A run it holds reports `killedBy: 'requested'` and SIGKILL, as the fake
-   * driver does, unless its wallclock had already fired.
+   * A run it holds and ends reports `killedBy: 'requested'` and SIGKILL, with
+   * the CLI's 137, as the fake driver does, unless its wallclock fired before
+   * the run ended.
+   * One the kill does not end (see finish() in run()) reports its own exit.
+   * It resolves once the `docker kill` has returned, before the CLI closes,
+   * so the name is still held then; the run's result says when it ended.
+   *
+   * A name without CONTAINER_PREFIX is no container of the kernel's: run()
+   * refuses one, so this driver never started it, and sweepOrphans skips one
+   * a daemon lists. A kill of it is sent nowhere, which keeps the contract
+   * (not an error) without reaching someone else's container on either VM.
    */
   async kill(name: string): Promise<void> {
+    if (!name.startsWith(CONTAINER_PREFIX)) return
     const held = this.#running.get(name)
     held?.requested()
     const domains = held === undefined ? DOMAINS : [held.domain]
@@ -1028,29 +1148,45 @@ export class DockerDriver implements SandboxDriver {
    * a workspace and a CPU, and nothing else will ever reap it. Nothing calls
    * it yet — boot only probes the driver, and no run starts a container — so
    * the boot sweep lands with the run wire-up (plan W2).
+   *
+   * Every domain is listed at once, as kill() asks every domain at once: a
+   * daemon that accepts the connection and never answers `ps` (no execFile
+   * timeout stands behind it) must not stop the other VM being listed and
+   * swept. The names are those of the trusted VM, then the hostile one's.
    */
   async sweepOrphans(): Promise<string[]> {
-    const killed: string[] = []
-    for (const domain of DOMAINS) {
-      let stdout = ''
-      try {
-        ;({ stdout } = await this.#options.execFile(
-          this.#binary,
-          ['ps', '--quiet', '--no-trunc', '--filter', `name=${CONTAINER_PREFIX}`, '--format', '{{.Names}}'],
-          { env: this.#env(domain) },
-        ))
-      } catch {
-        continue
-      }
-      for (const name of stdout.split('\n').map((s) => s.trim()).filter((s) => s !== '')) {
-        // Only ours. A filter is a request, not a guarantee.
-        if (!name.startsWith(CONTAINER_PREFIX)) continue
-        // On the daemon that listed it, which is the one that holds it.
-        await this.#killOn(name, domain)
-        killed.push(name)
-      }
+    const swept = await Promise.all(DOMAINS.map((domain) => this.#sweepOn(domain)))
+    return swept.flat()
+  }
+
+  /**
+   * List one domain's orphans, then kill them all on it at once.
+   *
+   * By name, so never with `--quiet`: the docker CLI ignores a custom
+   * `--format` when `--quiet` is set ("WARNING: Ignoring custom format,
+   * because both --format and --quiet are set.") and prints container IDs,
+   * which the prefix check below drops every one of, and the sweep would
+   * kill nothing. Nor `--no-trunc`: it is for IDs and commands, and a name is
+   * never cut short without it; on names it only adds a linked container's
+   * legacy `--link` aliases, comma-joined, to the one name wanted.
+   */
+  async #sweepOn(domain: SandboxDomain): Promise<string[]> {
+    let stdout: string
+    try {
+      ;({ stdout } = await this.#options.execFile(
+        this.#binary,
+        ['ps', '--filter', `name=${CONTAINER_PREFIX}`, '--format', '{{.Names}}'],
+        { env: this.#env(domain) },
+      ))
+    } catch {
+      return []
     }
-    return killed
+    // Only ours. A filter is a request, not a guarantee.
+    const names = stdout.split('\n').map((s) => s.trim()).filter((s) => s.startsWith(CONTAINER_PREFIX))
+    // On the daemon that listed each, which is the one that holds it, and all
+    // at once, so that one kill which never returns holds up no other.
+    await Promise.all(names.map((name) => this.#killOn(name, domain)))
+    return names
   }
 }
 

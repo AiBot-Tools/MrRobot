@@ -66,9 +66,21 @@ export function isNetworkName(value: string): boolean {
  * The plain names docker keeps for networks of its own: `host`, the VM's own
  * network stack, and `bridge` and `default`, its default bridge, which has a
  * route off the VM. None is internal, and docker refuses to remove or create
- * a predefined network, so none can be made a domain's. Compared without
- * regard to case, as the run-args audit (docker.ts) compares them. `none`,
- * docker's name for no network at all, is left to the caller.
+ * a predefined network, so none can be made a domain's.
+ *
+ * Compared without regard to case, as the run-args audit (docker.ts) compares
+ * them, though docker does not: it reads a plain mode name case-sensitively
+ * (NetworkMode.IsHost is n == "host"), so a plain `HOST` names a network of
+ * that name. Its key=value spelling lower-cases, and `name=HOST` is host, so
+ * no case of these is admitted.
+ *
+ * Two more are predefined in moby (IsPreDefinedNetwork) and left out here:
+ * `none`, docker's name for no network at all, which the egress plan's S1
+ * moves every worker onto (and which probe() should then not inspect for
+ * Internal, since there is no network to inspect), and `ingress`, swarm's
+ * routing mesh, which exists only on a swarm node. probe() still inspects a
+ * domain that names either, and its advice for one would be a command docker
+ * refuses; that is S1's to settle, or the operator's.
  */
 export function isDockerNetworkMode(value: string): boolean {
   return ['host', 'bridge', 'default'].includes(value.toLowerCase())

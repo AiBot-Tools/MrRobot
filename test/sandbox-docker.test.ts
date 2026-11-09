@@ -24,7 +24,22 @@
 //   Send a kill to any socket but the one whose daemon holds the container
 //   and the answer is "No such container", swallowed as the normal race: the
 //   run outlives its hard wallclock and nobody is told. Ask the VMs one after
-//   the other and a daemon that never answers stops the other's kill.
+//   the other, to kill or to list orphans, and a daemon that never answers
+//   stops the other's kill. Send a kill for a name without the kernel's
+//   prefix and it reaches someone else's container, on both VMs. Report a run
+//   killed because a kill was sent, rather than because its exit shows one,
+//   and a run that exited 0 on its own reads as killed; credit a 137 to the
+//   first kill sent rather than the last, and a run the wallclock ended reads
+//   as ended by a requested kill that reached no daemon; credit a 137 when no
+//   kill was sent and the OOM killer's reads as an operator kill. Resolve a
+//   sweep before its kills return and the boot sweep calls containers still
+//   running swept; list orphans with --quiet and docker prints IDs for names,
+//   and the sweep kills none. Let the fake end a killed run before kill()
+//   returns, or never end one with its own exit, and runtime code tested
+//   against it meets neither the held name nor the kill that ends nothing the
+//   real driver gives it; let it report a killed run with no output, a null
+//   exit code, or a post-kill 137 with no killedBy, and that code meets a
+//   result docker never gives.
 //   Write a workspace path holding a comma into --mount, or read that value
 //   other than as docker's CSV, and a second source= mounts what it names.
 //   Let the image slot hold an option, in any spelling, and docker obeys it.
@@ -330,12 +345,28 @@ test('the audit reads the --mount value as docker does and admits only type=bind
     `type=bind,source=/etc,target=${WORKSPACE_TARGET}`,
     `type=bind,source=${ws},target=/etc`,
     `type=bind,source=${ws}`,
-    `type=bind,"source=${ws},x",target=${WORKSPACE_TARGET}`, // a quoted field may hold a comma
-    `type=bind,source=${ws},target=${WORKSPACE_TARGET}\nsource=/etc`, // a line break ends the record
+    // A quoted field may hold a comma, and a line break ends the record. Both
+    // are refused by the field checks too, as a split here leaves a field
+    // that is no key=value or names no workspace; the two after this list are
+    // the cases only the quoting check refuses.
+    `type=bind,"source=${ws},x",target=${WORKSPACE_TARGET}`,
+    `type=bind,source=${ws},target=${WORKSPACE_TARGET}\nsource=/etc`,
     '',
   ]
   for (const value of bad) {
     assert.throws(() => auditRunArgs(withMount(value), home, ws, f.domain.network), ConfigError, JSON.stringify(value))
+  }
+  // A workspace that itself holds a double quote or a line break, written into
+  // the value as the builder writes it, splits at its commas into exactly the
+  // three fields wanted. The builder refuses such a workspace (MOUNT_STRUCTURE);
+  // the audit is handed it here directly, and refuses it on its own terms,
+  // because docker's CSV reader would not read that value as this split does.
+  for (const quoted of ['/w/a"b', '/w/a\nb']) {
+    assert.throws(
+      () => auditRunArgs(withMount(`type=bind,source=${quoted},target=${WORKSPACE_TARGET}`), home, quoted, f.domain.network),
+      /holds a double quote or a control character, so docker would not split it at its commas/,
+      JSON.stringify(quoted),
+    )
   }
   // And the case a template comparison misses: the workspace carries the tail.
   const tail = `${ws},source=/etc`
@@ -402,6 +433,12 @@ test('the image slot cannot carry a docker option: everything before the image i
     )
   }
   assert.throws(() => auditRunArgs(args.slice(0, args.indexOf('aos/worker:0.0.1')), home, f.realWorkspace, f.domain.network), /name no image/)
+  // And the argv is a `docker run`: the walk starts after it, and `create`
+  // (or any other command) would be judged as though it were run.
+  assert.throws(
+    () => auditRunArgs(['create', ...args.slice(1)], home, f.realWorkspace, f.domain.network),
+    /docker args must start with run \(found "create"\)/,
+  )
 })
 
 test('the audit refuses every env, publish, tty, extra-host, dns, namespace-widening and unconfined flag, and a second or unexpected --network', (t) => {
@@ -410,152 +447,303 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
   // the command supplies the value and then an image. RUN_OPTIONS refuses all
   // of them already; each row asserts the refusal that NAMES what the option
   // widens, which is the one still standing when an edit widens RUN_OPTIONS
-  // and the builder together.
+  // and the builder together, and the reason it gives: a refusal that named
+  // the option but gave another's reason, or a wrong one, would still refuse,
+  // and send the operator after the wrong widening.
   const f = fixture(t)
   const home = join(f.root, 'home')
-  const named =
-    (option: string) =>
+  const named = (option: string, reason: RegExp) => (e: unknown): boolean => {
+    const before = `docker args carry ${option} before the image, which the builder never emits, and docker would obey it: it `
+    const after = ', which invariant 9 refuses in any spelling'
+    return (
+      e instanceof ConfigError &&
+      e.message.startsWith(before) &&
+      e.message.endsWith(after) &&
+      reason.test(e.message.slice(before.length, -after.length))
+    )
+  }
+  /** The refusal of an option the builder never emits, naming nothing it widens. */
+  const unnamed =
+    (arg: string) =>
     (e: unknown): boolean =>
       e instanceof ConfigError &&
-      e.message.startsWith(`docker args carry ${option} before the image, which the builder never emits, and docker would obey it: it `) &&
-      e.message.endsWith(', which invariant 9 refuses in any spelling')
+      e.message === `docker args carry ${JSON.stringify(arg)} before the image, which the builder never emits, and docker would obey it`
 
-  const rows: readonly (readonly [image: string, command: readonly string[], named: string])[] = [
+  const ENV = /^sets variables in the container's environment, where no credential may be \(invariant 2\)/
+  const PUBLISH = /^publishes a container port on the VM/
+  const TTY = /^allocates a pseudo-terminal/
+  const DETACH = /^returns as soon as the container starts/
+  const HOSTS = /^writes a name into the container's \/etc\/hosts/
+  const DNS = /^sets the container's resolver configuration/
+  const HOST_NETWORK = /^puts the container on the VM's own network stack, which reaches the Mac at 192\.168\.5\.2/
+  const BRIDGE = /^puts the container on docker's default bridge, which has a route off the VM/
+  const NOT_PLAIN = /^names no plain network \(a letter or digit/
+  const vmNamespace = (what: string): RegExp => new RegExp(`^shares the VM's ${what} namespace with the container`)
+  const theirNamespace = (what: string): RegExp => new RegExp(`^shares another container's ${what} namespace with this one`)
+  const SECCOMP_OFF = /^removes the seccomp filter/
+  const SECCOMP_REPLACED = /^replaces the default seccomp filter/
+  const SECCOMP_BUILTIN = /^replaces the daemon's own seccomp profile, if it was configured with one, with docker's built-in one/
+  const APPARMOR_OFF = /^removes the AppArmor profile/
+  const APPARMOR_REPLACED = /^replaces the default AppArmor profile/
+  const NNP_OFF = /^turns no-new-privileges off/
+  const OTHER_SECURITY = /^sets a security option the builder never sets/
+  const VOLUME = /^binds a path or a volume beside the one workspace mount/
+  const GROUP = /^gives the container's user a supplementary group/
+  const LOG_DRIVER = /^has the VM's dockerd ship the container's output through a driver the builder never chose/
+  const LOG_OPT = /^configures the container's log driver/
+  const WRITABLE = /^makes the container's root filesystem writable/
+  const CGROUPS = /^makes the container's cgroup filesystem writable/
+
+  const rows: readonly (readonly [image: string, command: readonly string[], named: string, reason: RegExp])[] = [
     // The environment: no credential is ever put there (invariant 2), and
     // --env-file has the CLI read a file on the Mac, .env included.
-    ['-e', ['ANTHROPIC_API_KEY', 'alpine'], '-e (--env)'],
-    ['-eANTHROPIC_API_KEY', ['alpine'], '-e (--env)'],
-    ['-e=ANTHROPIC_API_KEY', ['alpine'], '-e (--env)'],
-    ['-ie', ['ANTHROPIC_API_KEY', 'alpine'], '-e (--env)'],
-    ['--env', ['ANTHROPIC_API_KEY', 'alpine'], '--env'],
-    ['--env=ANTHROPIC_API_KEY', ['alpine'], '--env'],
-    ['--env-file', ['/Users/op/MrRobot/.env', 'alpine'], '--env-file'],
-    ['--env-file=.env', ['alpine'], '--env-file'],
+    ['-e', ['ANTHROPIC_API_KEY', 'alpine'], '-e (--env)', ENV],
+    ['-eANTHROPIC_API_KEY', ['alpine'], '-e (--env)', ENV],
+    ['-e=ANTHROPIC_API_KEY', ['alpine'], '-e (--env)', ENV],
+    ['-ie', ['ANTHROPIC_API_KEY', 'alpine'], '-e (--env)', ENV],
+    ['--env', ['ANTHROPIC_API_KEY', 'alpine'], '--env', ENV],
+    ['--env=ANTHROPIC_API_KEY', ['alpine'], '--env', ENV],
+    ['--env-file', ['/Users/op/MrRobot/.env', 'alpine'], '--env-file', ENV],
+    ['--env-file=.env', ['alpine'], '--env-file', ENV],
     // Published ports.
-    ['-p', ['8080:80', 'alpine'], '-p (--publish)'],
-    ['-p127.0.0.1:8080:80', ['alpine'], '-p (--publish)'],
-    ['-P', ['alpine'], '-P (--publish-all)'],
-    ['-iP', ['alpine'], '-P (--publish-all)'],
-    ['--publish', ['8080:80', 'alpine'], '--publish'],
-    ['--publish=8080:80', ['alpine'], '--publish'],
-    ['--publish-all', ['alpine'], '--publish-all'],
+    ['-p', ['8080:80', 'alpine'], '-p (--publish)', PUBLISH],
+    ['-p127.0.0.1:8080:80', ['alpine'], '-p (--publish)', PUBLISH],
+    ['-P', ['alpine'], '-P (--publish-all)', PUBLISH],
+    ['-iP', ['alpine'], '-P (--publish-all)', PUBLISH],
+    ['--publish', ['8080:80', 'alpine'], '--publish', PUBLISH],
+    ['--publish=8080:80', ['alpine'], '--publish', PUBLISH],
+    ['--publish-all', ['alpine'], '--publish-all', PUBLISH],
     // A terminal.
-    ['-t', ['alpine'], '-t (--tty)'],
-    ['-it', ['alpine'], '-t (--tty)'],
-    ['-ti', ['alpine'], '-t (--tty)'],
-    ['--tty', ['alpine'], '--tty'],
-    ['--tty=true', ['alpine'], '--tty'],
+    ['-t', ['alpine'], '-t (--tty)', TTY],
+    ['-it', ['alpine'], '-t (--tty)', TTY],
+    ['-ti', ['alpine'], '-t (--tty)', TTY],
+    ['--tty', ['alpine'], '--tty', TTY],
+    ['--tty=true', ['alpine'], '--tty', TTY],
     // A client that returns at once, and the hard wallclock, which lasts as
     // long as the client does, goes with it.
-    ['-d', ['alpine'], '-d (--detach)'],
-    ['-dP', ['alpine'], '-d (--detach)'],
-    ['--detach', ['alpine'], '--detach'],
-    ['--detach=true', ['alpine'], '--detach'],
+    ['-d', ['alpine'], '-d (--detach)', DETACH],
+    ['-dP', ['alpine'], '-d (--detach)', DETACH],
+    ['--detach', ['alpine'], '--detach', DETACH],
+    ['--detach=true', ['alpine'], '--detach', DETACH],
     // Names and resolvers: host.lima.internal is the Mac, where pmmcp listens.
-    ['--add-host', ['host.lima.internal:192.168.5.2', 'alpine'], '--add-host'],
-    ['--add-host=pmmcp:192.168.5.2', ['alpine'], '--add-host'],
-    ['--dns', ['192.168.5.3', 'alpine'], '--dns'],
-    ['--dns=1.1.1.1', ['alpine'], '--dns'],
-    ['--dns-search=lima.internal', ['alpine'], '--dns-search'],
-    ['--dns-option', ['ndots:0', 'alpine'], '--dns-option'],
-    ['--dns-opt=ndots:0', ['alpine'], '--dns-opt'],
-    ['--link', ['other:db', 'alpine'], '--link'],
+    ['--add-host', ['host.lima.internal:192.168.5.2', 'alpine'], '--add-host', HOSTS],
+    ['--add-host=pmmcp:192.168.5.2', ['alpine'], '--add-host', HOSTS],
+    ['--dns', ['192.168.5.3', 'alpine'], '--dns', DNS],
+    ['--dns=1.1.1.1', ['alpine'], '--dns', DNS],
+    ['--dns-search=lima.internal', ['alpine'], '--dns-search', DNS],
+    ['--dns-option', ['ndots:0', 'alpine'], '--dns-option', DNS],
+    ['--dns-opt=ndots:0', ['alpine'], '--dns-opt', DNS],
+    ['--link', ['other:db', 'alpine'], '--link', /^joins another container's network and copies its environment into this one/],
     // A second network in another spelling, and the networks docker gives a
     // meaning of its own, in every spelling.
-    ['--net', ['aos-internal', 'alpine'], '--net'],
-    ['--net=host', ['alpine'], '--net'],
-    ['--network=aos-internal', ['alpine'], '"--network=aos-internal"'],
-    ['--network=host', ['alpine'], '"--network=host"'],
-    ['--network', ['host', 'alpine'], '--network "host"'],
-    ['--network', ['HOST', 'alpine'], '--network "HOST"'],
-    ['--network', ['container:abc', 'alpine'], '--network "container:abc"'],
-    ['--network', ['bridge', 'alpine'], '--network "bridge"'],
-    ['--network=default', ['alpine'], '"--network=default"'],
-    ['--network', ['name=host', 'alpine'], '--network "name=host"'],
-    ['--network=NAME=HOST', ['alpine'], '"--network=NAME=HOST"'],
+    ['--net', ['aos-internal', 'alpine'], '--net', /^is --network under another name/],
+    ['--net=host', ['alpine'], '--net', /^is --network under another name/],
+    ['--network=aos-internal', ['alpine'], '"--network=aos-internal"', /^attaches a second network/],
+    ['--network=host', ['alpine'], '"--network=host"', HOST_NETWORK],
+    ['--network', ['host', 'alpine'], '--network "host"', HOST_NETWORK],
+    ['--network', ['container:abc', 'alpine'], '--network "container:abc"', /^puts the container in another container's network namespace/],
+    ['--network', ['bridge', 'alpine'], '--network "bridge"', BRIDGE],
+    ['--network=default', ['alpine'], '"--network=default"', BRIDGE],
+    ['--network', ['name=host', 'alpine'], '--network "name=host"', NOT_PLAIN],
+    ['--network=NAME=HOST', ['alpine'], '"--network=NAME=HOST"', NOT_PLAIN],
+    // A plain HOST is no host mode to docker, which compares mode names
+    // case-sensitively, but a network named HOST: refused in any case all the
+    // same, for the key=value spelling, which lower-cases (name=HOST is host).
+    // A Container:<id> is no container mode either, and no plain name.
+    [
+      '--network',
+      ['HOST', 'alpine'],
+      '--network "HOST"',
+      /^spells host in another case, which docker reads as a network of that name, but docker's key=value spelling lower-cases \(name=HOST is host\), so no case of host is admitted$/,
+    ],
+    ['--network=Bridge', ['alpine'], '"--network=Bridge"', /^spells bridge in another case, .*\(name=Bridge is bridge\)/],
+    ['--network', ['DEFAULT', 'alpine'], '--network "DEFAULT"', /^spells default in another case, .*\(name=DEFAULT is default\)/],
+    ['--network', ['Container:abc', 'alpine'], '--network "Container:abc"', NOT_PLAIN],
     // Namespaces shared with the VM or with another container.
-    ['--pid', ['host', 'alpine'], '--pid "host"'],
-    ['--pid=container:abc', ['alpine'], '"--pid=container:abc"'],
-    ['--ipc=host', ['alpine'], '"--ipc=host"'],
-    ['--ipc', ['container:abc', 'alpine'], '--ipc "container:abc"'],
-    ['--uts=host', ['alpine'], '"--uts=host"'],
-    ['--uts', ['host', 'alpine'], '--uts "host"'],
-    ['--cgroupns=host', ['alpine'], '"--cgroupns=host"'],
-    ['--cgroupns', ['host', 'alpine'], '--cgroupns "host"'],
-    ['--userns', ['host', 'alpine'], '--userns "host"'],
+    ['--pid', ['host', 'alpine'], '--pid "host"', vmNamespace('PID')],
+    ['--pid=container:abc', ['alpine'], '"--pid=container:abc"', theirNamespace('PID')],
+    ['--ipc=host', ['alpine'], '"--ipc=host"', vmNamespace('IPC')],
+    ['--ipc', ['container:abc', 'alpine'], '--ipc "container:abc"', theirNamespace('IPC')],
+    ['--uts=host', ['alpine'], '"--uts=host"', vmNamespace('UTS')],
+    ['--uts', ['host', 'alpine'], '--uts "host"', vmNamespace('UTS')],
+    ['--cgroupns=host', ['alpine'], '"--cgroupns=host"', vmNamespace('cgroup')],
+    ['--cgroupns', ['host', 'alpine'], '--cgroupns "host"', vmNamespace('cgroup')],
+    ['--userns', ['host', 'alpine'], '--userns "host"', vmNamespace('user')],
     // Confinements taken away, in docker's = and older : spellings, and a
     // seccomp file, which the CLI reads on the Mac and sends as the filter.
-    ['--security-opt=seccomp=unconfined', ['alpine'], '"--security-opt=seccomp=unconfined"'],
-    ['--security-opt', ['seccomp=unconfined', 'alpine'], '--security-opt "seccomp=unconfined"'],
-    ['--security-opt', ['seccomp:unconfined', 'alpine'], '--security-opt "seccomp:unconfined"'],
-    ['--security-opt', ['seccomp=/Users/op/allow-all.json', 'alpine'], '--security-opt "seccomp=/Users/op/allow-all.json"'],
-    ['--security-opt=apparmor=unconfined', ['alpine'], '"--security-opt=apparmor=unconfined"'],
-    ['--security-opt', ['apparmor:unconfined', 'alpine'], '--security-opt "apparmor:unconfined"'],
-    ['--security-opt=systempaths=unconfined', ['alpine'], '"--security-opt=systempaths=unconfined"'],
-    ['--security-opt=label=disable', ['alpine'], '"--security-opt=label=disable"'],
-    ['--security-opt', ['no-new-privileges=false', 'alpine'], '--security-opt "no-new-privileges=false"'],
-    ['--security-opt=no-new-privileges:false', ['alpine'], '"--security-opt=no-new-privileges:false"'],
+    ['--security-opt=seccomp=unconfined', ['alpine'], '"--security-opt=seccomp=unconfined"', SECCOMP_OFF],
+    ['--security-opt', ['seccomp=unconfined', 'alpine'], '--security-opt "seccomp=unconfined"', SECCOMP_OFF],
+    ['--security-opt', ['seccomp:unconfined', 'alpine'], '--security-opt "seccomp:unconfined"', SECCOMP_OFF],
+    [
+      '--security-opt',
+      ['seccomp=/Users/op/allow-all.json', 'alpine'],
+      '--security-opt "seccomp=/Users/op/allow-all.json"',
+      SECCOMP_REPLACED,
+    ],
+    // The CLI takes only unconfined and builtin, as spelled, for profiles of
+    // docker's own, and reads any other value as a file on the Mac: so
+    // UNCONFINED replaces the filter with one read from a file of that name.
+    ['--security-opt=seccomp=UNCONFINED', ['alpine'], '"--security-opt=seccomp=UNCONFINED"', SECCOMP_REPLACED],
+    ['--security-opt', ['seccomp:Unconfined', 'alpine'], '--security-opt "seccomp:Unconfined"', SECCOMP_REPLACED],
+    // And BUILTIN with one read from a file named BUILTIN.
+    ['--security-opt=seccomp=BUILTIN', ['alpine'], '"--security-opt=seccomp=BUILTIN"', SECCOMP_REPLACED],
+    ['--security-opt', ['seccomp:Builtin', 'alpine'], '--security-opt "seccomp:Builtin"', SECCOMP_REPLACED],
+    // builtin, as spelled, is docker's built-in profile, which the daemon then
+    // applies in place of any it was configured with (daemon.json's
+    // seccomp-profile), a stricter one among them.
+    ['--security-opt=seccomp=builtin', ['alpine'], '"--security-opt=seccomp=builtin"', SECCOMP_BUILTIN],
+    ['--security-opt', ['seccomp:builtin', 'alpine'], '--security-opt "seccomp:builtin"', SECCOMP_BUILTIN],
+    ['--security-opt=apparmor=unconfined', ['alpine'], '"--security-opt=apparmor=unconfined"', APPARMOR_OFF],
+    ['--security-opt', ['apparmor:unconfined', 'alpine'], '--security-opt "apparmor:unconfined"', APPARMOR_OFF],
+    [
+      '--security-opt=systempaths=unconfined',
+      ['alpine'],
+      '"--security-opt=systempaths=unconfined"',
+      /^unmasks the \/proc and \/sys paths docker hides/,
+    ],
+    ['--security-opt=label=disable', ['alpine'], '"--security-opt=label=disable"', /^changes or disables the SELinux labels/],
+    ['--security-opt', ['label:disable', 'alpine'], '--security-opt "label:disable"', /^changes or disables the SELinux labels/],
+    ['--security-opt', ['no-new-privileges=false', 'alpine'], '--security-opt "no-new-privileges=false"', NNP_OFF],
+    ['--security-opt=no-new-privileges:false', ['alpine'], '"--security-opt=no-new-privileges:false"', NNP_OFF],
     // Docker reads the value with Go's strconv.ParseBool, for which 0 and f
     // are off as much as false is.
-    ['--security-opt', ['no-new-privileges=0', 'alpine'], '--security-opt "no-new-privileges=0"'],
-    ['--security-opt=no-new-privileges=f', ['alpine'], '"--security-opt=no-new-privileges=f"'],
-    ['--security-opt=no-new-privileges=F', ['alpine'], '"--security-opt=no-new-privileges=F"'],
-    // A profile of any name replaces the default one, docker-default included.
-    ['--security-opt', ['apparmor=docker-default', 'alpine'], '--security-opt "apparmor=docker-default"'],
-    ['--security-opt=apparmor:unconfined-ish', ['alpine'], '"--security-opt=apparmor:unconfined-ish"'],
-    // Any other key, refused by name too: writable-cgroups makes the cgroup
-    // filesystem writable, and a bare disable turns the SELinux labels off.
-    ['--security-opt', ['writable-cgroups=true', 'alpine'], '--security-opt "writable-cgroups=true"'],
-    ['--security-opt=disable', ['alpine'], '"--security-opt=disable"'],
+    ['--security-opt', ['no-new-privileges=0', 'alpine'], '--security-opt "no-new-privileges=0"', NNP_OFF],
+    ['--security-opt=no-new-privileges=f', ['alpine'], '"--security-opt=no-new-privileges=f"', NNP_OFF],
+    ['--security-opt=no-new-privileges=F', ['alpine'], '"--security-opt=no-new-privileges=F"', NNP_OFF],
+    ['--security-opt=no-new-privileges=FALSE', ['alpine'], '"--security-opt=no-new-privileges=FALSE"', NNP_OFF],
+    ['--security-opt', ['no-new-privileges=False', 'alpine'], '--security-opt "no-new-privileges=False"', NNP_OFF],
+    // A custom profile replaces the default one. (docker-default, moby's own
+    // default profile, replaces nothing: below.)
+    ['--security-opt', ['apparmor=lax', 'alpine'], '--security-opt "apparmor=lax"', APPARMOR_REPLACED],
+    ['--security-opt=apparmor:unconfined-ish', ['alpine'], '"--security-opt=apparmor:unconfined-ish"', APPARMOR_REPLACED],
+    // A profile name is case-sensitive to AppArmor, so these are others:
+    // neither is docker-default, nor unconfined.
+    ['--security-opt=apparmor=DOCKER-DEFAULT', ['alpine'], '"--security-opt=apparmor=DOCKER-DEFAULT"', APPARMOR_REPLACED],
+    ['--security-opt', ['apparmor=UNCONFINED', 'alpine'], '--security-opt "apparmor=UNCONFINED"', APPARMOR_REPLACED],
+    // Writable cgroups, in every spelling ParseBool reads as true.
+    ['--security-opt', ['writable-cgroups=true', 'alpine'], '--security-opt "writable-cgroups=true"', CGROUPS],
+    ['--security-opt=writable-cgroups=1', ['alpine'], '"--security-opt=writable-cgroups=1"', CGROUPS],
+    ['--security-opt=writable-cgroups:TRUE', ['alpine'], '"--security-opt=writable-cgroups:TRUE"', CGROUPS],
+    ['--security-opt=writable-cgroups=t', ['alpine'], '"--security-opt=writable-cgroups=t"', CGROUPS],
+    ['--security-opt', ['writable-cgroups=T', 'alpine'], '--security-opt "writable-cgroups=T"', CGROUPS],
+    ['--security-opt=writable-cgroups=True', ['alpine'], '"--security-opt=writable-cgroups=True"', CGROUPS],
+    // A key docker 29 does not read is refused by name too, over-named on
+    // purpose, since a later docker may read it: seccomp-profile (a daemon
+    // setting, no --security-opt key), and a bare disable, which the daemon
+    // reads as label=disable though the CLI refuses an option with no value
+    // but no-new-privileges.
+    ['--security-opt', ['seccomp-profile=/x.json', 'alpine'], '--security-opt "seccomp-profile=/x.json"', OTHER_SECURITY],
+    ['--security-opt=disable', ['alpine'], '"--security-opt=disable"', OTHER_SECURITY],
     // Devices past FORBIDDEN_FLAGS' exact --device, another runtime, kernel
     // parameters and another cgroup parent.
-    ['--device-cgroup-rule', ['c 1:3 rwm', 'alpine'], '--device-cgroup-rule'],
-    ['--device-cgroup-rule=b 8:0 rwm', ['alpine'], '--device-cgroup-rule'],
-    ['--gpus', ['all', 'alpine'], '--gpus'],
-    ['--gpus=all', ['alpine'], '--gpus'],
-    ['--runtime', ['runc-unconfined', 'alpine'], '--runtime'],
-    ['--runtime=io.containerd.runc.v2', ['alpine'], '--runtime'],
-    ['--sysctl', ['net.ipv4.ip_forward=1', 'alpine'], '--sysctl'],
-    ['--sysctl=kernel.shm_rmid_forced=1', ['alpine'], '--sysctl'],
-    ['--cgroup-parent', ['/', 'alpine'], '--cgroup-parent'],
-    ['--cgroup-parent=/system.slice', ['alpine'], '--cgroup-parent'],
+    ['--device-cgroup-rule', ['c 1:3 rwm', 'alpine'], '--device-cgroup-rule', /^lets the container use device nodes the default device cgroup denies/],
+    ['--device-cgroup-rule=b 8:0 rwm', ['alpine'], '--device-cgroup-rule', /^lets the container use device nodes/],
+    ['--gpus', ['all', 'alpine'], '--gpus', /^gives the container the VM's GPUs/],
+    ['--gpus=all', ['alpine'], '--gpus', /^gives the container the VM's GPUs/],
+    ['--runtime', ['runc-unconfined', 'alpine'], '--runtime', /^runs the container under an OCI runtime the builder never chose/],
+    ['--runtime=io.containerd.runc.v2', ['alpine'], '--runtime', /^runs the container under an OCI runtime/],
+    ['--sysctl', ['net.ipv4.ip_forward=1', 'alpine'], '--sysctl', /^sets kernel parameters in the container's namespaces/],
+    ['--sysctl=kernel.shm_rmid_forced=1', ['alpine'], '--sysctl', /^sets kernel parameters/],
+    ['--cgroup-parent', ['/', 'alpine'], '--cgroup-parent', /^puts the container's cgroup under a parent the builder never chose/],
+    ['--cgroup-parent=/system.slice', ['alpine'], '--cgroup-parent', /^puts the container's cgroup under a parent/],
     // Mounts beside the one, and the daemon itself.
-    ['--volumes-from', ['other', 'alpine'], '--volumes-from'],
-    ['--volumes-from=other:ro', ['alpine'], '--volumes-from'],
-    ['--volume=/:/host', ['alpine'], '--volume'],
-    ['-v/:/host', ['alpine'], '-v (--volume)'],
-    ['--mount=type=bind,source=/,target=/host', ['alpine'], '"--mount=type=bind,source=/,target=/host"'],
-    ['--use-api-socket', ['alpine'], '--use-api-socket'],
+    ['--volumes-from', ['other', 'alpine'], '--volumes-from', /^mounts every volume another container has/],
+    ['--volumes-from=other:ro', ['alpine'], '--volumes-from', /^mounts every volume another container has/],
+    ['--volume=/:/host', ['alpine'], '--volume', VOLUME],
+    ['-v/:/host', ['alpine'], '-v (--volume)', VOLUME],
+    [
+      '--mount=type=bind,source=/,target=/host',
+      ['alpine'],
+      '"--mount=type=bind,source=/,target=/host"',
+      /^adds a mount beside the one workspace mount, which the builder writes as --mount <value>/,
+    ],
+    ['--use-api-socket', ['alpine'], '--use-api-socket', /^mounts the docker API socket, and with it the VM's daemon/],
     // Root's group by another route than --user x:0, which the audit refuses.
-    ['--group-add', ['0', 'alpine'], '--group-add'],
-    ['--group-add=root', ['alpine'], '--group-add'],
+    ['--group-add', ['0', 'alpine'], '--group-add', GROUP],
+    ['--group-add=root', ['alpine'], '--group-add', GROUP],
     // The VM's dockerd ships the container's output wherever the log options
     // say, 192.168.5.2 (the Mac) among them, off the internal network.
-    ['--log-driver', ['syslog', 'alpine'], '--log-driver'],
-    ['--log-driver=gelf', ['alpine'], '--log-driver'],
-    ['--log-opt', ['syslog-address=udp://192.168.5.2:514', 'alpine'], '--log-opt'],
-    ['--log-opt=gelf-address=udp://192.168.5.2:12201', ['alpine'], '--log-opt'],
+    ['--log-driver', ['syslog', 'alpine'], '--log-driver', LOG_DRIVER],
+    ['--log-driver=gelf', ['alpine'], '--log-driver', LOG_DRIVER],
+    ['--log-opt', ['syslog-address=udp://192.168.5.2:514', 'alpine'], '--log-opt', LOG_OPT],
+    ['--log-opt=gelf-address=udp://192.168.5.2:12201', ['alpine'], '--log-opt', LOG_OPT],
     // A writable root filesystem, in every spelling ParseBool reads as off.
-    ['--read-only=false', ['alpine'], '"--read-only=false"'],
-    ['--read-only=0', ['alpine'], '"--read-only=0"'],
-    ['--read-only=F', ['alpine'], '"--read-only=F"'],
-    ['--read-only=False', ['alpine'], '"--read-only=False"'],
+    ['--read-only=false', ['alpine'], '"--read-only=false"', WRITABLE],
+    ['--read-only=0', ['alpine'], '"--read-only=0"', WRITABLE],
+    ['--read-only=F', ['alpine'], '"--read-only=F"', WRITABLE],
+    ['--read-only=False', ['alpine'], '"--read-only=False"', WRITABLE],
+    ['--read-only=FALSE', ['alpine'], '"--read-only=FALSE"', WRITABLE],
+    ['--read-only=f', ['alpine'], '"--read-only=f"', WRITABLE],
   ]
-  for (const [image, command, option] of rows) {
-    assert.throws(() => argsFor(f, { image, command }), named(option), `${image} ${command.join(' ')}`)
+  for (const [image, command, option, reason] of rows) {
+    assert.throws(() => argsFor(f, { image, command }), named(option, reason), `${image} ${command.join(' ')}`)
+  }
+
+  // What widens nothing is refused all the same, as an option the builder
+  // never emits, and is not named for a widening it does not make. A
+  // no-new-privileges that ParseBool reads as on (1, t, true) keeps the option
+  // on, and a value it cannot read (yes, or false in a case it does not take)
+  // is refused by docker; so for writable-cgroups read as false, or not read
+  // (true in a case ParseBool does not take). docker-default is docker's own
+  // default AppArmor profile, which it applies anyway. A security-opt key in another case (SECCOMP) is no key
+  // docker reads, which compares keys case-sensitively, and refuses; and only
+  // systempaths=unconfined, as spelled, unmasks anything: the CLI sends any
+  // other systempaths on to the daemon, which reads no such key. A namespace
+  // mode in another case (HOST, Container:<id>) is no mode docker reads, and
+  // --uts, --cgroupns and --userns have no container mode at all. And a
+  // --read-only value ParseBool cannot read is refused by docker.
+  for (const [image, command, arg] of [
+    ['--security-opt=no-new-privileges=1', ['alpine'], '--security-opt=no-new-privileges=1'],
+    ['--security-opt', ['no-new-privileges=1', 'alpine'], '--security-opt'],
+    ['--security-opt=no-new-privileges=t', ['alpine'], '--security-opt=no-new-privileges=t'],
+    ['--security-opt=no-new-privileges=T', ['alpine'], '--security-opt=no-new-privileges=T'],
+    ['--security-opt=no-new-privileges=true', ['alpine'], '--security-opt=no-new-privileges=true'],
+    ['--security-opt=no-new-privileges:TRUE', ['alpine'], '--security-opt=no-new-privileges:TRUE'],
+    ['--security-opt=no-new-privileges=yes', ['alpine'], '--security-opt=no-new-privileges=yes'],
+    ['--security-opt', ['no-new-privileges', 'alpine'], '--security-opt'],
+    ['--security-opt=apparmor=docker-default', ['alpine'], '--security-opt=apparmor=docker-default'],
+    ['--security-opt', ['apparmor:docker-default', 'alpine'], '--security-opt'],
+    ['--security-opt=no-new-privileges=fALSE', ['alpine'], '--security-opt=no-new-privileges=fALSE'],
+    ['--security-opt', ['no-new-privileges=fAlse', 'alpine'], '--security-opt'],
+    ['--security-opt=writable-cgroups=false', ['alpine'], '--security-opt=writable-cgroups=false'],
+    ['--security-opt=writable-cgroups=0', ['alpine'], '--security-opt=writable-cgroups=0'],
+    ['--security-opt', ['writable-cgroups=yes', 'alpine'], '--security-opt'],
+    ['--security-opt=writable-cgroups=tRUE', ['alpine'], '--security-opt=writable-cgroups=tRUE'],
+    ['--security-opt=SECCOMP=unconfined', ['alpine'], '--security-opt=SECCOMP=unconfined'],
+    ['--security-opt', ['Seccomp:unconfined', 'alpine'], '--security-opt'],
+    ['--security-opt=AppArmor=unconfined', ['alpine'], '--security-opt=AppArmor=unconfined'],
+    ['--security-opt=LABEL=disable', ['alpine'], '--security-opt=LABEL=disable'],
+    ['--security-opt=No-New-Privileges=false', ['alpine'], '--security-opt=No-New-Privileges=false'],
+    ['--security-opt=Writable-Cgroups=true', ['alpine'], '--security-opt=Writable-Cgroups=true'],
+    ['--security-opt=SYSTEMPATHS=unconfined', ['alpine'], '--security-opt=SYSTEMPATHS=unconfined'],
+    ['--security-opt', ['systempaths:unconfined', 'alpine'], '--security-opt'],
+    ['--security-opt=systempaths=UNCONFINED', ['alpine'], '--security-opt=systempaths=UNCONFINED'],
+    ['--security-opt=systempaths=unconfined,', ['alpine'], '--security-opt=systempaths=unconfined,'],
+    ['--pid', ['HOST', 'alpine'], '--pid'],
+    ['--pid=HOST', ['alpine'], '--pid=HOST'],
+    ['--userns=Host', ['alpine'], '--userns=Host'],
+    ['--ipc', ['Container:abc', 'alpine'], '--ipc'],
+    ['--uts=HOST', ['alpine'], '--uts=HOST'],
+    ['--uts=container:abc', ['alpine'], '--uts=container:abc'],
+    ['--cgroupns', ['container:abc', 'alpine'], '--cgroupns'],
+    ['--userns=container:abc', ['alpine'], '--userns=container:abc'],
+    ['--read-only=fALSE', ['alpine'], '--read-only=fALSE'],
+    ['--read-only=yes', ['alpine'], '--read-only=yes'],
+  ] as const) {
+    assert.throws(() => argsFor(f, { image, command }), unnamed(arg), `${image} ${command.join(' ')}`)
   }
 
   // An option refused whatever its value is named without it: the value of
   // --env is the one thing the refusal must not repeat.
   assert.throws(
     () => argsFor(f, { image: '--env=AOS_CONTROL_TOKEN=the-value', command: ['alpine'] }),
-    (e: unknown) => named('--env')(e) && !(e as Error).message.includes('the-value'),
+    (e: unknown) => named('--env', ENV)(e) && !(e as Error).message.includes('the-value'),
   )
   // A letter that takes a value ends its group, as in docker: the t in -u0t
   // is part of --user's value, not a terminal (and -u is refused anyway).
   assert.throws(
     () => argsFor(f, { image: '-u0t', command: ['alpine'] }),
-    (e: unknown) => e instanceof ConfigError && !named('-t (--tty)')(e) && /carry "-u0t" before the image/.test(e.message),
+    (e: unknown) => e instanceof ConfigError && !named('-t (--tty)', TTY)(e) && /carry "-u0t" before the image/.test(e.message),
   )
   // The spellings an earlier check meets first are refused there.
   for (const [image, command] of [
@@ -617,7 +805,7 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
     /put the container on network "aos-internal"; invariant 9 needs the domain's internal network "aos-hostile"/,
   )
   // No value at all is no plain network name, and is refused as one.
-  assert.throws(() => auditRunArgs(onNetwork(''), home, f.realWorkspace, 'aos-internal'), named('--network ""'))
+  assert.throws(() => auditRunArgs(onNetwork(''), home, f.realWorkspace, 'aos-internal'), named('--network ""', NOT_PLAIN))
   // A domain that names a network docker gives a meaning of its own is
   // refused although the value matches what the builder was handed: the
   // modes, and anything but a plain name, which docker may read as its
@@ -628,9 +816,7 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
     (network: string) =>
     (e: unknown): boolean =>
       e instanceof ConfigError &&
-      e.message.startsWith(
-        `the domain network ${JSON.stringify(network)} is not a network docker reads by that name: as --network it `,
-      ) &&
+      e.message.startsWith(`the domain network ${JSON.stringify(network)} is not one a domain may name: as --network it `) &&
       e.message.endsWith("; invariant 9 needs the domain's own internal network") &&
       !e.message.includes('never emits')
   assert.throws(
@@ -639,10 +825,25 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
       domainNamed('host')(e) &&
       (e as Error).message.includes("it puts the container on the VM's own network stack, which reaches the Mac at 192.168.5.2;"),
   )
+  // A plain HOST is a network of that name to docker, not host mode, and the
+  // refusal says why it is refused anyway rather than calling it host mode.
+  assert.throws(
+    () => auditRunArgs(onNetwork('HOST'), home, f.realWorkspace, 'HOST'),
+    (e: unknown) =>
+      domainNamed('HOST')(e) &&
+      (e as Error).message.includes("it spells host in another case, which docker reads as a network of that name, but docker's key=value spelling lower-cases (name=HOST is host)") &&
+      !(e as Error).message.includes('own network stack'),
+  )
+  // Refused before every other check reads the argv, so a domain network
+  // that would read there as a forbidden flag, the docker socket, a -v or a
+  // second --mount is still refused as the domain's, the config to change.
   for (const network of [
     'host',
+    'HOST',
     'bridge',
+    'Bridge',
     'default',
+    'DEFAULT',
     'container:abc',
     'name=host',
     'NAME=HOST',
@@ -653,6 +854,10 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
     'aos-internal,',
     '-aos-internal',
     '',
+    '--privileged',
+    '/var/run/docker.sock',
+    '-v',
+    '--mount',
   ]) {
     assert.throws(
       () => buildRunArgs({ spec: spec(f), domain: { ...f.domain, network }, defaults: DEFAULTS, repoRoot: f.repoRoot, home }),
@@ -1001,10 +1206,13 @@ test('wallclock fires docker kill by name', async (t) => {
   // the one the kernel most needs to be able to end.
   assert.deepEqual(d.execs[0]?.args, ['kill', '--signal=KILL', `${CONTAINER_PREFIX}abc123`])
 
-  d.child.close(null, 'SIGKILL')
+  // As the docker CLI ends when its container is killed: 137, not by signal.
+  d.child.close(137, null)
   const result = await running.result
   assert.equal(result.killedBy, 'wallclock')
   assert.equal(result.signal, 'SIGKILL')
+  assert.equal(result.exitCode, 137)
+  assert.equal(result.overran, true)
   assert.equal(result.name, `${CONTAINER_PREFIX}abc123`)
 })
 
@@ -1065,11 +1273,13 @@ test('probe refuses a domain whose network is not internal, and checks each doma
   assert.match(missing.ok ? '' : missing.why, /^trusted: network aos-internal could not be inspected: .*not found/)
 })
 
-test('probe names a domain network docker reads as no network of that name, and never advises recreating it', async (t) => {
+test('probe refuses a domain network no domain may name without inspecting it, and never advises recreating it', async (t) => {
   // host reports Internal=false, so probe used to advise `docker network rm
   // host && docker network create --internal host`, which docker refuses for
   // a predefined network. kernel.yaml refuses these names
   // (test/config.test.ts); a driver handed its domains another way meets this.
+  // HOST among them: docker reads it as a network of that name, and the
+  // reason says so rather than calling it host mode.
   const f = fixture(t)
   for (const network of ['host', 'HOST', 'bridge', 'default', 'container:abc', 'name=host']) {
     const d = driverFor({ ...f, hostile: { ...f.hostile, network } })
@@ -1084,12 +1294,11 @@ test('probe names a domain network docker reads as no network of that name, and 
     })
     const result = await d.driver.probe()
     const why = result.ok ? '' : result.why
-    assert.ok(
-      why.startsWith(
-        `hostile: network ${JSON.stringify(network)} is not a network docker reads by that name: as --network it `,
-      ),
-      why,
-    )
+    assert.ok(why.startsWith(`hostile: network ${JSON.stringify(network)} is not one a domain may name: as --network it `), why)
+    if (network === 'HOST') {
+      assert.ok(why.includes('as --network it spells host in another case, which docker reads as a network of that name'), why)
+      assert.equal(why.includes("VM's own network stack"), false, why)
+    }
     assert.ok(why.endsWith("Name the domain's own internal network in kernel.yaml (docker network create --internal aos-hostile)"), why)
     assert.equal(why.includes('docker network rm'), false, why)
     // The trusted domain's network was inspected, and the hostile one never.
@@ -1119,6 +1328,39 @@ test('kill is idempotent and sweepOrphans reaps only our containers', async (t) 
     `${CONTAINER_PREFIX}bbb`,
   ])
   assert.equal(killed.includes('someone-elses-container'), false)
+})
+
+test('sweepOrphans asks each VM for names, never with --quiet, under which docker prints IDs', async (t) => {
+  // The docker CLI ignores a custom --format when --quiet is set: it warns on
+  // stderr and prints container IDs. A sweep that asked so would drop every
+  // line at the prefix check and kill nothing, and every orphan of a crashed
+  // kernel would run on past its hard wallclock. The exec answers as docker
+  // does, IDs under --quiet and names otherwise, and the argv is pinned
+  // whole, since a fake that answered names to any argv could not see it.
+  const f = fixture(t)
+  const d = driverFor(f)
+  d.setExec((args, env) => {
+    if (args[0] !== 'ps') return Promise.resolve({ stdout: '', stderr: '' })
+    const vm = env['DOCKER_HOST'] === HOSTILE_HOST ? 'h' : 't'
+    if (args.includes('--quiet') || args.includes('-q')) {
+      return Promise.resolve({
+        stdout: `${'0'.repeat(63)}${vm === 'h' ? '1' : '2'}\n`,
+        stderr: 'WARNING: Ignoring custom format, because both --format and --quiet are set.\n',
+      })
+    }
+    return Promise.resolve({ stdout: `${CONTAINER_PREFIX}${vm}1\n`, stderr: '' })
+  })
+
+  assert.deepEqual(await d.driver.sweepOrphans(), [`${CONTAINER_PREFIX}t1`, `${CONTAINER_PREFIX}h1`])
+  const listed = d.execs.filter((e) => e.args[0] === 'ps')
+  assert.deepEqual(
+    listed.map((e) => e.env['DOCKER_HOST']),
+    [TRUSTED_HOST, HOSTILE_HOST],
+  )
+  for (const e of listed) {
+    assert.deepEqual(e.args, ['ps', '--filter', `name=${CONTAINER_PREFIX}`, '--format', '{{.Names}}'])
+  }
+  assert.deepEqual(killsSent(d), [`${TRUSTED_HOST} ${CONTAINER_PREFIX}t1`, `${HOSTILE_HOST} ${CONTAINER_PREFIX}h1`])
 })
 
 /** Each `docker kill` the driver sent, as "<DOCKER_HOST> <name>". */
@@ -1265,6 +1507,262 @@ test('kill(name) of a name it does not know asks every VM at once, so a daemon t
   }
 })
 
+test('sweepOrphans lists every VM at once and kills each orphan at once, so a daemon that never answers holds up no other', async (t) => {
+  // The boot sweep (plan W2) reaps what a crashed kernel left on both VMs.
+  // Listed one VM after the other, a trusted daemon that accepts the
+  // connection and never answers `ps` would leave the hostile VM unlisted and
+  // its orphans running; killed one after the other, one kill that never
+  // returns would leave the rest. Hung on each side in turn, so the order the
+  // domains are listed in decides nothing.
+  const listed: Record<string, string> = {
+    [TRUSTED_HOST]: `${CONTAINER_PREFIX}t1\n${CONTAINER_PREFIX}t2\n`,
+    [HOSTILE_HOST]: `${CONTAINER_PREFIX}h1\n${CONTAINER_PREFIX}h2\n`,
+  }
+  const hang = new Promise<never>(() => undefined)
+  for (const [hung, other, first, second] of [
+    [TRUSTED_HOST, HOSTILE_HOST, 'h1', 'h2'],
+    [HOSTILE_HOST, TRUSTED_HOST, 't1', 't2'],
+  ] as const) {
+    const f = fixture(t)
+    const d = driverFor(f)
+    d.setExec((args, env) => {
+      const host = env['DOCKER_HOST'] ?? ''
+      if (args[0] === 'ps') return host === hung ? hang : Promise.resolve({ stdout: listed[host] ?? '', stderr: '' })
+      // The first orphan's kill never returns either.
+      return args[2] === `${CONTAINER_PREFIX}${first}` ? hang : Promise.resolve({ stdout: '', stderr: '' })
+    })
+    void d.driver.sweepOrphans()
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.deepEqual(
+      d.execs.filter((e) => e.args[0] === 'ps').map((e) => e.env['DOCKER_HOST']).sort(),
+      [HOSTILE_HOST, TRUSTED_HOST],
+      `${hung}: both VMs were not asked for their orphans`,
+    )
+    assert.deepEqual(
+      killsSent(d),
+      [`${other} ${CONTAINER_PREFIX}${first}`, `${other} ${CONTAINER_PREFIX}${second}`],
+      `${hung}: the other VM's orphans were not all killed`,
+    )
+  }
+})
+
+test('sweepOrphans still sweeps one VM when the other cannot be listed', async (t) => {
+  // The commonest boot of all: one VM is not running, and its `ps` fails at
+  // once ("Cannot connect to the Docker daemon"). Each domain catches its own
+  // failure, so the other VM's orphans are still killed and returned. A sweep
+  // that rejected instead would still have sent those kills, but the boot
+  // sweep (plan W2) would throw and lose the list of what it reaped. Failed
+  // on each side in turn, so the order the domains are listed in decides
+  // nothing.
+  for (const [down, up, names] of [
+    [TRUSTED_HOST, HOSTILE_HOST, ['h1', 'h2']],
+    [HOSTILE_HOST, TRUSTED_HOST, ['t1']],
+  ] as const) {
+    const f = fixture(t)
+    const d = driverFor(f)
+    d.setExec((args, env) => {
+      const host = env['DOCKER_HOST'] ?? ''
+      if (args[0] !== 'ps') return Promise.resolve({ stdout: '', stderr: '' })
+      if (host === down) {
+        return Promise.reject(new Error(`Cannot connect to the Docker daemon at ${host}. Is the docker daemon running?`))
+      }
+      return Promise.resolve({ stdout: names.map((n) => `${CONTAINER_PREFIX}${n}\n`).join(''), stderr: '' })
+    })
+    const killed = await d.driver.sweepOrphans()
+    assert.deepEqual(killed, names.map((n) => `${CONTAINER_PREFIX}${n}`), `${down} down`)
+    assert.deepEqual(killsSent(d), names.map((n) => `${up} ${CONTAINER_PREFIX}${n}`), `${down} down`)
+    assert.deepEqual(
+      d.execs.filter((e) => e.args[0] === 'ps').map((e) => e.env['DOCKER_HOST']).sort(),
+      [HOSTILE_HOST, TRUSTED_HOST],
+      `${down} down`,
+    )
+  }
+})
+
+test('sweepOrphans resolves only once every kill it sent has returned, and kill() once each of its own has', async (t) => {
+  // The boot sweep (plan W2) reports what it swept. One that resolved with the
+  // names while their kills were still in flight would say swept of
+  // containers still running, and a boot that went on to reuse a name would
+  // meet it. Likewise kill(), which runtime code awaits before it reports a
+  // run killed.
+  const f = fixture(t)
+  const d = driverFor(f)
+  let release: () => void = () => undefined
+  const held = new Promise<{ stdout: string; stderr: string }>((resolve) => {
+    release = () => {
+      resolve({ stdout: '', stderr: '' })
+    }
+  })
+  d.setExec((args, env) =>
+    args[0] === 'ps'
+      ? Promise.resolve({ stdout: env['DOCKER_HOST'] === HOSTILE_HOST ? `${CONTAINER_PREFIX}h1\n` : '', stderr: '' })
+      : held,
+  )
+  const settledYet = <T>(promise: Promise<T>): (() => boolean) => {
+    let settled = false
+    void promise.then(() => {
+      settled = true
+    })
+    return () => settled
+  }
+
+  const sweep = d.driver.sweepOrphans()
+  const swept = settledYet(sweep)
+  const kill = d.driver.kill(`${CONTAINER_PREFIX}stranger`)
+  const killed = settledYet(kill)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(killsSent(d).sort(), [
+    `${HOSTILE_HOST} ${CONTAINER_PREFIX}h1`,
+    `${HOSTILE_HOST} ${CONTAINER_PREFIX}stranger`,
+    `${TRUSTED_HOST} ${CONTAINER_PREFIX}stranger`,
+  ])
+  assert.equal(swept(), false, 'sweepOrphans resolved while its kill was in flight')
+  assert.equal(killed(), false, 'kill() resolved while its docker kills were in flight')
+
+  release()
+  assert.deepEqual(await sweep, [`${CONTAINER_PREFIX}h1`])
+  await kill
+})
+
+test('kill of a name without the kernel prefix sends nothing to either VM', async (t) => {
+  // run() refuses such a name, so no container this driver started has one,
+  // and sweepOrphans skips one a daemon lists: it is someone else's. Asked of
+  // every domain as an unknown name, it would reach that container on both
+  // VMs. A no-op, not a refusal, as kill is idempotent on both drivers.
+  const f = fixture(t)
+  const d = driverFor(f)
+  for (const name of ['someone-elses-container', `x${CONTAINER_PREFIX}abc`, '', CONTAINER_PREFIX.slice(0, -1)]) {
+    await d.driver.kill(name)
+  }
+  assert.deepEqual(d.execs, [])
+  // A name with the prefix is still asked of every VM.
+  await d.driver.kill(`${CONTAINER_PREFIX}abc`)
+  assert.deepEqual(killsSent(d), [`${TRUSTED_HOST} ${CONTAINER_PREFIX}abc`, `${HOSTILE_HOST} ${CONTAINER_PREFIX}abc`])
+})
+
+test('a kill that ends nothing leaves the run its own exit: no killedBy, and the CLI\'s code and signal', async (t) => {
+  // kill(name) and the wallclock mark the run before the kill is sent, and
+  // whether it ended the run is the CLI's exit to say: 137 for a killed
+  // container, and nothing else. A kill that lands after the container exited
+  // on its own, or never reaches the daemon, ended nothing, and a run reported
+  // as {exitCode: 0, signal: SIGKILL, killedBy} would read as killed though it
+  // finished. The fake, scripted with ignoresKill, shows the same: see the
+  // parity test 'the fake and the real driver agree: a kill that ends nothing
+  // leaves the run its own exit' below.
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const name = `${CONTAINER_PREFIX}abc123`
+  const ended = async (
+    exec: ScriptedExec,
+    end: (d: Spied) => Promise<void>,
+    exit: (child: FakeChild) => void,
+  ): Promise<SandboxResult> => {
+    const f = fixture(t)
+    const d = driverFor(f)
+    d.setExec(exec)
+    const running = d.driver.run(spec(f, { limits: { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 } }))
+    await end(d)
+    assert.equal(killsSent(d).length, 1, 'no kill was sent')
+    exit(d.child)
+    return running.result
+  }
+  const closes =
+    (code: number | null, signal: string | null) =>
+    (child: FakeChild): void => {
+      child.close(code, signal)
+    }
+  const ok = (): Promise<{ stdout: string; stderr: string }> => Promise.resolve({ stdout: '', stderr: '' })
+  const gone = (): Promise<never> => Promise.reject(new Error(`Error response from daemon: No such container: ${name}`))
+  const unreachable = (): Promise<never> =>
+    Promise.reject(new Error('Cannot connect to the Docker daemon at unix:///tmp/colima-trusted.sock'))
+  const requested = (d: Spied): Promise<void> => d.driver.kill(name)
+  const wallclock = (): Promise<void> => {
+    t.mock.timers.tick(5_000)
+    return Promise.resolve()
+  }
+
+  for (const [label, exec, end, code, signal] of [
+    ['requested, after the container exited', gone, requested, 0, null],
+    ['requested, with the daemon unreachable', unreachable, requested, 0, null],
+    ['requested, and the container then failed on its own', gone, requested, 1, null],
+    // The kernel sends only KILL, so a container that ends SIGTERMed (143)
+    // was ended by something else, though the kill reached a daemon.
+    ['requested, and the container then SIGTERMed', ok, requested, 143, null],
+    // A CLI that dies by a signal shows nothing of its container: it forwards
+    // every signal it can catch to the container and exits with the
+    // container's status, so one that dies by a signal met a SIGKILL from
+    // outside, or a signal that came before it had installed its handlers
+    // (the SIGTERM rows), and its container is expected to run on. Its own
+    // signal, and no killedBy, though a kill was sent and reached a daemon.
+    ['requested, with the daemon unreachable, and the CLI then SIGKILLed', unreachable, requested, null, 'SIGKILL'],
+    ['requested, and the CLI SIGKILLed', ok, requested, null, 'SIGKILL'],
+    ['requested, and the CLI SIGTERMed', ok, requested, null, 'SIGTERM'],
+    ['wallclock, with the daemon unreachable', unreachable, wallclock, 0, null],
+    ['wallclock, after the container exited', gone, wallclock, 3, null],
+    ['wallclock, and the container then SIGTERMed', ok, wallclock, 143, null],
+    ['wallclock, with the daemon unreachable, and the CLI then SIGKILLed', unreachable, wallclock, null, 'SIGKILL'],
+    ['wallclock, and the CLI SIGKILLed', ok, wallclock, null, 'SIGKILL'],
+  ] as const) {
+    const result = await ended(exec, end, closes(code, signal))
+    assert.equal(result.killedBy, undefined, label)
+    assert.equal(result.signal, signal, label)
+    assert.equal(result.exitCode, code, label)
+    // A wallclock that fired is still said, though its kill ended nothing:
+    // the run outlived its hard wallclock, and this is all that shows it.
+    assert.equal(result.overran, end === wallclock ? true : undefined, label)
+  }
+
+  // A spawn that started no process ('error', which Node emits after spawn
+  // has returned, so after a kill sent in the same tick) was ended by no kill
+  // either, though its exit code is null as a signalled CLI's is.
+  for (const [label, end] of [
+    ['requested, then a spawn error', requested],
+    ['wallclock, then a spawn error', wallclock],
+  ] as const) {
+    const result = await ended(ok, end, (child) => {
+      child.fail(Object.assign(new Error('spawn docker ENOENT'), { code: 'ENOENT' }))
+    })
+    assert.equal(result.killedBy, undefined, label)
+    assert.equal(result.signal, null, label)
+    assert.equal(result.exitCode, null, label)
+    assert.equal(result.overran, end === wallclock ? true : undefined, label)
+  }
+
+  // And a kill that did end it says so: the CLI exits 137.
+  for (const [label, end, by] of [
+    ['requested, 137', requested, 'requested'],
+    ['wallclock, 137', wallclock, 'wallclock'],
+  ] as const) {
+    const result = await ended(ok, end, closes(137, null))
+    assert.equal(result.killedBy, by, label)
+    assert.equal(result.signal, 'SIGKILL', label)
+    assert.equal(result.exitCode, 137, label)
+    assert.equal(result.overran, by === 'wallclock' ? true : undefined, label)
+  }
+
+  // A requested kill that reached no daemon, then the wallclock, whose kill
+  // ends the run: the 137 is the wallclock's, the last kill sent before the
+  // run ended, and a run reported killedBy requested with overran would say
+  // the requested kill ended a run that had outlived its wallclock.
+  const f = fixture(t)
+  const d = driverFor(f)
+  let reached = false
+  d.setExec(() => {
+    if (reached) return ok()
+    reached = true
+    return unreachable()
+  })
+  const running = d.driver.run(spec(f, { limits: { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 } }))
+  await requested(d)
+  await wallclock()
+  assert.deepEqual(killsSent(d), [`${TRUSTED_HOST} ${name}`, `${TRUSTED_HOST} ${name}`])
+  d.child.close(137, null)
+  const result = await running.result
+  assert.equal(result.killedBy, 'wallclock')
+  assert.equal(result.signal, 'SIGKILL')
+  assert.equal(result.exitCode, 137)
+  assert.equal(result.overran, true)
+})
+
 test('a spawn that throws leaves no record: the name runs again, and a kill of it still asks every VM', async (t) => {
   // Node's spawn refuses some arguments synchronously (a NUL byte, for one),
   // and then nothing started. A record made before that throw would refuse
@@ -1286,7 +1784,7 @@ test('a spawn that throws leaves no record: the name runs again, and a kill of i
   assert.equal(d.spawns[0]?.env['DOCKER_HOST'], HOSTILE_HOST)
 })
 
-test('the fake and the real driver agree: a name still running is refused, and a requested kill reports killedBy requested with SIGKILL', async (t) => {
+test('the fake and the real driver agree: a name is refused until its run\'s result settles, hung or not, and a requested kill reports killedBy requested with SIGKILL', async (t) => {
   // Runtime code is tested against the fake. Had the fake let a name run twice,
   // or the real driver said nothing of who ended a run, code that passed
   // against one would meet different behaviour from the other.
@@ -1308,18 +1806,438 @@ test('the fake and the real driver agree: a name still running is refused, and a
       label,
     )
 
+    let settled = false
+    void running.result.then(() => {
+      settled = true
+    })
     await driver.kill(name)
+    // kill() resolves once the kill is sent, not once the run has ended: the
+    // real driver's run ends when the docker CLI closes, after `docker kill`
+    // has returned, and the fake's on a later macrotask. Had the fake ended
+    // it before kill() returned, code tested against it could kill a name and
+    // start it again at once, which the real driver refuses.
+    assert.equal(settled, false, `${label}: the run ended before kill() returned`)
+    assert.throws(
+      () => driver.run(spec(f, { name })),
+      (e: unknown) => e instanceof ConfigError && /already running on the trusted domain/.test(e.message),
+      `${label}: the name was free when kill() returned`,
+    )
     exitAfterKill()
     const result = await running.result
     assert.equal(result.killedBy, 'requested', label)
     assert.equal(result.signal, 'SIGKILL', label)
+    // The docker CLI's exit for a killed container, on the fake too: code
+    // that told a kill by a null exit code would pass against a fake that
+    // reported one, and never see a kill on docker.
+    assert.equal(result.exitCode, 137, label)
 
     // Free again once that run has ended.
     assert.doesNotThrow(() => driver.run(spec(f, { name })), label)
   }
-  // The refused call is recorded, as every call is, and spent no scripted exit:
-  // the third call ran on the fake's second entry rather than finding none.
-  assert.equal(fake.specs.length, 3)
+  // The refused calls are recorded, as every call is, and spent no scripted
+  // exit: the fourth call ran on the fake's second entry rather than finding
+  // none.
+  assert.equal(fake.specs.length, 4)
+
+  // A run that does not hang holds its name as long: the real driver until
+  // the CLI closes, the fake until the result it resolved at once has
+  // settled. Had the fake freed the name before run() returned, code tested
+  // against it could start one name twice in a tick and pass. And free on
+  // both once `await result` has returned, so neither keeps it for good.
+  const realQuick = driverFor(f)
+  const quick = fakeSandbox({ script: [{ exitCode: 0 }, { exitCode: 0 }] })
+  const quickly: readonly (readonly [string, SandboxDriver, () => void])[] = [
+    ['real', realQuick.driver, () => realQuick.child.close(0, null)],
+    ['fake', quick, () => undefined],
+  ]
+  for (const [label, driver, exit] of quickly) {
+    const first = driver.run(spec(f, { name }))
+    assert.throws(
+      () => driver.run(spec(f, { name })),
+      (e: unknown) => e instanceof ConfigError && /already running on the trusted domain/.test(e.message),
+      label,
+    )
+    exit()
+    const result = await first.result
+    assert.equal(result.exitCode, 0, label)
+    assert.equal(result.killedBy, undefined, label)
+    assert.equal(result.overran, undefined, label)
+    assert.doesNotThrow(() => driver.run(spec(f, { name })), label)
+  }
+  assert.equal(quick.specs.length, 3)
+
+  // A name without the kernel's prefix is no container of the kernel's: both
+  // refuse to run one, with the same ConfigError, before anything starts and
+  // before the fake spends a scripted exit; and a kill of one ends nothing on
+  // either, leaving a run under the prefix running. Had the fake run such a
+  // name, a kill of it would have settled that run, though the real driver
+  // sends the kill nowhere: code tested against the fake could use a name
+  // the real driver refuses.
+  const realBare = driverFor(f)
+  const bare = fakeSandbox({ script: [{ hangs: true }] })
+  const stranger = 'someone-elses-container'
+  for (const [label, driver] of [
+    ['real', realBare.driver],
+    ['fake', bare],
+  ] as const) {
+    assert.throws(
+      () => driver.run(spec(f, { name: stranger })),
+      (e: unknown) => e instanceof ConfigError && e.message === `container name "${stranger}" must start with ${CONTAINER_PREFIX}`,
+      label,
+    )
+    // On the fake, the scripted exit the refusal did not spend.
+    const running = driver.run(spec(f, { name }))
+    let settled = false
+    void running.result.then(() => {
+      settled = true
+    })
+    await driver.kill(stranger)
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(settled, false, `${label}: a kill of ${stranger} ended another run`)
+  }
+  assert.equal(realBare.spawns.length, 1)
+  assert.deepEqual(realBare.execs, [])
+  assert.deepEqual(bare.kills, [stranger])
+  assert.deepEqual(bare.specs.map((s) => s.name), [stranger, name])
+})
+
+test('the fake and the real driver agree: an overrun reports killedBy wallclock with SIGKILL, and that it overran', async (t) => {
+  // W1 logs a run that outlived its hard wallclock. Runtime code tested
+  // against the fake's overrun must meet what the real driver reports for
+  // one: the kill the wallclock sent, and the overrun itself, which the real
+  // driver reports even when that kill ends nothing.
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = fixture(t)
+  const real = driverFor(f)
+  const fake = fakeSandbox({ script: [{ hangs: true }] })
+  const name = `${CONTAINER_PREFIX}overrun`
+  const limits = { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 }
+  const drivers: readonly (readonly [string, SandboxDriver, () => void])[] = [
+    [
+      'real',
+      real.driver,
+      () => {
+        t.mock.timers.tick(5_000)
+        real.child.close(137, null)
+      },
+    ],
+    ['fake', fake, () => fake.simulateOverrun(name)],
+  ]
+  for (const [label, driver, overrun] of drivers) {
+    const running = driver.run(spec(f, { name, limits }))
+    overrun()
+    const result = await running.result
+    assert.equal(result.killedBy, 'wallclock', label)
+    assert.equal(result.signal, 'SIGKILL', label)
+    assert.equal(result.exitCode, 137, label)
+    assert.equal(result.overran, true, label)
+  }
+})
+
+test('the fake and the real driver agree: a kill that ends nothing leaves the run its own exit, and a wallclock that fires before a killed run ends is what ended it', async (t) => {
+  // Since a kill's credit is the CLI's exit to give (finish() in docker.ts),
+  // the real driver reports a kill that reached no daemon as nothing: the run
+  // reports its own exit when its container does exit, with no killedBy, and
+  // after an overrun says only that it overran. W1 code must handle that, so
+  // the fake can be scripted to meet it (ignoresKill). And a requested kill
+  // still in flight when the wallclock fires is credited to the wallclock on
+  // both: the last kill sent before the run ended.
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = fixture(t)
+  const name = `${CONTAINER_PREFIX}parity`
+  const limits = { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 }
+  const unreachable = (): Promise<never> =>
+    Promise.reject(new Error('Cannot connect to the Docker daemon at unix:///tmp/colima-trusted.sock'))
+
+  for (const how of ['requested', 'wallclock'] as const) {
+    const real = driverFor(f)
+    real.setExec(unreachable)
+    const fake = fakeSandbox({ script: [{ hangs: true, ignoresKill: true, exitCode: 3 }] })
+    const drivers: readonly (readonly [string, SandboxDriver, () => Promise<void>, () => void])[] = [
+      [
+        'real',
+        real.driver,
+        async () => {
+          if (how === 'requested') await real.driver.kill(name)
+          else t.mock.timers.tick(5_000)
+        },
+        () => real.child.close(3, null),
+      ],
+      [
+        'fake',
+        fake,
+        async () => {
+          if (how === 'requested') await fake.kill(name)
+          else fake.simulateOverrun(name)
+        },
+        () => undefined,
+      ],
+    ]
+    for (const [label, driver, kill, exitOnItsOwn] of drivers) {
+      const running = driver.run(spec(f, { name, limits }))
+      await kill()
+      // The kill ended nothing, and the name is still held.
+      assert.throws(
+        () => driver.run(spec(f, { name })),
+        (e: unknown) => e instanceof ConfigError && /already running/.test(e.message),
+        `${label}, ${how}`,
+      )
+      exitOnItsOwn()
+      const result = await running.result
+      assert.equal(result.killedBy, undefined, `${label}, ${how}`)
+      assert.equal(result.exitCode, 3, `${label}, ${how}`)
+      assert.equal(result.signal, null, `${label}, ${how}`)
+      assert.equal(result.overran, how === 'wallclock' ? true : undefined, `${label}, ${how}`)
+    }
+    assert.deepEqual(fake.kills, how === 'requested' ? [name] : [])
+  }
+
+  // A requested kill, then the wallclock before the run ended: the
+  // wallclock's kill is the one the end is credited to.
+  const real = driverFor(f)
+  const fake = fakeSandbox({ script: [{ hangs: true }] })
+  const drivers: readonly (readonly [string, SandboxDriver, () => void, () => void])[] = [
+    ['real', real.driver, () => t.mock.timers.tick(5_000), () => real.child.close(137, null)],
+    ['fake', fake, () => fake.simulateOverrun(name), () => undefined],
+  ]
+  for (const [label, driver, wallclock, exitAfterKill] of drivers) {
+    const running = driver.run(spec(f, { name, limits }))
+    await driver.kill(name)
+    wallclock()
+    exitAfterKill()
+    const result = await running.result
+    assert.equal(result.killedBy, 'wallclock', label)
+    assert.equal(result.signal, 'SIGKILL', label)
+    assert.equal(result.exitCode, 137, label)
+    assert.equal(result.overran, true, label)
+  }
+
+  // ignoresKill says something only of a run that hangs: one that does not
+  // has ended before any kill reaches it.
+  assert.throws(() => fakeSandbox({ script: [{ ignoresKill: true }] }), /scripted exit 0: ignoresKill on a run that does not hang/)
+})
+
+test('the fake and the real driver agree: an exit of 137 with no kill sent is the run\'s own, with no killedBy', async (t) => {
+  // Every run carries --memory, so the OOM killer's 137 is the commonest 137
+  // that is not the kernel's, and a worker can `exit 137` itself. The docker
+  // CLI exits the same for either as for the kernel's kill; what tells them
+  // apart is that no kill was sent. Credited to a kill all the same, W1 would
+  // log an OOM or a worker's own exit as an operator kill.
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = fixture(t)
+  const real = driverFor(f)
+  const fake = fakeSandbox({ script: [{ exitCode: 137 }] })
+  const name = `${CONTAINER_PREFIX}oom`
+  const limits = { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 }
+  const drivers: readonly (readonly [string, SandboxDriver, () => void])[] = [
+    ['real', real.driver, () => real.child.close(137, null)],
+    ['fake', fake, () => undefined],
+  ]
+  for (const [label, driver, exit] of drivers) {
+    const running = driver.run(spec(f, { name, limits }))
+    exit()
+    const result = await running.result
+    assert.equal(result.exitCode, 137, label)
+    assert.equal(result.signal, null, label)
+    assert.equal(result.killedBy, undefined, label)
+    assert.equal(result.overran, undefined, label)
+  }
+  // No kill was sent, by anyone.
+  assert.deepEqual(real.execs, [])
+  assert.deepEqual(fake.kills, [])
+})
+
+test('the fake refuses a kill that ends nothing followed by a 137, which the real driver credits to that kill', async (t) => {
+  // The docker CLI's 137 is the same for the kernel's kill as for the OOM
+  // killer or a worker's own exit 137, so the real driver credits a 137 to
+  // the kill sent before it, whether or not that kill reached a daemon.
+  // Scripted on the fake, a kill that ends nothing and then a 137 would hand
+  // runtime code a post-kill 137 with no killedBy, which docker never gives.
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = fixture(t)
+  const name = `${CONTAINER_PREFIX}oom-after-kill`
+  const limits = { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 }
+  for (const how of ['requested', 'wallclock'] as const) {
+    const real = driverFor(f)
+    real.setExec(() => Promise.reject(new Error('Cannot connect to the Docker daemon at unix:///tmp/colima-trusted.sock')))
+    const running = real.driver.run(spec(f, { name, limits }))
+    if (how === 'requested') await real.driver.kill(name)
+    else t.mock.timers.tick(5_000)
+    real.child.close(137, null)
+    const result = await running.result
+    assert.equal(result.killedBy, how, how)
+    assert.equal(result.signal, 'SIGKILL', how)
+    assert.equal(result.exitCode, 137, how)
+  }
+
+  assert.throws(
+    () => fakeSandbox({ script: [{ hangs: true }, { hangs: true, ignoresKill: true, exitCode: 137 }] }),
+    /^Error: scripted exit 1: ignoresKill with exitCode 137, which the real driver reports as ended by the kill sent before it \(killedBy, SIGKILL\)/,
+  )
+  // Any other exit after a kill that ends nothing is one the real driver
+  // gives (the parity test above), and so is a 137 with no ignoresKill.
+  assert.doesNotThrow(() =>
+    fakeSandbox({
+      script: [
+        { hangs: true, ignoresKill: true, exitCode: 136 },
+        { hangs: true, ignoresKill: true, exitCode: 0 },
+        { hangs: true, exitCode: 137 },
+        { exitCode: 137 },
+      ],
+    }),
+  )
+})
+
+test('the fake and the real driver agree: a killed run returns what it wrote before the kill, with the CLI\'s 137, and an overrun ran its whole wallclock', async (t) => {
+  // W1 logs a killed run's partial output: what it had done before the kernel
+  // ended it. The real driver returns whatever it captured up to the kill,
+  // and the docker CLI's 137 as its exit code; a fake that reported '' would
+  // let code that drops that output pass against it, and one that reported
+  // a null exit code, code that told a kill by one. Date is mocked with the
+  // wallclock, so the real driver's duration for an overrun is the wallclock
+  // too, as the fake's must be: a run that outlived its wallclock did not end
+  // sooner.
+  const f = fixture(t)
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const name = `${CONTAINER_PREFIX}partial`
+  const limits = { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 }
+  const wrote = { stdout: 'partial progress\n', stderr: 'warn\n' }
+  for (const how of ['requested', 'wallclock'] as const) {
+    const stdout = new PassThrough()
+    const stderr = new PassThrough()
+    const real = driverFor(f, { stdout, stderr })
+    const fake = fakeSandbox({ script: [{ hangs: true, ...wrote }] })
+    const drivers: readonly (readonly [string, SandboxDriver, () => Promise<void>])[] = [
+      [
+        'real',
+        real.driver,
+        async () => {
+          stdout.end(wrote.stdout)
+          stderr.end(wrote.stderr)
+          await Promise.all([finished(stdout), finished(stderr)])
+          if (how === 'requested') await real.driver.kill(name)
+          else t.mock.timers.tick(5_000)
+          real.child.close(137, null)
+        },
+      ],
+      [
+        'fake',
+        fake,
+        async () => {
+          if (how === 'requested') await fake.kill(name)
+          else fake.simulateOverrun(name)
+        },
+      ],
+    ]
+    for (const [label, driver, kill] of drivers) {
+      const running = driver.run(spec(f, { name, limits }))
+      await kill()
+      const result = await running.result
+      assert.equal(result.stdout, wrote.stdout, `${label}, ${how}`)
+      assert.equal(result.stderr, wrote.stderr, `${label}, ${how}`)
+      assert.equal(result.truncated, false, `${label}, ${how}`)
+      assert.equal(result.exitCode, 137, `${label}, ${how}`)
+      assert.equal(result.signal, 'SIGKILL', `${label}, ${how}`)
+      assert.equal(result.killedBy, how, `${label}, ${how}`)
+      assert.equal(result.overran, how === 'wallclock' ? true : undefined, `${label}, ${how}`)
+      if (how === 'wallclock') assert.equal(result.durationMs, 5_000, `${label}, ${how}`)
+    }
+  }
+
+  // A cut is kept too, as the real driver keeps a cut it made before the kill.
+  const cut = fakeSandbox({ script: [{ hangs: true, stdout: 'o'.repeat(CAPTURE_MAX_BYTES), truncated: true }] })
+  const running = cut.run(spec(f, { name, limits }))
+  await cut.kill(name)
+  const result = await running.result
+  assert.equal(result.truncated, true)
+  assert.equal(result.stdout.length, CAPTURE_MAX_BYTES)
+  assert.equal(result.killedBy, 'requested')
+})
+
+test('the fake and the real driver agree: a kill sent after the wallclock fired, before the run ended, leaves it ended by the wallclock', async (t) => {
+  // The wallclock's kill is the one that ended the run. A requested kill sent
+  // after it (an operator, a shutdown) does not rewrite why the run ended: a
+  // run reported killedBy requested with overran would say the operator
+  // ended a run that had outlived its hard wallclock.
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = fixture(t)
+  const real = driverFor(f)
+  const fake = fakeSandbox({ script: [{ hangs: true }] })
+  const name = `${CONTAINER_PREFIX}late-kill`
+  const limits = { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 }
+  const drivers: readonly (readonly [string, SandboxDriver, () => void, () => void])[] = [
+    ['real', real.driver, () => t.mock.timers.tick(5_000), () => real.child.close(137, null)],
+    ['fake', fake, () => fake.simulateOverrun(name), () => undefined],
+  ]
+  for (const [label, driver, wallclock, exitAfterKill] of drivers) {
+    const running = driver.run(spec(f, { name, limits }))
+    wallclock()
+    await driver.kill(name)
+    exitAfterKill()
+    const result = await running.result
+    assert.equal(result.killedBy, 'wallclock', label)
+    assert.equal(result.signal, 'SIGKILL', label)
+    assert.equal(result.exitCode, 137, label)
+    assert.equal(result.overran, true, label)
+  }
+  assert.deepEqual(fake.kills, [name])
+})
+
+/** `n` real macrotask turns, on setImmediate as it was before any test could mock it. */
+const realImmediate = setImmediate
+async function turns(n: number): Promise<void> {
+  for (let i = 0; i < n; i++) await new Promise<void>((resolve) => realImmediate(() => resolve()))
+}
+
+/** What a run's result has settled to so far, read without awaiting it. */
+function soFar(running: { readonly result: Promise<SandboxResult> }): () => SandboxResult | undefined {
+  let settled: SandboxResult | undefined
+  void running.result.then((r) => {
+    settled = r
+  })
+  return () => settled
+}
+
+test('a killed hung run on the fake still ends with every timer API mocked', async (t) => {
+  // A test that mocks timers, to drive the real driver's wallclock or its own
+  // clock, must not stop the fake's hung runs from ending: the fake queues a
+  // kill's end on setImmediate as it was when the fake loaded. Queued on the
+  // global one, mocked here, the run would never end and its caller would
+  // wait for good.
+  const f = fixture(t)
+  t.mock.timers.enable()
+  const fake = fakeSandbox({ script: [{ hangs: true }, { hangs: true }] })
+  for (const [how, name] of [
+    ['requested', `${CONTAINER_PREFIX}mocked-kill`],
+    ['wallclock', `${CONTAINER_PREFIX}mocked-overrun`],
+  ] as const) {
+    const result = soFar(fake.run(spec(f, { name })))
+    if (how === 'requested') await fake.kill(name)
+    else fake.simulateOverrun(name)
+    await turns(3)
+    assert.equal(result()?.killedBy, how, `${how}: the run did not end with timers mocked`)
+  }
+})
+
+test('two kills of a hung run in one tick end it once, and a rerun of its name is still the kill\'s to end', async (t) => {
+  // Each kill would otherwise queue an end of its own. The first frees the
+  // name, and a caller that starts it again in its continuation gets a new
+  // run under it, before the second end runs; that end would then forget the
+  // new run, and no kill could ever end it.
+  const f = fixture(t)
+  const fake = fakeSandbox({ script: [{ hangs: true }, { hangs: true }] })
+  const name = `${CONTAINER_PREFIX}twice-killed`
+  const first = fake.run(spec(f, { name }))
+  await Promise.all([fake.kill(name), fake.kill(name)])
+  assert.equal((await first.result).killedBy, 'requested')
+  // In the continuation of the first result, before the next macrotask.
+  const result = soFar(fake.run(spec(f, { name })))
+  await turns(3)
+  assert.equal(result(), undefined, 'the rerun ended though nothing killed it')
+  await fake.kill(name)
+  await turns(3)
+  assert.equal(result()?.killedBy, 'requested', 'a kill of the rerun did not end it')
+  assert.deepEqual(fake.kills, [name, name, name])
 })
 
 // ── what a run writes ──────────────────────────────────────────────────────
@@ -1433,6 +2351,19 @@ test('the cut never splits a character, and a stream that is not UTF-8 still kee
   })
   assert.ok(longest.stdout === 'a'.repeat(CAPTURE_MAX_BYTES - 3), 'stdout was not cut before the split character')
 
+  // A three-byte character (€, …, a smart quote, a box-drawing bar, CJK: the
+  // commonest non-ASCII in CLI output) split by the cap, its lead two short of
+  // the cap and one short. A lead read as declaring two bytes keeps the first
+  // case's E2 82, one read as standing alone keeps either's lead, and the text
+  // ends in U+FFFD.
+  const three = await capture(t, (stdout, stderr) => {
+    stdout.write(Buffer.concat([Buffer.alloc(CAPTURE_MAX_BYTES - 2, 'a'), Buffer.from('€… and more')]))
+    stderr.write(Buffer.concat([Buffer.alloc(CAPTURE_MAX_BYTES - 1, 'a'), Buffer.from('€… and more')]))
+  })
+  assert.ok(three.stdout === 'a'.repeat(CAPTURE_MAX_BYTES - 2), 'stdout was not cut before the split €')
+  assert.ok(three.stderr === 'a'.repeat(CAPTURE_MAX_BYTES - 1), 'stderr was not cut before the split €')
+  assert.equal(three.truncated, true)
+
   // Continuation bytes with no character to belong to, after one that is
   // ASCII: the cut stays at the cap, each continuation byte decodes to U+FFFD,
   // and the stream is not walked back to the last lead it can find (here to
@@ -1472,10 +2403,12 @@ test('a stray continuation byte past the cap costs no character that the cap doe
 
 /**
  * A full collection, for the one test that measures what a capture holds: the
- * process's own gc when it was started with --expose-gc, and otherwise one
- * exposed at runtime through V8's flag, which Node 20 and 22 honour. Should a
- * later V8 stop honouring it, this says so and fails, rather than skipping:
- * a skip passes npm test, and this is the only check of the memory bound.
+ * process's own gc when it was started with --expose-gc, as npm test and the
+ * falsify runner start every test file (test/falsify.test.ts holds both to
+ * it), and otherwise, for this file run some other way, one exposed at
+ * runtime through V8's flag, which Node 20 and 22 honour. Should a later V8
+ * stop honouring that, this says so and fails, rather than skipping: a skip
+ * passes, and this is the only check of the memory bound.
  */
 function exposedGc(): () => void {
   const own: unknown = (globalThis as { gc?: unknown }).gc
@@ -1589,8 +2522,15 @@ test('the fake and the real driver agree: a run whose output was cut reports tru
 test('the fake refuses a scripted result the real driver cannot return, and accepts each one it does', { timeout: 30_000 }, async (t) => {
   // A stream over the cap, which the real driver never returns whole, counted
   // in bytes as the driver counts it: CAPTURE_MAX_BYTES / 2 + 1 é is one
-  // character past half the cap, and two bytes past the cap.
-  const over = ['o'.repeat(CAPTURE_MAX_BYTES + 1), 'o'.repeat(2 * CAPTURE_MAX_BYTES), 'é'.repeat(CAPTURE_MAX_BYTES / 2 + 1)]
+  // character past half the cap, and two bytes past the cap. And one U+FFFD
+  // past the cap: each stands for at least one stream byte, a byte that is
+  // not UTF-8, so a fake that counted it as none would return any number.
+  const over = [
+    'o'.repeat(CAPTURE_MAX_BYTES + 1),
+    'o'.repeat(2 * CAPTURE_MAX_BYTES),
+    'é'.repeat(CAPTURE_MAX_BYTES / 2 + 1),
+    '\uFFFD'.repeat(CAPTURE_MAX_BYTES + 1),
+  ]
   for (const text of over) {
     for (const scripted of [{ stdout: text }, { stderr: text }, { stdout: text, truncated: true }]) {
       assert.throws(() => fakeSandbox({ script: [{ stdout: 'ok\n' }, scripted] }), /scripted exit 1: its std(out|err) is \d+ bytes or more/)

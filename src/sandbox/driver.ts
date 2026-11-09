@@ -42,6 +42,15 @@ import { MAX_LOGGED_OUTPUT } from '../events/bound.js'
  */
 export const CAPTURE_MAX_BYTES = 16 * MAX_LOGGED_OUTPUT
 
+/**
+ * Prefix for every container the kernel creates, so orphans are findable, and
+ * so that a name without it is someone else's container, which no driver
+ * starts or kills (SandboxDriver.run, kill). Here rather than in a driver's
+ * module so that whatever codes against this interface, the fake driver
+ * among it, has the rule without importing a driver.
+ */
+export const CONTAINER_PREFIX = 'aos-run-'
+
 /** Isolation domain. Each maps to its own VM and its own internal network. */
 export type SandboxDomain = 'trusted' | 'hostile'
 
@@ -74,11 +83,25 @@ export type ExitSignal = 'SIGKILL' | 'SIGTERM' | null
 
 export interface SandboxResult {
   readonly name: string
-  /** Null when the process was signalled rather than exiting. */
+  /**
+   * Null when the process was signalled rather than exiting, or never
+   * started. A run the kernel's kill ended reports 137, the docker CLI's exit
+   * for a killed container, with signal SIGKILL and killedBy; a 137 with no
+   * killedBy is the run's own (the OOM killer's, or the worker's exit 137).
+   * Tell a kill by killedBy, never by this code.
+   */
   readonly exitCode: number | null
   readonly signal: ExitSignal
   /** Set when the kernel stopped it, rather than it finishing on its own. */
   readonly killedBy?: 'wallclock' | 'requested'
+  /**
+   * Set when the run's hard wallclock elapsed before it ended, whether or not
+   * the kill the driver then sent ended it (killedBy 'wallclock' says it did).
+   * A run that outlived its wallclock and then exited on its own, its kill
+   * having reached no daemon, reports this and no killedBy: it is the one
+   * trace that invariant 9's hard wallclock did not hold, and a caller logs it.
+   */
+  readonly overran?: true
   /**
    * The first CAPTURE_MAX_BYTES bytes of each stream at most, decoded as UTF-8
    * and cut on a character boundary. A byte that is not UTF-8 decodes to
@@ -113,15 +136,27 @@ export interface SandboxDriver {
   /** Availability, never a throw: a missing runtime is a degraded boot. */
   probe(): Promise<ProbeResult>
   /**
-   * Throws, before starting anything, while a run under `spec.name` from an
-   * earlier call has not finished: the name is how kill() and the wallclock
-   * reach a container, so it must name exactly one.
+   * Throws a ConfigError, before starting anything, for a `spec.name` that
+   * does not start with CONTAINER_PREFIX: such a name is no container of the
+   * kernel's, and the orphan sweep would never find it. And throws, before
+   * starting anything, while a run under `spec.name` from an earlier call has
+   * not finished: the name is how kill() and the wallclock reach a container,
+   * so it must name exactly one. The name stays held until the result has
+   * settled, and is free once `await result` has returned.
    */
   run(spec: SandboxSpec): RunningSandbox
   /**
    * Idempotent: killing an unknown or already-dead container is not an error.
-   * A run it ends reports `killedBy: 'requested'` and SIGKILL, unless its
-   * wallclock had already fired.
+   * A name without CONTAINER_PREFIX is someone else's container: a kill of it
+   * is sent nowhere and ends nothing, and is not an error either.
+   *
+   * Resolves once the kill has been sent, not once the run has ended: the run
+   * under that name may still be running, and its name still held, when this
+   * returns; `await result` is what says it ended. A run it ends reports
+   * `killedBy: 'requested'` and SIGKILL, unless its wallclock fired before
+   * the run ended. A kill can also end nothing (it reached no daemon, or came
+   * after the run had exited on its own), and the run then reports its own
+   * exit.
    */
   kill(name: string): Promise<void>
 }

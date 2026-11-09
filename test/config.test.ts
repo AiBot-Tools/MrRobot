@@ -577,7 +577,9 @@ test('a sandbox domain network may not be host, bridge or default, in any case; 
   // network create --internal host`, which docker refuses for a predefined
   // network. Refused without regard to case, as the run-args audit refuses
   // them (test/sandbox-docker.test.ts), so no name boots that every run
-  // refuses.
+  // refuses. Docker reads a plain HOST as a network of that name, not as
+  // host, so the message gives the reason a case variant is refused: the
+  // key=value spelling, which lower-cases.
   for (const network of ['host', 'HOST', 'bridge', 'Bridge', 'default', 'DEFAULT']) {
     for (const domain of ['trusted', 'hostile'] as const) {
       const doc = fixture('valid.yaml') as { sandbox: { domains: Record<string, { network: string }> } }
@@ -586,7 +588,12 @@ test('a sandbox domain network may not be host, bridge or default, in any case; 
       entry.network = network
       assert.throws(
         () => parse(doc),
-        /a sandbox domain network may not be host, bridge or default, in any case/,
+        (e: unknown) =>
+          e instanceof Error &&
+          e.message.includes('a sandbox domain network may not be host, bridge or default, nor any of them in another case') &&
+          e.message.includes("a plain HOST names a separate network called HOST, but docker's key=value spelling lower-cases (name=HOST is host)") &&
+          !e.message.includes('HOST would name a network of its own') &&
+          !e.message.includes('in any case:'),
         `${domain}: ${JSON.stringify(network)}`,
       )
     }

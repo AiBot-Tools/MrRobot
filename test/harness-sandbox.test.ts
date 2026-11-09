@@ -61,6 +61,7 @@ test('records the exact spec and returns the scripted exit', async () => {
   assert.equal(result.signal, null)
   assert.equal(result.stdout, 'ok\n')
   assert.equal(result.killedBy, undefined, 'a normal exit was not killed by anyone')
+  assert.equal(result.overran, undefined, 'a normal exit did not outlive its wallclock')
 })
 
 test('simulateOverrun resolves with SIGKILL and killedBy wallclock', async () => {
@@ -71,10 +72,12 @@ test('simulateOverrun resolves with SIGKILL and killedBy wallclock', async () =>
   const result = await running.result
 
   // The wallclock is a hard stop, so it must be distinguishable from both a
-  // clean exit and an operator kill.
-  assert.equal(result.exitCode, null)
+  // clean exit and an operator kill. Its exit code is the docker CLI's for a
+  // killed container, as the real driver reports it.
+  assert.equal(result.exitCode, 137)
   assert.equal(result.signal, 'SIGKILL')
   assert.equal(result.killedBy, 'wallclock')
+  assert.equal(result.overran, true)
   assert.equal(result.durationMs, 600_000)
 })
 

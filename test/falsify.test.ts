@@ -33,6 +33,7 @@ import {
   JournalUnreadable,
   judge,
   liveRun,
+  nodeTestRunner,
   processStarted,
   PS_CLOCK,
   problems,
@@ -144,6 +145,29 @@ test('each verdict is reached for its own reason, and the file is put back after
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
   assert.equal(leftover, '', 'a hung mutant left a test process running')
+})
+
+test('npm test and the runner start every test process with gc exposed, so the memory test needs no runtime flag', async (t) => {
+  // test/sandbox-docker.test.ts measures what a run's capture holds across
+  // full collections. Exposing gc at runtime (v8.setFlagsFromString after V8
+  // has started) is its fallback, not something to depend on: a Node whose V8
+  // stops honouring it would fail that test under npm test and under every
+  // falsify run of the sandbox suite. So both start node with --expose-gc,
+  // which node --test hands each test file's own process.
+  const scripts = (JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')) as { scripts: Record<string, string> }).scripts
+  assert.match(scripts['test'] ?? '', /^node --expose-gc --import tsx --test test\/\*\.test\.ts$/)
+
+  const { root } = fixture(t)
+  t.after(() => {
+    spawnSync('pkill', ['-KILL', '-f', root])
+  })
+  writeFileSync(
+    join(root, 'gc.test.ts'),
+    "import test from 'node:test'\nimport assert from 'node:assert/strict'\n\n" +
+      "test('gc is exposed', () => {\n  assert.equal(typeof (globalThis as { gc?: unknown }).gc, 'function')\n})\n",
+  )
+  const run = await nodeTestRunner(root)([join(root, 'gc.test.ts')], 20_000)
+  assert.deepEqual({ code: run.code, failing: run.failing, passing: run.passing }, { code: 0, failing: [], passing: ['gc is exposed'] })
 })
 
 test('a test process that throws still leaves the file restored', async (t) => {

@@ -829,7 +829,7 @@ npm run falsify -- --only D13,W3
 npm run falsify -- --list
 ```
 
-In order: every suite (seventeen, see `--list`); one suite, or several
+In order: every suite (twenty, see `--list`); one suite, or several
 space-separated; named mutants, across suites; the catalog, touching nothing.
 `--recover` restores what an interrupted run left and runs nothing else;
 `--timeout MS` bounds each test run (default 240000).
@@ -883,10 +883,12 @@ Run it after changing delegation, crash recovery, tool-call replay, the memory
 namespace pin, goal tracking, anchor trust, the eval checks, the chain /
 canonicalizer / triggers (`integrity`), redaction, the cron scheduler, the agent
 registry, restart recovery of approvals and holds, the container audit and path
-containment (`sandbox`), the `.env` loader and the credential checks around it
-(`dotenv`, and `dotenvDefault` for how an entry point picks its file), the
+containment (`sandbox`), the egress host normaliser and address classifier
+(`egress`), the `.env` loader and the credential checks around it (`dotenv`, and
+`dotenvDefault` for how an entry point picks its file), the `.env` writer
+(`dotenvAppend`), the installer's plan and confirmation gate (`installPlan`), the
 `.gitignore` reading (`gitignore`), or the runner itself (`runner`) — the
-seventeen suites — and add a mutant
+twenty suites — and add a mutant
 whenever a new test exists to catch a specific bug. No test may let a mutant
 reach your real `.env`: `test/entrypoints.test.ts` runs every entry point from a
 temporary copy of the checkout holding a trap `.env`, through `runEntry` /

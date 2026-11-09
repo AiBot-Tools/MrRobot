@@ -624,6 +624,42 @@ const sandbox: Suite = {
   control: { id: 'C', file: DOCKER, from: '    // Invariant 9, one flag at a time.', to: '    // Invariant 9, one flag at a time. (control)', why: 'comment only' },
 }
 
+const ADDR = 'src/egress/addr.ts'
+const HOST = 'src/egress/host.ts'
+
+// The egress plan's host normaliser and address classifier (E1). Every mutant
+// here fails open unless its why says otherwise: a name or an address the
+// kernel must never dial is let through. F1 adds the rest of the egress suite.
+const egress: Suite = {
+  name: 'egress',
+  tests: ['test/egress-address.test.ts'],
+  mutants: [
+    { id: 'EG1', file: ADDR, from: "  if (value >> 32n === 0xffffn) return [['ipv4-mapped', Number(value & LOW_32)]]\n", to: '  if (value >> 32n === 0xffffn) return []\n', why: 'an IPv4-mapped answer is recognised and never judged, so ::ffff:127.0.0.1 and ::ffff:192.168.5.2 are dialled' },
+    { id: 'EG2', file: ADDR, from: "  if (value >> 32n === 0x0064ff9b_0000_0000_0000_0000n) return [['nat64', Number(value & LOW_32)]]\n", to: '  if (value >> 32n === 0x0064ff9b_0000_0000_0000_0000n) return []\n', why: 'a NAT64 answer is recognised and never judged, so 64:ff9b::7f00:1 reaches the Mac\'s loopback through the gateway' },
+    { id: 'EG3', file: ADDR, from: "  if (value >> 112n === 0x2002n) return [['6to4', Number((value >> 80n) & LOW_32)]]\n", to: '', why: 'a 6to4 address is judged only as IPv6, where 2002::/16 is global unicast, so 2002:7f00:1:: is dialled' },
+    { id: 'EG4', file: ADDR, from: "      ['teredo-client', Number((value & LOW_32) ^ LOW_32)],\n", to: "      ['teredo-client', Number(value & LOW_32)],\n", why: 'the Teredo client field is read uninverted, so a Teredo address whose client is 127.0.0.1 reads as the public 128.255.255.254 and is dialled' },
+    { id: 'EG5', file: ADDR, from: '  if (!isIPv6(address)) return NOT_AN_ADDRESS\n', to: '  if (!isIPv6(address)) return v4Denial(address)\n', why: 'text neither reader accepts is asked of the IPv4 deny lists, where BlockList answers in no range for 127.1, 0x7f.1 or 2130706433, so every legacy notation is dialled' },
+    { id: 'EG6', file: ADDR, from: "  return GLOBAL_UNICAST.check(address, 'ipv6') ? undefined : denial('not-global-unicast')\n", to: '  return undefined\n', why: 'an IPv6 address outside 2000::/3 and in no named range (fec0::, ::ffff:0:a.b.c.d, 4000::) is dialled' },
+    { id: 'EG7', file: ADDR, from: "'192.168.0.0/16'", to: "'192.168.0.0/24'", why: 'the private range stops short of 192.168.5.0/24, and 192.168.5.2, the Mac\'s loopback as a VM reaches it, is dialled' },
+    { id: 'EG8', file: ADDR, from: "  ['this-network', ['0.0.0.0/8']],\n", to: '', why: '0.0.0.0, which reaches the Mac\'s own listeners, is dialled' },
+    { id: 'EG9', file: HOST, from: "  if (NUMERIC_LABEL.test(name.slice(name.lastIndexOf('.') + 1))) {", to: '  if (false) {', why: '0x7f.1, 0177.0.0.1 and 127.1, IPv4 addresses to a URL parser, are admitted as names' },
+    { id: 'EG10', file: HOST, from: 'const NUMERIC_LABEL = /^(?:[0-9]+|0x[0-9a-f]*)$/', to: 'const NUMERIC_LABEL = /^[0-9]+$/', why: 'a host ending in a hex part (0x7f.0x0.0x0.0x1, example.0x7f) is admitted as a name' },
+    { id: 'EG11', file: HOST, from: "  'internal',\n", to: '', why: 'host.lima.internal and host.docker.internal, the Mac\'s loopback by name, are admitted' },
+    { id: 'EG12', file: HOST, from: '  if (SPECIAL_USE.some((suffix) => name === suffix || name.endsWith(`.${suffix}`))) {', to: '  if (SPECIAL_USE.includes(name)) {', why: 'only the bare special-use names are refused, so host.lima.internal, mac.local and api.localhost are admitted' },
+    { id: 'EG13', file: HOST, from: "  if (!name.includes('.')) {", to: '  if (false) {', why: 'a single label, which a resolver may complete with a search domain, is admitted' },
+    { id: 'EG14', file: HOST, from: "  return /[^\\x00-\\x7f]/.test(unicode) && !unicode.includes('.') && domainToASCII(unicode) === label\n", to: '  return true\n', why: 'an xn-- label that is no punycode, or not the one spelling of its name, is admitted' },
+    { id: 'EG15', file: HOST, from: "    ctx.addIssue({ code: 'custom', message: `not an egress host: it ${seen.why}` })\n", to: '', why: 'the schema reports success for a refused host, so kernel.yaml or a manifest may name 127.0.0.1 or host.lima.internal' },
+    { id: 'EG16', file: HOST, from: 'export const SPECIAL_USE: readonly string[] = Object.freeze([', to: 'export const SPECIAL_USE: readonly string[] = ([', why: 'the special-use list inspect() reads on every call is a mutable array, so an importer that casts the type away and empties it admits host.lima.internal' },
+    { id: 'EG17', file: ADDR, from: 'function frozenTable(table: readonly DeniedRanges[]): readonly DeniedRanges[] {\n', to: 'function frozenTable(table: readonly DeniedRanges[]): readonly DeniedRanges[] {\n  return table\n', why: 'not fail-open (the BlockLists are compiled at load): the exported deny tables, which tests and log rows read as the deny list, can be rewritten by any importer' },
+    { id: 'EG18', file: HOST, from: "import { z } from 'zod'\n", to: "import { z } from 'zod'\nexport * from 'node:fs'\n", why: 'not fail-open: the pure host normaliser re-exports node:fs, handing every importer the file system with no import line and no name of its own' },
+    { id: 'EG19', file: ADDR, from: "import { BlockList, isIPv4, isIPv6 } from 'node:net'\n", to: "import { BlockList, isIPv4, isIPv6 } from 'node:net'\nexport * from '../secrets/broker.js'\n", why: 'not fail-open: src/egress reaches the secrets broker through a re-export, against the rule that it never imports src/secrets' },
+    { id: 'EG20', file: HOST, from: "import { isIP } from 'node:net'\n", to: "import { isIP, connect as dial } from 'node:net'\nexport const probe = (): unknown => dial(443, '192.168.5.2')\n", why: "not fail-open on its own: the pure host normaliser imports node:net's connect under another name and exports a socket to the Mac's loopback as a VM sees it, past a scan that looked for the word connect(" },
+    { id: 'EG21', file: ADDR, from: '  return Object.freeze(carried === undefined ? { reason } : { reason, via: carried.via, embedded: carried.embedded })\n', to: '  return carried === undefined ? { reason } : { reason, via: carried.via, embedded: carried.embedded }\n', why: "not fail-open (every answer is still a denial): denials are mutable, and NOT_AN_ADDRESS is one object, so a caller that enriches one for its log row writes that request's via and embedded address into every later not-an-address decision" },
+    { id: 'EG22', file: HOST, from: "  return /[^\\x00-\\x7f]/.test(unicode) && !unicode.includes('.') && domainToASCII(unicode) === label\n", to: "  return /[^\\x00-\\x7f]/.test(unicode) && !unicode.includes('.')\n", why: 'an xn-- label that decodes but is not the A-label of what it decodes to (xn---2sw, a second spelling of xn--2sw) is admitted, so an allowlist holding one spelling misses the other' },
+  ],
+  control: { id: 'C', file: ADDR, from: '// The egress address classifier (egress plan E1).', to: '// The egress address classifier (egress plan E1). (control)', why: 'comment only' },
+}
+
 const DOTENV = 'src/secrets/dotenv.ts'
 
 const dotenv: Suite = {
@@ -664,6 +700,7 @@ const dotenv: Suite = {
     { id: 'X21', file: DOTENV, from: '  if (fromShell !== undefined) return fromShell\n', to: '', why: 'the CLI opens the file even when the shell already has the token' },
     { id: 'X32', file: DOTENV, from: '  if (fromShell !== undefined) return fromShell\n', to: '  if (fromShell !== undefined) return fromShell.trim()\n', why: 'the live tests pass on a trimmed key the daemon\'s broker refuses as it is set' },
     { id: 'X33', file: 'src/control/auth.ts', from: '  if (/[^\\x21-\\x7e]/.test(token)) {', to: '  if (false) {', why: 'a smart-quoted control token boots the daemon and fails every client with an unreadable header error' },
+    { id: 'X45', file: 'src/policy/gate.ts', from: "import { z } from 'zod'\n", to: "import { createRequire } from 'node:module'\nimport { z } from 'zod'\nexport const reachBroker = (): unknown => createRequire(import.meta.url)('../secrets/broker.js')\n", why: 'a lower layer loads the secrets broker through createRequire, which no import declaration names and no relative-import resolution sees (invariant 2)' },
     { id: 'X36', file: 'src/control/auth.ts', from: '  if (/\\s/.test(token)) {', to: '  if (false) {', why: 'a passphrase token is refused as holding a non-ASCII character, sending the operator after one that is not there' },
     { id: 'X44', file: 'src/control/auth.ts', from: "  if (/[#'\"`]/.test(token)) {", to: '  if (false) {', why: 'a control token holding # or a quote boots from the shell and is refused once moved into .env' },
     { id: 'X37', file: 'src/secrets/broker.ts', from: '  if (problem !== undefined) return `${name} ${problem}, so it is not a bearer`', to: '  void problem', why: 'a pmmcp bearer with a newline is sent, and the HTTP error quoting it lands in the chained log and on capture-pmmcp\'s terminal' },
@@ -893,6 +930,7 @@ export const CATALOG: readonly Suite[] = [
   registry,
   restart,
   sandbox,
+  egress,
   dotenv,
   dotenvDefault,
   dotenvAppend,

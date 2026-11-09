@@ -305,7 +305,7 @@ test('src/ never imports test/', () => {
   }
 })
 
-test('dependency direction: src/runtime, src/models, src/mcp, src/agents, src/policy never import mintHumanActor or src/secrets internals; only src/control/server.ts imports mintHumanActor', () => {
+test('dependency direction: src/runtime, src/models, src/mcp, src/agents, src/policy, src/egress never import mintHumanActor or src/secrets internals; only src/control/server.ts imports mintHumanActor', () => {
   // mintHumanActor is the only way to make an actor the approvals path accepts.
   // It belongs to the one module that can know a human is on the other end of a
   // socket. Anywhere else it is a forgery kit: a subsystem that can mint one can
@@ -316,7 +316,12 @@ test('dependency direction: src/runtime, src/models, src/mcp, src/agents, src/po
   ])
 
   // The lower layers take an actor as an argument and never manufacture one.
-  const LOWER = ['src/runtime/', 'src/models/', 'src/mcp/', 'src/agents/', 'src/policy/']
+  // src/egress parses what a hostile container sends and dials for it: it is
+  // handed a kernel-built closure for the one header it injects, and must
+  // never be able to reach the broker or the .env loader itself.
+  const LOWER = ['src/runtime/', 'src/models/', 'src/mcp/', 'src/agents/', 'src/policy/', 'src/egress/']
+  // A directory the walk finds nothing in makes its entry vacuous.
+  for (const dir of LOWER) assert.ok(SRC.some((f) => f.path.startsWith(dir)), `no source file under ${dir}`)
   for (const file of SRC.filter((f) => LOWER.some((d) => f.path.startsWith(d)))) {
     assert.equal(/\bmintHumanActor\b/.test(file.text), false, `${file.path} can mint a human actor`)
     // The broker is kernel-only (invariant 2). A lower layer reaching into it
@@ -326,9 +331,83 @@ test('dependency direction: src/runtime, src/models, src/mcp, src/agents, src/po
       false,
       `${file.path} imports the secrets broker`,
     )
+    // Resolved and parsed as well as matched: a double-quoted specifier, a
+    // re-export, an import(), an absolute or file: path, createRequire and a
+    // path held in a variable name src/secrets without the single-quoted
+    // `from` above (secretsReach says what it sees and what it cannot).
+    const reached = secretsReach(file)
+    assert.deepEqual(reached, [], `${file.path} reaches src/secrets: ${reached.join('; ')}`)
   }
   // Exactly one composer wires the broker in.
   assert.deepEqual(importersOf(SRC, './secrets/broker.js'), ['src/kernel.ts'])
+})
+
+/** A path with a `secrets` directory in it, in either separator. */
+const SECRETS_PATH = /(?:^|[\\/])secrets(?:[\\/]|$)/
+/** node:module, whose createRequire loads a module by a path no import declaration spells. */
+const LOADER_MODULE = /^(?:node:)?module$/
+
+/**
+ * How a file reaches src/secrets, as `line  text` hits: an import of any form
+ * whose relative specifier resolves there; a specifier of any form (import,
+ * bare import, re-export, `import x = require()`, `import('x')` in a type)
+ * that names a secrets/ directory, as an absolute path or a file: URL does
+ * without resolving as relative; node:module by any specifier; and a string
+ * in code that names either, which is what createRequire(import.meta.url),
+ * process.getBuiltinModule, require() or an import() of a name held first in
+ * a variable is handed. A tripwire for natural code, as the .env write scan
+ * is, not a proof: a path built from parts at run time is beyond any static
+ * scan, and a reviewer reads that by eye.
+ */
+function secretsReach(file: SourceFile): string[] {
+  const source = parsed(file)
+  const out: string[] = []
+  const at = (node: ts.Node): string => `${String(source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1)}  ${node.getText(source)}`
+  const names = (text: string): boolean => SECRETS_PATH.test(text) || LOADER_MODULE.test(text)
+  for (const target of relativeImports(file)) if (target.startsWith('src/secrets/')) out.push(`resolves to ${target}`)
+  const visit = (node: ts.Node): void => {
+    let spec: ts.Node | undefined
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier !== undefined) spec = node.moduleSpecifier
+    else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) spec = node.moduleReference.expression
+    else if (ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) spec = node.argument.literal
+    if (spec !== undefined && ts.isStringLiteralLike(spec) && names(spec.text)) out.push(at(node))
+    ts.forEachChild(node, visit)
+  }
+  visit(source)
+  for (const { value, node } of codeStrings(source)) if (names(value)) out.push(at(node))
+  return out
+}
+
+test('the secrets-reach scan sees a relative import of any form, an absolute or file: specifier, node:module and createRequire, and a path held in a variable', () => {
+  // Each of these, in a lower layer, would reach the broker or the .env
+  // loader. The last group is what a resolved relative import cannot see.
+  const reaches = [
+    "import { SecretsBroker } from '../secrets/broker.js'",
+    'export * from "../secrets/broker.js"',
+    "const b = await import('../secrets/dotenv.js')",
+    "import b = require('../secrets/broker.js')",
+    "type B = typeof import('../secrets/broker.js')",
+    "import '/Users/op/MrRobot/src/secrets/broker.js'",
+    "import { SecretsBroker } from '/Users/op/MrRobot/src/secrets/broker.js'",
+    "const b = await import('file:///Users/op/MrRobot/src/secrets/broker.js')",
+    "import { createRequire } from 'node:module'\nconst b = createRequire(import.meta.url)('../secrets/broker.js')",
+    "import { createRequire } from 'node:module'",
+    "import * as m from 'module'",
+    "const req = process.getBuiltinModule('node:module').createRequire(import.meta.url)",
+    "const where = '../secrets/broker.js'\nconst b = await import(where)",
+    'const b = await import(`../secrets/${"broker"}.js`)',
+  ]
+  for (const text of reaches) {
+    assert.notDeepEqual(secretsReach({ path: 'src/egress/probe.ts', text, lines: text.split('\n') }), [], text)
+  }
+  // A comment, a longer name and an unrelated module are not a reach.
+  for (const text of [
+    "// import { SecretsBroker } from '../secrets/broker.js'\nconst s = 1",
+    "import { SecretMask } from '../events/redact.js'\nconst why = 'no secrets here'",
+    "import { thing } from './secrets-free.js'\nconst m = 'modules'",
+  ]) {
+    assert.deepEqual(secretsReach({ path: 'src/egress/probe.ts', text, lines: text.split('\n') }), [], text)
+  }
 })
 
 test('no source file contains a gate bypass keyword', () => {

@@ -66,7 +66,18 @@ secrets:
 
 sandbox:
   driver: docker
+  # The worker image's name: the tag the image build script (egress plan I1,
+  # scripts/build-worker-image.sh, not yet written) gives what it builds, so
+  # `docker images` shows which image is the kernel's. A name only: no run
+  # executes it, because a tag is whatever image was last given it on that VM
+  # and a name the VM lacks would be pulled.
   image: aos-worker:0.0.1
+  # What every run executes: the image id that script prints (as `docker image
+  # inspect --format {{.Id}}` does, sha256:<64 lower-case hex>), run by id with
+  # --pull=never on both VMs. None ships, because no image is built yet: while
+  # it is unset the sandbox subsystem is degraded, naming this key, no run is
+  # built and nothing is pulled. Set it once the image exists on both VMs:
+  # imageId: sha256:<64 hex>
   domains:
     trusted:
       # Colima keeps its sockets under $HOME; the ~ is expanded at parse,

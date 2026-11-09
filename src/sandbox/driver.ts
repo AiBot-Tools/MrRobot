@@ -68,6 +68,14 @@ export interface SandboxSpec {
   readonly runId: string
   readonly agentId: string
   readonly domain: SandboxDomain
+  /**
+   * The image the run asks for. A driver is not bound to run it as given: the
+   * docker driver runs only the pinned sandbox.imageId, by id and with
+   * --pull=never, and refuses a spec naming anything else, a tag among them,
+   * and every spec while none is pinned; the fake driver refuses the same.
+   * So a caller copies config.sandbox.imageId here, never config.sandbox.image
+   * or a manifest's sandbox.image, which are tags.
+   */
   readonly image: string
   readonly command: readonly string[]
   /**

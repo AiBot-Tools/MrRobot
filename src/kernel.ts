@@ -74,7 +74,7 @@ import { RunLoop, type RunAgent, type RunOutcome } from './runtime/loop.js'
 import { assertEgressEnforced } from './runtime/egress.js'
 import { Scheduler } from './runtime/scheduler.js'
 import { AppleContainerDriver } from './sandbox/apple-container.js'
-import { realDockerDriver } from './sandbox/docker.js'
+import { DockerDriver, realDockerDriver, type DockerProcesses } from './sandbox/docker.js'
 import type { ProbeResult as SandboxProbe, SandboxDriver } from './sandbox/driver.js'
 import { assertTokenUsable } from './control/auth.js'
 import { ControlServer, type ControlSurface } from './control/server.js'
@@ -823,18 +823,28 @@ function stubReason(id: string, call: () => unknown): string {
   throw new ConfigError(`${id} is listed as absent but did not refuse when called`)
 }
 
-function defaultDriver(config: KernelConfig, repoRoot: string): SandboxDriver {
+/**
+ * The sandbox driver boot builds from kernel.yaml when no test hands it one.
+ * Exported, with the docker CLI's two process functions injectable, so that a
+ * test can prove what kernel.yaml's sandbox block reaches the driver (the
+ * pinned image id above all) with no docker binary. Boot passes none: the
+ * process wiring lives in the docker module, which is the one place allowed to
+ * import node:child_process.
+ */
+export function defaultDriver(config: KernelConfig, repoRoot: string, processes?: DockerProcesses): SandboxDriver {
   if (config.sandbox.driver === 'apple-container') return new AppleContainerDriver()
   // The driver is constructed, not used: nothing spawns until a run asks for a
-  // container, and in Phase 0 nothing does. Boot only probes it. The process
-  // wiring lives in the docker module, which is the one place allowed to import
-  // node:child_process.
-  return realDockerDriver({
+  // container, and in Phase 0 nothing does. Boot only probes it.
+  const options = {
     domains: config.sandbox.domains,
     defaults: config.sandbox.defaults,
+    // Unset until the operator pins the built worker image; the probe then
+    // reports the sandbox degraded, naming the key.
+    imageId: config.sandbox.imageId,
     dockerConfig: join(config.dataDir, 'docker'),
     repoRoot,
-  })
+  }
+  return processes === undefined ? realDockerDriver(options) : new DockerDriver({ ...options, ...processes })
 }
 
 /**

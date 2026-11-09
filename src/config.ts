@@ -30,7 +30,7 @@ import { ConfigError } from './errors.js'
 import { rootGitignoreIgnores } from './gitignore.js'
 import { entryProblem, homeDirectory, identify, isSpelledUnder, isUnder, realpathNearest, type Identify } from './agents/protected.js'
 import { DENY_KEYS } from './events/redact.js'
-import { isDockerNetworkMode, isNetworkName, isUnprivilegedUser, memoryBytes } from './sandbox/limits.js'
+import { isDockerNetworkMode, isImageId, isNetworkName, isUnprivilegedUser, memoryBytes } from './sandbox/limits.js'
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
 
@@ -286,7 +286,25 @@ const SandboxDomain = z
 const Sandbox = z
   .object({
     driver: z.enum(['docker', 'apple-container']).default('docker'),
+    // The worker image's NAME: the tag the image build script (egress plan I1,
+    // scripts/build-worker-image.sh, not yet written) gives what it builds, so
+    // that `docker images` shows which image is the kernel's. Never what a run
+    // executes: a tag is whatever image was last given it on that VM, and a
+    // name the VM lacks would be pulled.
     image: z.string().min(1),
+    // What every run executes, by id and with --pull=never (sandbox/docker.ts):
+    // the id that script prints, as `docker image inspect --format {{.Id}}`
+    // does. Optional because kernel.yaml ships none until the image is built;
+    // while it is unset the sandbox subsystem is degraded, naming this key,
+    // and no run is built.
+    imageId: z
+      .string()
+      .refine(isImageId, {
+        message:
+          'sandbox.imageId must be sha256:<64 lower-case hex>, the id `docker image inspect --format {{.Id}}` prints: ' +
+          'a tag or a repository digest (name@sha256:...) is a name the VM resolves, and could be pulled',
+      })
+      .optional(),
     domains: z.object({ trusted: SandboxDomain, hostile: SandboxDomain }).strict(),
     defaults: z
       .object({

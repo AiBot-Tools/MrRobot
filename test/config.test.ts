@@ -542,6 +542,70 @@ test('sandbox.defaults.user is never root or its group, and memory is a positive
   assert.doesNotThrow(() => parse(written))
 })
 
+test('sandbox.imageId must be sha256:<64 hex>', () => {
+  // Egress plan P4: every run executes the image by this id, with
+  // --pull=never. A tag names whatever image was last given it on that VM,
+  // and a repository digest is a name the daemon resolves, so neither pins
+  // anything. The run-args audit refuses them again (test/sandbox-docker.test.ts).
+  const id = `sha256:${'0123456789abcdef'.repeat(4)}`
+  const withId = (imageId: unknown): unknown => {
+    const doc = fixture('valid.yaml') as { sandbox: Record<string, unknown> }
+    doc.sandbox['imageId'] = imageId
+    return doc
+  }
+  for (const imageId of [
+    'aos-worker:0.0.1',
+    'aos-worker',
+    `aos-worker@${id}`,
+    id.slice('sha256:'.length),
+    id.toUpperCase(),
+    `sha256:${'0123456789ABCDEF'.repeat(4)}`,
+    id.slice(0, -1),
+    `${id}0`,
+    `sha512:${'0'.repeat(64)}`,
+    `${id}\n`,
+    ` ${id}`,
+    '',
+    // Lower case, the right length, and not hex. digest.Parse refuses it, so
+    // docker reads the whole string as the TAG of repository
+    // docker.io/library/sha256, whatever image the VM last gave that name.
+    `sha256:${'g'.repeat(64)}`,
+    `sha256:${'0123456789abcdef'.repeat(4).slice(0, 63)}g`,
+    `sha256:${'z'.repeat(64)}`,
+  ]) {
+    assert.throws(() => parse(withId(imageId)), /sandbox\.imageId must be sha256:<64 lower-case hex>/, JSON.stringify(imageId))
+  }
+  for (const imageId of [123, null, true, [id]]) {
+    assert.throws(() => parse(withId(imageId)), /kernel\.yaml is invalid/, JSON.stringify(imageId))
+  }
+
+  assert.equal(parse(withId(id)).sandbox.imageId, id)
+  // Optional: kernel.yaml ships none until the image is built, and the
+  // sandbox subsystem is then degraded, naming the key (sandbox-docker,
+  // config-files and kernel-boot tests).
+  assert.equal(parse(fixture('valid.yaml')).sandbox.imageId, undefined)
+  assert.equal(parse(fixture('minimal.yaml')).sandbox.imageId, undefined)
+
+  // The tag stays beside it, and stays required: a name only, the one the
+  // build script gives the image, which no run executes.
+  assert.equal(parse(withId(id)).sandbox.image, 'aos-worker:0.0.1')
+  for (const pinned of [undefined, id]) {
+    const doc = withId(pinned) as { sandbox: Record<string, unknown> }
+    delete doc.sandbox['image']
+    assert.throws(
+      () => parse(doc),
+      (e: unknown) =>
+        e instanceof Error && /^kernel\.yaml is invalid/.test(e.message) && /"path": \[\s*"sandbox",\s*"image"\s*\]/.test(e.message),
+      `no sandbox.image, imageId ${String(pinned)}`,
+    )
+  }
+  for (const image of ['', 7, null]) {
+    const doc = withId(id) as { sandbox: Record<string, unknown> }
+    doc.sandbox['image'] = image
+    assert.throws(() => parse(doc), /kernel\.yaml is invalid/, JSON.stringify(image))
+  }
+})
+
 test('a sandbox domain network must be a plain network name: name=host and the like are refused at boot', () => {
   // Invariant 9's internal network. The docker CLI reads a --network value
   // holding = as key=value fields, lower-cased, whose name= is the network,

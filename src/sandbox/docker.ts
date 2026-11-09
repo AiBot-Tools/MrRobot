@@ -12,9 +12,20 @@
 // terminal, a detached client, an extra host or resolver, a shared namespace,
 // an unconfined security option, a device, another runtime, kernel parameters
 // or cgroup parent, a supplementary group, a log driver, a writable root
-// filesystem, another mount or network) in any spelling docker reads, and
-// exactly one --network, the domain's, by a plain name — and a future edit
-// that widens any of those throws rather than producing a container.
+// filesystem, another mount or network, a pull) in any spelling docker reads,
+// exactly one --network, the domain's, by a plain name, and exactly one
+// --pull=never before an image that is the pinned sandbox.imageId — and a
+// future edit that widens any of those throws rather than producing a
+// container.
+//
+// The image is run by its id, never by a name. A tag is whatever image was
+// last given it on that VM, so it pins nothing, and a name the VM lacks is
+// pulled by default, by the VM's daemon over the VM's own route out, which the
+// internal network does not cover: what then runs is whatever the registry
+// serves. So the image is the sha256 id the operator pinned, with
+// --pull=never, and while no id is pinned the driver reports itself degraded
+// and builds no run at all. The probe also asks each VM for the pinned id and
+// reports the sandbox degraded, naming the domain, while one lacks it.
 //
 // The spawn environment is exactly { DOCKER_CONFIG, DOCKER_HOST, PATH }, and that
 // is a security property rather than a tidiness one. DOCKER_CONFIG is a
@@ -31,7 +42,8 @@
 // the endpoint depends solely on kernel config, and no edit to a dotfile can
 // redirect a kernel container at another daemon. Credential helpers would
 // matter only for registry pulls, which this driver never does — it runs
-// `run`, `kill`, `version` and `ps` against a locally built image.
+// `run`, `kill`, `version` and `ps` against a locally built image, by its id
+// and with --pull=never.
 //
 // The whole process environment is never passed. A worker that inherited the
 // kernel's environment would receive every provider key the operator exported
@@ -46,7 +58,17 @@ const execFileAsync = promisify(execFile)
 import { ConfigError } from '../errors.js'
 import { homeDirectory, realpathNearest } from '../agents/protected.js'
 import { confineWorkspace } from './confine.js'
-import { isCpus, isDockerNetworkMode, isNetworkName, isPidsLimit, isUnprivilegedUser, memoryBytes } from './limits.js'
+import {
+  imageIdProblem,
+  imageRefusal,
+  isCpus,
+  isImageId,
+  isDockerNetworkMode,
+  isNetworkName,
+  isPidsLimit,
+  isUnprivilegedUser,
+  memoryBytes,
+} from './limits.js'
 import {
   CAPTURE_MAX_BYTES,
   CONTAINER_PREFIX,
@@ -95,6 +117,7 @@ const RUN_OPTIONS: ReadonlyMap<string, 'flag' | 'value'> = new Map([
   ['--tmpfs', 'value'],
   ['--mount', 'value'],
   ['--workdir', 'value'],
+  ['--pull=never', 'flag'],
 ])
 
 /**
@@ -278,6 +301,34 @@ function writableRoot(value: string | undefined, inline: boolean): string | unde
 }
 
 /**
+ * --pull, as the docker CLI reads it: `missing`, its default, pulls the image
+ * when the VM lacks it, and `always` on every run. The pull is the VM's
+ * daemon's, over the VM's own route out, which no container network covers,
+ * and what runs is then whatever the registry served. Only `never` keeps a run
+ * to an image already on the VM.
+ *
+ * Any other value (an empty one, `NEVER`, `yes`) is refused as a value the
+ * builder never writes, over-named on purpose, as unconfines() names a key
+ * docker 29 refuses. What docker makes of it is not claimed here: it refuses
+ * some, and a later docker may read one as a pull. `--pull never`, in two
+ * elements, pulls nothing and is left to RUN_OPTIONS, which refuses it as a
+ * spelling the builder never emits.
+ */
+function pulls(value: string | undefined): string | undefined {
+  if (value === 'never') return undefined
+  if (value === 'missing' || value === 'always') {
+    return (
+      "has the VM's daemon pull the image over the VM's own route out, when the VM lacks it (missing, docker's " +
+      'default) or on every run (always), so that what runs is whatever the registry serves; only never is admitted'
+    )
+  }
+  return (
+    'sets --pull to a value the builder never writes, refused whatever docker makes of it, since a later docker ' +
+    'may read it as a pull; only never is admitted'
+  )
+}
+
+/**
  * Options refused before the image, in every spelling docker reads:
  * `--flag value`, `--flag=value`, and a letter in a group. A string refuses
  * the option whatever its value; a function judges the value. RUN_OPTIONS,
@@ -295,7 +346,8 @@ function writableRoot(value: string | undefined, inline: boolean): string | unde
  * the run's hard wallclock lives as long as the docker client does: a client
  * that returns at once clears it. `--group-add`, the log options and
  * `--read-only=false` undo, by another route, what --user, the internal
- * network and --read-only give. A second `--network` or `--mount` written as
+ * network and --read-only give, and a `--pull` other than never undoes the
+ * pinned image id. A second `--network` or `--mount` written as
  * the builder writes its own is caught by the count of each option, and the
  * one --network value is then held to the domain's. A domain that names
  * host, bridge or `name=host` is refused before this list is read
@@ -347,6 +399,7 @@ const WIDENING: ReadonlyMap<string, string | Widens> = new Map<string, string | 
   ],
   ['--log-opt', "configures the container's log driver, the address it ships the container's output to among them"],
   ['--read-only', writableRoot],
+  ['--pull', pulls],
 ])
 
 /** Options whose family shares their refusal: `--dns-search` is `--dns`'s. */
@@ -414,6 +467,13 @@ export interface BuildArgsInput {
   readonly domain: DomainConfig
   readonly defaults: DockerDefaults
   readonly repoRoot: string
+  /**
+   * The pinned image id, `sha256:<64 hex>` (kernel.yaml's sandbox.imageId), and
+   * the only image a run may name: the spec's image is a request, held to it
+   * by the audit, as its workspace is held to the mountRoot. Undefined while
+   * the operator has pinned none, which refuses every run.
+   */
+  readonly imageId: string | undefined
   /** Defaults to the current user's home; injected so a test can pin it. */
   readonly home?: string
 }
@@ -483,11 +543,15 @@ export function buildRunArgs(input: BuildArgsInput): string[] {
     `type=bind,source=${workspace},target=${WORKSPACE_TARGET}`,
     '--workdir',
     WORKSPACE_TARGET,
+    // The image is never pulled: one the VM lacks fails the run, rather than
+    // being fetched by the VM's daemon over the VM's own route. The audit
+    // holds the image after it to the pinned id.
+    '--pull=never',
     spec.image,
     ...spec.command,
   ]
 
-  auditRunArgs(args, home, workspace, domain.network)
+  auditRunArgs(args, home, workspace, domain.network, input.imageId)
   return args
 }
 
@@ -498,7 +562,13 @@ export function buildRunArgs(input: BuildArgsInput): string[] {
  * set of conditions spread through the builder: it catches a widening
  * introduced anywhere above, including in `spec.command`.
  */
-export function auditRunArgs(args: readonly string[], home: string, workspace: string, network: string): void {
+export function auditRunArgs(
+  args: readonly string[],
+  home: string,
+  workspace: string,
+  network: string,
+  imageId: string | undefined,
+): void {
   // The builder writes the domain's network into its own --network. A domain
   // that names a network docker reads as no network of that name (host,
   // bridge, `name=host`), or any other value a domain may not name, is refused
@@ -624,12 +694,26 @@ export function auditRunArgs(args: readonly string[], home: string, workspace: s
   if (at >= args.length) {
     throw new ConfigError('docker args name no image after their options')
   }
+  // The image docker runs, which --pull=never (there exactly once, by the
+  // count above) keeps it from pulling: it must be the pinned id.
+  assertTheImage(args[at] ?? '', imageId)
 
   // Each once, by the count above, so this is the value docker uses — and,
   // for --network, the one network it attaches.
   for (const option of CAP_VALUES.keys()) assertCapValue(option, values.get(option) ?? '')
   assertTheMount(mount ?? '', workspace)
   assertTheNetwork(values.get('--network') ?? '', network)
+}
+
+/**
+ * The image slot must hold the pinned id, exactly, and the pinned value must
+ * be an id: imageRefusal (limits.ts) says why not, in the words the fake
+ * driver uses for the same spec, and that is thrown whatever spec, edit or
+ * config put the image there.
+ */
+function assertTheImage(image: string, imageId: string | undefined): void {
+  const refused = imageRefusal(image, imageId)
+  if (refused !== undefined) throw new ConfigError(refused)
 }
 
 /**
@@ -748,6 +832,13 @@ export interface DockerDriverOptions {
   readonly domains: Readonly<Record<'trusted' | 'hostile', DomainConfig>>
   readonly defaults: DockerDefaults
   readonly repoRoot: string
+  /**
+   * kernel.yaml's sandbox.imageId: the one image every run executes, by id.
+   * Undefined while none is pinned, and then probe() reports why and every
+   * run() is refused (BuildArgsInput.imageId). Required rather than optional,
+   * so that a caller that forgets it does not compile.
+   */
+  readonly imageId: string | undefined
   readonly binary?: string
   readonly path?: string
   readonly home?: string
@@ -897,6 +988,14 @@ export class DockerDriver implements SandboxDriver {
   }
 
   async probe(): Promise<ProbeResult> {
+    // No run can be built without a pinned image, whatever the daemons say,
+    // so none is asked anything: degraded, saying which key to set and how to
+    // get its value, and nothing pulled now or at a run.
+    const image = imageIdProblem(this.#options.imageId)
+    if (image !== undefined) return { ok: false, why: image }
+    // imageIdProblem has passed it, so it is an id, sha256:<64 hex>.
+    const imageId = String(this.#options.imageId)
+
     let version: string
     try {
       const { stdout } = await this.#options.execFile(
@@ -961,8 +1060,51 @@ export class DockerDriver implements SandboxDriver {
             `internet. Recreate it: docker network rm ${network} && docker network create --internal ${network}`,
         }
       }
+
+      // The pinned image, on this domain's own VM, by id. Each run names it
+      // with --pull=never, so a VM that lacks it pulls nothing, but every run
+      // there fails at docker with no such image: an image built on the
+      // trusted VM and never loaded into the hostile one would leave the
+      // sandbox reported ok and every hostile run failing. And docker must
+      // print the pin itself as the image's id: the pin is what it prints
+      // (isImageId), and an id it prints differently is not the one pinned.
+      // `image inspect` reads the VM's own store and never pulls.
+      const missing = await this.#imageMissingOn(domain, imageId)
+      if (missing !== undefined) return { ok: false, why: missing }
     }
     return { ok: true, version }
+  }
+
+  /**
+   * Why the pinned image cannot run on `domain`'s VM, or undefined when that
+   * VM's daemon has it and prints the pin as its id.
+   */
+  async #imageMissingOn(domain: SandboxDomain, imageId: string): Promise<string | undefined> {
+    let printed: string
+    try {
+      const { stdout } = await this.#options.execFile(
+        this.#binary,
+        ['image', 'inspect', '--format', '{{.Id}}', imageId],
+        { env: this.#env(domain) },
+      )
+      printed = stdout.trim()
+    } catch (e) {
+      return (
+        `${domain}: the pinned sandbox.imageId ${imageId} could not be inspected on this domain's VM, so every run ` +
+        `there would fail at docker, which is told never to pull it: ${e instanceof Error ? e.message : String(e)}. ` +
+        'Load the worker image into this VM (docker save on the VM that built it, docker load on this one), or ' +
+        'build it here, so that both VMs hold it under the one pinned id'
+      )
+    }
+    if (printed === imageId) return undefined
+    // Shown only when it reads as an id: what docker prints here goes into
+    // the hash-chained log (sandbox.degraded.reason), and an id is bounded.
+    const what = printed === '' ? 'no id' : isImageId(printed) ? `the id ${printed}` : 'something that is no image id'
+    return (
+      `${domain}: docker image inspect ${imageId} printed ${what} on this domain's VM, not the pinned ` +
+      'sandbox.imageId: pin the id `docker image inspect --format {{.Id}}` prints for the worker image, the same ' +
+      'on both VMs'
+    )
   }
 
   run(spec: SandboxSpec): RunningSandbox {
@@ -972,6 +1114,7 @@ export class DockerDriver implements SandboxDriver {
       domain,
       defaults: this.#options.defaults,
       repoRoot: this.#options.repoRoot,
+      imageId: this.#options.imageId,
       ...(this.#options.home === undefined ? {} : { home: this.#options.home }),
     })
 
@@ -1191,6 +1334,12 @@ export class DockerDriver implements SandboxDriver {
 }
 
 /**
+ * The two functions through which the driver reaches the docker CLI. Only
+ * realDockerDriver binds them to node:child_process; a test hands its own.
+ */
+export type DockerProcesses = Pick<DockerDriverOptions, 'spawn' | 'execFile'>
+
+/**
  * The real driver, wired to the real process APIs.
  *
  * This is the ONLY place in the kernel that imports node:child_process, and so
@@ -1198,7 +1347,9 @@ export class DockerDriver implements SandboxDriver {
  * `spawn` and `execFile` as options precisely so that every test can drive it
  * without a process; this factory is where the production wiring lives, next to
  * the code that knows what a docker invocation must look like rather than in the
- * composer that merely asks for a driver.
+ * composer that merely asks for a driver. The composer (kernel.ts's
+ * defaultDriver) builds a DockerDriver itself only when a test hands it its own
+ * DockerProcesses, and then from that test's functions, never from these.
  */
 export function realDockerDriver(
   options: Omit<DockerDriverOptions, 'spawn' | 'execFile'>,

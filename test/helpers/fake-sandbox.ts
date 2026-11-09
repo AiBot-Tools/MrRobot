@@ -11,10 +11,19 @@
 //   would let runtime code call the sandbox more times than intended — or
 //   for the wrong run — and still pass.
 //
-// Where the real driver refuses or reports something, so does this: a name
-// without the kernel's container prefix is refused, and a kill of one ends
-// nothing; a second run under a name whose result has not settled is refused,
-// whether the run hangs or not. A kill or an overrun ends a hung run on a later
+//   No image id is pinned unless the test pins one (`imageId`), as
+//   kernel.yaml ships none, and then every run is REFUSED, as the real driver
+//   refuses it.
+//
+// Where the real driver refuses or reports something, so does this: a spec
+// whose image is not the pinned id, exactly, is refused, a tag among them, and
+// every spec while no valid id is pinned, with the real driver's own words
+// (imageRefusal, src/sandbox/limits.ts); a probe scripted ok reports the
+// sandbox degraded instead while no valid id is pinned (none, or a value that
+// is no id), as the real driver never reports ok without one; a name without
+// the kernel's container prefix is refused, and a kill of one ends nothing; a
+// second run under a name whose result has not settled is refused, whether
+// the run hangs or not. A kill or an overrun ends a hung run on a later
 // macrotask, as the real one's run ends when the docker CLI closes, after
 // `docker kill` has returned: so the name is still held, and the result not
 // yet settled, when `await kill()` returns, and the name is free once
@@ -26,12 +35,18 @@
 // driver returns what it captured up to the kill. A kill of a run that has
 // ended changes nothing. And a script may say that a kill ends nothing
 // (`ignoresKill`), as the real driver's kill that reaches no daemon or lands
-// after the container exited: the run then exits on its own, with its scripted
-// exit and no killedBy, and says it overran if the wallclock had fired.
-// test/sandbox-docker.test.ts drives both through the same steps for these.
+// after the container exited: the run then exits on its own, with its
+// scripted exit and no killedBy, and says it overran if the wallclock had
+// fired. test/sandbox-docker.test.ts drives both through the same steps for
+// these.
 //
 // What still differs: when a run whose kill ended nothing exits, which here is
 // just after that kill, and on the real driver whenever its container does.
+// And the reason a probe gives with no valid id pinned and a probe scripted
+// not ok (or none scripted): the scripted (or default) reason here, where the
+// real driver names sandbox.imageId before asking any daemon anything.
+// Degraded on both. A probe scripted ok or not stands for everything the real
+// driver asks the daemons, the pinned image's presence on each VM among it.
 //
 // And a script may not describe a result the real driver cannot return: a
 // stream longer than its capture keeps, a cut with no stream near the cap, or
@@ -55,6 +70,7 @@ import {
   type SandboxResult,
   type SandboxSpec,
 } from '../../src/sandbox/driver.js'
+import { imageIdProblem, imageRefusal } from '../../src/sandbox/limits.js'
 
 export interface ScriptedExit {
   readonly exitCode?: number | null
@@ -83,6 +99,12 @@ export interface ScriptedExit {
 export interface FakeSandboxOptions {
   readonly probe?: ProbeResult
   readonly script?: readonly ScriptedExit[]
+  /**
+   * The pinned image id, as the real driver is handed kernel.yaml's
+   * sandbox.imageId: the only image a spec may name. Unset, as kernel.yaml
+   * ships it, every run is refused and no probe reports ok.
+   */
+  readonly imageId?: string | undefined
 }
 
 export interface FakeSandbox extends SandboxDriver {
@@ -238,7 +260,12 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
     kills,
 
     async probe(): Promise<ProbeResult> {
-      return options.probe ?? UNAVAILABLE
+      const probe = options.probe ?? UNAVAILABLE
+      // As the real driver: never ok without a pinned id, whatever a daemon
+      // would say.
+      const unpinned = imageIdProblem(options.imageId)
+      if (probe.ok && unpinned !== undefined) return { ok: false, why: unpinned }
+      return probe
     },
 
     run(spec: SandboxSpec): RunningSandbox {
@@ -249,6 +276,11 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
       if (!spec.name.startsWith(CONTAINER_PREFIX)) {
         throw new ConfigError(`container name "${spec.name}" must start with ${CONTAINER_PREFIX}`)
       }
+      // As the real driver's audit does (buildRunArgs): the image must be the
+      // pinned id, exactly, and with none pinned no run is built at all.
+      // Refused before anything starts, with no scripted exit spent on it.
+      const image = imageRefusal(spec.image, options.imageId)
+      if (image !== undefined) throw new ConfigError(image)
       // As the real driver does (SandboxDriver.run): a name still running is
       // refused before anything starts, and no scripted exit is spent on it.
       if (running.has(spec.name)) {

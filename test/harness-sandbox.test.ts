@@ -1,16 +1,21 @@
 // T09 — the sandbox driver interface and its fake.
 //
 // The fake's defaults are chosen to be the inconvenient ones: no runtime
-// available, and no run permitted that the test did not ask for. Both make
-// the kernel's degraded and bounded paths the ones that get exercised.
+// available, no image id pinned, and no run permitted that the test did not
+// ask for. Each makes the kernel's degraded and bounded paths the ones that
+// get exercised.
 
 import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
+import { ConfigError } from '../src/errors.js'
 import type { SandboxSpec } from '../src/sandbox/driver.js'
 import { fakeSandbox } from './helpers/fake-sandbox.js'
+
+/** The pinned worker image, as kernel.yaml's sandbox.imageId would hold it. */
+const IMAGE_ID = `sha256:${'0123456789abcdef'.repeat(4)}`
 
 function spec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
   return {
@@ -18,7 +23,7 @@ function spec(overrides: Partial<SandboxSpec> = {}): SandboxSpec {
     runId: 'run-abc',
     agentId: 'coder',
     domain: 'trusted',
-    image: 'aos-worker:0.0.1',
+    image: IMAGE_ID,
     command: ['npm', 'test'],
     workspace: '/var/aos/workspaces/run-abc',
     limits: { memoryMb: 2048, cpus: 2, pids: 256, wallclockMs: 600_000 },
@@ -36,14 +41,34 @@ test('reports unavailable by default with a reason', async () => {
   assert.equal(typeof (probe.ok ? '' : probe.why), 'string')
   assert.ok((probe.ok ? '' : probe.why).length > 0)
 
-  const available = fakeSandbox({ probe: { ok: true, version: '27.0.0' } })
+  const available = fakeSandbox({ probe: { ok: true, version: '27.0.0' }, imageId: IMAGE_ID })
   const ok = await available.probe()
   assert.equal(ok.ok, true)
   assert.equal(ok.ok && ok.version, '27.0.0')
+
+  // Available only with an image id pinned, as the real driver: kernel.yaml
+  // ships none, and a daemon that answers does not make the sandbox usable.
+  const unpinned = await fakeSandbox({ probe: { ok: true, version: '27.0.0' } }).probe()
+  assert.equal(unpinned.ok, false)
+  assert.match(unpinned.ok ? '' : unpinned.why, /^sandbox\.imageId is not set in config\/kernel\.yaml/)
+})
+
+test('runs only the pinned image id, and nothing while none is pinned', () => {
+  // As the real driver does: code that builds a spec from a tag
+  // (config.sandbox.image, a manifest's sandbox.image) is refused here, as
+  // docker would refuse it, and spends no scripted exit.
+  const unpinned = fakeSandbox({ script: [{ exitCode: 0 }] })
+  assert.throws(() => unpinned.run(spec()), (e: unknown) => e instanceof ConfigError && /sandbox\.imageId is not set/.test(e.message))
+
+  const pinned = fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: 0 }] })
+  assert.throws(() => pinned.run(spec({ image: 'aos-worker:0.0.1' })), /which is no image id but a name/)
+  assert.throws(() => pinned.run(spec({ image: `sha256:${'f'.repeat(64)}` })), /which is not the pinned sandbox\.imageId/)
+  assert.doesNotThrow(() => pinned.run(spec()))
+  assert.equal(pinned.specs.length, 3, 'every call is recorded, the refused ones too')
 })
 
 test('records the exact spec and returns the scripted exit', async () => {
-  const driver = fakeSandbox({ script: [{ exitCode: 0, stdout: 'ok\n', durationMs: 120 }] })
+  const driver = fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: 0, stdout: 'ok\n', durationMs: 120 }] })
   const requested = spec()
   const running = driver.run(requested)
 
@@ -65,7 +90,7 @@ test('records the exact spec and returns the scripted exit', async () => {
 })
 
 test('simulateOverrun resolves with SIGKILL and killedBy wallclock', async () => {
-  const driver = fakeSandbox({ script: [{ hangs: true }] })
+  const driver = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }] })
   const running = driver.run(spec({ name: 'aos-run-slow' }))
 
   driver.simulateOverrun('aos-run-slow')
@@ -82,7 +107,7 @@ test('simulateOverrun resolves with SIGKILL and killedBy wallclock', async () =>
 })
 
 test('kill is idempotent', async () => {
-  const driver = fakeSandbox({ script: [{ hangs: true }] })
+  const driver = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }] })
   const running = driver.run(spec({ name: 'aos-run-kill' }))
 
   await driver.kill('aos-run-kill')
@@ -101,7 +126,7 @@ test('kill is idempotent', async () => {
 })
 
 test('throws on an unscripted run', () => {
-  const driver = fakeSandbox({ script: [{ exitCode: 0 }] })
+  const driver = fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: 0 }] })
   driver.run(spec({ name: 'aos-run-1' }))
 
   // A double that invented a clean exit here would let runtime code start

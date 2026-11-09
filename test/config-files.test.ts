@@ -20,6 +20,8 @@
 //   Merge an older package-lock.json and `npm ci` installs a release an
 //   advisory was fixed after; range-pin a dependency and `npm install` moves it
 //   on its own. The lockfile tests read every copy, nested ones included.
+//   Lose sandbox.imageId between kernel.yaml and the driver boot builds and a
+//   pinned kernel.yaml boots with its sandbox degraded for an unset id.
 
 import './helpers/guard.js'
 
@@ -31,6 +33,7 @@ import { join, relative } from 'node:path'
 import { parse as parseYaml } from 'yaml'
 
 import { parseKernelConfig } from '../src/config.js'
+import { defaultDriver } from '../src/kernel.js'
 import { parseProviders } from '../src/models/registry.js'
 import {
   FORCED_DISABLED,
@@ -109,6 +112,52 @@ test('config/kernel.yaml parses and its four D30 budget defaults are present and
   }
   assert.equal(config.dataDir, join(REPO, '.aos'))
   assert.notEqual(config.dataDir, homedir())
+})
+
+test('config/kernel.yaml pins no sandbox.imageId, so the driver boot builds from it is degraded, naming the key, and asks docker nothing; pinned, it asks the daemons', async () => {
+  // Egress plan P4: no worker image is built yet, so the shipped file pins no
+  // id, and the tag beside it is a name no run executes. The driver is the one
+  // boot builds (defaultDriver), with only the docker CLI's two process
+  // functions swapped for ones that answer as a healthy daemon would: what
+  // kernel.yaml holds is what decides.
+  const raw = read('config/kernel.yaml')
+  assert.match(raw, /^ {2}image: aos-worker:0\.0\.1$/m)
+  assert.doesNotMatch(raw, /^ {2}imageId:/m)
+  const probeOf = async (text: string): Promise<{ why: string; calls: string[][] }> => {
+    const calls: string[][] = []
+    const driver = defaultDriver(parseKernelConfig(parseYaml(text), { repoRoot: REPO }), REPO, {
+      spawn: (_command, args) => {
+        calls.push([...args])
+        throw new Error('a probe starts no run')
+      },
+      execFile: (_command, args) => {
+        calls.push([...args])
+        return Promise.resolve({
+          stdout: args[0] === 'network' ? 'true\n' : args[0] === 'image' ? `${args[args.length - 1] ?? ''}\n` : '29.5.2\n',
+          stderr: '',
+        })
+      },
+    })
+    const probe = await driver.probe()
+    return { why: probe.ok ? '' : probe.why, calls }
+  }
+
+  const shipped = await probeOf(raw)
+  assert.match(shipped.why, /^sandbox\.imageId is not set in config\/kernel\.yaml/)
+  assert.deepEqual(shipped.calls, [], 'the shipped config had docker asked something')
+
+  const id = `sha256:${'0123456789abcdef'.repeat(4)}`
+  const pinned = await probeOf(raw.replace('  image: aos-worker:0.0.1\n', `  image: aos-worker:0.0.1\n  imageId: ${id}\n`))
+  assert.equal(pinned.why, '')
+  assert.deepEqual(pinned.calls.map((args) => args.slice(0, 2)), [
+    ['version', '--format'],
+    ['network', 'inspect'],
+    ['image', 'inspect'],
+    ['network', 'inspect'],
+    ['image', 'inspect'],
+  ])
+  // The image each VM is asked for is the id kernel.yaml pins, by that id.
+  assert.deepEqual(pinned.calls.filter((args) => args[0] === 'image').map((args) => args[args.length - 1]), [id, id])
 })
 
 test('scripts/colima-up.sh exists, is executable, and its header says NEEDS VALIDATION', () => {

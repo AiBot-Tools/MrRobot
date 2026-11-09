@@ -43,6 +43,11 @@
 //   Write a workspace path holding a comma into --mount, or read that value
 //   other than as docker's CSV, and a second source= mounts what it names.
 //   Let the image slot hold an option, in any spelling, and docker obeys it.
+//   Run the image by a tag, or a repository digest, and what runs is whatever
+//   image that name last had on the VM; drop --pull=never, or admit another
+//   --pull, and a name the VM lacks is fetched by its daemon over the VM's own
+//   route, from whatever a registry serves; probe ok with no image id pinned
+//   and the kernel reports a sandbox no run can use.
 //   Keep everything a container writes and one that writes without end grows
 //   the kernel's memory until its wallclock, or past it; stop reading at the
 //   cap instead and the container blocks on a full pipe; keep each chunk as
@@ -94,6 +99,9 @@ import { CAPTURE_MAX_BYTES, type SandboxDriver, type SandboxResult, type Sandbox
 import { fakeSandbox } from './helpers/fake-sandbox.js'
 
 const DEFAULTS: DockerDefaults = { user: '65534:65534', pidsLimit: 256, memory: '2g', cpus: 2 }
+
+/** The pinned worker image (kernel.yaml's sandbox.imageId), as docker prints an id. */
+const IMAGE_ID = `sha256:${'0123456789abcdef'.repeat(4)}`
 
 interface Fixture {
   readonly root: string
@@ -157,7 +165,7 @@ function spec(f: Fixture, over: Partial<SandboxSpec> = {}): SandboxSpec {
     runId: 'run_abc123',
     agentId: 'researcher',
     domain: 'trusted',
-    image: 'aos/worker:0.0.1',
+    image: IMAGE_ID,
     command: ['node', '--version'],
     // Each domain's own: a workspace is confined to its domain's mountRoot.
     workspace: over.domain === 'hostile' ? f.hostileWorkspace : f.workspace,
@@ -172,6 +180,7 @@ function argsFor(f: Fixture, over: Partial<SandboxSpec> = {}, home = join(f.root
     domain: f.domain,
     defaults: DEFAULTS,
     repoRoot: f.repoRoot,
+    imageId: IMAGE_ID,
     home,
   })
 }
@@ -204,7 +213,7 @@ test('run args contain --read-only, --cap-drop=ALL, --security-opt=no-new-privil
   assert.equal(valueOf(args, '--name'), `${CONTAINER_PREFIX}abc123`)
 
   // The command runs last, after the image.
-  assert.deepEqual(args.slice(-3), ['aos/worker:0.0.1', 'node', '--version'])
+  assert.deepEqual(args.slice(-3), [IMAGE_ID, 'node', '--version'])
   assert.equal(valueOf(args, '--workdir'), WORKSPACE_TARGET)
 })
 
@@ -273,6 +282,7 @@ test('an empty HOME is treated as unset: confinement and the run-args audit stil
         domain: f.domain,
         defaults: DEFAULTS,
         repoRoot: f.repoRoot,
+        imageId: IMAGE_ID,
       }),
     /docker args reference the home directory/,
   )
@@ -331,7 +341,7 @@ test('the audit reads the --mount value as docker does and admits only type=bind
   const args = argsFor(f)
   const at = args.indexOf('--mount') + 1
   const withMount = (value: string): string[] => args.map((a, i) => (i === at ? value : a))
-  assert.doesNotThrow(() => auditRunArgs(args, home, ws, f.domain.network))
+  assert.doesNotThrow(() => auditRunArgs(args, home, ws, f.domain.network, IMAGE_ID))
 
   const bad = [
     `type=bind,source=${ws},source=/etc,target=${WORKSPACE_TARGET}`, // docker keeps the last source
@@ -354,7 +364,7 @@ test('the audit reads the --mount value as docker does and admits only type=bind
     '',
   ]
   for (const value of bad) {
-    assert.throws(() => auditRunArgs(withMount(value), home, ws, f.domain.network), ConfigError, JSON.stringify(value))
+    assert.throws(() => auditRunArgs(withMount(value), home, ws, f.domain.network, IMAGE_ID), ConfigError, JSON.stringify(value))
   }
   // A workspace that itself holds a double quote or a line break, written into
   // the value as the builder writes it, splits at its commas into exactly the
@@ -363,7 +373,7 @@ test('the audit reads the --mount value as docker does and admits only type=bind
   // because docker's CSV reader would not read that value as this split does.
   for (const quoted of ['/w/a"b', '/w/a\nb']) {
     assert.throws(
-      () => auditRunArgs(withMount(`type=bind,source=${quoted},target=${WORKSPACE_TARGET}`), home, quoted, f.domain.network),
+      () => auditRunArgs(withMount(`type=bind,source=${quoted},target=${WORKSPACE_TARGET}`), home, quoted, f.domain.network, IMAGE_ID),
       /holds a double quote or a control character, so docker would not split it at its commas/,
       JSON.stringify(quoted),
     )
@@ -371,7 +381,7 @@ test('the audit reads the --mount value as docker does and admits only type=bind
   // And the case a template comparison misses: the workspace carries the tail.
   const tail = `${ws},source=/etc`
   assert.throws(
-    () => auditRunArgs(withMount(`type=bind,source=${tail},target=${WORKSPACE_TARGET}`), home, tail, f.domain.network),
+    () => auditRunArgs(withMount(`type=bind,source=${tail},target=${WORKSPACE_TARGET}`), home, tail, f.domain.network, IMAGE_ID),
     /names source twice/,
   )
 })
@@ -427,18 +437,151 @@ test('the image slot cannot carry a docker option: everything before the image i
   const args = argsFor(f)
   for (const dropped of ['--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--init']) {
     assert.throws(
-      () => auditRunArgs(args.filter((a) => a !== dropped), home, f.realWorkspace, f.domain.network),
+      () => auditRunArgs(args.filter((a) => a !== dropped), home, f.realWorkspace, f.domain.network, IMAGE_ID),
       new RegExp(`carry ${dropped} 0 time\\(s\\)`),
       dropped,
     )
   }
-  assert.throws(() => auditRunArgs(args.slice(0, args.indexOf('aos/worker:0.0.1')), home, f.realWorkspace, f.domain.network), /name no image/)
+  assert.throws(() => auditRunArgs(args.slice(0, args.indexOf(IMAGE_ID)), home, f.realWorkspace, f.domain.network, IMAGE_ID), /name no image/)
   // And the argv is a `docker run`: the walk starts after it, and `create`
   // (or any other command) would be judged as though it were run.
   assert.throws(
-    () => auditRunArgs(['create', ...args.slice(1)], home, f.realWorkspace, f.domain.network),
+    () => auditRunArgs(['create', ...args.slice(1)], home, f.realWorkspace, f.domain.network, IMAGE_ID),
     /docker args must start with run \(found "create"\)/,
   )
+})
+
+test('argv runs a sha256 image id with --pull=never; the audit refuses a tag or a missing --pull=never', (t) => {
+  // Egress plan P4. A tag is whatever image was last given it on that VM, and
+  // a name the VM lacks is pulled by default, by the VM's daemon over the
+  // VM's own route out, which no container network covers. So the run names
+  // the pinned id, exactly, and docker is told never to pull.
+  const f = fixture(t)
+  const home = join(f.root, 'home')
+  const args = argsFor(f)
+  const at = args.indexOf(IMAGE_ID)
+  assert.equal(args.filter((a) => a === IMAGE_ID).length, 1)
+  assert.equal(args[at - 1], '--pull=never', 'the last option before the image')
+  assert.deepEqual(args.slice(at), [IMAGE_ID, 'node', '--version'])
+  assert.deepEqual(args.filter((a) => a.startsWith('--pull')), ['--pull=never'])
+
+  // The spec's image is a request, held to the pinned id: a tag, a
+  // repository digest of the very same content, another id, or the pinned id
+  // in another spelling is refused, never run.
+  const name = (image: string) => (e: unknown): boolean =>
+    e instanceof ConfigError &&
+    e.message ===
+      `docker args run ${JSON.stringify(image)}, which is no image id but a name the VM's daemon resolves to whatever ` +
+        `image it last gave that name; the driver runs only the pinned sandbox.imageId ${IMAGE_ID}`
+  for (const image of [
+    'aos-worker:0.0.1',
+    'aos-worker',
+    'aos-worker:latest',
+    `aos-worker@${IMAGE_ID}`,
+    `docker.io/library/aos-worker@${IMAGE_ID}`,
+    IMAGE_ID.slice('sha256:'.length),
+    IMAGE_ID.toUpperCase(),
+    `${IMAGE_ID.slice(0, -1)}`,
+    `${IMAGE_ID}0`,
+    // Lower case and the right length, but not hex: no digest to docker,
+    // which reads the whole string as the tag of repository
+    // docker.io/library/sha256, whatever image the VM last gave that name.
+    `sha256:${'g'.repeat(64)}`,
+    `${IMAGE_ID.slice(0, -1)}g`,
+    // The pinned id with whitespace about it: no reference docker reads, and
+    // not the pin, which is compared exactly, never trimmed.
+    ` ${IMAGE_ID}`,
+    `${IMAGE_ID}\n`,
+    `${IMAGE_ID} `,
+  ]) {
+    assert.throws(() => argsFor(f, { image }), name(image), JSON.stringify(image))
+  }
+  const other = `sha256:${'f'.repeat(64)}`
+  assert.throws(
+    () => argsFor(f, { image: other }),
+    (e: unknown) =>
+      e instanceof ConfigError &&
+      e.message === `docker args run image ${other}, which is not the pinned sandbox.imageId ${IMAGE_ID}; the driver runs no other`,
+  )
+
+  // Exactly one --pull=never: missing (an edit that drops it, or an argv the
+  // builder did not make) and a second copy are both refused by the count.
+  assert.throws(
+    () => auditRunArgs(args.filter((a) => a !== '--pull=never'), home, f.realWorkspace, f.domain.network, IMAGE_ID),
+    /carry --pull=never 0 time\(s\) before the image; the builder emits it exactly once/,
+  )
+  assert.throws(
+    () => argsFor(f, { image: '--pull=never', command: [IMAGE_ID, 'node'] }),
+    /carry --pull=never 2 time\(s\) before the image; the builder emits it exactly once/,
+  )
+  // And any --pull that pulls is refused for that, by name, beside the
+  // builder's or in its place: missing (docker's default) and always. Any
+  // other value, an empty one or one docker itself refuses, is refused as a
+  // value the builder never writes, without a claim about what docker would
+  // make of it. `--pull never` in two elements pulls nothing, and is refused
+  // as a spelling the builder never emits.
+  const refusal = (why: string): RegExp =>
+    new RegExp(
+      `^docker args carry (.+) before the image, which the builder never emits, and docker would obey it: it ${why}, which invariant 9 refuses in any spelling$`,
+    )
+  const PULLS = refusal(
+    "has the VM's daemon pull the image over the VM's own route out, when the VM lacks it \\(missing, docker's default\\) or on every run \\(always\\), so that what runs is whatever the registry serves; only never is admitted",
+  )
+  const UNWRITTEN = refusal(
+    'sets --pull to a value the builder never writes, refused whatever docker makes of it, since a later docker may read it as a pull; only never is admitted',
+  )
+  const pulled = (named: string, why = PULLS) => (e: unknown): boolean =>
+    e instanceof ConfigError && why.exec(e.message)?.[1] === named
+  for (const [inline, why] of [
+    ['--pull=always', PULLS],
+    ['--pull=missing', PULLS],
+    ['--pull=', UNWRITTEN],
+    ['--pull=NEVER', UNWRITTEN],
+    ['--pull=never ', UNWRITTEN],
+    ['--pull=yes', UNWRITTEN],
+  ] as const) {
+    assert.throws(() => argsFor(f, { image: inline, command: [IMAGE_ID] }), pulled(JSON.stringify(inline), why), inline)
+    assert.throws(
+      () => auditRunArgs(args.map((a) => (a === '--pull=never' ? inline : a)), home, f.realWorkspace, f.domain.network, IMAGE_ID),
+      pulled(JSON.stringify(inline), why),
+      `${inline} in place of the builder's`,
+    )
+  }
+  assert.throws(() => argsFor(f, { image: '--pull', command: ['always', IMAGE_ID] }), pulled('--pull "always"'))
+  assert.throws(() => argsFor(f, { image: '--pull', command: ['', IMAGE_ID] }), pulled('--pull ""', UNWRITTEN))
+  assert.throws(
+    () => argsFor(f, { image: '--pull', command: ['never', IMAGE_ID] }),
+    (e: unknown) =>
+      e instanceof ConfigError &&
+      e.message === 'docker args carry "--pull" before the image, which the builder never emits, and docker would obey it',
+  )
+
+  // The pinned value itself must be an id, whatever path handed it to the
+  // builder: a tag pinned is still a tag, even when the spec names the same.
+  for (const pinned of ['aos-worker:0.0.1', `aos-worker@${IMAGE_ID}`, IMAGE_ID.toUpperCase(), `sha256:${'g'.repeat(64)}`, '']) {
+    assert.throws(
+      () =>
+        buildRunArgs({ spec: spec(f, { image: pinned }), domain: f.domain, defaults: DEFAULTS, repoRoot: f.repoRoot, imageId: pinned, home }),
+      (e: unknown) =>
+        e instanceof ConfigError &&
+        e.message.startsWith(`docker args cannot be built: sandbox.imageId ${JSON.stringify(pinned)} is no image id: it must be sha256:<64 lower-case hex>`),
+      JSON.stringify(pinned),
+    )
+  }
+  // And none pinned refuses every run, naming the key and the script that
+  // will make its value.
+  assert.throws(
+    () => buildRunArgs({ spec: spec(f), domain: f.domain, defaults: DEFAULTS, repoRoot: f.repoRoot, imageId: undefined, home }),
+    (e: unknown) =>
+      e instanceof ConfigError &&
+      e.message.startsWith('docker args cannot be built: sandbox.imageId is not set in config/kernel.yaml') &&
+      e.message.includes('with --pull=never, and never pulls one') &&
+      e.message.includes('scripts/build-worker-image.sh'),
+  )
+  assert.throws(() => auditRunArgs(args, home, f.realWorkspace, f.domain.network, undefined), /sandbox\.imageId is not set/)
+  // While the argv the builder made, against the id it was built for, passes.
+  assert.doesNotThrow(() => auditRunArgs(args, home, f.realWorkspace, f.domain.network, IMAGE_ID))
+  assert.throws(() => auditRunArgs(args, home, f.realWorkspace, f.domain.network, other), /which is not the pinned sandbox\.imageId/)
 })
 
 test('the audit refuses every env, publish, tty, extra-host, dns, namespace-widening and unconfined flag, and a second or unexpected --network', (t) => {
@@ -767,7 +910,7 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
     '--device-cgroup-rule', 'r', '--network', 'name=host', '--security-opt=disable',
     '--group-add', '0', '--log-driver', 'syslog', '--log-opt=syslog-address=udp://192.168.5.2:514', '--read-only=false',
   ]
-  assert.deepEqual(argsFor(f, { command }).slice(-command.length - 1), ['aos/worker:0.0.1', ...command])
+  assert.deepEqual(argsFor(f, { command }).slice(-command.length - 1), [IMAGE_ID, ...command])
   // Except to the whole-argv scans, which still read the command: kept until
   // the operator decides, for the count and FORBIDDEN_FLAGS together
   // (docker.ts, before the option walk), so `grep -v` is refused as a second
@@ -790,10 +933,10 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
   // proved internal: not merely a well-formed name.
   const args = argsFor(f)
   const onNetwork = (value: string): string[] => args.map((a, i) => (args[i - 1] === '--network' ? value : a))
-  assert.doesNotThrow(() => auditRunArgs(args, home, f.realWorkspace, 'aos-internal'))
+  assert.doesNotThrow(() => auditRunArgs(args, home, f.realWorkspace, 'aos-internal', IMAGE_ID))
   for (const value of ['aos-hostile', 'aos-internal2', 'AOS-INTERNAL', 'none']) {
     assert.throws(
-      () => auditRunArgs(onNetwork(value), home, f.realWorkspace, 'aos-internal'),
+      () => auditRunArgs(onNetwork(value), home, f.realWorkspace, 'aos-internal', IMAGE_ID),
       (e: unknown) =>
         e instanceof ConfigError &&
         e.message === `docker args put the container on network ${JSON.stringify(value)}; invariant 9 needs the domain's internal network "aos-internal"`,
@@ -801,11 +944,11 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
     )
   }
   assert.throws(
-    () => auditRunArgs(args, home, f.realWorkspace, 'aos-hostile'),
+    () => auditRunArgs(args, home, f.realWorkspace, 'aos-hostile', IMAGE_ID),
     /put the container on network "aos-internal"; invariant 9 needs the domain's internal network "aos-hostile"/,
   )
   // No value at all is no plain network name, and is refused as one.
-  assert.throws(() => auditRunArgs(onNetwork(''), home, f.realWorkspace, 'aos-internal'), named('--network ""', NOT_PLAIN))
+  assert.throws(() => auditRunArgs(onNetwork(''), home, f.realWorkspace, 'aos-internal', IMAGE_ID), named('--network ""', NOT_PLAIN))
   // A domain that names a network docker gives a meaning of its own is
   // refused although the value matches what the builder was handed: the
   // modes, and anything but a plain name, which docker may read as its
@@ -820,7 +963,7 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
       e.message.endsWith("; invariant 9 needs the domain's own internal network") &&
       !e.message.includes('never emits')
   assert.throws(
-    () => auditRunArgs(onNetwork('host'), home, f.realWorkspace, 'host'),
+    () => auditRunArgs(onNetwork('host'), home, f.realWorkspace, 'host', IMAGE_ID),
     (e: unknown) =>
       domainNamed('host')(e) &&
       (e as Error).message.includes("it puts the container on the VM's own network stack, which reaches the Mac at 192.168.5.2;"),
@@ -828,7 +971,7 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
   // A plain HOST is a network of that name to docker, not host mode, and the
   // refusal says why it is refused anyway rather than calling it host mode.
   assert.throws(
-    () => auditRunArgs(onNetwork('HOST'), home, f.realWorkspace, 'HOST'),
+    () => auditRunArgs(onNetwork('HOST'), home, f.realWorkspace, 'HOST', IMAGE_ID),
     (e: unknown) =>
       domainNamed('HOST')(e) &&
       (e as Error).message.includes("it spells host in another case, which docker reads as a network of that name, but docker's key=value spelling lower-cases (name=HOST is host)") &&
@@ -860,7 +1003,7 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
     '--mount',
   ]) {
     assert.throws(
-      () => buildRunArgs({ spec: spec(f), domain: { ...f.domain, network }, defaults: DEFAULTS, repoRoot: f.repoRoot, home }),
+      () => buildRunArgs({ spec: spec(f), domain: { ...f.domain, network }, defaults: DEFAULTS, repoRoot: f.repoRoot, imageId: IMAGE_ID, home }),
       domainNamed(network),
       network,
     )
@@ -875,7 +1018,7 @@ test('the audit refuses a root --user and a --memory, --pids-limit or --cpus tha
   const f = fixture(t)
   const home = join(f.root, 'home')
   const build = (defaults: Partial<DockerDefaults>): string[] =>
-    buildRunArgs({ spec: spec(f), domain: f.domain, defaults: { ...DEFAULTS, ...defaults }, repoRoot: f.repoRoot, home })
+    buildRunArgs({ spec: spec(f), domain: f.domain, defaults: { ...DEFAULTS, ...defaults }, repoRoot: f.repoRoot, imageId: IMAGE_ID, home })
 
   const refused: readonly (readonly [keyof DockerDefaults, string | number])[] = [
     ['user', '0:0'],
@@ -935,11 +1078,11 @@ test('the audit refuses a root --user and a --memory, --pids-limit or --cpus tha
   // the flag, wherever it came from.
   const args = argsFor(f)
   const swapped = (flag: string, value: string): string[] => args.map((a, i) => (args[i - 1] === flag ? value : a))
-  assert.doesNotThrow(() => auditRunArgs(swapped('--user', '1000:1000'), home, f.realWorkspace, f.domain.network))
-  assert.throws(() => auditRunArgs(swapped('--user', '0:0'), home, f.realWorkspace, f.domain.network), /--user "0:0"; invariant 9/)
-  assert.throws(() => auditRunArgs(swapped('--memory', '0'), home, f.realWorkspace, f.domain.network), /--memory "0"; invariant 9/)
-  assert.throws(() => auditRunArgs(swapped('--pids-limit', '-1'), home, f.realWorkspace, f.domain.network), /--pids-limit "-1"; invariant 9/)
-  assert.throws(() => auditRunArgs(swapped('--cpus', '0.0'), home, f.realWorkspace, f.domain.network), /--cpus "0.0"; invariant 9/)
+  assert.doesNotThrow(() => auditRunArgs(swapped('--user', '1000:1000'), home, f.realWorkspace, f.domain.network, IMAGE_ID))
+  assert.throws(() => auditRunArgs(swapped('--user', '0:0'), home, f.realWorkspace, f.domain.network, IMAGE_ID), /--user "0:0"; invariant 9/)
+  assert.throws(() => auditRunArgs(swapped('--memory', '0'), home, f.realWorkspace, f.domain.network, IMAGE_ID), /--memory "0"; invariant 9/)
+  assert.throws(() => auditRunArgs(swapped('--pids-limit', '-1'), home, f.realWorkspace, f.domain.network, IMAGE_ID), /--pids-limit "-1"; invariant 9/)
+  assert.throws(() => auditRunArgs(swapped('--cpus', '0.0'), home, f.realWorkspace, f.domain.network, IMAGE_ID), /--cpus "0.0"; invariant 9/)
 })
 
 // ── confinement ────────────────────────────────────────────────────────────
@@ -1093,10 +1236,23 @@ type ScriptedExec = (
   env: Record<string, string>,
 ) => Promise<{ stdout: string; stderr: string }>
 
+/**
+ * A daemon that answers probe() as a healthy one does: its server version,
+ * every network internal, and every image asked about present, printed under
+ * the id it was asked by.
+ */
+function healthyDaemon(version: string): ScriptedExec {
+  return (args) =>
+    Promise.resolve({
+      stdout: args[0] === 'network' ? 'true\n' : args[0] === 'image' ? `${args[args.length - 1] ?? ''}\n` : `${version}\n`,
+      stderr: '',
+    })
+}
+
 const TRUSTED_HOST = 'unix:///tmp/colima-trusted.sock'
 const HOSTILE_HOST = 'unix:///tmp/colima-hostile.sock'
 
-function driverFor(f: Fixture, streams?: ChildStreams): Spied {
+function driverFor(f: Fixture, streams?: ChildStreams, pinned: { readonly imageId: string | undefined } = { imageId: IMAGE_ID }): Spied {
   const spawns: Spied['spawns'] = []
   const execs: Spied['execs'] = []
   const child = fakeChild(streams)
@@ -1118,6 +1274,7 @@ function driverFor(f: Fixture, streams?: ChildStreams): Spied {
     domains: { trusted: f.domain, hostile: f.hostile },
     defaults: DEFAULTS,
     repoRoot: f.repoRoot,
+    imageId: pinned.imageId,
     path: '/usr/bin:/bin',
     home: join(f.root, 'home'),
     dockerConfig: join(f.root, 'data', 'docker'),
@@ -1227,7 +1384,7 @@ test('probe reports why when docker is unreachable', async (t) => {
   assert.equal(down.ok, false)
   assert.match(down.ok ? '' : down.why, /Cannot connect to the Docker daemon/)
 
-  d.setExec((args) => Promise.resolve({ stdout: args[0] === 'network' ? 'true\n' : '27.3.1\n', stderr: '' }))
+  d.setExec(healthyDaemon('27.3.1'))
   const up = await d.driver.probe()
   assert.deepEqual(up, { ok: true, version: '27.3.1' })
 
@@ -1243,8 +1400,8 @@ test('probe refuses a domain whose network is not internal, and checks each doma
   const d = driverFor(f)
   const internalOn = new Set(['unix:///tmp/colima-trusted.sock'])
   const seen: string[] = []
-  d.setExec((args) => {
-    if (args[0] !== 'network') return Promise.resolve({ stdout: '27.3.1\n', stderr: '' })
+  d.setExec((args, env) => {
+    if (args[0] !== 'network') return healthyDaemon('27.3.1')(args, env)
     const host = d.execs[d.execs.length - 1]?.env['DOCKER_HOST'] ?? ''
     seen.push(`${host} ${args.join(' ')}`)
     return Promise.resolve({ stdout: internalOn.has(host) ? 'true\n' : 'false\n', stderr: '' })
@@ -1264,10 +1421,10 @@ test('probe refuses a domain whose network is not internal, and checks each doma
   assert.deepEqual(await d.driver.probe(), { ok: true, version: '27.3.1' })
 
   // A network that does not exist is not internal either.
-  d.setExec((args) =>
+  d.setExec((args, env) =>
     args[0] === 'network'
       ? Promise.reject(new Error('Error response from daemon: network aos-internal not found'))
-      : Promise.resolve({ stdout: '27.3.1\n', stderr: '' }),
+      : healthyDaemon('27.3.1')(args, env),
   )
   const missing = await d.driver.probe()
   assert.match(missing.ok ? '' : missing.why, /^trusted: network aos-internal could not be inspected: .*not found/)
@@ -1284,8 +1441,8 @@ test('probe refuses a domain network no domain may name without inspecting it, a
   for (const network of ['host', 'HOST', 'bridge', 'default', 'container:abc', 'name=host']) {
     const d = driverFor({ ...f, hostile: { ...f.hostile, network } })
     const inspected: string[] = []
-    d.setExec((args) => {
-      if (args[0] !== 'network') return Promise.resolve({ stdout: '27.3.1\n', stderr: '' })
+    d.setExec((args, env) => {
+      if (args[0] !== 'network') return healthyDaemon('27.3.1')(args, env)
       const name = args[args.length - 1] ?? ''
       inspected.push(name)
       // The trusted domain's network is internal; anything else answers as
@@ -1303,6 +1460,191 @@ test('probe refuses a domain network no domain may name without inspecting it, a
     assert.equal(why.includes('docker network rm'), false, why)
     // The trusted domain's network was inspected, and the hostile one never.
     assert.deepEqual(inspected, ['aos-internal'], network)
+  }
+})
+
+test('probe asks each VM for the pinned image by id, and is degraded naming the domain when it lacks it or prints another id', async (t) => {
+  // Every run names the pinned id with --pull=never, so a VM without the
+  // image pulls nothing, but every run on it fails at docker. Built on the
+  // trusted VM and never loaded into the hostile one, the sandbox would read
+  // ok at boot and every hostile run would fail.
+  const f = fixture(t)
+  const d = driverFor(f)
+  const other = `sha256:${'f'.repeat(64)}`
+  // What each VM's daemon prints for `image inspect`, by socket; an Error is
+  // docker's refusal for an image it does not hold.
+  let printed: Record<string, string | Error> = {}
+  const asked: string[] = []
+  d.setExec((args, env) => {
+    if (args[0] !== 'image') return healthyDaemon('29.5.2')(args, env)
+    const host = env['DOCKER_HOST'] ?? ''
+    asked.push(`${host} ${args.join(' ')}`)
+    const answer = printed[host] ?? `${IMAGE_ID}\n`
+    return answer instanceof Error ? Promise.reject(answer) : Promise.resolve({ stdout: answer, stderr: '' })
+  })
+  const why = async (): Promise<string> => {
+    const probe = await d.driver.probe()
+    return probe.ok ? '' : probe.why
+  }
+
+  // Held by both: ok, each VM asked through its OWN socket, by the id itself.
+  assert.deepEqual(await d.driver.probe(), { ok: true, version: '29.5.2' })
+  assert.deepEqual(asked, [
+    `${TRUSTED_HOST} image inspect --format {{.Id}} ${IMAGE_ID}`,
+    `${HOSTILE_HOST} image inspect --format {{.Id}} ${IMAGE_ID}`,
+  ])
+
+  // Never loaded into the hostile VM.
+  printed = { [HOSTILE_HOST]: new Error(`Error response from daemon: No such image: ${IMAGE_ID}`) }
+  const hostile = await why()
+  assert.ok(hostile.startsWith(`hostile: the pinned sandbox.imageId ${IMAGE_ID} could not be inspected on this domain's VM`), hostile)
+  assert.ok(hostile.includes(`which is told never to pull it: Error response from daemon: No such image: ${IMAGE_ID}`), hostile)
+  assert.ok(hostile.includes('docker load on this one'), hostile)
+
+  // Nor built on the trusted one: the first domain asked is the one named.
+  printed = { [TRUSTED_HOST]: new Error(`Error response from daemon: No such image: ${IMAGE_ID}`) }
+  assert.ok((await why()).startsWith(`trusted: the pinned sandbox.imageId ${IMAGE_ID} could not be inspected`))
+
+  // Held, but printed under another id, nothing, or something that is no id,
+  // whose text stays out of the reason the log keeps.
+  printed = { [HOSTILE_HOST]: `${other}\n` }
+  assert.equal(
+    await why(),
+    `hostile: docker image inspect ${IMAGE_ID} printed the id ${other} on this domain's VM, not the pinned ` +
+      'sandbox.imageId: pin the id `docker image inspect --format {{.Id}}` prints for the worker image, the same on both VMs',
+  )
+  printed = { [HOSTILE_HOST]: '  \n' }
+  assert.ok((await why()).startsWith(`hostile: docker image inspect ${IMAGE_ID} printed no id on this domain's VM`))
+  printed = { [TRUSTED_HOST]: `[{"Id":"${IMAGE_ID}"}]\n` }
+  const junk = await why()
+  assert.ok(junk.startsWith(`trusted: docker image inspect ${IMAGE_ID} printed something that is no image id`), junk)
+  assert.equal(junk.includes('"Id"'), false, junk)
+
+  // At no point was anything pulled, or asked of docker but the probe's
+  // three questions.
+  for (const call of d.execs) {
+    assert.ok(
+      ['version', 'network inspect', 'image inspect'].some((q) => call.args.join(' ').startsWith(q)),
+      call.args.join(' '),
+    )
+    assert.equal(call.args.some((a) => a === 'pull' || a.startsWith('--pull')), false, call.args.join(' '))
+  }
+  assert.deepEqual(d.spawns, [])
+})
+
+test('with sandbox.imageId unset the driver is degraded, naming the key and the build script, asks no daemon anything and starts no run', async (t) => {
+  // kernel.yaml ships no id: no worker image is built yet (egress plan I1).
+  // The driver must then say so rather than probe ok, and no run may reach
+  // docker, where a name would be resolved, or pulled, on the VM.
+  const f = fixture(t)
+  const answer = healthyDaemon('29.5.2')
+  const unset = driverFor(f, undefined, { imageId: undefined })
+  // Every daemon would answer ok: the verdict is the id's alone.
+  unset.setExec(answer)
+
+  const probe = await unset.driver.probe()
+  const why = probe.ok ? '' : probe.why
+  assert.equal(probe.ok, false)
+  assert.ok(why.startsWith('sandbox.imageId is not set in config/kernel.yaml'), why)
+  assert.ok(why.includes('runs the worker image only by that pinned id, with --pull=never, and never pulls one'), why)
+  assert.ok(why.includes('Build the image with scripts/build-worker-image.sh, which is still to be written, on the trusted VM'), why)
+  assert.ok(why.endsWith('then set sandbox.imageId to the sha256:<64 hex> id it prints'), why)
+  // Written into the hash-chained log for good (sandbox.degraded.reason) and
+  // shown in status: it names the key and the script, in the repository, and
+  // no plan that lives outside it.
+  assert.doesNotMatch(why, /\bplan\b|\bI1\b/, why)
+  assert.deepEqual(unset.execs, [], 'probe asked a daemon something')
+
+  assert.throws(() => unset.driver.run(spec(f)), /docker args cannot be built: sandbox\.imageId is not set/)
+  assert.deepEqual(unset.spawns, [], 'a run reached docker')
+  assert.deepEqual(unset.execs, [])
+
+  // An id handed to the driver by some path other than kernel.yaml is held
+  // to the same shape, before any daemon is asked.
+  for (const imageId of ['aos-worker:0.0.1', `aos-worker@${IMAGE_ID}`, IMAGE_ID.toUpperCase()]) {
+    const bad = driverFor(f, undefined, { imageId })
+    bad.setExec(answer)
+    const result = await bad.driver.probe()
+    assert.equal(result.ok ? '' : result.why.startsWith(`sandbox.imageId ${JSON.stringify(imageId)} is no image id`), true, imageId)
+    assert.deepEqual(bad.execs, [], imageId)
+    assert.throws(() => bad.driver.run(spec(f, { image: imageId })), /docker args cannot be built: sandbox\.imageId .* is no image id/)
+    assert.deepEqual(bad.spawns, [], imageId)
+  }
+
+  // Pinned, the probe goes on to the daemons, and a run names the id and
+  // --pull=never: nothing at any point asks docker to pull.
+  const pinned = driverFor(f)
+  pinned.setExec(answer)
+  assert.deepEqual(await pinned.driver.probe(), { ok: true, version: '29.5.2' })
+  pinned.driver.run(spec(f))
+  const run = pinned.spawns[0]?.args ?? []
+  assert.deepEqual(run.slice(run.indexOf('--pull=never')), ['--pull=never', IMAGE_ID, 'node', '--version'])
+  for (const call of [...pinned.execs, ...pinned.spawns]) {
+    assert.equal(call.args.some((a) => a === 'pull' || (a.startsWith('--pull') && a !== '--pull=never')), false, call.args.join(' '))
+  }
+})
+
+test('the fake and the real driver agree: only the pinned image id runs, a tag or another id is refused in the same words, and with none pinned, or a value pinned that is no id, every run is refused and no probe is ok', async (t) => {
+  // Runtime code is tested against the fake. Had the fake run a spec naming a
+  // tag, code that built its specs from config.sandbox.image or a manifest's
+  // sandbox.image (both tags) would pass every offline test, and have every
+  // run refused on the Mac.
+  const f = fixture(t)
+  const answer = healthyDaemon('29.5.2')
+  const refusal = (driver: SandboxDriver, image: string): string => {
+    try {
+      driver.run(spec(f, { image }))
+    } catch (e) {
+      if (e instanceof ConfigError) return e.message
+      throw e
+    }
+    return ''
+  }
+  const names = ['aos-worker:0.0.1', 'aos-worker:test', `aos-worker@${IMAGE_ID}`, IMAGE_ID.toUpperCase(), `sha256:${'g'.repeat(64)}`]
+  const other = `sha256:${'f'.repeat(64)}`
+
+  // Pinned to the id, to nothing, and to a tag: a value kernel.yaml refuses,
+  // and one a driver handed its id another way may still meet. A fake that
+  // checked only for an unset id would probe ok under the tag, where the real
+  // driver names it as no id.
+  for (const imageId of [IMAGE_ID, undefined, 'aos-worker:0.0.1']) {
+    const real = driverFor(f, undefined, { imageId })
+    // Every daemon would answer ok, and the fake is scripted to say so.
+    real.setExec(answer)
+    const fake = fakeSandbox({ imageId, probe: { ok: true, version: '29.5.2' }, script: [{ exitCode: 0 }] })
+    const label = imageId === undefined ? 'unpinned' : imageId === IMAGE_ID ? 'pinned' : `pinned ${imageId}`
+
+    for (const image of [...names, other, ...(imageId === IMAGE_ID ? [] : [IMAGE_ID])]) {
+      const said = refusal(real.driver, image)
+      assert.notEqual(said, '', `${label}: the real driver ran ${image}`)
+      assert.equal(refusal(fake, image), said, `${label}: ${image}`)
+      if (imageId !== IMAGE_ID) assert.match(said, /^docker args cannot be built: sandbox\.imageId /, `${label}: ${image}`)
+    }
+    assert.deepEqual(real.spawns, [], `${label}: a refused run reached docker`)
+
+    const [realProbe, fakeProbe] = [await real.driver.probe(), await fake.probe()]
+    if (imageId !== IMAGE_ID) {
+      assert.equal(realProbe.ok, false, label)
+      assert.deepEqual(fakeProbe, realProbe, `${label}: the fake reports ok where the real driver cannot`)
+      assert.match(
+        fakeProbe.ok ? '' : fakeProbe.why,
+        imageId === undefined
+          ? /^sandbox\.imageId is not set in config\/kernel\.yaml/
+          : /^sandbox\.imageId "aos-worker:0\.0\.1" is no image id/,
+        label,
+      )
+      assert.deepEqual(real.execs, [], label)
+    } else {
+      assert.deepEqual(realProbe, { ok: true, version: '29.5.2' })
+      assert.deepEqual(fakeProbe, realProbe)
+      // And the pinned id itself runs on both, the fake on the scripted exit
+      // no refusal spent.
+      const ran = real.driver.run(spec(f))
+      real.child.close(0, null)
+      assert.equal((await ran.result).exitCode, 0)
+      assert.equal((await fake.run(spec(f)).result).exitCode, 0)
+      assert.equal(real.spawns.length, 1)
+    }
   }
 })
 
@@ -1790,7 +2132,7 @@ test('the fake and the real driver agree: a name is refused until its run\'s res
   // against one would meet different behaviour from the other.
   const f = fixture(t)
   const real = driverFor(f)
-  const fake = fakeSandbox({ script: [{ hangs: true }, { exitCode: 0 }] })
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }, { exitCode: 0 }] })
   const name = `${CONTAINER_PREFIX}parity`
   // The docker CLI exits 137 when its container is killed; the fake settles on its own.
   const drivers: readonly (readonly [string, SandboxDriver, () => void])[] = [
@@ -1845,7 +2187,7 @@ test('the fake and the real driver agree: a name is refused until its run\'s res
   // against it could start one name twice in a tick and pass. And free on
   // both once `await result` has returned, so neither keeps it for good.
   const realQuick = driverFor(f)
-  const quick = fakeSandbox({ script: [{ exitCode: 0 }, { exitCode: 0 }] })
+  const quick = fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: 0 }, { exitCode: 0 }] })
   const quickly: readonly (readonly [string, SandboxDriver, () => void])[] = [
     ['real', realQuick.driver, () => realQuick.child.close(0, null)],
     ['fake', quick, () => undefined],
@@ -1874,7 +2216,7 @@ test('the fake and the real driver agree: a name is refused until its run\'s res
   // sends the kill nowhere: code tested against the fake could use a name
   // the real driver refuses.
   const realBare = driverFor(f)
-  const bare = fakeSandbox({ script: [{ hangs: true }] })
+  const bare = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }] })
   const stranger = 'someone-elses-container'
   for (const [label, driver] of [
     ['real', realBare.driver],
@@ -1909,7 +2251,7 @@ test('the fake and the real driver agree: an overrun reports killedBy wallclock 
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const f = fixture(t)
   const real = driverFor(f)
-  const fake = fakeSandbox({ script: [{ hangs: true }] })
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }] })
   const name = `${CONTAINER_PREFIX}overrun`
   const limits = { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 }
   const drivers: readonly (readonly [string, SandboxDriver, () => void])[] = [
@@ -1952,7 +2294,7 @@ test('the fake and the real driver agree: a kill that ends nothing leaves the ru
   for (const how of ['requested', 'wallclock'] as const) {
     const real = driverFor(f)
     real.setExec(unreachable)
-    const fake = fakeSandbox({ script: [{ hangs: true, ignoresKill: true, exitCode: 3 }] })
+    const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true, ignoresKill: true, exitCode: 3 }] })
     const drivers: readonly (readonly [string, SandboxDriver, () => Promise<void>, () => void])[] = [
       [
         'real',
@@ -1995,7 +2337,7 @@ test('the fake and the real driver agree: a kill that ends nothing leaves the ru
   // A requested kill, then the wallclock before the run ended: the
   // wallclock's kill is the one the end is credited to.
   const real = driverFor(f)
-  const fake = fakeSandbox({ script: [{ hangs: true }] })
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }] })
   const drivers: readonly (readonly [string, SandboxDriver, () => void, () => void])[] = [
     ['real', real.driver, () => t.mock.timers.tick(5_000), () => real.child.close(137, null)],
     ['fake', fake, () => fake.simulateOverrun(name), () => undefined],
@@ -2014,7 +2356,7 @@ test('the fake and the real driver agree: a kill that ends nothing leaves the ru
 
   // ignoresKill says something only of a run that hangs: one that does not
   // has ended before any kill reaches it.
-  assert.throws(() => fakeSandbox({ script: [{ ignoresKill: true }] }), /scripted exit 0: ignoresKill on a run that does not hang/)
+  assert.throws(() => fakeSandbox({ imageId: IMAGE_ID, script: [{ ignoresKill: true }] }), /scripted exit 0: ignoresKill on a run that does not hang/)
 })
 
 test('the fake and the real driver agree: an exit of 137 with no kill sent is the run\'s own, with no killedBy', async (t) => {
@@ -2026,7 +2368,7 @@ test('the fake and the real driver agree: an exit of 137 with no kill sent is th
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const f = fixture(t)
   const real = driverFor(f)
-  const fake = fakeSandbox({ script: [{ exitCode: 137 }] })
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: 137 }] })
   const name = `${CONTAINER_PREFIX}oom`
   const limits = { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 }
   const drivers: readonly (readonly [string, SandboxDriver, () => void])[] = [
@@ -2071,7 +2413,7 @@ test('the fake refuses a kill that ends nothing followed by a 137, which the rea
   }
 
   assert.throws(
-    () => fakeSandbox({ script: [{ hangs: true }, { hangs: true, ignoresKill: true, exitCode: 137 }] }),
+    () => fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }, { hangs: true, ignoresKill: true, exitCode: 137 }] }),
     /^Error: scripted exit 1: ignoresKill with exitCode 137, which the real driver reports as ended by the kill sent before it \(killedBy, SIGKILL\)/,
   )
   // Any other exit after a kill that ends nothing is one the real driver
@@ -2106,7 +2448,7 @@ test('the fake and the real driver agree: a killed run returns what it wrote bef
     const stdout = new PassThrough()
     const stderr = new PassThrough()
     const real = driverFor(f, { stdout, stderr })
-    const fake = fakeSandbox({ script: [{ hangs: true, ...wrote }] })
+    const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true, ...wrote }] })
     const drivers: readonly (readonly [string, SandboxDriver, () => Promise<void>])[] = [
       [
         'real',
@@ -2145,7 +2487,7 @@ test('the fake and the real driver agree: a killed run returns what it wrote bef
   }
 
   // A cut is kept too, as the real driver keeps a cut it made before the kill.
-  const cut = fakeSandbox({ script: [{ hangs: true, stdout: 'o'.repeat(CAPTURE_MAX_BYTES), truncated: true }] })
+  const cut = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true, stdout: 'o'.repeat(CAPTURE_MAX_BYTES), truncated: true }] })
   const running = cut.run(spec(f, { name, limits }))
   await cut.kill(name)
   const result = await running.result
@@ -2162,7 +2504,7 @@ test('the fake and the real driver agree: a kill sent after the wallclock fired,
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const f = fixture(t)
   const real = driverFor(f)
-  const fake = fakeSandbox({ script: [{ hangs: true }] })
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }] })
   const name = `${CONTAINER_PREFIX}late-kill`
   const limits = { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 }
   const drivers: readonly (readonly [string, SandboxDriver, () => void, () => void])[] = [
@@ -2206,7 +2548,7 @@ test('a killed hung run on the fake still ends with every timer API mocked', asy
   // wait for good.
   const f = fixture(t)
   t.mock.timers.enable()
-  const fake = fakeSandbox({ script: [{ hangs: true }, { hangs: true }] })
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }, { hangs: true }] })
   for (const [how, name] of [
     ['requested', `${CONTAINER_PREFIX}mocked-kill`],
     ['wallclock', `${CONTAINER_PREFIX}mocked-overrun`],
@@ -2225,7 +2567,7 @@ test('two kills of a hung run in one tick end it once, and a rerun of its name i
   // run under it, before the second end runs; that end would then forget the
   // new run, and no kill could ever end it.
   const f = fixture(t)
-  const fake = fakeSandbox({ script: [{ hangs: true }, { hangs: true }] })
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }, { hangs: true }] })
   const name = `${CONTAINER_PREFIX}twice-killed`
   const first = fake.run(spec(f, { name }))
   await Promise.all([fake.kill(name), fake.kill(name)])
@@ -2502,7 +2844,7 @@ test('the fake and the real driver agree: a run whose output was cut reports tru
   // Runtime code is tested against the fake (sandbox.exec, plan S3). Had the
   // fake dropped the flag, code that passed against it would never have met a cut.
   const f = fixture(t)
-  const fake = fakeSandbox({ script: [{ stdout: 'o'.repeat(CAPTURE_MAX_BYTES), truncated: true }, { stdout: 'ok\n' }] })
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ stdout: 'o'.repeat(CAPTURE_MAX_BYTES), truncated: true }, { stdout: 'ok\n' }] })
   const results: readonly (readonly [string, SandboxResult, SandboxResult])[] = [
     [
       'real',
@@ -2533,12 +2875,12 @@ test('the fake refuses a scripted result the real driver cannot return, and acce
   ]
   for (const text of over) {
     for (const scripted of [{ stdout: text }, { stderr: text }, { stdout: text, truncated: true }]) {
-      assert.throws(() => fakeSandbox({ script: [{ stdout: 'ok\n' }, scripted] }), /scripted exit 1: its std(out|err) is \d+ bytes or more/)
+      assert.throws(() => fakeSandbox({ imageId: IMAGE_ID, script: [{ stdout: 'ok\n' }, scripted] }), /scripted exit 1: its std(out|err) is \d+ bytes or more/)
     }
   }
   // A cut with no stream near the cap, which the real driver never reports.
   for (const scripted of [{ truncated: true }, { stdout: 'ok\n', stderr: 'e'.repeat(CAPTURE_MAX_BYTES - 4), truncated: true }]) {
-    assert.throws(() => fakeSandbox({ script: [scripted] }), /scripted exit 0: truncated with no stream within three bytes/)
+    assert.throws(() => fakeSandbox({ imageId: IMAGE_ID, script: [scripted] }), /scripted exit 0: truncated with no stream within three bytes/)
   }
 
   // What the real driver returns is accepted as a script, the shapes the
@@ -2558,7 +2900,7 @@ test('the fake refuses a scripted result the real driver cannot return, and acce
     real.map((r) => r.truncated),
     [false, true, true],
   )
-  const fake = fakeSandbox({ script: real.map(({ stdout, stderr, truncated }) => ({ stdout, stderr, truncated })) })
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: real.map(({ stdout, stderr, truncated }) => ({ stdout, stderr, truncated })) })
   for (const scripted of real) {
     const result = await fake.run(spec(f)).result
     assert.ok(result.stdout === scripted.stdout && result.stderr === scripted.stderr, 'the fake did not return the scripted streams')

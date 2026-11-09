@@ -29,7 +29,7 @@ import { WebSocket } from 'ws'
 import { createServer, type IncomingHttpHeaders } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
-import { bootKernel, configHash, STUBS, SUBSYSTEM_ORDER } from '../src/kernel.js'
+import { bootKernel, configHash, defaultDriver, STUBS, SUBSYSTEM_ORDER } from '../src/kernel.js'
 import { isClean, projectRecovery } from '../src/events/projections.js'
 import { rebuildFromLog as rebuildApprovals } from '../src/policy/approvals.js'
 import { rebuildFromLog as rebuildQuarantine } from '../src/policy/quarantine.js'
@@ -41,6 +41,7 @@ import { readAnchor } from '../src/events/anchor.js'
 import { CONTROL_PATH } from '../src/control/auth.js'
 import { VERSION } from '../src/version.js'
 import {
+  bootOn,
   fixture,
   REPO_ROOT,
   rows,
@@ -48,10 +49,12 @@ import {
   TEST_TOKEN,
   verifyAt,
   withKernel,
+  type KernelFixture,
 } from './helpers/kernel.js'
 import { tmpdir } from './helpers/tmpdir.js'
 import { join } from 'node:path'
 import { fakeSandbox } from './helpers/fake-sandbox.js'
+import type { SandboxDriver } from '../src/sandbox/driver.js'
 import { anthropicEndTurn, fakeProvider } from './helpers/fake-provider.js'
 import { freshProbe } from './helpers/probe.js'
 import { writeProbeRecord } from '../src/models/probe.js'
@@ -170,6 +173,60 @@ test('boots DEGRADED with hub, sandbox and router degraded, each with a reason, 
   // environment", which secrets.source: env makes the designed path.
   assert.equal(status.envFallback, true)
   assert.ok(fx.dataDir.length > 0, 'the fixture has no data dir')
+})
+
+test('with sandbox.imageId unset, boot marks the sandbox degraded, naming the key and the build script, and asks docker nothing', async (t) => {
+  // Egress plan P4. kernel.yaml ships no image id, because no worker image is
+  // built yet. The driver boot builds from kernel.yaml (defaultDriver), with
+  // only the docker CLI's two process functions swapped for ones that answer
+  // as a healthy daemon would, is what reports it: the verdict is the id's
+  // alone, and nothing is asked of a daemon, let alone pulled.
+  const driverFor = (fx: KernelFixture, calls: string[][]): SandboxDriver =>
+    defaultDriver(fx.config, REPO_ROOT, {
+      spawn: (_command, args) => {
+        calls.push([...args])
+        throw new Error('no run starts at boot')
+      },
+      execFile: (_command, args) => {
+        calls.push([...args])
+        return Promise.resolve({
+          stdout: args[0] === 'network' ? 'true\n' : args[0] === 'image' ? `${args[args.length - 1] ?? ''}\n` : '29.5.2\n',
+          stderr: '',
+        })
+      },
+    })
+
+  const fx = fixture(t)
+  assert.equal(fx.config.sandbox.imageId, undefined)
+  const calls: string[][] = []
+  const kernel = await bootOn(t, fx, { sandboxDriver: driverFor(fx, calls) })
+  const sandbox = kernel.status().subsystems.sandbox
+  const reason = sandbox.reason ?? ''
+  assert.equal(sandbox.state, 'degraded')
+  assert.ok(reason.startsWith('docker: sandbox.imageId is not set in config/kernel.yaml'), reason)
+  assert.ok(reason.includes('scripts/build-worker-image.sh'), reason)
+  assert.ok(kernel.degraded.includes('sandbox'))
+  assert.deepEqual(calls, [], 'boot asked docker something')
+  await kernel.shutdown()
+  const degraded = payloadOf(fx.dbPath, 'sandbox.degraded')
+  assert.equal(degraded['driver'], 'docker')
+  assert.equal(`docker: ${String(degraded['reason'])}`, reason)
+
+  // Pinned, the same driver goes on to the daemons, and the sandbox is ok.
+  const id = `sha256:${'0123456789abcdef'.repeat(4)}`
+  const pinned = fixture(t, { kernelYaml: (base) => base.replace('  image: aos-worker:test\n', `  image: aos-worker:test\n  imageId: ${id}\n`) })
+  assert.equal(pinned.config.sandbox.imageId, id)
+  const asked: string[][] = []
+  const ok = await bootOn(t, pinned, { sandboxDriver: driverFor(pinned, asked) })
+  assert.equal(ok.status().subsystems.sandbox.state, 'ok', ok.status().subsystems.sandbox.reason ?? '')
+  assert.deepEqual(asked.map((a) => a[0]), ['version', 'network', 'image', 'network', 'image'])
+  // Each VM asked for kernel.yaml's pinned id, by that id.
+  assert.deepEqual(asked.filter((a) => a[0] === 'image').map((a) => a.join(' ')), [
+    `image inspect --format {{.Id}} ${id}`,
+    `image inspect --format {{.Id}} ${id}`,
+  ])
+  await ok.shutdown()
+  assert.equal(rows(pinned.dbPath).some((r) => r.type === 'sandbox.degraded'), false)
 })
 
 test('kernel.booted is the first event of this boot (seq = tail+1 at boot start) and carries configHash', async (t) => {

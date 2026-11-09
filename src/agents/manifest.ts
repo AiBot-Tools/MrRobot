@@ -50,6 +50,13 @@ const Tools = z
 const Sandbox = z
   .object({
     domain: z.enum(['trusted', 'hostile']),
+    // Parsed, and not honoured: the docker driver runs only kernel.yaml's
+    // pinned sandbox.imageId (sha256:<64 hex>), by id and with --pull=never,
+    // and refuses a run whose spec names anything else, a tag above all
+    // (src/sandbox/docker.ts, imageRefusal in src/sandbox/limits.ts). A spec
+    // built from this field is refused unless it holds that very id, so the
+    // image a run asks for comes from config.sandbox.imageId, never from here
+    // or from config.sandbox.image, which is a tag too.
     image: z.string().min(1).optional(),
   })
   .strict()

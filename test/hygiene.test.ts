@@ -261,7 +261,7 @@ test("'as Transport' appears only in src/mcp/hub.ts", () => {
   assert.equal(hits(SRC, /\bas Transport\b/).length, 1)
 })
 
-test('node:child_process is imported only by src/sandbox/docker.ts and four test files that need real processes', () => {
+test('node:child_process is imported only by src/sandbox/docker.ts and five test files that need real processes', () => {
   // The only module that may spawn a process is the one that knows what a
   // docker invocation must look like — the argv audit, the two-key environment,
   // the wallclock kill. A second importer is a second way to run something, and
@@ -283,8 +283,13 @@ test('node:child_process is imported only by src/sandbox/docker.ts and four test
   // git's index whether a .env was force-added. helpers/checkout.ts holds
   // runEntry/spawnEntry, the one way a test runs an entry point, so that the
   // cwd of every such run is the shadow copy's, set in one place.
+  // egress-upstream.test.ts proves the upstream's response parser stays
+  // strict under --insecure-http-parser, a flag of the node process itself,
+  // which only a node started with it can show; it runs one of its own tests
+  // again in one, as env.test.ts does for config-files.test.ts.
   assert.deepEqual(importersOf([...SRC, ...TEST], 'node:child_process'), [
     'src/sandbox/docker.ts',
+    'test/egress-upstream.test.ts',
     'test/entrypoints.test.ts',
     'test/env.test.ts',
     'test/falsify.test.ts',
@@ -340,6 +345,20 @@ test('dependency direction: src/runtime, src/models, src/mcp, src/agents, src/po
   }
   // Exactly one composer wires the broker in.
   assert.deepEqual(importersOf(SRC, './secrets/broker.js'), ['src/kernel.ts'])
+})
+
+test('only decide() mints an egress allow: mintEgressAllow is named in src/egress/decision.ts alone, and only upstream.ts imports it', () => {
+  // The upstream resolves and dials only an EgressAllow, and the brand is the
+  // proof that decide() judged the request. Anywhere else mintEgressAllow is
+  // a way past the allowlist: a subsystem that can mint one can send a
+  // worker's request to any host it names. E3's src/egress/policy.ts, where
+  // decide() lives, joins both lists and nothing else does.
+  assert.deepEqual(pathsOf(hits(SRC, /\bmintEgressAllow\b/)), ['src/egress/decision.ts'])
+  // The name is not the only way to it: a namespace import or re-export of
+  // decision.ts reaches the mint as d['mint' + 'EgressAllow'] without ever
+  // spelling it. So the module's importers are pinned too, resolved and
+  // parsed (import, re-export, import()), type-only imports included.
+  assert.deepEqual(importersOfModule(SRC, 'src/egress/decision.ts'), ['src/egress/upstream.ts'])
 })
 
 /** A path with a `secrets` directory in it, in either separator. */

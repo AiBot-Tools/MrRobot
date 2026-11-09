@@ -67,7 +67,9 @@
 // truth, and no importer may rewrite them. So is every denial addressDenial
 // returns: one object stands for every unreadable answer, and a caller that
 // enriched a denial for its log row (Object.assign checks no readonly) would
-// otherwise write one request's data into another request's decision.
+// otherwise write one request's data into another request's decision. The
+// lists carriedAddresses returns are frozen for the same reason: one empty
+// list stands for every address that carries none.
 //
 // Pure: no I/O. Nothing is resolved here; E2's upstream resolves and asks this
 // of every answer.
@@ -272,4 +274,31 @@ export function addressDenial(address: string): AddressDenial | undefined {
 /** True unless `address` is one global unicast address, judged as addressDenial judges it. */
 export function isDeniedAddress(address: string): boolean {
   return addressDenial(address) !== undefined
+}
+
+/** An IPv4 address an IPv6 one carries, and the form it is carried in. */
+export interface CarriedAddress {
+  readonly via: Unwrap
+  /** Dotted-quad. */
+  readonly address: string
+}
+
+const CARRIES_NOTHING: readonly CarriedAddress[] = Object.freeze([])
+
+/**
+ * The IPv4 addresses `address` carries in one of the four forms above, the
+ * ones addressDenial judges it by, frozen; none for an IPv4 address, an IPv6
+ * address of no such form, or text that is no address. addressDenial already
+ * checks them against the deny ranges. This is for a check that compares an
+ * answer with addresses rather than ranges (E2's test of the Mac's own
+ * interface addresses), which must see the IPv4 address a packet ends up at
+ * just as addressDenial does: ::ffff:a.b.c.d is a.b.c.d to a dual-stack
+ * socket.
+ */
+export function carriedAddresses(address: string): readonly CarriedAddress[] {
+  if (address.includes('%') || !isIPv6(address)) return CARRIES_NOTHING
+  const value = ipv6Value(address)
+  const carried = value === undefined ? undefined : carriedIpv4(value)
+  if (carried === undefined) return CARRIES_NOTHING
+  return Object.freeze(carried.map(([via, v4]) => Object.freeze({ via, address: ipv4Text(v4) })))
 }

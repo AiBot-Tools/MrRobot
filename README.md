@@ -883,8 +883,8 @@ Run it after changing delegation, crash recovery, tool-call replay, the memory
 namespace pin, goal tracking, anchor trust, the eval checks, the chain /
 canonicalizer / triggers (`integrity`), redaction, the cron scheduler, the agent
 registry, restart recovery of approvals and holds, the container audit and path
-containment (`sandbox`), the egress host normaliser and address classifier
-(`egress`), the `.env` loader and the credential checks around it (`dotenv`, and
+containment (`sandbox`), the egress host normaliser, address classifier and
+upstream (`egress`), the `.env` loader and the credential checks around it (`dotenv`, and
 `dotenvDefault` for how an entry point picks its file), the `.env` writer
 (`dotenvAppend`), the installer's plan and confirmation gate (`installPlan`), the
 `.gitignore` reading (`gitignore`), or the runner itself (`runner`) — the

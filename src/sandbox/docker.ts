@@ -74,6 +74,7 @@ import { promisify } from 'node:util'
 const execFileAsync = promisify(execFile)
 
 import { ConfigError } from '../errors.js'
+import { recordable } from '../events/bound.js'
 import { homeDirectory, realpathNearest } from '../agents/protected.js'
 import { confineWorkspace } from './confine.js'
 import {
@@ -1071,6 +1072,21 @@ function channelOf(child: ChildLike, stderr: Capture): SandboxChannel | undefine
   return { input: stdout, output: stdin }
 }
 
+/**
+ * The most of docker's refusal a probe's reason quotes, in UTF-8 bytes. The
+ * reason goes into the hash-chained log for good (sandbox.degraded.reason),
+ * and a failed call's error is the command line and whatever the daemon
+ * wrote to stderr, as much as execFile buffers: text the kernel does not
+ * size. Docker's own refusals ("No such image", "Cannot connect to the Docker
+ * daemon") come to a few hundred bytes, command line and all.
+ */
+export const PROBE_ERROR_BYTES = 1_024
+
+/** What docker said when one of probe()'s calls failed: redacted, and cut to PROBE_ERROR_BYTES (recordable). */
+function dockerSaid(e: unknown): string {
+  return recordable(e instanceof Error ? e.message : String(e), PROBE_ERROR_BYTES)
+}
+
 /** A run this driver is holding, by name. */
 interface Held {
   readonly domain: SandboxDomain
@@ -1137,7 +1153,7 @@ export class DockerDriver implements SandboxDriver {
     } catch (e) {
       // Availability, never a throw: a kernel with no container runtime must
       // still boot and say why.
-      return { ok: false, why: e instanceof Error ? e.message : String(e) }
+      return { ok: false, why: dockerSaid(e) }
     }
 
     // Each domain's internal network, PROVEN internal on its own VM rather
@@ -1180,14 +1196,19 @@ export class DockerDriver implements SandboxDriver {
       } catch (e) {
         return {
           ok: false,
-          why: `${domain}: network ${network} could not be inspected: ${e instanceof Error ? e.message : String(e)}`,
+          why: `${domain}: network ${network} could not be inspected: ${dockerSaid(e)}`,
         }
       }
       if (internal !== 'true') {
+        // What docker printed goes into the hash-chained log for good
+        // (sandbox.degraded.reason), as #imageMissingOn's does: the boolean
+        // {{.Internal}} prints is quoted, and anything else, text the kernel
+        // does not size, only named.
+        const printed = internal === 'false' ? 'false' : internal === '' ? '?' : 'something that is no boolean'
         return {
           ok: false,
           why:
-            `${domain}: network ${network} is not internal (Internal=${internal === '' ? '?' : internal}), so a ` +
+            `${domain}: network ${network} is not internal (Internal=${printed}), so a ` +
             "container on it could reach the Mac's loopback (where pmmcp listens unauthenticated) and the " +
             `internet. Recreate it: docker network rm ${network} && docker network create --internal ${network}`,
         }
@@ -1221,16 +1242,21 @@ export class DockerDriver implements SandboxDriver {
       )
       printed = stdout.trim()
     } catch (e) {
+      // Loaded, never built here: a docker build is not reproducible (the
+      // image config records when it was made), so a build on this VM gives
+      // the image another id, and pinning that one breaks the other VM.
       return (
         `${domain}: the pinned sandbox.imageId ${imageId} could not be inspected on this domain's VM, so every run ` +
-        `there would fail at docker, which is told never to pull it: ${e instanceof Error ? e.message : String(e)}. ` +
-        'Load the worker image into this VM (docker save on the VM that built it, docker load on this one), or ' +
-        'build it here, so that both VMs hold it under the one pinned id'
+        `there would fail at docker, which is told never to pull it: ${dockerSaid(e)}. ` +
+        'Load the worker image into this VM (docker save on the VM that built it, docker load on this one), so ' +
+        'that both VMs hold it under the one pinned id'
       )
     }
     if (printed === imageId) return undefined
-    // Shown only when it reads as an id: what docker prints here goes into
-    // the hash-chained log (sandbox.degraded.reason), and an id is bounded.
+    // What docker says goes into the hash-chained log for good
+    // (sandbox.degraded.reason), so it is bounded there: its refusal, above,
+    // cut by dockerSaid, and what it printed shown only when it reads as an
+    // id, which is bounded, and otherwise only named.
     const what = printed === '' ? 'no id' : isImageId(printed) ? `the id ${printed}` : 'something that is no image id'
     return (
       `${domain}: docker image inspect ${imageId} printed ${what} on this domain's VM, not the pinned ` +
@@ -1374,16 +1400,20 @@ export class DockerDriver implements SandboxDriver {
         // the run reports that exit, as the fake does for a script whose kill
         // ends nothing (ignoresKill); so does a spawn that started no process
         // ('error' below), even after a kill. A run the kernel did end says
-        // so, with SIGKILL, and credits the last kill sent before it ended: a
+        // so, with SIGKILL, and credits the wallclock's kill if the wallclock
+        // fired before the run ended, and otherwise the requested kill: a
         // wallclock that fires after a requested kill reached no daemon is the
-        // one whose kill a 137 shows. (A 137 the container came to by another
-        // route, the OOM killer, after a kill that reached no daemon, is
-        // credited to the kill: the CLI's exit cannot tell the two apart; the
-        // fake refuses to script one, ignoresKill with exitCode 137.) A 137
-        // with no kill sent is the run's own, and reports no killedBy; so is
-        // one whose only kill was sent after the CLI had exited (the run's
-        // `requested`, and the timer is cleared at the exit), which the fake
-        // gives for a kill of a run that has ended.
+        // one whose kill a 137 shows, and a requested kill sent after the
+        // wallclock fired (an operator's, a shutdown's) does not take the
+        // credit from it, though it was the last kill sent. (A 137 the
+        // container came to by another route, the OOM killer, after a kill
+        // that reached no daemon, is credited to the kill: the CLI's exit
+        // cannot tell the two apart; the fake refuses to script one,
+        // ignoresKill with exitCode 137.) A 137 with no kill sent is the
+        // run's own, and reports no killedBy; so is one whose only kill was
+        // sent after the CLI had exited (the run's `requested`, and the timer
+        // is cleared at the exit), which the fake gives for a kill of a run
+        // that has ended.
         const endedBy = exitCode === 137 ? killSentBy : undefined
         resolve({
           name: spec.name,

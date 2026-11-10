@@ -160,6 +160,62 @@ test('config/kernel.yaml pins no sandbox.imageId, so the driver boot builds from
   assert.deepEqual(pinned.calls.filter((args) => args[0] === 'image').map((args) => args[args.length - 1]), [id, id])
 })
 
+test('defaultDriver takes only spawn and execFile from the processes a test hands it: an imageId, domains or dockerConfig beside them never overrides kernel.yaml', async () => {
+  // TypeScript checks no excess property on an argument that is not a
+  // literal, so a DockerProcesses value may carry more than its two
+  // functions. Spread over what kernel.yaml produced, those keys would decide
+  // the driver, and the tests above, meant to prove that kernel.yaml decides,
+  // would prove something else. Here each extra key names something
+  // kernel.yaml does not: a pinned id while kernel.yaml pins none, and
+  // another socket and DOCKER_CONFIG.
+  const raw = read('config/kernel.yaml')
+  const config = parseKernelConfig(parseYaml(raw), { repoRoot: REPO })
+  assert.equal(config.sandbox.imageId, undefined)
+  const calls: { args: readonly string[]; env: Record<string, string> }[] = []
+  const elsewhere = { dockerHost: 'unix:///tmp/elsewhere.sock', mountRoot: '/tmp/elsewhere', network: 'aos-elsewhere' }
+  const processes = {
+    spawn: () => {
+      throw new Error('a probe starts no run')
+    },
+    execFile: (_command: string, args: readonly string[], options: { env: Record<string, string> }) => {
+      calls.push({ args, env: options.env })
+      return Promise.resolve({
+        stdout: args[0] === 'network' ? 'true\n' : args[0] === 'image' ? `${args[args.length - 1] ?? ''}\n` : '29.5.2\n',
+        stderr: '',
+      })
+    },
+    imageId: `sha256:${'0123456789abcdef'.repeat(4)}`,
+    domains: { trusted: elsewhere, hostile: elsewhere },
+    dockerConfig: '/tmp/elsewhere-docker',
+  }
+  const unpinned = await defaultDriver(config, REPO, processes).probe()
+  assert.match(unpinned.ok ? '' : unpinned.why, /^sandbox\.imageId is not set in config\/kernel\.yaml/, 'an imageId beside the processes was pinned')
+  assert.equal(calls.length, 0, 'the shipped config had docker asked something')
+
+  // Pinned in kernel.yaml, the daemons are asked, through kernel.yaml's
+  // sockets and DOCKER_CONFIG, for kernel.yaml's id.
+  const id = `sha256:${'f'.repeat(64)}`
+  const pinned = parseKernelConfig(parseYaml(raw.replace('  image: aos-worker:0.0.1\n', `  image: aos-worker:0.0.1\n  imageId: ${id}\n`)), { repoRoot: REPO })
+  assert.deepEqual(await defaultDriver(pinned, REPO, processes).probe(), { ok: true, version: '29.5.2' })
+  assert.deepEqual(calls.filter((c) => c.args[0] === 'image').map((c) => c.args[c.args.length - 1]), [id, id])
+  assert.deepEqual(
+    calls.map((c) => c.env['DOCKER_HOST']),
+    [
+      pinned.sandbox.domains.trusted.dockerHost,
+      pinned.sandbox.domains.trusted.dockerHost,
+      pinned.sandbox.domains.trusted.dockerHost,
+      pinned.sandbox.domains.hostile.dockerHost,
+      pinned.sandbox.domains.hostile.dockerHost,
+    ],
+  )
+  for (const call of calls) assert.equal(call.env['DOCKER_CONFIG'], join(pinned.dataDir, 'docker'))
+  // And each VM was asked about kernel.yaml's own network, not the extra one.
+  assert.deepEqual(
+    calls.filter((c) => c.args[0] === 'network').map((c) => c.args[c.args.length - 1]),
+    [pinned.sandbox.domains.trusted.network, pinned.sandbox.domains.hostile.network],
+  )
+})
+
 test('scripts/colima-up.sh exists, is executable, and its header says NEEDS VALIDATION', () => {
   const path = join(REPO, 'scripts/colima-up.sh')
   const stat = statSync(path)

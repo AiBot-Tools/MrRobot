@@ -42,19 +42,30 @@
 //
 // What still differs: when a run whose kill ended nothing exits, which here is
 // just after that kill, and on the real driver whenever its container does.
+// And when a run that does not hang exits: inside run(), so a kill sent before
+// its result settles, in the same tick, reaches a name still held and ends
+// nothing, as the real driver's kill sent after the CLI's exit; its scripted
+// 137 is then the run's own, with no killedBy. On the real driver a kill sent
+// while the name is held but before the CLI's exit is credited with a 137
+// that follows it (killedBy requested, SIGKILL): a run a kill ends is
+// scripted `hangs` here.
 // And the reason a probe gives with no valid id pinned and a probe scripted
 // not ok (or none scripted): the scripted (or default) reason here, where the
 // real driver names sandbox.imageId before asking any daemon anything.
 // Degraded on both. A probe scripted ok or not stands for everything the real
 // driver asks the daemons, the pinned image's presence on each VM among it.
 //
-// And a script may not describe a result the real driver cannot return: a
-// stream longer than its capture keeps, a cut with no stream near the cap, or
-// a kill that ends nothing followed by an exit of 137, which the real driver
-// credits to that kill (assertDriverShaped), or any stdout on a channel run,
-// whose stdout the real driver never reads. Runtime code is tested against
-// this fake, and could otherwise come to rely on a result shape it will never
-// meet.
+// And a script may not describe a result the real driver cannot return.
+// assertDriverShaped refuses a stream longer than its capture keeps, a cut
+// with no stream near the cap, a kill that ends nothing followed by an exit
+// of 137, which the real driver credits to that kill, and a signal beside an
+// exit code, which it reports only for a run its kill ended: 137, SIGKILL and
+// killedBy, the shape the fake gives a hung run's kill itself. And run()
+// refuses any stdout on a channel run, whose stdout the real driver never
+// reads. A script's exitCode null is the run's exit as it stands, a docker
+// CLI killed by a signal or a spawn that started nothing, never a clean 0.
+// Runtime code is tested against this fake, and could otherwise come to rely
+// on a result shape it will never meet.
 //
 // A spec is read once, at run()'s entry, and every decision is made from
 // that reading (readSpecOnce), as the real driver reads it: a field that
@@ -113,7 +124,9 @@ import {
 import { imageIdProblem, imageRefusal } from '../../src/sandbox/limits.js'
 
 export interface ScriptedExit {
+  /** Unset, 0. Null, as the real driver reports a docker CLI killed by a signal, or a spawn that started nothing. */
   readonly exitCode?: number | null
+  /** Only beside exitCode null: the signal a docker CLI was killed by. */
   readonly signal?: SandboxResult['signal']
   readonly stdout?: string
   readonly stderr?: string
@@ -216,9 +229,13 @@ function fewestBytes(text: string): number {
  * reports a cut only for a stream that carried more, which it cuts at most
  * three bytes short of the cap, on a character boundary. It credits an exit of
  * 137 to the kill sent before it (finish() in run()), so a kill that ends
- * nothing and then a 137 is a result it never gives. And refuse one that says
- * nothing: `ignoresKill` on a run that does not hang, which has ended before
- * any kill could reach it.
+ * nothing and then a 137 is a result it never gives. It reports a signal
+ * beside an exit code only for a run its kill ended (137, SIGKILL and
+ * killedBy), a shape the fake makes itself from a hung run's kill, so a
+ * script's signal comes with a null exit code: a docker CLI killed by a
+ * signal ({null, SIGKILL or SIGTERM}). And refuse one that says nothing:
+ * `ignoresKill` on a run that does not hang, which has ended before any kill
+ * could reach it.
  */
 function assertDriverShaped(scripted: ScriptedExit, index: number): void {
   const streams = [
@@ -254,6 +271,17 @@ function assertDriverShaped(scripted: ScriptedExit, index: number): void {
         'reaches it, so no kill could end it anyway. Add hangs: true.',
     )
   }
+  // The exit and signal ownExit reports, as it reads them.
+  const exitCode = scripted.exitCode === undefined ? 0 : scripted.exitCode
+  const signal = scripted.signal ?? null
+  if (signal !== null && exitCode !== null) {
+    throw new Error(
+      `scripted exit ${String(index)}: signal ${signal} beside exitCode ${String(exitCode)}, a pair the real driver ` +
+        'returns only for a run its kill ended (137, SIGKILL and killedBy), which the fake reports itself for a hung ' +
+        "run's kill or overrun. A docker CLI killed by a signal exits with no code: script exitCode: null beside the " +
+        'signal, or drop the signal for an exit of its own.',
+    )
+  }
 }
 
 /**
@@ -265,7 +293,10 @@ function assertDriverShaped(scripted: ScriptedExit, index: number): void {
 function ownExit(spec: SandboxSpec, scripted: ScriptedExit, overran: boolean): SandboxResult {
   return {
     name: spec.name,
-    exitCode: scripted.exitCode ?? 0,
+    // Unscripted, 0; scripted null, null: the exit of a docker CLI that died
+    // by a signal, or of a spawn that started nothing, which `?? 0` would
+    // turn into a clean exit.
+    exitCode: scripted.exitCode === undefined ? 0 : scripted.exitCode,
     signal: scripted.signal ?? null,
     ...(overran ? { overran: true as const } : {}),
     stdout: scripted.stdout ?? '',

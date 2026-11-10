@@ -31,16 +31,27 @@
 //   prefix and it reaches someone else's container, on both VMs. Report a run
 //   killed because a kill was sent, rather than because its exit shows one,
 //   and a run that exited 0 on its own reads as killed; credit a 137 to the
-//   first kill sent rather than the last, and a run the wallclock ended reads
-//   as ended by a requested kill that reached no daemon; credit a 137 when no
-//   kill was sent and the OOM killer's reads as an operator kill. Resolve a
+//   requested kill when the wallclock fired before the run ended, and a run
+//   the wallclock ended reads as ended by a requested kill, one that reached
+//   no daemon before the wallclock fired or one sent after it; credit a 137
+//   when no kill was sent and the OOM killer's reads as an operator kill;
+//   mark a run as killed only once its `docker kill` has answered, and a CLI
+//   that exits 137 while the kill is in flight reads as the OOM killer's.
+//   Read the id docker prints for the pinned image by its prefix, its suffix
+//   or its first word, and the pin with more before or after it passes as the
+//   pin; quote a probe's docker refusal uncut, and a daemon writes what it
+//   likes into the log for good; quote what `network inspect` prints for
+//   {{.Internal}} rather than only its boolean, and a daemon writes what it
+//   likes there too; advise building the image on a VM that lacks it, and the
+//   operator is sent after an id that differs on each VM. Resolve a
 //   sweep before its kills return and the boot sweep calls containers still
 //   running swept; list orphans with --quiet and docker prints IDs for names,
 //   and the sweep kills none. Let the fake end a killed run before kill()
 //   returns, or never end one with its own exit, and runtime code tested
 //   against it meets neither the held name nor the kill that ends nothing the
 //   real driver gives it; let it report a killed run with no output, a null
-//   exit code, or a post-kill 137 with no killedBy, and that code meets a
+//   exit code, or a post-kill 137 with no killedBy, turn a script's null exit
+//   code into 0, or take a signal beside an exit code, and that code meets a
 //   result docker never gives.
 //   Write a workspace path holding a comma into --mount, or read that value
 //   other than as docker's CSV, and a second source= mounts what it names.
@@ -116,13 +127,14 @@ import ts from 'typescript'
 
 import { tmpdir } from './helpers/tmpdir.js'
 import { ConfigError, NotImplementedError } from '../src/errors.js'
-import { MAX_LOGGED_OUTPUT } from '../src/events/bound.js'
+import { MAX_LOGGED_OUTPUT, recordable } from '../src/events/bound.js'
 import { confineWorkspace } from '../src/sandbox/confine.js'
 import {
   auditRunArgs,
   buildRunArgs,
   CONTAINER_PREFIX,
   DockerDriver,
+  PROBE_ERROR_BYTES,
   WORKSPACE_TARGET,
   type ChildLike,
   type DockerDefaults,
@@ -2252,6 +2264,44 @@ test('probe refuses a domain whose network is not internal, and checks each doma
   assert.match(missing.ok ? '' : missing.why, /^trusted: network aos-internal could not be inspected: .*not found/)
 })
 
+test('probe quotes only a boolean from network inspect, since the reason goes into the log for good', async (t) => {
+  // The reason lands in the hash-chained log (sandbox.degraded.reason) at
+  // every degraded boot, and SandboxDegradedPayload.reason is unbounded. A
+  // daemon (on the hostile VM, say) that answers {{.Internal}} with anything
+  // but a boolean has that text named, never quoted, as #imageMissingOn names
+  // what is no image id; the advice to recreate the network is kept whole.
+  const f = fixture(t)
+  const d = driverFor(f)
+  const reason = (printed: string): string =>
+    "hostile: network aos-hostile is not internal (Internal=" +
+    printed +
+    "), so a container on it could reach the Mac's loopback (where pmmcp listens unauthenticated) and the " +
+    'internet. Recreate it: docker network rm aos-hostile && docker network create --internal aos-hostile'
+  const junk = `${'x'.repeat(5_000)}\n${'y'.repeat(5_000)}\n`
+  // The boolean is all of what docker prints, and nothing else: false with
+  // more after it, on its own line or the same one, is no boolean, so a
+  // parse by line or by prefix quotes none of the rest.
+  for (const [answer, printed] of [
+    ['false\n', 'false'],
+    ['  \n', '?'],
+    [junk, 'something that is no boolean'],
+    ['True\n', 'something that is no boolean'],
+    [`false\n${junk}`, 'something that is no boolean'],
+    ['falsey\n', 'something that is no boolean'],
+  ] as const) {
+    d.setExec((args, env) => {
+      if (args[0] !== 'network') return healthyDaemon('29.5.2')(args, env)
+      const name = args[args.length - 1] ?? ''
+      return Promise.resolve({ stdout: name === 'aos-hostile' ? answer : 'true\n', stderr: '' })
+    })
+    const probe = await d.driver.probe()
+    const why = probe.ok ? '' : probe.why
+    assert.equal(why, reason(printed), JSON.stringify(answer.slice(0, 20)))
+    assert.ok(Buffer.byteLength(why) < 512, String(Buffer.byteLength(why)))
+    assert.equal(/x{2}|y{2}/.test(why), false, why)
+  }
+})
+
 test('probe refuses a domain network no domain may name without inspecting it, and never advises recreating it', async (t) => {
   // host reports Internal=false, so probe used to advise `docker network rm
   // host && docker network create --internal host`, which docker refuses for
@@ -2338,7 +2388,18 @@ test('probe asks each VM for the pinned image by id, and is degraded naming the 
   const hostile = await why()
   assert.ok(hostile.startsWith(`hostile: the pinned sandbox.imageId ${IMAGE_ID} could not be inspected on this domain's VM`), hostile)
   assert.ok(hostile.includes(`which is told never to pull it: Error response from daemon: No such image: ${IMAGE_ID}`), hostile)
-  assert.ok(hostile.includes('docker load on this one'), hostile)
+  // Loaded, and never built there: a docker build is not reproducible, so a
+  // build on the VM that lacks the image gives it another id, the next probe
+  // fails the same way, and re-pinning to that id breaks the first VM. The
+  // advice always ends with one id held by both VMs.
+  assert.ok(
+    hostile.endsWith(
+      '. Load the worker image into this VM (docker save on the VM that built it, docker load on this one), so that ' +
+        'both VMs hold it under the one pinned id',
+    ),
+    hostile,
+  )
+  assert.doesNotMatch(hostile, /\bbuild\b/, hostile)
 
   // Nor built on the trusted one: the first domain asked is the one named.
   printed = { [TRUSTED_HOST]: new Error(`Error response from daemon: No such image: ${IMAGE_ID}`) }
@@ -2358,6 +2419,23 @@ test('probe asks each VM for the pinned image by id, and is degraded naming the 
   const junk = await why()
   assert.ok(junk.startsWith(`trusted: docker image inspect ${IMAGE_ID} printed something that is no image id`), junk)
   assert.equal(junk.includes('"Id"'), false, junk)
+  // Nor is the pin with more before or after it: one more hex digit, or a
+  // line with another id after it or before it. The pin is what docker
+  // prints, all of it, and nothing else.
+  for (const [host, domain, answer] of [
+    [TRUSTED_HOST, 'trusted', `${IMAGE_ID}0\n`],
+    [HOSTILE_HOST, 'hostile', `${IMAGE_ID}\n${other}\n`],
+    [TRUSTED_HOST, 'trusted', `${other}\n${IMAGE_ID}\n`],
+  ] as const) {
+    printed = { [host]: answer }
+    assert.equal(
+      await why(),
+      `${domain}: docker image inspect ${IMAGE_ID} printed something that is no image id on this domain's VM, not the ` +
+        'pinned sandbox.imageId: pin the id `docker image inspect --format {{.Id}}` prints for the worker image, the ' +
+        'same on both VMs',
+      JSON.stringify(answer),
+    )
+  }
 
   // At no point was anything pulled, or asked of docker but the probe's
   // three questions.
@@ -2369,6 +2447,45 @@ test('probe asks each VM for the pinned image by id, and is degraded naming the 
     assert.equal(call.args.some((a) => a === 'pull' || a.startsWith('--pull')), false, call.args.join(' '))
   }
   assert.deepEqual(d.spawns, [])
+})
+
+test("probe quotes docker's refusal cut to PROBE_ERROR_BYTES at each of its calls, since the reason goes into the log for good", async (t) => {
+  // A failed call's error is the command line and whatever the daemon wrote
+  // to stderr, as much as execFile buffers, and the reason it lands in is
+  // written into the hash-chained log (sandbox.degraded.reason) at every
+  // degraded boot. A short refusal is quoted whole (the tests above); a long
+  // one is cut as recordable() cuts it, redacted and on a character
+  // boundary, with the rest of the reason, the advice among it, kept.
+  const f = fixture(t)
+  const d = driverFor(f)
+  const said = `Error response from daemon: ${'é'.repeat(5_000)}\nand a second line\n`
+  const calls: readonly (readonly [string, (quoted: string) => string])[] = [
+    ['version', (quoted) => quoted],
+    ['network', (quoted) => `trusted: network aos-internal could not be inspected: ${quoted}`],
+    [
+      'image',
+      (quoted) =>
+        `trusted: the pinned sandbox.imageId ${IMAGE_ID} could not be inspected on this domain's VM, so every run ` +
+        `there would fail at docker, which is told never to pull it: ${quoted}. Load the worker image into this VM ` +
+        '(docker save on the VM that built it, docker load on this one), so that both VMs hold it under the one ' +
+        'pinned id',
+    ],
+  ]
+  for (const [failing, reason] of calls) {
+    let message = ''
+    d.setExec((args, env) => {
+      if (args[0] !== failing) return healthyDaemon('29.5.2')(args, env)
+      message = `Command failed: docker ${args.join(' ')}\n${said}`
+      return Promise.reject(new Error(message))
+    })
+    const probe = await d.driver.probe()
+    const why = probe.ok ? '' : probe.why
+    const quoted = recordable(message, PROBE_ERROR_BYTES)
+    assert.ok(quoted.endsWith('…') && Buffer.byteLength(quoted) <= PROBE_ERROR_BYTES, quoted)
+    assert.ok(quoted.startsWith(`Command failed: docker ${failing}`), quoted)
+    assert.equal(why, reason(quoted), failing)
+    assert.equal(why.includes('a second line'), false, failing)
+  }
 })
 
 test('with sandbox.imageId unset the driver is degraded, naming the key and the build script, asks no daemon anything and starts no run', async (t) => {
@@ -2932,9 +3049,9 @@ test('a kill that ends nothing leaves the run its own exit: no killedBy, and the
   }
 
   // A requested kill that reached no daemon, then the wallclock, whose kill
-  // ends the run: the 137 is the wallclock's, the last kill sent before the
-  // run ended, and a run reported killedBy requested with overran would say
-  // the requested kill ended a run that had outlived its wallclock.
+  // ends the run: the 137 is the wallclock's, which fired before the run
+  // ended, and a run reported killedBy requested with overran would say the
+  // requested kill ended a run that had outlived its wallclock.
   const f = fixture(t)
   const d = driverFor(f)
   let reached = false
@@ -3211,7 +3328,7 @@ test('the fake and the real driver agree: a kill that ends nothing leaves the ru
   // after an overrun says only that it overran. W1 code must handle that, so
   // the fake can be scripted to meet it (ignoresKill). And a requested kill
   // still in flight when the wallclock fires is credited to the wallclock on
-  // both: the last kill sent before the run ended.
+  // both: the wallclock fired before the run ended.
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const f = fixture(t)
   const name = `${CONTAINER_PREFIX}parity`
@@ -3358,6 +3475,132 @@ test('the fake refuses a kill that ends nothing followed by a 137, which the rea
   )
 })
 
+test('the fake and the real driver agree: a docker CLI killed by a signal reports that signal, a null exit code and no killedBy, and the fake refuses a signal beside an exit code', async (t) => {
+  // The real driver returns a signal beside an exit code only for a run its
+  // kill ended (137, SIGKILL and killedBy). A docker CLI killed by a signal
+  // from outside, or by one that came before it had installed its handlers,
+  // closes with no code, whether or not a kill was sent: {null, SIGKILL or
+  // SIGTERM}, no killedBy (finish() in docker.ts); a spawn that started
+  // nothing gives {null, null}. A fake that turned a scripted null into 0
+  // would hand runtime code a clean exit for each, so it never meets the null
+  // the real driver gives, and one that took {0, SIGKILL} or {137, SIGKILL}
+  // would hand it a result docker never gives.
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = fixture(t)
+  const name = `${CONTAINER_PREFIX}signalled`
+  const limits = { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 }
+  const shape = (r: SandboxResult): unknown => ({ exitCode: r.exitCode, signal: r.signal, killedBy: r.killedBy, overran: r.overran })
+
+  // No kill sent, by anyone.
+  const ends: readonly (readonly [string, SandboxResult['signal'], (child: FakeChild) => void])[] = [
+    ['the CLI SIGKILLed', 'SIGKILL', (child) => child.close(null, 'SIGKILL')],
+    ['the CLI SIGTERMed', 'SIGTERM', (child) => child.close(null, 'SIGTERM')],
+    ['a spawn that started nothing', null, (child) => child.fail(Object.assign(new Error('spawn docker ENOENT'), { code: 'ENOENT' }))],
+  ]
+  for (const [label, signal, end] of ends) {
+    const real = driverFor(f)
+    const running = real.driver.run(spec(f, { name, limits }))
+    end(real.child)
+    const fromReal = await running.result
+    assert.deepEqual(real.execs, [], label)
+    const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: null, signal }] })
+    const fromFake = await fake.run(spec(f, { name, limits })).result
+    const expected = { exitCode: null, signal, killedBy: undefined, overran: undefined }
+    assert.deepEqual(shape(fromReal), expected, `real, ${label}`)
+    assert.deepEqual(shape(fromFake), expected, `fake, ${label}`)
+    assert.deepEqual(fake.kills, [], label)
+  }
+
+  // A kill sent, which ended nothing, and then the CLI SIGKILLed: on the
+  // fake, ignoresKill with that exit. After an overrun, it says it overran.
+  for (const how of ['requested', 'wallclock'] as const) {
+    const real = driverFor(f)
+    const running = real.driver.run(spec(f, { name, limits }))
+    if (how === 'requested') await real.driver.kill(name)
+    else t.mock.timers.tick(5_000)
+    assert.deepEqual(killsSent(real), [`${TRUSTED_HOST} ${name}`], how)
+    real.child.close(null, 'SIGKILL')
+    const fromReal = await running.result
+    const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true, ignoresKill: true, exitCode: null, signal: 'SIGKILL' }] })
+    const onFake = fake.run(spec(f, { name, limits }))
+    if (how === 'requested') await fake.kill(name)
+    else fake.simulateOverrun(name)
+    const fromFake = await onFake.result
+    const expected = { exitCode: null, signal: 'SIGKILL', killedBy: undefined, overran: how === 'wallclock' ? true : undefined }
+    assert.deepEqual(shape(fromReal), expected, `real, ${how}`)
+    assert.deepEqual(shape(fromFake), expected, `fake, ${how}`)
+  }
+
+  // A signal beside an exit code, an unset one (0) among them, is refused as
+  // a script: the real driver gives one only with killedBy, from its kill.
+  for (const [scripted, code] of [
+    [{ exitCode: 0, signal: 'SIGKILL' }, '0'],
+    [{ exitCode: 137, signal: 'SIGKILL' }, '137'],
+    [{ signal: 'SIGTERM' }, '0'],
+    [{ exitCode: 143, signal: 'SIGTERM' }, '143'],
+    [{ hangs: true, ignoresKill: true, exitCode: 3, signal: 'SIGKILL' }, '3'],
+  ] as const) {
+    assert.throws(
+      () => fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: 0 }, scripted] }),
+      new RegExp(
+        `^Error: scripted exit 1: signal ${scripted.signal} beside exitCode ${code}, a pair the real driver returns only ` +
+          'for a run its kill ended \\(137, SIGKILL and killedBy\\)',
+      ),
+      JSON.stringify(scripted),
+    )
+  }
+  // And every shape the real driver gives is accepted, the fake's own killed
+  // 137 among them, which a hung run's kill makes.
+  assert.doesNotThrow(() =>
+    fakeSandbox({
+      script: [
+        { exitCode: null, signal: 'SIGKILL' },
+        { exitCode: null, signal: 'SIGTERM' },
+        { exitCode: null, signal: null },
+        { exitCode: null },
+        { exitCode: 137 },
+        { exitCode: 0, signal: null },
+        { hangs: true, ignoresKill: true, exitCode: null, signal: 'SIGTERM' },
+        { hangs: true },
+      ],
+    }),
+  )
+})
+
+test("kill(name) marks the run before its docker kill answers: a CLI that exits 137 while `docker kill` is still in flight is credited to that kill", async (t) => {
+  // moby's kill answers only once the container has stopped, and the
+  // `docker run --rm` CLI attached to it can exit first. Were the run marked
+  // only once the kill had returned, it would have settled by then with no
+  // killedBy, and W1 would log the operator's kill as an OOM or the worker's
+  // own exit 137.
+  const f = fixture(t)
+  const d = driverFor(f)
+  let release: () => void = () => undefined
+  d.setExec(
+    () =>
+      new Promise((resolve) => {
+        release = () => resolve({ stdout: '', stderr: '' })
+      }),
+  )
+  const running = d.driver.run(spec(f))
+  let returned = false
+  const kill = d.driver.kill(running.name).then(() => {
+    returned = true
+  })
+  // Sent, and not yet answered.
+  assert.deepEqual(killsSent(d), [`${TRUSTED_HOST} ${running.name}`])
+  d.child.exit(137, null)
+  d.child.close(137, null)
+  const result = await running.result
+  assert.equal(returned, false, 'the kill answered before the run ended')
+  assert.equal(result.killedBy, 'requested')
+  assert.equal(result.signal, 'SIGKILL')
+  assert.equal(result.exitCode, 137)
+  release()
+  await kill
+  assert.equal(returned, true)
+})
+
 test('the fake and the real driver agree: a killed run returns what it wrote before the kill, with the CLI\'s 137, and an overrun ran its whole wallclock', async (t) => {
   // W1 logs a killed run's partial output: what it had done before the kernel
   // ended it. The real driver returns whatever it captured up to the kill,
@@ -3422,6 +3665,27 @@ test('the fake and the real driver agree: a killed run returns what it wrote bef
   assert.equal(result.truncated, true)
   assert.equal(result.stdout.length, CAPTURE_MAX_BYTES)
   assert.equal(result.killedBy, 'requested')
+
+  // An overrun whose CLI closed two seconds past the wallclock ran seven
+  // seconds, not five: the real driver's duration ends at the CLI's end, and
+  // the fake's at a scripted duration longer than the wallclock.
+  const late = `${CONTAINER_PREFIX}late-close`
+  const real = driverFor(f)
+  const slow = real.driver.run(spec(f, { name: late, limits }))
+  t.mock.timers.tick(5_000)
+  t.mock.timers.tick(2_000)
+  real.child.close(137, null)
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true, durationMs: 7_000 }] })
+  const onFake = fake.run(spec(f, { name: late, limits }))
+  fake.simulateOverrun(late)
+  for (const [label, ran] of [
+    ['real', await slow.result],
+    ['fake', await onFake.result],
+  ] as const) {
+    assert.equal(ran.durationMs, 7_000, label)
+    assert.equal(ran.overran, true, label)
+    assert.equal(ran.killedBy, 'wallclock', label)
+  }
 })
 
 test('the fake and the real driver agree: a kill sent after the wallclock fired, before the run ended, leaves it ended by the wallclock', async (t) => {
@@ -3868,6 +4132,68 @@ test("the sandbox layer's prose names the accepted egress design: the kernel's e
   for (const fact of ['No worker is attached to it: every run is --network none', "the kernel's egress engine, over its run's docker -i channel", 'as defence in depth']) {
     assert.ok(comment.includes(fact), `colima-up.sh's network comment does not say: ${fact}\n${comment}`)
   }
+})
+
+test("the sandbox prose states the kill-credit rule as finish() applies it, and the fake says when a run that does not hang exits and what refuses each result it may not script", () => {
+  // finish() credits a 137 to the wallclock's kill if the wallclock fired
+  // before the run ended, and otherwise to the requested kill: `killSentBy =
+  // 'wallclock'` in the timer, `??= 'requested'` in kill(). "The last kill
+  // sent" is not that rule: a requested kill sent after the wallclock fired
+  // is the last one sent, and the credit stays the wallclock's (the parity
+  // test 'a kill sent after the wallclock fired' above). Prose that says
+  // otherwise tells the next reader to change the code to match it.
+  const read = (rel: string): string => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8')
+  const prose = (text: string): string =>
+    text
+      .split('\n')
+      .map((line) => line.replace(/^\s*(\/\/|\*|\/\*\*|\*\/)\s?/, ''))
+      .join(' ')
+      .replace(/\s+/g, ' ')
+  const docker = read('src/sandbox/docker.ts')
+  const finishAt = docker.indexOf('      const finish = (exitCode: number | null, signal: string | null): void => {')
+  const endedByAt = docker.indexOf('        const endedBy = exitCode === 137 ? killSentBy : undefined\n')
+  assert.ok(finishAt > 0 && endedByAt > finishAt, 'docker.ts no longer has finish() and its endedBy')
+  const finishComment = prose(docker.slice(finishAt, endedByAt))
+  assert.ok(
+    finishComment.includes(
+      "credits the wallclock's kill if the wallclock fired before the run ended, and otherwise the requested kill",
+    ),
+    finishComment,
+  )
+  assert.ok(finishComment.includes('a requested kill sent after the wallclock fired'), finishComment)
+  const WRONG_RULE = /\bcredits? (a 137 to )?the (last|first) kill sent\b|\bthe (last|first) kill sent rather than the (first|last)\b/i
+  for (const rel of ['src/sandbox/docker.ts', 'src/sandbox/driver.ts', 'test/helpers/fake-sandbox.ts']) {
+    assert.doesNotMatch(prose(read(rel)), WRONG_RULE, rel)
+  }
+  const ownHeader = headerOf('test/sandbox-docker.test.ts')
+  assert.doesNotMatch(ownHeader, WRONG_RULE, "test/sandbox-docker.test.ts's header")
+  assert.ok(ownHeader.includes('credit a 137 to the requested kill when the wallclock fired before the run ended'), ownHeader)
+
+  // The fake's header lists where it still differs from the real driver,
+  // and a run that does not hang, scripted to exit 137, is one: it exits
+  // inside run(), so a kill sent before its result settles ends nothing,
+  // where the real driver's kill sent before the CLI's exit is credited.
+  const fake = headerOf('test/helpers/fake-sandbox.ts')
+  const differs = fake.slice(fake.indexOf('What still differs:'), fake.indexOf('And a script may not describe'))
+  for (const fact of [
+    'when a run that does not hang exits: inside run()',
+    'reaches a name still held and ends nothing',
+    "On the real driver a kill sent while the name is held but before the CLI's exit is credited",
+    'a run a kill ends is scripted `hangs` here',
+  ]) {
+    assert.ok(differs.includes(fact), `the fake's 'What still differs' does not say: ${fact}\n${differs}`)
+  }
+
+  // And it names assertDriverShaped once, as what refuses the shapes its
+  // sentence lists, and run() as what refuses a channel run's stdout, never
+  // as a parenthetical beside another, where it reads as the source of the
+  // one clause next to it, or of the whole list, as the reader guesses.
+  const refused = fake.slice(fake.indexOf('And a script may not describe'), fake.indexOf("A script's exitCode null"))
+  assert.equal(refused.split('assertDriverShaped').length, 2, refused)
+  assert.ok(refused.includes('assertDriverShaped refuses a stream longer than its capture keeps, a cut with no stream'), refused)
+  assert.ok(refused.includes('and a signal beside an exit code, which it reports only for a run its kill ended: 137'), refused)
+  assert.ok(refused.includes('And run() refuses any stdout on a channel run'), refused)
+  assert.doesNotMatch(fake, /\)\s*\(/, "two parentheticals side by side in the fake's header")
 })
 
 // ── what a run writes ──────────────────────────────────────────────────────

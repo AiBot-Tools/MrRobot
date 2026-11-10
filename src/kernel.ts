@@ -848,7 +848,14 @@ export function defaultDriver(config: KernelConfig, repoRoot: string, processes?
     dockerConfig: join(config.dataDir, 'docker'),
     repoRoot,
   }
-  return processes === undefined ? realDockerDriver(options) : new DockerDriver({ ...options, ...processes })
+  // The two functions by name, never a spread of what was handed: TypeScript
+  // checks no excess property on an argument that is not a literal, so a
+  // DockerProcesses value carrying an imageId, domains or a dockerConfig of
+  // its own would, spread last, override what kernel.yaml holds, and the test
+  // meant to prove kernel.yaml decides would prove something else.
+  return processes === undefined
+    ? realDockerDriver(options)
+    : new DockerDriver({ ...options, spawn: processes.spawn, execFile: processes.execFile })
 }
 
 /**

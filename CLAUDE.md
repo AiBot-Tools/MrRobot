@@ -16,7 +16,7 @@ Phase 0 exited on 2026-10-19 (README exit-criterion checklist, all three lines a
 
 ```
 npm run typecheck        # tsc --noEmit, must be clean before any claim of done
-npm test                 # node --import tsx --test test/*.test.ts
+npm test                 # node --expose-gc --import tsx --test test/*.test.ts
 npm run dev              # daemon on 127.0.0.1:7777 (reads ./.env via --dotenv; a shell export that is not blank wins)
 npm run cli -- <cmd>     # agents | verify-chain | search | probe | run | kill | approve | deny | approvals (socket commands read only AOS_CONTROL_TOKEN from ./.env)
 npm run build            # emits dist/

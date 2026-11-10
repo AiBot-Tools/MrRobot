@@ -15,10 +15,12 @@
 //   be committed. A mountRoot containing $HOME or the repo would hand a
 //   container everything (invariant 9).
 //
-//   A post-parse walk rejects any key whose name looks like a secret, naming
-//   the path. CLAUDE.md says kernel.yaml holds no secrets; this makes that
-//   structural rather than a habit, and the path is named because "there is a
-//   secret somewhere in your config" is not an actionable error.
+//   A walk of the raw document rejects any key whose name looks like a
+//   secret, or that names part of a JavaScript object (`__proto__`, which
+//   the schema would drop, and `constructor` and `prototype`, as a
+//   precaution), naming the path. CLAUDE.md says kernel.yaml holds no secrets; this makes
+//   that structural rather than a habit, and the path is named because "there
+//   is a secret somewhere in your config" is not an actionable error.
 //
 // Every numeric field is positive and no field admits "unlimited". A budget
 // that can be switched off is not a budget.
@@ -29,7 +31,11 @@ import { z } from 'zod'
 import { ConfigError } from './errors.js'
 import { rootGitignoreIgnores } from './gitignore.js'
 import { entryProblem, homeDirectory, identify, isSpelledUnder, isUnder, realpathNearest, type Identify } from './agents/protected.js'
-import { DENY_KEYS } from './events/redact.js'
+import { EgressHost } from './egress/host.js'
+import { BINDING_ID } from './egress/policy.js'
+import { EGRESS_PROFILES, EgressProfileName, PUSH_ROOT, RepoSlug } from './egress/routes.js'
+import { DENY_KEYS, redactString } from './events/redact.js'
+import type { ProvidersFile } from './models/registry.js'
 import { isDockerNetworkMode, isImageId, isNetworkName, isUnprivilegedUser, memoryBytes } from './sandbox/limits.js'
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
@@ -110,6 +116,12 @@ const TOKEN_ENV_NAME = /^[A-Z][A-Z0-9_]*$/
  */
 const PMMCP_PREFIX = 'PMMCP_'
 
+/** Why no credential name the kernel reads may start with PMMCP_ (decision D34), for every refusal of one. */
+const PMMCP_PREFIX_WHY =
+  "pmmcp's own prefix: pmmcp's load_config reads an exported PMMCP_<SECTION>__<KEY> as a setting, in any case, and " +
+  'refuses to start under a bare section name such as PMMCP_SERVER, and a pmmcp checkout up to 53ea308 refuses to ' +
+  'start under any PMMCP_ name that is no setting (decision D34)'
+
 /** The server whose bearer is AOS_PMMCP_TOKEN, as pmmcp's client aos-kernel. */
 const PMMCP_SERVER = 'pmmcp'
 
@@ -127,12 +139,7 @@ function prefixRefusal(server: string): string {
     server === PMMCP_SERVER
       ? 'Name it AOS_PMMCP_TOKEN, or another name that does not start with PMMCP_'
       : `Give ${server} an AOS_ name of its own, not AOS_PMMCP_TOKEN: that is pmmcp's bearer, and ${server} would be sent it`
-  return (
-    "mcp server tokenEnv must not start with PMMCP_, pmmcp's own prefix: pmmcp's load_config reads an exported " +
-    'PMMCP_<SECTION>__<KEY> as a setting, in any case, and refuses to start under a bare section name such as ' +
-    'PMMCP_SERVER, and a pmmcp checkout up to 53ea308 refuses to start under any PMMCP_ name that is no setting ' +
-    `(decision D34). ${wayOut}`
-  )
+  return `mcp server tokenEnv must not start with PMMCP_, ${PMMCP_PREFIX_WHY}. ${wayOut}`
 }
 
 const McpServer = z
@@ -330,6 +337,221 @@ const Sandbox = z
   })
   .strict()
 
+// ── egress (egress plan E5) ─────────────────────────────────────────────────
+//
+// What the kernel's egress engine (src/egress) may do for a sandboxed run,
+// as data. Only the .env loader reads it yet (a binding's envVar is a name it
+// accepts, and the daemon loads that value into kernel memory at boot);
+// egress itself is the stub that refuses (src/runtime/egress.ts) until the
+// wiring task (W1). It ships disabled with no binding, and every field is
+// strict, because each one decides what a run can reach:
+//
+//   A binding is a credential for one host, named by the .env name its value
+//   is read from (never a value, never a vault id: the vault is dormant), the
+//   profiles it may be used for and the repositories it may be used on
+//   (src/egress/routes.ts). Its envVar joins the names the .env loader admits
+//   (credentialNames, src/secrets/dotenv.ts); the installer mints none. It
+//   names a credential of its own: never a bearer the kernel holds for
+//   another use, which it would send to the binding's host (the control
+//   token and MCP bearers here, a provider's key by bindingKeyProblem).
+//
+//   Every identifier a grant row records (a binding's id, its host, its
+//   repositories) must be one the redaction pass leaves alone: the store
+//   parses a row before it redacts it, so `sk-abcdefghij.example.com` would
+//   be stored as `[REDACTED].example.com`, a grant that no longer says where
+//   a run could reach and that fails its own schema read back (events/types.ts
+//   EGRESS_TOKEN_PATTERNS). Refused here, naming the key, so no boot learns it
+//   at the first grant.
+//
+//   Only the trusted domain is served, so the section names no domain: the
+//   hostile domain gets no channel and no egress (docs/design/agent-fleet.md,
+//   the egress plan's operator decision on hostile egress), and a `domain`
+//   or `hostile` key is refused as unknown.
+
+/** The Basic user a binding names unless it says another: GitHub's, for a token sent over git. */
+export const DEFAULT_BASIC_USER = 'x-access-token'
+
+/**
+ * Where a binding's pushes and pull requests land, the run's id after it:
+ * refs/heads/aos/<runId>/. The push and pull-request checks hold the
+ * kernel's own prefix (routes.ts PUSH_ROOT), so this field can name only
+ * that one: a binding says where its writes land, and cannot move them.
+ */
+export const EGRESS_PUSH_PREFIX = `${PUSH_ROOT}/`
+
+/**
+ * A Basic credential's user: no `:`, which would end it (RFC 7617), and
+ * nothing a header could read as two values.
+ */
+const BASIC_USER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+
+/** The most repositories one binding names: EgressRoute's own bound (src/egress/policy.ts). */
+const MAX_BINDING_REPOS = 64
+
+/** Whether the redaction pass would store `text` as something else (the section header says why that is refused). */
+const censoredInLog = (text: string): boolean => redactString(text) !== text
+
+const CENSORED_WHY =
+  'is in the shape of a credential, so the event log would store it censored, a grant row naming nothing it could ' +
+  'read back: rename it'
+
+const BindingFields = {
+  host: EgressHost,
+  // Bearer and Basic are both Authorization schemes, and the session (egress
+  // plan E8) strips every Authorization a worker sends before it injects the
+  // binding's, so exactly one reaches the host (the rule credentialedFetch
+  // keeps). A header it does not strip could arrive beside the worker's own.
+  header: z
+    .literal('Authorization', {
+      error: "an egress binding's header is Authorization: Bearer and Basic are both Authorization schemes",
+    })
+    .default('Authorization'),
+  envVar: z.string().regex(TOKEN_ENV_NAME, {
+    message: 'an egress binding envVar must be an upper-case .env name: A-Z, 0-9 and _, starting with a letter',
+  }),
+  profiles: z.array(EgressProfileName).min(1).max(EGRESS_PROFILES.length),
+  repos: z.array(RepoSlug).min(1).max(MAX_BINDING_REPOS),
+  pushPrefix: z
+    .literal(EGRESS_PUSH_PREFIX, {
+      error:
+        `an egress binding's pushPrefix is ${EGRESS_PUSH_PREFIX}: every push and pull request lands under ` +
+        `refs/heads/${EGRESS_PUSH_PREFIX}<runId>/, the prefix the kernel's push check holds`,
+    })
+    .default(EGRESS_PUSH_PREFIX),
+}
+
+const EgressBinding = z
+  .discriminatedUnion(
+    'scheme',
+    [
+      z
+        .object({
+          ...BindingFields,
+          scheme: z.literal('Bearer'),
+          basicUser: z
+            .never({ error: 'basicUser is the user of a Basic credential: a Bearer binding sends the value alone' })
+            .optional(),
+        })
+        .strict(),
+      z
+        .object({
+          ...BindingFields,
+          scheme: z.literal('Basic'),
+          basicUser: z
+            .string()
+            .regex(BASIC_USER, {
+              message: 'an egress binding basicUser is letters, digits, ., _ and -, starting with a letter or digit, at most 64',
+            })
+            .default(DEFAULT_BASIC_USER),
+        })
+        .strict(),
+    ],
+    { error: "an egress binding's scheme is Bearer or Basic" },
+  )
+  .superRefine((binding, ctx) => {
+    const issue = (path: (string | number)[], message: string): void => ctx.addIssue({ code: 'custom', path, message })
+    if (binding.envVar.startsWith(PMMCP_PREFIX)) {
+      issue(
+        ['envVar'],
+        `an egress binding envVar must not start with PMMCP_, ${PMMCP_PREFIX_WHY}. Give the binding an AOS_ name of its own`,
+      )
+    }
+    if (new Set(binding.profiles).size !== binding.profiles.length) issue(['profiles'], 'a binding lists a profile twice')
+    if (new Set(binding.repos).size !== binding.repos.length) {
+      issue(['repos'], 'a binding lists a repository twice (owner/name is read without case)')
+    }
+    if (censoredInLog(binding.host)) issue(['host'], `the binding's host ${CENSORED_WHY}`)
+    binding.repos.forEach((repo, i) => {
+      if (censoredInLog(repo)) issue(['repos', i], `the repository ${CENSORED_WHY}`)
+    })
+  })
+
+export type EgressBinding = z.output<typeof EgressBinding>
+
+const EgressBindings = z
+  .record(
+    z.string().regex(BINDING_ID, {
+      message: 'an egress binding id is lower-case letters, digits and -, starting with a letter, at most 63 characters',
+    }),
+    EgressBinding,
+  )
+  .superRefine((bindings, ctx) => {
+    // A repository on a host is in one binding only: a request to it would
+    // not say whose credential it carries (EgressGrant refuses the same).
+    // One listed twice in one binding is that binding's own issue, named
+    // there, not a clash with itself.
+    const owner = new Map<string, string>()
+    for (const [id, binding] of Object.entries(bindings)) {
+      if (censoredInLog(id)) ctx.addIssue({ code: 'custom', path: [id], message: `the binding id ${CENSORED_WHY}` })
+      binding.repos.forEach((repo, i) => {
+        const key = `${binding.host} ${repo}`
+        const earlier = owner.get(key)
+        if (earlier === undefined) {
+          owner.set(key, id)
+          return
+        }
+        if (earlier === id) return
+        ctx.addIssue({
+          code: 'custom',
+          path: [id, 'repos', i],
+          message: `${repo} on ${binding.host} is already bound by binding ${earlier}: a request to it would not say whose credential it carries`,
+        })
+      })
+    }
+  })
+
+/**
+ * The longest delay a Node timer takes, 2^31 - 1 ms (about 24.8 days):
+ * setTimeout and socket.setTimeout given more fire after 1 ms, with a
+ * TimeoutOverflowWarning. An idle limit past it would revoke every grant as
+ * idle at once, so it is refused here, not discovered at the first grant.
+ */
+export const MAX_TIMER_MS = 2_147_483_647
+
+/**
+ * A count or size the session holds a grant to (events/types.ts PROXY_LIMITS
+ * names the same seven): a grant past one is revoked with reason `limit`.
+ * The three that size what the kernel holds for a container (one frame, the
+ * open flows, one request's head) are bounded too: the container is hostile,
+ * and the kernel holds the provider keys. idleMs is a timer's delay, so at
+ * most MAX_TIMER_MS.
+ */
+const EgressLimits = z
+  .object({
+    frameMaxBytes: posInt().max(1_048_576).default(65_536),
+    maxFlows: posInt().max(256).default(16),
+    maxHeaderBytes: posInt().max(65_536).default(16_384),
+    maxRequests: posInt().default(2_000),
+    maxBytes: posInt().default(536_870_912),
+    maxDenied: posInt().default(20),
+    idleMs: posInt().max(MAX_TIMER_MS).default(60_000),
+  })
+  .strict()
+  .prefault({})
+
+/**
+ * Where the in-image mux listens, inside the container's own network
+ * namespace (--network none): the port the worker image bakes into its
+ * HTTP(S)_PROXY (egress plan I1) and the mux binds (E9, which holds no
+ * config). Another port here would disagree with the image, so the field
+ * names only this one, as a binding's header and pushPrefix do.
+ */
+export const EGRESS_MUX_PORT = 3128
+
+// No `domain` key: egress serves the trusted domain alone (the section header).
+const Egress = z
+  .object({
+    enabled: z.boolean().default(false),
+    muxPort: z
+      .literal(EGRESS_MUX_PORT, {
+        error: `egress.muxPort is ${String(EGRESS_MUX_PORT)}: the port the worker image's HTTP(S)_PROXY names and its mux binds`,
+      })
+      .default(EGRESS_MUX_PORT),
+    limits: EgressLimits,
+    bindings: EgressBindings.default({}),
+  })
+  .strict()
+
 const Lanes = z
   .object({ main: posInt().default(4), subagent: posInt().default(8) })
   .strict()
@@ -358,12 +580,61 @@ export const KernelConfig = z
     secrets: Secrets.prefault({}),
     goals: Goals.prefault({}),
     sandbox: Sandbox,
+    egress: Egress.prefault({}),
     lanes: Lanes,
     budgets: Budgets,
   })
   .strict()
+  .superRefine((config, ctx) => {
+    // A binding's envVar names a credential of its own. One that is a bearer
+    // the kernel already holds would be sent to the binding's host: the
+    // control plane's token, or an MCP server's (pmmcp's among them).
+    // Providers' keys are in providers.yaml, which this schema never sees:
+    // bindingKeyProblem holds a binding to those, where both files are read.
+    const held = new Map<string, string>([[config.control.tokenEnv, "the control plane's bearer (control.tokenEnv)"]])
+    for (const [server, entry] of Object.entries(config.mcp.servers)) {
+      if (entry.tokenEnv !== undefined) held.set(entry.tokenEnv, `mcp server ${server}'s bearer (mcp.servers.${server}.tokenEnv)`)
+    }
+    for (const [id, binding] of Object.entries(config.egress.bindings)) {
+      const whose = held.get(binding.envVar)
+      if (whose === undefined) continue
+      ctx.addIssue({
+        code: 'custom',
+        path: ['egress', 'bindings', id, 'envVar'],
+        message: `an egress binding envVar names a credential of its own: ${binding.envVar} is ${whose}, and the binding would send it to ${binding.host}`,
+      })
+    }
+  })
 
 export type KernelConfig = z.output<typeof KernelConfig>
+
+/**
+ * Why these bindings may not run beside these providers, or undefined. A
+ * binding whose envVar is a provider's key (auth.envVar in providers.yaml)
+ * would send that key, the most valuable bearer the kernel holds, to the
+ * binding's host. KernelConfig refuses the control token and an MCP bearer
+ * itself, but never sees providers.yaml, so this is checked where both files
+ * are read. Pure, and nothing calls it yet: boot (egress plan W1) throws what
+ * it returns as a ConfigError before it resolves any binding.
+ */
+export function bindingKeyProblem(config: KernelConfig, providers: ProvidersFile): string | undefined {
+  const keyOf = new Map<string, string[]>()
+  for (const [ref, entry] of Object.entries(providers.entries)) {
+    const envVar = entry.auth.envVar
+    if (envVar !== undefined) keyOf.set(envVar, [...(keyOf.get(envVar) ?? []), ref])
+  }
+  const clashes: string[] = []
+  for (const [id, binding] of Object.entries(config.egress.bindings)) {
+    const refs = keyOf.get(binding.envVar)
+    if (refs === undefined) continue
+    clashes.push(
+      `egress.bindings.${id}.envVar ${binding.envVar} is the key of provider ${refs.join(', ')} ` +
+        `(auth.envVar in providers.yaml), and the binding would send it to ${binding.host}`,
+    )
+  }
+  if (clashes.length === 0) return undefined
+  return `an egress binding envVar names a credential of its own: ${clashes.join('; ')}. Give the binding an AOS_ name of its own`
+}
 
 /** Expand a leading ~ to the current user's home directory. */
 export function expandHome(p: string): string {
@@ -394,7 +665,35 @@ export function expandDockerHost(value: string): string {
   return `unix://${real}`
 }
 
-/** Walk every key in the document; reject anything that looks like a secret. */
+/**
+ * Keys kernel.yaml refuses as names, though only one of them is lost. The
+ * yaml parser makes `__proto__: ...` an own key, and zod's record drops it,
+ * so a binding or an MCP server named `__proto__` would vanish from the
+ * parsed config with no error (a strict object reports it as unknown).
+ *
+ * zod reads `constructor` and `prototype` as ordinary keys: a record keeps
+ * the entry, a strict object reports it as unknown. They are refused as a
+ * precaution, since no setting is named either. That does not make a lookup
+ * by name safe: a parsed record is a plain object, so `bindings['constructor']`
+ * is Object and `'constructor' in bindings` is true with no such binding.
+ * Code that resolves an id from outside the file (a manifest's bind, a
+ * grant's binding) asks Object.hasOwn or a Map, never `in` or a bare index
+ * (egress plan E6).
+ */
+const OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+/** What a refusal of an OBJECT_KEYS name says about it. */
+function objectKeyWhy(key: string): string {
+  return key === '__proto__'
+    ? 'the schema drops a __proto__ entry with no error, so the setting would vanish from the parsed config'
+    : 'constructor and prototype name parts of a JavaScript object, and kernel.yaml refuses both as a precaution, ' +
+        'though the schema would read either as an ordinary key'
+}
+
+/**
+ * Walk every key in the document; reject anything that looks like a secret,
+ * and any key OBJECT_KEYS names, each by its path.
+ */
 export function assertNoSecretKeys(value: unknown, path: string[] = []): void {
   if (Array.isArray(value)) {
     value.forEach((item, i) => assertNoSecretKeys(item, [...path, String(i)]))
@@ -406,6 +705,11 @@ export function assertNoSecretKeys(value: unknown, path: string[] = []): void {
       throw new ConfigError(
         `kernel.yaml holds no secrets: key "${key}" at ${[...path, key].join('.')} looks like one. ` +
           'Reference an environment variable or a vault id instead.',
+      )
+    }
+    if (OBJECT_KEYS.has(key)) {
+      throw new ConfigError(
+        `kernel.yaml key "${key}" at ${[...path, key].join('.')} is not a name a setting can have: ${objectKeyWhy(key)}. Rename it.`,
       )
     }
     assertNoSecretKeys(item, [...path, key])

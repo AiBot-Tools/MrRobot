@@ -631,26 +631,31 @@ const DECISION = 'src/egress/decision.ts'
 const POLICY = 'src/egress/policy.ts'
 const ROUTES = 'src/egress/routes.ts'
 const EVENT_TYPES = 'src/events/types.ts'
+const CONFIG = 'src/config.ts'
 
 // The egress plan's host normaliser and address classifier (E1), its
-// upstream (E2), its binding routes and decide() (E3), and the rows egress
-// writes (E4). Every mutant here fails open unless its why says otherwise: a
-// name or an address the kernel must never dial is let through, a request
-// reaches somewhere nobody allowed, or a row records what the log must never
-// hold or the kernel must never do. F1 adds the rest of the egress suite.
+// upstream (E2), its binding routes and decide() (E3), the rows egress
+// writes (E4), and kernel.yaml's egress section (E5). Every mutant here
+// fails open unless its why says otherwise: a name or an address the kernel
+// must never dial is let through, a request reaches somewhere nobody
+// allowed, a credential goes where nobody bound it, or a row records what
+// the log must never hold or the kernel must never do. F1 adds the rest of
+// the egress suite.
 const egress: Suite = {
   name: 'egress',
   // hygiene.test.ts for the pins on who names mintEgressAllow and who imports decision.ts (EG79, EG112);
   // events-types.test.ts for the egress rows (EG125 to EG135, EG139 to EG213, EG218 to EG237; EG210
   // and EG211 are upstream.ts's and routes.ts's halves of the copies it holds equal);
   // egress-policy.test.ts for parseTarget reading the host before the port (EG214 to EG217), and with
-  // events-types.test.ts for the rows' PROXY_DENIES_* tables (EG224 to EG229).
+  // events-types.test.ts for the rows' PROXY_DENIES_* tables (EG224 to EG229);
+  // config.test.ts for kernel.yaml's egress section (EG239 to EG256).
   tests: [
     'test/egress-address.test.ts',
     'test/egress-upstream.test.ts',
     'test/egress-policy.test.ts',
     'test/hygiene.test.ts',
     'test/events-types.test.ts',
+    'test/config.test.ts',
   ],
   mutants: [
     { id: 'EG1', file: ADDR, from: "  if (value >> 32n === 0xffffn) return [['ipv4-mapped', Number(value & LOW_32)]]\n", to: '  if (value >> 32n === 0xffffn) return []\n', why: 'an IPv4-mapped answer is recognised and never judged, so ::ffff:127.0.0.1 and ::ffff:192.168.5.2 are dialled' },
@@ -889,6 +894,24 @@ const egress: Suite = {
     { id: 'EG235', file: EVENT_TYPES, from: '        const key = `${route.host} ${repo}`', to: '        const key = repo', why: 'not fail-open: a grant naming one repository on two bound hosts, which EgressGrant admits, is refused, and the grant is never issued' },
     { id: 'EG236', file: EVENT_TYPES, from: '|| row.queryBytes !== undefined || row.service !== undefined)) {', to: '|| row.queryBytes !== undefined || row.service !== undefined || row.bindingId !== undefined)) {', why: 'not fail-open: a coalesced deny on a bound route (a push-ref flood) may not name its binding, so E8\'s row of it is refused and the count lost' },
     { id: 'EG237', file: EVENT_TYPES, from: '      if (row.why !== PROXY_OVERFLOW_WHY) issue(', to: '      if (!row.why.startsWith(PROXY_OVERFLOW_WHY)) issue(', why: 'an overflow row carries one request\'s clause after the kernel\'s, which it does not stand for' },
+    { id: 'EG239', file: CONFIG, from: '    if (binding.envVar.startsWith(PMMCP_PREFIX)) {', to: '    if (false) {', why: "not fail-open: a binding's credential may be a PMMCP_ name, which pmmcp's load_config reads as a setting, or refuses to start under, from a shell that exports it (D34)" },
+    { id: 'EG240', file: CONFIG, from: '  host: EgressHost,\n  // Bearer and Basic', to: '  host: z.string().min(1),\n  // Bearer and Basic', why: "a binding's credential is bound to 192.168.5.2, host.lima.internal or any string, so it is injected on the way to the Mac's loopback as a VM sees it" },
+    { id: 'EG241', file: CONFIG, from: '    if (censoredInLog(binding.host)) issue(', to: '    if (false) issue(', why: 'a binding host in a credential shape (sk-abcdefghij.example.com) is admitted, and its grant row is stored as [REDACTED].example.com, naming nowhere, and fails its schema read back' },
+    { id: 'EG242', file: CONFIG, from: '      if (censoredInLog(id)) ctx.addIssue(', to: '      if (false) ctx.addIssue(', why: 'a binding id in a credential shape (sk-abcdefghij) is admitted, and every row naming the binding is stored censored, saying no credential was used' },
+    { id: 'EG243', file: CONFIG, from: "      if (censoredInLog(repo)) issue(['repos', i]", to: "      if (false) issue(['repos', i]", why: 'a bound repository in a credential shape (op/ghp_...) is admitted, and its grant row is stored censored, not saying which repository a run could write' },
+    { id: 'EG244', file: CONFIG, from: '      if (whose === undefined) continue', to: '      continue', why: "a binding may name AOS_CONTROL_TOKEN or AOS_PMMCP_TOKEN, and the kernel's own bearer is injected into requests to the binding's host" },
+    { id: 'EG245', file: CONFIG, from: '      if (entry.tokenEnv !== undefined) held.set(', to: '      if (false) held.set(', why: "a binding may name an MCP server's bearer, AOS_PMMCP_TOKEN among them, which is then sent to the binding's host" },
+    { id: 'EG246', file: CONFIG, from: '        if (earlier === undefined) {', to: '        if (true) {', why: 'two bindings may hold one repository on one host, so a request to it does not say whose credential it carries' },
+    { id: 'EG247', file: CONFIG, from: "    .literal('Authorization', {", to: "    .enum(['Authorization', 'x-api-key'], {", why: 'a binding may inject its credential as x-api-key, beside an Authorization the worker sent, so two credentials reach the host' },
+    { id: 'EG248', file: CONFIG, from: '    frameMaxBytes: posInt().max(1_048_576).default(65_536),', to: '    frameMaxBytes: posInt().default(65_536),', why: 'not fail-open: kernel.yaml may let a hostile container send frames of up to 2^53 bytes, which the kernel, holding the provider keys, buffers whole' },
+    { id: 'EG249', file: CONFIG, from: '            .optional(),\n        })\n        .strict(),', to: '            .optional(),\n        }),', why: 'a Bearer binding with a typo or a stale key (vaultId, methods, domain: hostile, repo) has it stripped and is accepted, a setting the operator believes is active' },
+    { id: 'EG250', file: CONFIG, from: '    if (new Set(binding.repos).size !== binding.repos.length) {', to: '    if (false) {', why: "not fail-open: a binding listing one repository twice is admitted, and every grant routing it, which EgressGrant refuses ('a repository on a host is in two routes'), is never issued" },
+    { id: 'EG251', file: CONFIG, from: '        if (earlier === id) return\n', to: '', why: 'not fail-open: a repository listed twice in one binding is also reported as already bound by that same binding, an issue naming no other binding' },
+    { id: 'EG252', file: CONFIG, from: '    idleMs: posInt().max(MAX_TIMER_MS).default(60_000),', to: '    idleMs: posInt().default(60_000),', why: "not fail-open: an idleMs past 2^31 - 1 ms (30 days) is admitted, and Node's timer fires it after 1 ms, so every grant is revoked as idle at once" },
+    { id: 'EG253', file: CONFIG, from: '      .literal(EGRESS_MUX_PORT, {', to: '      .literal([EGRESS_MUX_PORT, 1024, 8080], {', why: "not fail-open: kernel.yaml may name a mux port the worker image's HTTP(S)_PROXY does not, so the kernel and the image disagree on where every request goes" },
+    { id: 'EG254', file: CONFIG, from: '    if (OBJECT_KEYS.has(key)) {', to: '    if (false) {', why: "not fail-open: a binding or an MCP server keyed __proto__ vanishes from the parsed config with no error (zod's record drops it), and one keyed constructor or prototype, which zod reads as an ordinary key and kernel.yaml refuses only as a precaution, is admitted" },
+    { id: 'EG255', file: CONFIG, from: '    if (refs === undefined) continue\n', to: '    continue\n', why: "a binding may name ANTHROPIC_API_KEY or any provider's key, and once W1 resolves it the kernel's provider key is injected into requests to the binding's host" },
+    { id: 'EG256', file: CONFIG, from: "  return key === '__proto__'\n", to: '  return true\n', why: 'not fail-open: a constructor or prototype key is refused with the reason of __proto__, that the schema would drop it, which is false of both: zod reads them as ordinary keys' },
   ],
   control: { id: 'C', file: ADDR, from: '// The egress address classifier (egress plan E1).', to: '// The egress address classifier (egress plan E1). (control)', why: 'comment only' },
 }
@@ -951,6 +974,8 @@ const dotenv: Suite = {
     { id: 'X25', file: 'test/helpers/guard.ts', from: 'if (!KEEPS_CREDENTIALS) {', to: 'if (false) {', why: 'a key exported in the shell running npm test reaches every offline test' },
     { id: 'X31', file: 'test/helpers/guard.ts', from: "  process.env['AOS_LIVE_TESTS'] === '1' && process.argv.length === 2 && LIVE_FILE.test(process.argv[1] ?? '')", to: "  process.env['AOS_LIVE_TESTS'] === '1'", why: 'on the live run every offline test file keeps the shell\'s keys, not just the two live ones' },
     { id: 'X35', file: 'test/helpers/guard.ts', from: "  process.env['AOS_LIVE_TESTS'] === '1' && process.argv.length === 2 && LIVE_FILE.test(process.argv[1] ?? '')", to: "  process.env['AOS_LIVE_TESTS'] === '1' && LIVE_FILE.test(process.argv[1] ?? '')", why: 'one process running several files (--test-isolation=none) keeps the keys for all of them when a live file comes first' },
+    { id: 'X46', file: DOTENV, from: '  for (const binding of Object.values(config.egress.bindings)) names.add(binding.envVar)\n', to: '', why: "not fail-open: an egress binding's credential in .env is refused as a name the kernel does not read, so no bound host can ever be reached" },
+    { id: 'X47', file: DOTENV, from: '  for (const binding of Object.values(config.egress.bindings)) names.add(binding.envVar)\n', to: "  for (const binding of Object.values(config.egress.bindings)) if (binding.scheme === 'Basic') names.add(binding.envVar)\n", why: "not fail-open: a Bearer binding's credential in .env (api.github.com on a name of its own) is refused as a name the kernel does not read, and the daemon does not boot" },
     // Deliberately NOT here: a mutant disabling liveCredential's no-path gate.
     // Its killing test would call liveCredential in-process with the default
     // path, which under that mutant IS the operator's real <repo>/.env.

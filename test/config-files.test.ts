@@ -809,13 +809,14 @@ test('DECISIONS.md records D34 for the bearer kernel.yaml declares and keeps D37
   assert.equal(Number(totals[4]), rows.filter((l) => /^\| \*\*[DQ]\d+\*\* /.test(l)).length, 'the blocking total is not the number of blocking rows')
 })
 
-test("no credential name the shipped config declares is in pmmcp's PMMCP_ prefix, and D34 claims config's refusal for a tokenEnv alone", () => {
-  // src/config.ts refuses the prefix only as an MCP server's tokenEnv
-  // (config.test.ts). A provider's auth.envVar is read from a shell export at
-  // boot as well, and one in pmmcp's prefix would set a pmmcp setting, or stop
-  // pmmcp, in any shell that starts it. The provider schema does not refuse
-  // one (that change awaits the operator), so the shipped files are held here,
-  // in any case, as pmmcp reads them.
+test("no credential name the shipped config declares is in pmmcp's PMMCP_ prefix, and D34 claims config's refusal only for a tokenEnv and a binding envVar", () => {
+  // src/config.ts refuses the prefix only as an MCP server's tokenEnv or an
+  // egress binding's envVar (config.test.ts). A provider's auth.envVar is
+  // read from a shell export at boot as well, and one in pmmcp's prefix
+  // would set a pmmcp setting, or stop pmmcp, in any shell that starts it.
+  // The provider schema does not refuse one (that change awaits the
+  // operator), so the shipped files are held here, in any case, as pmmcp
+  // reads them.
   const names = [
     ...credentialNames(
       parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO }),
@@ -830,6 +831,7 @@ test("no credential name the shipped config declares is in pmmcp's PMMCP_ prefix
   const d34 = read('docs/DECISIONS.md').split('\n').find((l) => l.startsWith('| D34 |')) ?? ''
   assert.doesNotMatch(d34, /no AOS credential name may start/, 'D34 claims a refusal for every credential name')
   assert.match(d34, /so no kernel `tokenEnv` may start with `PMMCP_`/)
+  assert.match(d34, /holds an egress binding's `envVar` \(`egress\.bindings`, egress plan E5, 2026-11-10\) to the same two rules/)
   assert.match(d34, /A provider's `auth\.envVar` is not held to the prefix by `src\/models\/registry\.ts`/)
 })
 

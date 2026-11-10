@@ -1,9 +1,10 @@
 # aos-kernel — kernel configuration.
 #
 # This file holds NO secrets. Credentials are referenced by environment
-# variable name (control.tokenEnv, mcp.servers.*.tokenEnv) or by vault id in
-# providers.yaml; a key whose name looks like a secret is refused at parse and
-# the path is named. See src/config.ts.
+# variable name (control.tokenEnv, mcp.servers.*.tokenEnv,
+# egress.bindings.*.envVar) or by vault id in providers.yaml; a key whose name
+# looks like a secret is refused at parse and the path is named. See
+# src/config.ts.
 #
 # control.host is a literal in the schema: there is no spelling of this file
 # that binds the control plane to a public interface (invariant 1).
@@ -95,6 +96,51 @@ sandbox:
     memory: 2g
     cpus: 2
     wallclockMs: 600000
+
+# What the kernel's egress engine may do for a sandboxed run (egress plan,
+# Phase 2). Only the .env loader reads this yet (a binding's envVar is a name
+# it accepts); egress itself is a stub that refuses until the wiring task
+# (W1), whatever this says. It ships disabled with no binding, because any
+# binding widens what a run can reach. Every key is strict: a typo is refused
+# at parse, not taken for a setting. Egress serves the trusted domain alone,
+# so there is no domain key: the hostile domain gets no channel and no egress.
+egress:
+  enabled: false
+  # Where the in-image mux listens, inside the container's own network
+  # namespace (--network none): the port the worker image's proxy settings
+  # name and its mux binds. Parse admits no other.
+  muxPort: 3128
+  # Per grant (one container's channel). A grant past any of these is revoked.
+  # The three that size what the kernel holds for a container are bounded:
+  # frameMaxBytes at most 1 MiB, maxFlows at most 256, maxHeaderBytes at most
+  # 64 KiB. idleMs is a timer's delay: at most 2147483647 (about 24.8 days).
+  limits:
+    frameMaxBytes: 65536
+    maxFlows: 16
+    maxHeaderBytes: 16384
+    maxRequests: 2000
+    maxBytes: 536870912
+    maxDenied: 20
+    idleMs: 60000
+  # A binding is a credential for one host, named by the .env name its value
+  # is read from (never a value; the vault is dormant), with the profiles it
+  # serves (git-fetch, git-push, github-pulls) and the repositories it may be
+  # used on. Its envVar joins the names the .env loader accepts; the operator
+  # adds the value, and the installer never generates one. Never a PMMCP_ name
+  # (pmmcp's own prefix, D34), and never control.tokenEnv or an MCP server's
+  # tokenEnv. A provider's key will be refused at boot once the wiring task
+  # (W1) lands; until then no request uses a binding. Its id, host and
+  # repositories must be names the event log would record as they are, not
+  # censored as a credential shape. Pushes and pull requests land under
+  # refs/heads/aos/<runId>/ only. A shape, for when the operator adds one:
+  #   bindings:
+  #     github-git:
+  #       host: github.com
+  #       scheme: Basic   # user x-access-token unless basicUser names another
+  #       envVar: AOS_GITHUB_TOKEN
+  #       profiles: [git-fetch]
+  #       repos: [owner/fixture]
+  bindings: {}
 
 # pmmcp goal tools. Every name and argument here matches the operator's live
 # capture of 2026-10-18 (test/fixtures/pmmcp-listtools.json), and every call goes

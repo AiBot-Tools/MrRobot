@@ -940,6 +940,27 @@ test('mintedCredentialNames gives exactly the tokens the AOS mints: AOS_CONTROL_
   assert.deepEqual([...credentialNames(both, PROVIDERS)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'GITHUB_MCP_TOKEN'])
 })
 
+test('an egress binding envVar is accepted, never minted: mintedCredentialNames leaves it out and the writer will not generate it', (t) => {
+  t.after(() => SecretMask.clear())
+  // A binding's credential is issued by its service (a GitHub token): the
+  // operator adds it. The installer is unchanged by egress (plan E5).
+  const raw = readConfig('config/kernel.yaml') as { egress: { bindings: Record<string, unknown> } }
+  raw.egress.bindings = { 'github-git': { host: 'github.com', scheme: 'Basic', envVar: 'AOS_GITHUB_TOKEN', profiles: ['git-fetch'], repos: ['op/fixture'] } }
+  const bound = parseKernelConfig(raw, { repoRoot: REPO_ROOT })
+  const accepted = credentialNames(bound, PROVIDERS)
+  assert.ok(accepted.has('AOS_GITHUB_TOKEN'))
+  assert.deepEqual([...mintedCredentialNames(bound)], [...mintedCredentialNames(shippedConfig())])
+  assert.equal(mintedCredentialNames(bound).has('AOS_GITHUB_TOKEN'), false)
+
+  // Asked to generate it, with the installer's own generatable set: refused, nothing written.
+  const repo = repoWith(t)
+  const g = generators('AOS_GITHUB_TOKEN')
+  const message = untouched(() => appendIn(repo, g.generate, { accepted, generatable: mintedCredentialNames(bound) }))
+  assert.match(message, /AOS_GITHUB_TOKEN is not a token the AOS mints/)
+  assert.equal(g.calls(), 0)
+  assert.deepEqual(readdirSync(repo).sort(), ['.gitignore'])
+})
+
 test('a generator for a provider\'s key is refused even when the caller lists it as generatable, and one for a name the AOS does not mint is refused: nothing generated, nothing written', (t) => {
   t.after(() => SecretMask.clear())
   const provider = /^ANTHROPIC_API_KEY is a provider's key \(auth\.envVar in providers\.yaml\): the installer never generates one; add it to \.env yourself\. Nothing was written$/

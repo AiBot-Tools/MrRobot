@@ -419,6 +419,43 @@ test('credentialNames on the shipped config is exactly AOS_CONTROL_TOKEN, AOS_PM
   assert.deepEqual([...credentialNames(tokenless, providers)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN'])
 })
 
+test('credentialNames includes every egress binding envVar', () => {
+  // A binding's credential is one the operator adds to .env (egress plan E5),
+  // so the loader must accept its name; the shipped config binds nothing, so
+  // the shipped names are unchanged (the test above).
+  const read = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
+  const providers = parseProviders(read('config/providers.yaml'))
+  const raw = read('config/kernel.yaml') as { egress: { bindings: Record<string, unknown> } }
+  const bind = (host: string, scheme: string, envVar: string, profiles: string[]): Record<string, unknown> => ({ host, scheme, envVar, profiles, repos: ['op/fixture'] })
+  // A name of each scheme's own, so a loader that reads only Basic or only
+  // Bearer bindings loses one; and one name two bindings share.
+  raw.egress.bindings = {
+    'github-git': bind('github.com', 'Basic', 'AOS_GITHUB_TOKEN', ['git-fetch', 'git-push']),
+    'github-api': bind('api.github.com', 'Bearer', 'AOS_GITHUB_API_TOKEN', ['github-pulls']),
+    // One credential for two hosts: one name, accepted once.
+    'gist-git': bind('gist.github.com', 'Basic', 'AOS_GITHUB_TOKEN', ['git-fetch']),
+  }
+  const config = parseKernelConfig(raw, { repoRoot: REPO_ROOT })
+  assert.deepEqual(
+    Object.values(config.egress.bindings).map((b) => [b.scheme, b.envVar]),
+    [['Basic', 'AOS_GITHUB_TOKEN'], ['Bearer', 'AOS_GITHUB_API_TOKEN'], ['Basic', 'AOS_GITHUB_TOKEN']],
+  )
+  const names = credentialNames(config, providers)
+  assert.deepEqual([...names].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN', 'AOS_GITHUB_API_TOKEN', 'AOS_GITHUB_TOKEN', 'AOS_PMMCP_TOKEN'])
+  for (const binding of Object.values(config.egress.bindings)) assert.ok(names.has(binding.envVar), binding.envVar)
+
+  // So the loader admits each binding's line, and refuses it once nothing binds the name.
+  const text = `AOS_GITHUB_TOKEN=${KEY}\nAOS_GITHUB_API_TOKEN=${TOKEN}\n`
+  assert.equal(parseDotenv(text, names).get('AOS_GITHUB_TOKEN')?.value, KEY)
+  assert.equal(parseDotenv(text, names).get('AOS_GITHUB_API_TOKEN')?.value, TOKEN)
+  const unbound = credentialNames(parseKernelConfig(read('config/kernel.yaml'), { repoRoot: REPO_ROOT }), providers)
+  const message = refusal(() => parseDotenv(text, unbound))
+  assert.match(message, /line 1: a name this kernel does not read/)
+  assert.equal(message.includes(KEY) || message.includes(TOKEN), false)
+  // The Bearer binding's line alone is refused without its binding: the name is not read for another reason.
+  assert.match(refusal(() => parseDotenv(`AOS_GITHUB_API_TOKEN=${TOKEN}\n`, unbound)), /line 1: a name this kernel does not read/)
+})
+
 test('dotenvPathFrom reads --dotenv once, resolves it against the base, and refuses a repeat, a missing value or an option', () => {
   assert.equal(dotenvPathFrom(['--config', 'x'], '/base'), undefined)
   assert.equal(dotenvPathFrom(['--dotenv', '.env'], '/base'), '/base/.env')

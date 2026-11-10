@@ -10,13 +10,29 @@ import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, userInfo } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse as parseYaml } from 'yaml'
 
-import { assertAosEntry, assertDataLocation, assertNoSecretKeys, expandHome, gitignoresAos, parseKernelConfig } from '../src/config.js'
+import {
+  DEFAULT_BASIC_USER,
+  EGRESS_MUX_PORT,
+  EGRESS_PUSH_PREFIX,
+  KernelConfig,
+  MAX_TIMER_MS,
+  assertAosEntry,
+  assertDataLocation,
+  assertNoSecretKeys,
+  bindingKeyProblem,
+  expandHome,
+  gitignoresAos,
+  parseKernelConfig,
+} from '../src/config.js'
+import { parseProviders } from '../src/models/registry.js'
+import { pushBranchPrefix } from '../src/egress/routes.js'
+import { PROXY_LIMITS } from '../src/events/types.js'
 import { tmpdir } from './helpers/tmpdir.js'
 import { homeDirectory } from '../src/agents/protected.js'
 
@@ -755,4 +771,435 @@ test('control.port refuses a privileged port but allows the literal 0', () => {
     broken.control.port = port
     assert.throws(() => parse(broken), /is invalid/, String(port))
   }
+})
+
+// ── egress (egress plan E5) ─────────────────────────────────────────────────
+
+/** valid.yaml with `egress` set as given, or with no egress section at all. */
+function withEgress(egress?: unknown): Record<string, unknown> {
+  const doc = fixture('valid.yaml') as Record<string, unknown>
+  if (egress !== undefined) doc['egress'] = egress
+  return doc
+}
+
+/** A binding as an operator would write one, with `overrides` laid over it. */
+function binding(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { host: 'github.com', scheme: 'Basic', envVar: 'AOS_GITHUB_TOKEN', profiles: ['git-fetch'], repos: ['op/fixture'], ...overrides }
+}
+
+/** valid.yaml holding `bindings` and nothing else in its egress section. */
+function withBindings(bindings: Record<string, unknown>): Record<string, unknown> {
+  return withEgress({ bindings })
+}
+
+/** The issues a kernel.yaml refusal's message lists, as zod wrote them. */
+function issuesOf(message: string): unknown {
+  return JSON.parse(message.slice(message.indexOf('[')))
+}
+
+/** The message `fn` throws, asserting it is a kernel.yaml refusal. */
+function invalid(fn: () => unknown, label: string): string {
+  try {
+    fn()
+  } catch (e) {
+    assert.ok(e instanceof Error, label)
+    assert.match(e.message, /kernel\.yaml is invalid/, label)
+    return e.message
+  }
+  assert.fail(`${label} was accepted`)
+}
+
+test('egress is strict, ships disabled, and refuses a non-EgressHost binding host, a PMMCP_ envVar, a hostile entry and a DENY_KEYS-named key', () => {
+  // The shipped file: disabled, no binding, the plan's limits and mux port,
+  // and exactly the plan's four keys (no domain: egress serves the trusted
+  // domain alone). No binding ships, because any binding widens what a run
+  // can reach.
+  const shipped = parse(parseYaml(readFileSync(join(REPO_ROOT, 'config', 'kernel.yaml'), 'utf8')))
+  assert.deepEqual(shipped.egress, {
+    enabled: false,
+    muxPort: 3128,
+    limits: { frameMaxBytes: 65_536, maxFlows: 16, maxHeaderBytes: 16_384, maxRequests: 2_000, maxBytes: 536_870_912, maxDenied: 20, idleMs: 60_000 },
+    bindings: {},
+  })
+  // No egress section at all is the same section: every field has its safe default.
+  assert.deepEqual(parse(withEgress()).egress, shipped.egress)
+  assert.deepEqual(parse(fixture('minimal.yaml')).egress, shipped.egress)
+
+  // Strict at every level, both schemes' bindings included: a typo or a
+  // stale key is refused, never taken for a setting or silently dropped.
+  const bearer = (overrides: Record<string, unknown>): Record<string, unknown> =>
+    binding({ host: 'api.github.com', scheme: 'Bearer', profiles: ['github-pulls'], ...overrides })
+  assert.equal(parse(withBindings({ api: bearer({}) })).egress.bindings['api']?.scheme, 'Bearer')
+  for (const [label, egress, key] of [
+    ['egress.enable', { enable: true }, 'enable'],
+    ['egress.limits.maxFlow', { limits: { maxFlow: 4 } }, 'maxFlow'],
+    ['a Basic binding field', { bindings: { github: binding({ methods: ['GET'] }) } }, 'methods'],
+    ['a Basic binding vaultId', { bindings: { github: binding({ vaultId: 'github-pat' }) } }, 'vaultId'],
+    ['a Bearer binding field', { bindings: { api: bearer({ methods: ['GET'] }) } }, 'methods'],
+    ['a Bearer binding vaultId', { bindings: { api: bearer({ vaultId: 'github-pat' }) } }, 'vaultId'],
+    ['a Bearer binding repo', { bindings: { api: bearer({ repo: 'op/fixture' }) } }, 'repo'],
+  ] as const) {
+    const message = invalid(() => parse(withEgress(egress)), label)
+    assert.match(message, new RegExp(`"code": "unrecognized_keys",\\s*"keys": \\[\\s*"${key}"\\s*\\]`), label)
+  }
+  invalid(() => parse(withEgress({ enabled: 'false' })), 'egress.enabled: "false"')
+
+  // A binding host is an EgressHost: never an address in any notation, a
+  // name the Mac, a VM or the LAN answers, a port, a wildcard or a URL.
+  for (const host of [
+    '192.168.5.2',
+    '127.0.0.1',
+    '2130706433',
+    '0x7f.1',
+    '[::1]',
+    '::1',
+    'host.lima.internal',
+    'host.docker.internal',
+    'gateway.docker.internal',
+    'localhost',
+    'api.localhost',
+    'mac.local',
+    'github',
+    'github.com:443',
+    '*.github.com',
+    'https://github.com',
+    'op@github.com',
+    'githüb.com',
+    '',
+  ]) {
+    const message = invalid(() => parse(withBindings({ github: binding({ host }) })), `host ${JSON.stringify(host)}`)
+    assert.match(message, /not an egress host/, host)
+    assert.ok(message.includes('"host"'), `the refusal of ${JSON.stringify(host)} names the key`)
+  }
+  // One name in one spelling: the host and the repositories are normalised.
+  const parsed = parse(withBindings({ github: binding({ host: 'GitHub.com.', repos: ['Op/Fixture'] }) })).egress.bindings['github']
+  assert.equal(parsed?.host, 'github.com')
+  assert.deepEqual(parsed?.repos, ['op/fixture'])
+
+  // A PMMCP_ envVar is refused as an MCP tokenEnv is (D34), naming the way out.
+  for (const envVar of ['PMMCP_GITHUB_TOKEN', 'PMMCP_SERVER', 'PMMCP_']) {
+    const message = invalid(() => parse(withBindings({ github: binding({ envVar }) })), envVar)
+    assert.match(message, /egress binding envVar must not start with PMMCP_/, envVar)
+    assert.match(message, /pmmcp's load_config/, envVar)
+    assert.match(message, /53ea308/, envVar)
+    assert.match(message, /Give the binding an AOS_ name of its own/, envVar)
+  }
+  // Not upper case is refused before any prefix rule, as a tokenEnv is: pmmcp
+  // reads its settings without regard to case.
+  for (const envVar of ['pmmcp_github_token', 'aos_github_token', 'AOS-GITHUB-TOKEN', '1AOS', 'AOS_GITHUB_TOKEN=x', '']) {
+    const message = invalid(() => parse(withBindings({ github: binding({ envVar }) })), envVar)
+    assert.match(message, /egress binding envVar must be an upper-case \.env name/, envVar)
+  }
+  // A prefix, not a substring.
+  assert.equal(parse(withBindings({ github: binding({ envVar: 'AOS_PMMCP_GITHUB' }) })).egress.bindings['github']?.envVar, 'AOS_PMMCP_GITHUB')
+
+  // Only the trusted domain: the hostile domain gets no channel and no
+  // egress, so the section names no domain at all, and whichever way
+  // kernel.yaml tries to name one is an unknown key.
+  for (const [label, egress] of [
+    ['domain: hostile', { domain: 'hostile' }],
+    ['domain: trusted', { domain: 'trusted' }],
+    ['domain: [trusted, hostile]', { domain: ['trusted', 'hostile'] }],
+    ['egress.hostile', { hostile: { enabled: true } }],
+    ['egress.domains', { domains: { trusted: {}, hostile: {} } }],
+    ['a Basic binding domain', { bindings: { github: binding({ domain: 'hostile' }) } }],
+    ['a Bearer binding domain', { bindings: { api: bearer({ domain: 'hostile' }) } }],
+  ] as const) {
+    assert.match(invalid(() => parse(withEgress(egress)), label), /Unrecognized key/, label)
+  }
+
+  // A key DENY_KEYS names, anywhere in the section, binding ids included, is
+  // refused before parsing and named: kernel.yaml holds no secrets.
+  for (const [egress, path] of [
+    [{ bindings: { token: binding() } }, /egress\.bindings\.token\b/],
+    [{ bindings: { 'api-key': binding() } }, /egress\.bindings\.api-key\b/],
+    [{ bindings: { github: binding({ token: 'FAKE' }) } }, /egress\.bindings\.github\.token\b/],
+    [{ bindings: { github: binding({ secret: 'FAKE' }) } }, /egress\.bindings\.github\.secret\b/],
+    [{ limits: { password: 'FAKE' } }, /egress\.limits\.password\b/],
+    [{ credentials: { github: 'FAKE' } }, /egress\.credentials\b/],
+  ] as const) {
+    assert.throws(() => parse(withEgress(egress)), /holds no secrets/, String(path))
+    assert.throws(() => parse(withEgress(egress)), path)
+  }
+})
+
+test("an egress binding names a credential of its own: never the control plane's bearer or an MCP server's", () => {
+  // Either would be sent to the binding's host: pmmcp's bearer to GitHub.
+  for (const [envVar, whose] of [
+    ['AOS_CONTROL_TOKEN', /AOS_CONTROL_TOKEN is the control plane's bearer \(control\.tokenEnv\)/],
+    ['AOS_PMMCP_TOKEN', /AOS_PMMCP_TOKEN is mcp server pmmcp's bearer \(mcp\.servers\.pmmcp\.tokenEnv\)/],
+  ] as const) {
+    const message = invalid(() => parse(withBindings({ github: binding({ envVar }) })), envVar)
+    assert.match(message, whose, envVar)
+    assert.match(message, /the binding would send it to github\.com/, envVar)
+    assert.match(message, /"egress",\s*"bindings",\s*"github",\s*"envVar"/, envVar)
+  }
+  // Another server's bearer, declared beside pmmcp, is held the same way.
+  const second = withBindings({ github: binding({ envVar: 'AOS_GITHUB_MCP_TOKEN' }) }) as { mcp: { servers: Record<string, unknown> } }
+  second.mcp.servers['github'] = { url: 'http://127.0.0.1:9911/mcp', tokenEnv: 'AOS_GITHUB_MCP_TOKEN' }
+  assert.match(invalid(() => parse(second), 'a second server'), /mcp server github's bearer/)
+
+  // One credential for two hosts is the operator's to choose (one PAT for
+  // git on github.com and pull requests on api.github.com): admitted.
+  const shared = parse(
+    withBindings({
+      'github-git': binding({ profiles: ['git-fetch', 'git-push'] }),
+      'github-api': binding({ host: 'api.github.com', scheme: 'Bearer', profiles: ['github-pulls'] }),
+    }),
+  )
+  assert.deepEqual(Object.values(shared.egress.bindings).map((b) => b.envVar), ['AOS_GITHUB_TOKEN', 'AOS_GITHUB_TOKEN'])
+})
+
+test('an egress binding whose id, host or repository the redaction pass would change is refused, naming the key', () => {
+  // The store parses a row before it redacts it, so each of these would be
+  // stored censored, in a grant row that fails its own schema read back.
+  const ghp = `ghp_${'a1'.repeat(18)}`
+  for (const [bindings, path] of [
+    [{ 'sk-abcdefghij': binding() }, /"bindings",\s*"sk-abcdefghij"\s*\]/],
+    [{ 'xoxb-abcdefghij': binding() }, /"bindings",\s*"xoxb-abcdefghij"\s*\]/],
+    [{ github: binding({ host: 'sk-abcdefghij.example.com' }) }, /"github",\s*"host"/],
+    [{ github: binding({ host: 'xoxb-abcdefghij.example.com' }) }, /"github",\s*"host"/],
+    [{ github: binding({ host: `ey${'a'.repeat(10)}.ey${'b'.repeat(10)}.${'c'.repeat(10)}` }) }, /"github",\s*"host"/],
+    [{ github: binding({ repos: ['op/fixture', `op/${ghp}`] }) }, /"github",\s*"repos",\s*1/],
+    [{ github: binding({ repos: [`OP/${ghp.toUpperCase().replace('GHP_', 'ghp_')}`] }) }, /"github",\s*"repos",\s*0/],
+  ] as const) {
+    const message = invalid(() => parse(withBindings(bindings)), String(path))
+    assert.match(message, /in the shape of a credential, so the event log would store it censored/, String(path))
+    assert.match(message, path)
+  }
+  // The same names one character short of a credential's shape are kept as they are.
+  const kept = parse(withBindings({ 'sk-abcdefg': binding({ host: 'sk-abcdefg.example.com', repos: ['op/ghp_short'] }) }))
+  assert.deepEqual(kept.egress.bindings['sk-abcdefg']?.repos, ['op/ghp_short'])
+  assert.equal(kept.egress.bindings['sk-abcdefg']?.host, 'sk-abcdefg.example.com')
+})
+
+test('an egress binding: Bearer or Basic (x-access-token unless it names a user), header Authorization, pushes under aos/, profiles and repositories non-empty and unique, a repository on a host in one binding', () => {
+  // Basic names its user; Bearer has none, and parse refuses one.
+  const parsed = parse(
+    withBindings({
+      git: binding(),
+      user: binding({ host: 'git.example.com', basicUser: 'aos-bot' }),
+      api: binding({ host: 'api.github.com', scheme: 'Bearer', profiles: ['github-pulls'] }),
+    }),
+  ).egress.bindings
+  assert.deepEqual(parsed['git'], {
+    host: 'github.com',
+    header: 'Authorization',
+    scheme: 'Basic',
+    basicUser: DEFAULT_BASIC_USER,
+    envVar: 'AOS_GITHUB_TOKEN',
+    profiles: ['git-fetch'],
+    repos: ['op/fixture'],
+    pushPrefix: 'aos/',
+  })
+  assert.equal(DEFAULT_BASIC_USER, 'x-access-token')
+  assert.equal(parsed['user']?.scheme === 'Basic' ? parsed['user'].basicUser : undefined, 'aos-bot')
+  assert.equal(parsed['api']?.scheme, 'Bearer')
+  assert.equal(Object.hasOwn(parsed['api'] ?? {}, 'basicUser'), false)
+  assert.match(
+    invalid(() => parse(withBindings({ api: binding({ scheme: 'Bearer', basicUser: 'x-access-token' }) })), 'Bearer with a user'),
+    /basicUser is the user of a Basic credential/,
+  )
+  for (const basicUser of ['', 'x:y', 'x y', '-x', 'x\n', 'é']) {
+    invalid(() => parse(withBindings({ git: binding({ basicUser }) })), `basicUser ${JSON.stringify(basicUser)}`)
+  }
+  for (const scheme of ['none', 'bearer', 'Token', 'Digest', undefined]) {
+    const message = invalid(() => parse(withBindings({ git: binding({ scheme }) })), `scheme ${String(scheme)}`)
+    assert.match(message, /scheme is Bearer or Basic/, String(scheme))
+  }
+
+  // The header and the push prefix can only be what the kernel does.
+  assert.equal(parse(withBindings({ git: binding({ header: 'Authorization', pushPrefix: 'aos/' }) })).egress.bindings['git']?.header, 'Authorization')
+  for (const header of ['x-api-key', 'authorization', 'Proxy-Authorization', 'Cookie']) {
+    assert.match(invalid(() => parse(withBindings({ git: binding({ header }) })), header), /header is Authorization/, header)
+  }
+  for (const pushPrefix of ['', 'main', 'aos', 'refs/heads/aos/', 'aos/../', 'bots/aos/']) {
+    assert.match(invalid(() => parse(withBindings({ git: binding({ pushPrefix }) })), pushPrefix), /pushPrefix is aos\//, pushPrefix)
+  }
+
+  // Profiles are the three routes.ts serves, each once, at least one.
+  for (const profiles of [[], ['git-fetch', 'git-fetch'], ['git-clone'], ['git-fetch', 'git-push', 'github-pulls', 'git-fetch'], 'git-fetch']) {
+    invalid(() => parse(withBindings({ git: binding({ profiles }) })), `profiles ${JSON.stringify(profiles)}`)
+  }
+  assert.deepEqual(
+    parse(withBindings({ git: binding({ profiles: ['git-fetch', 'git-push', 'github-pulls'] }) })).egress.bindings['git']?.profiles,
+    ['git-fetch', 'git-push', 'github-pulls'],
+  )
+  // Repositories are owner/name, at least one, each once in any case, at most 64.
+  for (const repos of [[], ['fixture'], ['op/fixture.git'], ['op/..'], ['op/a/b'], ['op/fixture', 'Op/Fixture'], Array.from({ length: 65 }, (_, i) => `op/r${String(i)}`)]) {
+    invalid(() => parse(withBindings({ git: binding({ repos }) })), `repos ${JSON.stringify(repos).slice(0, 60)}`)
+  }
+  assert.equal(parse(withBindings({ git: binding({ repos: Array.from({ length: 64 }, (_, i) => `op/r${String(i)}`) }) })).egress.bindings['git']?.repos.length, 64)
+  // One repository twice in one binding is that binding's one issue, at its
+  // repos, never also a clash of the binding with itself.
+  const doubled = issuesOf(invalid(() => parse(withBindings({ git: binding({ repos: ['op/fixture', 'Op/Fixture'] }) })), 'a repository twice in one binding'))
+  assert.deepEqual(doubled, [
+    { code: 'custom', path: ['egress', 'bindings', 'git', 'repos'], message: 'a binding lists a repository twice (owner/name is read without case)' },
+  ])
+
+  // A repository on a host is in one binding: a request to it would not say
+  // whose credential it carries. The same repository on two hosts is two.
+  const twice = invalid(
+    () => parse(withBindings({ fetch: binding(), push: binding({ profiles: ['git-push'], repos: ['other/repo', 'OP/fixture'] }) })),
+    'one repository bound twice on one host',
+  )
+  assert.match(twice, /op\/fixture on github\.com is already bound by binding fetch/)
+  assert.match(twice, /"push",\s*"repos",\s*1/)
+  assert.doesNotThrow(() => parse(withBindings({ git: binding(), api: binding({ host: 'api.github.com', scheme: 'Bearer', profiles: ['github-pulls'] }) })))
+
+  // Binding ids are what decisions name: lower-case letters, digits and -.
+  for (const id of ['GitHub', 'github_git', '1github', '-github', 'git hub', 'a'.repeat(64)]) {
+    invalid(() => parse(withBindings({ [id]: binding() })), `id ${JSON.stringify(id)}`)
+  }
+  assert.doesNotThrow(() => parse(withBindings({ ['a'.repeat(63)]: binding() })))
+
+  // The plan's acceptance names the prefix the push check holds.
+  assert.equal(EGRESS_PUSH_PREFIX, pushBranchPrefix('r').slice(0, -'r/'.length))
+})
+
+test('egress.limits names exactly the limits a grant is revoked on, each a positive whole number, the three that size kernel memory bounded, idleMs a timer delay Node keeps; muxPort is 3128 alone', () => {
+  // events/types.ts PROXY_LIMITS is what a proxy.grant.revoked {limit} row may
+  // name, and E5 must use those names.
+  assert.deepEqual(Object.keys(parse(withEgress()).egress.limits).sort(), [...PROXY_LIMITS].sort())
+  for (const name of PROXY_LIMITS) {
+    for (const value of [0, -1, 1.5, '16', null, Number.MAX_SAFE_INTEGER + 1]) {
+      invalid(() => parse(withEgress({ limits: { [name]: value } })), `limits.${name}: ${String(value)}`)
+    }
+    assert.equal(parse(withEgress({ limits: { [name]: 1 } })).egress.limits[name], 1)
+  }
+  // What the kernel holds for one hostile container is bounded, at the bound and past it.
+  for (const [name, max] of [['frameMaxBytes', 1_048_576], ['maxFlows', 256], ['maxHeaderBytes', 65_536]] as const) {
+    assert.equal(parse(withEgress({ limits: { [name]: max } })).egress.limits[name], max)
+    invalid(() => parse(withEgress({ limits: { [name]: max + 1 } })), `limits.${name}: ${String(max + 1)}`)
+  }
+  // The counters have no bound but a whole number's.
+  assert.equal(parse(withEgress({ limits: { maxBytes: 8 * 1024 ** 3 } })).egress.limits.maxBytes, 8 * 1024 ** 3)
+  // idleMs is a timer's delay: Node fires one past 2^31 - 1 ms after 1 ms, so
+  // 30 days would revoke every grant as idle at once. At the bound and past it.
+  assert.equal(MAX_TIMER_MS, 2 ** 31 - 1)
+  assert.equal(parse(withEgress({ limits: { idleMs: MAX_TIMER_MS } })).egress.limits.idleMs, MAX_TIMER_MS)
+  for (const idleMs of [MAX_TIMER_MS + 1, 2_592_000_000]) {
+    assert.match(invalid(() => parse(withEgress({ limits: { idleMs } })), `idleMs ${String(idleMs)}`), /"idleMs"/)
+  }
+
+  // The mux port is the one the worker image bakes in and its mux binds: no
+  // other, privileged or not.
+  assert.equal(EGRESS_MUX_PORT, 3128)
+  for (const muxPort of [0, 80, 443, 1023, 1024, 3129, 8080, 65_535, 65_536, -1, 3128.5, '3128', null]) {
+    const message = invalid(() => parse(withEgress({ muxPort })), `muxPort ${String(muxPort)}`)
+    assert.match(message, /egress\.muxPort is 3128: the port the worker image's HTTP\(S\)_PROXY names and its mux binds/, String(muxPort))
+  }
+  assert.equal(parse(withEgress({ muxPort: 3128 })).egress.muxPort, 3128)
+  assert.equal(parse(withEgress({ enabled: true })).egress.enabled, true)
+})
+
+test('a key naming part of a JavaScript object is refused anywhere in kernel.yaml, naming its path: __proto__ as one the schema drops, constructor and prototype as a precaution', () => {
+  const valid = readFileSync(new URL('valid.yaml', FIXTURES), 'utf8')
+  const bound = (id: string): string =>
+    `${valid}\negress:\n  bindings:\n    ${id}:\n      host: github.com\n      scheme: Basic\n      envVar: AOS_GITHUB_TOKEN\n      profiles: [git-fetch]\n      repos: [op/fixture]\n`
+  // The parser makes `__proto__:` an own key, and zod's record drops it: the
+  // binding would vanish with no error, and its .env line would then be
+  // refused as a name the kernel does not read.
+  const raw = parseYaml(bound('__proto__')) as { egress: { bindings: Record<string, unknown> } }
+  assert.equal(Object.hasOwn(raw.egress.bindings, '__proto__'), true)
+  assert.equal(Object.getPrototypeOf(raw.egress.bindings), Object.prototype)
+  // What the refusals say holds of the schema without the walk: __proto__ is
+  // dropped, while constructor and prototype are read as ordinary keys (a
+  // record keeps them, a strict section reports them as unknown), so those
+  // two are refused as a precaution, not because they would be lost.
+  const schemaOnly = (id: string): Record<string, unknown> => {
+    const result = KernelConfig.safeParse(parseYaml(bound(id)))
+    assert.ok(result.success, id)
+    return result.data.egress.bindings
+  }
+  assert.deepEqual(Object.keys(schemaOnly('__proto__')), [])
+  for (const id of ['constructor', 'prototype']) {
+    assert.equal(Object.hasOwn(schemaOnly(id), id), true, id)
+    const strict = KernelConfig.safeParse(parseYaml(valid.replace('lanes:\n', `lanes:\n  ${id}: 2\n`)))
+    assert.equal(strict.success, false, id)
+    assert.match(strict.error?.message ?? '', new RegExp(`unrecognized_keys[\\s\\S]*"${id}"`), id)
+  }
+  const dropped = 'the schema drops a __proto__ entry with no error, so the setting would vanish from the parsed config'
+  const precaution =
+    'constructor and prototype name parts of a JavaScript object, and kernel.yaml refuses both as a precaution, though the schema would read either as an ordinary key'
+  for (const [id, reason] of [['__proto__', dropped], ['constructor', precaution], ['prototype', precaution]] as const) {
+    assert.throws(
+      () => parse(parseYaml(bound(id))),
+      (e: unknown) =>
+        e instanceof Error &&
+        e.message === `kernel.yaml key "${id}" at egress.bindings.${id} is not a name a setting can have: ${reason}. Rename it.`,
+      id,
+    )
+  }
+  // The precaution does not make a lookup by name safe: a parsed record is a
+  // plain object, so code resolving an id from outside the file asks
+  // Object.hasOwn (egress plan E6), never `in` or a bare index.
+  const shipped = parse(parseYaml(valid)).egress.bindings
+  assert.equal('constructor' in shipped, true)
+  assert.equal(Object.hasOwn(shipped, 'constructor'), false)
+  // Anywhere in the document: an MCP server's name, a key under a section, an
+  // entry in a list.
+  for (const [text, path] of [
+    [valid.replace('mcp:\n  servers:\n', 'mcp:\n  servers:\n    __proto__:\n      url: http://127.0.0.1:9911/mcp\n'), 'mcp.servers.__proto__'],
+    [valid.replace('lanes:\n', 'lanes:\n  constructor: 2\n'), 'lanes.constructor'],
+    [`${valid}\nlist:\n  - prototype: 1\n`, 'list.0.prototype'],
+  ] as const) {
+    assert.throws(() => parse(parseYaml(text)), (e: unknown) => e instanceof Error && e.message.includes(`at ${path} is not a name a setting can have`), path)
+  }
+  // A name that merely contains one is a name like any other.
+  assert.deepEqual(Object.keys(parse(parseYaml(bound('proto-mirror'))).egress.bindings), ['proto-mirror'])
+})
+
+test('bindingKeyProblem: a binding envVar that is a provider key is named, with the host it would be sent to; the shipped files have none', () => {
+  // kernel.yaml's schema never sees providers.yaml, so a binding on
+  // ANTHROPIC_API_KEY passes parse and credentialNames alike. Boot (W1)
+  // refuses what this returns, before any binding is resolved.
+  const providersRaw = parseYaml(readFileSync(join(REPO_ROOT, 'config', 'providers.yaml'), 'utf8')) as {
+    entries: Record<string, { auth: Record<string, unknown> }>
+  }
+  const providers = parseProviders(providersRaw)
+  const shipped = parse(parseYaml(readFileSync(join(REPO_ROOT, 'config', 'kernel.yaml'), 'utf8')))
+  assert.equal(bindingKeyProblem(shipped, providers), undefined)
+
+  const anthropic = parse(withBindings({ github: binding({ envVar: 'ANTHROPIC_API_KEY' }), forge: binding({ host: 'git.example.com' }) }))
+  assert.equal(anthropic.egress.bindings['github']?.envVar, 'ANTHROPIC_API_KEY')
+  assert.equal(
+    bindingKeyProblem(anthropic, providers),
+    'an egress binding envVar names a credential of its own: egress.bindings.github.envVar ANTHROPIC_API_KEY is the key of ' +
+      'provider anthropic/claude-sonnet-5 (auth.envVar in providers.yaml), and the binding would send it to github.com. ' +
+      'Give the binding an AOS_ name of its own',
+  )
+  // A clean binding beside it is not named; one of its own is no problem.
+  assert.equal(bindingKeyProblem(anthropic, providers)?.includes('forge'), false)
+  assert.equal(bindingKeyProblem(parse(withBindings({ github: binding() })), providers), undefined)
+
+  // Any provider's key, a placeholder's included, and every entry that shares it.
+  for (const ref of ['openrouter/moonshotai/kimi-k3', 'moonshot/kimi-k3']) {
+    const entry = providersRaw.entries[ref]
+    assert.ok(entry, ref)
+    entry.auth['envVar'] = 'AOS_MOONSHOT_KEY'
+  }
+  const shared = parse(withBindings({ api: binding({ host: 'api.github.com', scheme: 'Bearer', envVar: 'AOS_MOONSHOT_KEY', profiles: ['github-pulls'] }) }))
+  assert.match(
+    bindingKeyProblem(shared, parseProviders(providersRaw)) ?? '',
+    /^an egress binding envVar names a credential of its own: egress\.bindings\.api\.envVar AOS_MOONSHOT_KEY is the key of provider openrouter\/moonshotai\/kimi-k3, moonshot\/kimi-k3 \(auth\.envVar in providers\.yaml\), and the binding would send it to api\.github\.com\./,
+  )
+  // Two bindings on provider keys: both named, in one message.
+  const both = parse(withBindings({ github: binding({ envVar: 'ANTHROPIC_API_KEY' }), api: binding({ host: 'api.github.com', envVar: 'AOS_MOONSHOT_KEY' }) }))
+  const message = bindingKeyProblem(both, parseProviders(providersRaw)) ?? ''
+  assert.match(message, /egress\.bindings\.github\.envVar ANTHROPIC_API_KEY .*; egress\.bindings\.api\.envVar AOS_MOONSHOT_KEY /)
+})
+
+test('until the wiring task, nothing in src calls bindingKeyProblem, and kernel.yaml says a provider key is refused only once W1 lands', () => {
+  // A comment telling the operator a provider-key binding "is refused at
+  // boot" would be false today: it parses and boots, harmless only because
+  // no request uses a binding before W1. W1 calls the check and rewrites
+  // both halves of this test in the same commit.
+  const sources = readdirSync(join(REPO_ROOT, 'src'), { recursive: true, encoding: 'utf8' }).filter((f) => f.endsWith('.ts'))
+  const callers = sources.filter((f) => /\bbindingKeyProblem\s*\(/.test(readFileSync(join(REPO_ROOT, 'src', f), 'utf8').replace(/export function bindingKeyProblem\(/, '')))
+  assert.deepEqual(callers, [])
+  const yaml = readFileSync(join(REPO_ROOT, 'config', 'kernel.yaml'), 'utf8')
+  const comment = yaml.split('\n').filter((line) => /^\s*#/.test(line)).map((line) => line.replace(/^\s*#\s?/, '')).join(' ')
+  assert.match(comment, /A provider's key will be refused at boot once the wiring task \(W1\) lands; until then no request uses a binding\./)
+  assert.doesNotMatch(comment, /provider's key is refused at boot/)
 })

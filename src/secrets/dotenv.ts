@@ -104,14 +104,17 @@ interface Parsed {
 
 /**
  * The credential names the config declares: the control token, any declared
- * MCP bearer, and every provider entry's auth.envVar (placeholders included, so
- * clearing a placeholder needs no code change here).
+ * MCP bearer, every egress binding's envVar (kernel.yaml egress.bindings, a
+ * credential the operator adds and the installer never mints), and every
+ * provider entry's auth.envVar (placeholders included, so clearing a
+ * placeholder needs no code change here).
  */
 export function credentialNames(config: KernelConfig, providers: ProvidersFile): ReadonlySet<string> {
   const names = new Set<string>([config.control.tokenEnv])
   for (const server of Object.values(config.mcp.servers)) {
     if (server.tokenEnv !== undefined) names.add(server.tokenEnv)
   }
+  for (const binding of Object.values(config.egress.bindings)) names.add(binding.envVar)
   for (const entry of Object.values(providers.entries)) {
     if (entry.auth.envVar !== undefined) names.add(entry.auth.envVar)
   }

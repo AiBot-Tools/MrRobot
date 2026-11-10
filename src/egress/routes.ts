@@ -27,11 +27,14 @@
 // The request target is read here too, and refused rather than normalised:
 // whatever a peer might read another way is not sent at all. Only absolute
 // form (http:// or https://, lower-case) is a target; userinfo is a second
-// host; the host is read before the port, so a target naming an address or a
-// special-use name (192.168.5.2:8766, host.lima.internal:8766) is refused for
-// its host whatever port it names, and only an egress host on a port other
-// than 443 is refused for the port, which names another service than the one
-// dialled; and the path may hold no backslash, no empty segment (a double
+// host, refused with the host a URL parser reads past its last `@` (or why it
+// is none, namedHost), so a log row says where such a request was headed;
+// the host is read before the rest of the target (its length, its
+// characters, a fragment, the port and the path), so a target naming an
+// address or a special-use name (192.168.5.2:8766, host.lima.internal:8766)
+// is refused for its host whatever port it names and whatever follows it,
+// and only an egress host on a port other than 443 is refused for the port,
+// which names another service than the one dialled; and the path may hold no backslash, no empty segment (a double
 // slash), no dot segment, no percent-encoded slash, dot, backslash, percent or
 // control character, and nothing that does not decode to UTF-8 (an overlong
 // encoding is one more spelling of a dot or a slash). The query is carried as
@@ -76,9 +79,9 @@ export interface RouteRefused {
   readonly reason: RouteRefusal
   /** A clause; never holds the input. */
   readonly why: string
-  /** host.ts's reason, when the target's host is no EgressHost. */
+  /** host.ts's reason, when the target's host (past any userinfo) is no EgressHost. */
   readonly hostRefusal?: HostRefusal
-  /** The target's host, when parseTarget read one before it refused the port or the path. */
+  /** The target's host (past any userinfo), when parseTarget read one before it refused the userinfo, the port or the path. */
   readonly host?: EgressHost
 }
 
@@ -87,6 +90,37 @@ type RefusedAt = { readonly hostRefusal: HostRefusal } | { readonly host: Egress
 
 function refused(reason: RouteRefusal, why: string, at?: RefusedAt): RouteRefused {
   return Object.freeze(at === undefined ? { ok: false as const, reason, why } : { ok: false as const, reason, why, ...at })
+}
+
+/** Where a refused request was headed: the host its authority names, or host.ts's reason it names none. */
+export type NamedHost = { readonly host: EgressHost } | { readonly hostRefusal: HostRefusal }
+
+/**
+ * An authority (`host[:port]`) split as parseTarget reads one: brackets or a
+ * second colon are an IPv6 literal, which host.ts refuses whole, so the port
+ * is split off only after the one colon of a name or an IPv4 address.
+ */
+function splitAuthority(authority: string): { readonly hostText: string; readonly port: string | undefined } {
+  if (authority.includes('[') || authority.split(':').length !== 2) return { hostText: authority, port: undefined }
+  const colon = authority.indexOf(':')
+  return { hostText: authority.slice(0, colon), port: authority.slice(colon + 1) }
+}
+
+/**
+ * The host an authority names, for a refusal to record where the request was
+ * headed, never to admit one: a CONNECT's authority (policy.ts), or a
+ * target's whose userinfo is refused. Read as a URL parser reads it, past the
+ * last `@`, without its port, and judged by host.ts: its EgressHost, or the
+ * reason it is none (ip-literal for 192.168.5.2:8766, special-use for
+ * host.lima.internal:8766), so a probe of the Mac's loopback in either
+ * spelling is recorded as one. Text that is no authority (a slash, a `?`, a
+ * `#`: an absolute-form CONNECT, say) names nothing.
+ */
+export function namedHost(authority: string): NamedHost | undefined {
+  if (/[/?#]/.test(authority)) return undefined
+  const { hostText } = splitAuthority(authority.slice(authority.lastIndexOf('@') + 1))
+  const parsed = parseEgressHost(hostText)
+  return parsed.ok ? { host: parsed.host } : { hostRefusal: parsed.reason }
 }
 
 /** The one port egress dials (upstream.ts); a target naming any other names another service. */
@@ -222,38 +256,41 @@ function checkEncodings(path: string): boolean {
  * Read a request target, refusing what a peer could read another way. The
  * host is normalised (host.ts); everything else is refused, never rewritten,
  * so the request sent is the request the worker wrote.
+ *
+ * In absolute form the authority is read first, its userinfo and host before
+ * anything after them: where the request was headed is known before its
+ * length, its characters, a fragment, its port or its path is judged, so a
+ * probe of the Mac's loopback is refused for its host (or its userinfo, with
+ * the host past it) whatever else the target holds, and a target in absolute
+ * form is refused as `target`, which names no host, only when its host is an
+ * egress host. The authority ends at the first `/`, `?` or `#`, so
+ * http://github.com#x has the host github.com, as a URL parser reads it.
  */
 export function parseTarget(target: string): ParsedTarget | RouteRefused {
-  if (target.length === 0 || target.length > MAX_TARGET || !/^[\x21-\x7e]+$/.test(target) || target.includes('#')) {
-    return refused('target', 'the target is empty, too long, holds a fragment or a character no request line has')
-  }
-  const form = /^(?:http|https):\/\/([^/?]*)(.*)$/.exec(target)
+  const form = /^(?:http|https):\/\/([^/?#]*)([\s\S]*)$/.exec(target)
   if (form === null) {
     return refused('target', 'the target is not absolute-form http:// or https://: egress routes only a request that names its host')
   }
   const [, authority = '', rest = ''] = form
-  if (authority.includes('@')) return refused('second-host', 'the target carries userinfo, a second host a peer may read')
-  let hostText = authority
-  let port: string | undefined
-  // Brackets or a second colon: an IPv6 literal, which host.ts refuses whole.
-  if (!authority.includes('[') && authority.split(':').length === 2) {
-    const colon = authority.indexOf(':')
-    hostText = authority.slice(0, colon)
-    port = authority.slice(colon + 1)
-  }
+  if (authority.includes('@')) return refused('second-host', 'the target carries userinfo, a second host a peer may read', namedHost(authority))
+  const { hostText, port } = splitAuthority(authority)
   // The host before the port: 192.168.5.2:8766 is refused for its host, as
   // 192.168.5.2 is, not as a typo of a port, so the log tells a probe of the
   // Mac's loopback from a wrong-port request to a real host.
   const parsed = parseEgressHost(hostText)
   if (!parsed.ok) return refused('not-a-host', `the target's host is not an egress host: it ${parsed.why}`, { hostRefusal: parsed.reason })
   const host = parsed.host
+  if (target.length > MAX_TARGET || !/^[\x21-\x7e]+$/.test(target) || target.includes('#')) {
+    return refused('target', 'the target is too long, holds a fragment or a character no request line has')
+  }
   if (port !== undefined && port !== ROUTE_PORT) {
     return refused('port', `the target names a port other than ${ROUTE_PORT}, the only one egress dials, so it names another service`, { host })
   }
+  // The authority ends at a `/` or a `?` (a `#` was refused above), so the
+  // path is empty or starts with a slash, and an empty one is `/`.
   const queryAt = rest.indexOf('?')
   const path = (queryAt === -1 ? rest : rest.slice(0, queryAt)) || '/'
   const query = queryAt === -1 ? undefined : rest.slice(queryAt + 1)
-  if (!path.startsWith('/')) return refused('target', 'the target has no path after its host')
   const originForm = query === undefined ? path : `${path}?${query}`
   if (originForm.length > MAX_PATH) return refused('path', `the path and query are longer than the ${String(MAX_PATH)} characters the upstream sends`, { host })
   if (path.includes('\\')) return refused('path', 'the path holds a backslash, which some servers read as a slash', { host })

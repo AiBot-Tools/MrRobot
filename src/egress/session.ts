@@ -47,11 +47,13 @@
 //     Connection header names, the body's framing (the upstream frames it as
 //     decide() judged it), Expect, every forwarding header (Forwarded, Via,
 //     X-Forwarded-*, X-Real-IP and the like) and every header the upstream
-//     sets or refuses itself (upstream.ts UPSTREAM_OWNED_HEADERS) are
-//     dropped. A Connection header that names one decide() reads (Host, the
-//     framing, Content-Type, Content-Encoding) refuses the request unsent
-//     (an upstream row naming `head`): dropping it as hop-by-hop would send
-//     another record than the one judged. On a bound
+//     sets or refuses itself (upstream.ts UPSTREAM_OWNED_HEADERS) are dropped,
+//     each matched by the name a backend that folds names reads (policy.ts
+//     canonicalHeaderName: Proxy_Authorization is Proxy-Authorization there),
+//     as decide() reads every header. A Connection header that names one
+//     decide() reads (Host, the framing, Content-Type, Content-Encoding)
+//     refuses the request unsent (an upstream row naming `head`): dropping it
+//     as hop-by-hop would send another record than the one judged. On a bound
 //     route the kernel's CredentialInjector then sets exactly one header,
 //     Authorization, through a setter it is handed: the session never holds a
 //     SecretRef, never imports src/secrets (test/hygiene.test.ts pins both),
@@ -100,10 +102,12 @@
 //     one row per key (reason, decide()'s clause, host refusal, host, method,
 //     binding) with its count, the path detail kept only on a row that stands
 //     for one request; past PROXY_DENY_KEYS_PER_SECOND keys, the rest of the
-//     window is counted on overflow rows, by reason and, for not-a-host, host
-//     refusal. So a deny row can follow an allow row the worker sent after
-//     it. A deny's host that the redaction pass would change (the worker's
-//     text in a credential's shape) is recorded without it.
+//     window is counted on overflow rows, by reason and, for not-a-host,
+//     use-route and second-host (PROXY_DENIES_BY_HOST_REFUSAL), host refusal,
+//     so CONNECT 192.168.5.2:8766 is never counted with CONNECT
+//     github.com:443. So a deny row can follow an allow row the worker sent
+//     after it. A deny's host that the redaction pass would change (the
+//     worker's text in a credential's shape) is recorded without it.
 //   * Every decision before the revocation. Revoking stops every flow (no
 //     frame is sent once it begins), aborts every upstream request, waits for
 //     the requests in hand to append what they must, closes the deny window,
@@ -152,13 +156,14 @@ import {
   EGRESS_WHY_BYTES,
   METHOD_SHAPE,
   PROXY_DENIES_BEFORE_PATH,
+  PROXY_DENIES_BY_HOST_REFUSAL,
   PROXY_DENY_KEYS_PER_SECOND,
   PROXY_OVERFLOW_WHY,
 } from '../events/types.js'
 import { log } from '../log.js'
 import { CAPTURE_MAX_BYTES } from '../sandbox/driver.js'
 import { FRAME_MAX_BYTES_LIMIT, FrameChannel, FrameError, goPayload, MAX_FLOWS_LIMIT, type Frame, type FrameLimits, type ReceivedFrame } from './frame.js'
-import { decide, EgressGrant, leadingNeed, type EgressAllowed, type EgressDenied, type EgressHeaders, type LeadingNeed } from './policy.js'
+import { canonicalHeaderName, decide, EgressGrant, leadingNeed, type EgressAllowed, type EgressDenied, type EgressHeaders, type LeadingNeed } from './policy.js'
 import { parseTarget, RUN_REF, type ParsedTarget, type RouteRefused } from './routes.js'
 import { UPSTREAM_OWNED_HEADERS, type Upstream, type UpstreamBody, type UpstreamCallOptions, type UpstreamHead, type UpstreamRefused } from './upstream.js'
 
@@ -305,15 +310,17 @@ export interface EgressSession {
 }
 
 /**
- * The worker's headers the session never forwards, by lower-case name: every
- * auth header and cookie (the kernel's credential is the only one a host
- * reads), the hop-by-hop headers and the body's framing (the upstream frames
- * the body as decide() judged it), Expect, the forwarding headers (a
- * container says nothing about where a request came from), and every header
- * the upstream sets or refuses itself (UPSTREAM_OWNED_HEADERS: one left in
- * would have it refuse the request, where the session's rule is to drop it).
- * A header a Connection header names, and any X-Forwarded-*, is dropped as
- * well.
+ * The worker's headers the session never forwards, by the name
+ * canonicalHeaderName gives (policy.ts: Proxy_Authorization is
+ * proxy-authorization here, as a folding backend reads it): every auth header
+ * and cookie (the kernel's credential is the only one a host reads), the
+ * hop-by-hop headers and the body's framing (the upstream frames the body as
+ * decide() judged it), Expect, the forwarding headers (a container says
+ * nothing about where a request came from), and every header the upstream
+ * sets or refuses itself (UPSTREAM_OWNED_HEADERS: one left in would have it
+ * refuse the request, where the session's rule is to drop it). A header a
+ * Connection header names, and any X-Forwarded-*, is dropped as well, each by
+ * that name too.
  */
 const WORKER_STRIPPED: readonly string[] = [
   'authorization',
@@ -363,7 +370,10 @@ const FORWARDED_PREFIX = 'x-forwarded-'
 /**
  * The upstream's response headers the worker never gets: the hop-by-hop ones
  * (the session frames its own answer), a cookie minted for the operator's
- * credential, and the challenges that would have a client ask for one.
+ * credential, and the challenges that would have a client ask for one. Each
+ * is matched by the name canonicalHeaderName gives, as a header the host's
+ * Connection names is, so Set_Cookie and WWW_Authenticate, which a client
+ * that folds names reads as Set-Cookie and WWW-Authenticate, are dropped too.
  */
 export const RESPONSE_STRIPPED: readonly string[] = Object.freeze([
   'connection',
@@ -398,6 +408,7 @@ const SERVICES: ReadonlyMap<string, 'git-upload-pack' | 'git-receive-pack'> = ne
 const INFO_REFS = '/info/refs'
 
 const BEFORE_PATH: readonly string[] = PROXY_DENIES_BEFORE_PATH
+const BY_HOST_REFUSAL: readonly string[] = PROXY_DENIES_BY_HOST_REFUSAL
 
 /** The text the redaction pass leaves as it is: an identifier recorded as written. */
 const recordableAsIs = (text: string): boolean => redactString(text) === text
@@ -427,10 +438,10 @@ function headerRecord(raw: readonly string[]): HeaderRecord {
   return Object.freeze(record)
 }
 
-/** The names a Connection header lists (hop-by-hop by declaration), lower-case. */
+/** The names a Connection header lists (hop-by-hop by declaration), each as canonicalHeaderName spells it. */
 function connectionNamed(values: readonly string[] | undefined): Set<string> {
   const named = new Set<string>()
-  for (const value of values ?? []) for (const token of value.split(',')) named.add(token.trim().toLowerCase())
+  for (const value of values ?? []) for (const token of value.split(',')) named.add(canonicalHeaderName(token.trim()))
   return named
 }
 
@@ -439,7 +450,11 @@ function forwardedHeaders(record: HeaderRecord): Record<string, string> {
   const named = connectionNamed(record['connection'])
   const out = Object.create(null) as Record<string, string>
   for (const [name, values] of Object.entries(record)) {
-    if (REQUEST_STRIPPED.includes(name) || named.has(name) || name.startsWith(FORWARDED_PREFIX)) continue
+    // By the name a folding backend reads (policy.ts canonicalHeaderName):
+    // Proxy_Authorization, X_Forwarded_For and Content_Length are the
+    // headers they alias there, so they are stripped as those are.
+    const canonical = canonicalHeaderName(name)
+    if (REQUEST_STRIPPED.includes(canonical) || named.has(canonical) || canonical.startsWith(FORWARDED_PREFIX)) continue
     // One field per name (RFC 9110 5.3): the judged values in order. A
     // Content-Type or Content-Encoding is one value here, decide() having
     // refused two, so it reaches the upstream exactly as decide() read it.
@@ -452,13 +467,13 @@ function forwardedHeaders(record: HeaderRecord): Record<string, string> {
 function answeredHeaders(raw: readonly string[]): string[] {
   const named = new Set<string>()
   for (let i = 0; i + 1 < raw.length; i += 2) {
-    if ((raw[i] ?? '').toLowerCase() === 'connection') for (const t of connectionNamed([raw[i + 1] ?? ''])) named.add(t)
+    if (canonicalHeaderName(raw[i] ?? '') === 'connection') for (const t of connectionNamed([raw[i + 1] ?? ''])) named.add(t)
   }
   const out: string[] = []
   for (let i = 0; i + 1 < raw.length; i += 2) {
     const name = raw[i] ?? ''
-    const lower = name.toLowerCase()
-    if (RESPONSE_STRIPPED.includes(lower) || named.has(lower)) continue
+    const canonical = canonicalHeaderName(name)
+    if (RESPONSE_STRIPPED.includes(canonical) || named.has(canonical)) continue
     out.push(name, raw[i + 1] ?? '')
   }
   out.push('connection', 'close')
@@ -1286,7 +1301,7 @@ class Session implements EgressSession {
     }
     // Exactly one auth header on a bound route and none elsewhere, whatever
     // the strip above let through.
-    const auth = Object.keys(upstreamHeaders).filter((name) => AUTH_HEADERS.includes(name.toLowerCase()))
+    const auth = Object.keys(upstreamHeaders).filter((name) => AUTH_HEADERS.includes(canonicalHeaderName(name)))
     if (auth.length !== (routed ? 1 : 0)) {
       refuse(Object.freeze({ ok: false as const, reason: 'head' as const, sent: false, why: 'the head would carry an auth header other than the one the binding injects' }), 'session')
       return
@@ -1465,7 +1480,7 @@ class Session implements EgressSession {
     if (entry !== undefined) entry.count++
     else if (window.entries.size < PROXY_DENY_KEYS_PER_SECOND) window.entries.set(key, { row: Object.freeze(row), detail: Object.freeze(detail), count: 1 })
     else {
-      const hostRefusal = decision.reason === 'not-a-host' ? decision.hostRefusal : undefined
+      const hostRefusal = BY_HOST_REFUSAL.includes(decision.reason) ? decision.hostRefusal : undefined
       const overflowKey = JSON.stringify([decision.reason, hostRefusal])
       const counted = window.overflow.get(overflowKey)
       if (counted !== undefined) counted.count++
@@ -1589,11 +1604,15 @@ class Session implements EgressSession {
 
 /**
  * The revocation's detail: its reason's own, then how many decision rows the
- * store refused, which always fits (the reason's own is cut to leave it
- * room), so a loss is on record whenever it happened, the window #revoke
- * closes last included.
+ * store refused, which always fits: the reason's own is cut so that both fit
+ * EGRESS_DETAIL_BYTES, the revoked row's bound, so a loss is on record
+ * whenever it happened, the window #revoke closes last included. Exported for
+ * its test alone: today no detail long enough to be cut can meet a loss (the
+ * one of arbitrary length, a ReadyJudge clause, is refused in the handshake,
+ * before any decision row), so only a direct test holds the cut for the
+ * detail a later change may add.
  */
-function withLoss(detail: string | undefined, lost: number): string | undefined {
+export function withLoss(detail: string | undefined, lost: number): string | undefined {
   if (lost === 0) return detail === undefined ? undefined : recordable(detail, EGRESS_DETAIL_BYTES)
   const loss = `${String(lost)} decision row${lost === 1 ? '' : 's'} could not be appended`
   return detail === undefined ? loss : `${recordable(detail, EGRESS_DETAIL_BYTES - loss.length - 2)}; ${loss}`

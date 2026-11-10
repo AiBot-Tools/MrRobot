@@ -39,6 +39,7 @@ import {
   PROXY_ALLOW_REASONS,
   PROXY_DENIES_BEFORE_HOST,
   PROXY_DENIES_BEFORE_PATH,
+  PROXY_DENIES_BY_HOST_REFUSAL,
   PROXY_DENIES_ON_A_ROUTE,
   PROXY_DENY_REASONS,
   PROXY_GRANT_MAX_REPOS,
@@ -530,6 +531,11 @@ const EGRESS_VARIANTS: ReadonlyArray<readonly [EventType, Record<string, unknown
   ['proxy.decision', { ...OVERFLOW_ROW, reason: 'not-a-host', hostRefusal: 'ip-literal', count: 1 }],
   ['proxy.decision', { ...OVERFLOW_ROW, reason: 'not-a-host', hostRefusal: 'special-use', count: 9 }],
   ['proxy.decision', { ...DENY_ROW, reason: 'use-route', method: 'CONNECT', hostRefusal: undefined }],
+  // A CONNECT names where it was headed: pmmcp by its host refusal, a real host by name; past the bound, counted by its refusal.
+  ['proxy.decision', { ...DENY_ROW, reason: 'use-route', method: 'CONNECT', hostRefusal: 'ip-literal' }],
+  ['proxy.decision', { ...DENY_ROW, reason: 'use-route', method: 'CONNECT', hostRefusal: undefined, host: 'github.com', count: 3 }],
+  ['proxy.decision', { ...OVERFLOW_ROW, reason: 'use-route', hostRefusal: 'ip-literal', count: 40 }],
+  ['proxy.decision', { ...DENY_ROW, reason: 'second-host', method: 'GET', hostRefusal: 'special-use' }],
   // An exec grant's container asking for a push: denied, and the service it asked for named.
   [
     'proxy.decision',
@@ -910,10 +916,56 @@ test("a proxy.decision allow is a request its reason admits: GET or HEAD on a cr
     ['a repository in a credential shape', { ...row, repo: `op/ghp_${'a'.repeat(36)}` }],
   ]
   for (const [what, refused] of censoredRefused) assert.equal(parses('proxy.decision', refused), false, `${what} was recorded`)
+
+  // A row that judged one path and recorded another (an E8 bug, or a test) is
+  // refused in time linear in its path however many spans the pass censored:
+  // the spelling is scanned, never backtracked. A pattern of one unbounded
+  // class per span took 12 s for eight spans on a 102-byte path, inside the
+  // store's append, where it blocks the kernel's event loop.
+  const hyphens = `op/${'-'.repeat(60)}`
+  for (const spans of [8, 12, 40, 90]) {
+    const path = `/op/${Array.from({ length: spans }, () => CENSOR).join('-')}x/info/refs`
+    const inconsistent = { ...ALLOW_ROW, repo: hyphens, path, pathBytes: 500 }
+    const began = performance.now()
+    assert.equal(parses('proxy.decision', inconsistent), false, `${String(spans)} spans were recorded`)
+    const took = performance.now() - began
+    assert.ok(took < 250, `${String(spans)} censored spans took ${took.toFixed(0)} ms to refuse`)
+    // And one whose every span stands for what the repository holds there is
+    // taken as fast (a name holds at most 100 characters, so 33 spans of two).
+    const kept = Math.min(spans, 33)
+    const named = Array.from({ length: kept }, () => 'ab').join('-')
+    const consistent = { ...ALLOW_ROW, repo: `op/${named}`, path: `/op/${Array.from({ length: kept }, () => CENSOR).join('-')}/info/refs`, pathBytes: 500 }
+    const start = performance.now()
+    assert.equal(parses('proxy.decision', consistent), true, `${String(spans)} spans: ${why('proxy.decision', consistent)}`)
+    assert.ok(performance.now() - start < 250, `${String(spans)} censored spans took too long to take`)
+  }
+  // Each span stands for one character or more, and the literals between are found in order.
+  for (const [what, repo, path, taken] of [
+    ['a span for one character', 'op/x', `/op/${CENSOR}/info/refs`, true],
+    ['two spans for two characters', 'op/xy', `/op/${CENSOR}${CENSOR}/info/refs`, true],
+    ['two spans for one character', 'op/x', `/op/${CENSOR}${CENSOR}/info/refs`, false],
+    ['a span for nothing', 'op/x', `/op/x${CENSOR}/info/refs`, false],
+    // A .git survives the censor, so a span never stands for one.
+    ['a span for part of the .git', 'op/x', `/op/${CENSOR}it/info/refs`, false],
+    ['a .git after a span', 'op/x', `/op/${CENSOR}.GIT/info/refs`, true],
+    ['literals out of order', 'op/a-b', `/op/${CENSOR}b${CENSOR}a${CENSOR}/info/refs`, false],
+    ['a literal found again after its first place', 'op/ab-ab-c', `/op/${CENSOR}-${CENSOR}-c/info/refs`, true],
+    ['a span across the slash', 'op/x', `/${CENSOR}/info/refs`, false],
+    ['a span in the owner and one in the name', 'akiaabcdefghijklmnop/x-akiaabcdefghijklmnop', `/${CENSOR}/x-${CENSOR}/info/refs`, true],
+    ['the case of a literal', 'op/x-akiaabcdefghijklmnop', `/OP/X-${CENSOR}/info/refs`, true],
+    // A repository is an owner and a name, never a third part after them: the
+    // owner and name spelled, then more, is a path no route reads as theirs.
+    ['a third part after the name', 'op/fixture', '/op/fixture/extra/info/refs', false],
+    ['a third part after the name, with .git', 'op/fixture', '/op/fixture/x.git/info/refs', false],
+    ['a span for a third part after the name', 'op/fixture', `/op/fixture/${CENSOR}/info/refs`, false],
+  ] as const) {
+    const candidate = { ...ALLOW_ROW, repo, path, pathBytes: 500 }
+    assert.equal(parses('proxy.decision', candidate), taken, `${what}: ${why('proxy.decision', candidate)}`)
+  }
 })
 
 test('every id, name and answer is bounded where src/egress bounds it: taken at its limit, refused one past it', () => {
-  /** A method decide() denies as 'method' before it reads a target: it names nothing else. */
+  /** A method deny naming its method alone: the row may leave out the host decide() read, as the session does one in a credential's shape. */
   const methodDeny = (method: string): Record<string, unknown> => ({ ...DENY_ROW, reason: 'method', hostRefusal: undefined, method })
   const pairs: ReadonlyArray<readonly [string, EventType, Record<string, unknown>, Record<string, unknown>]> = [
     // node:http's longest method is 11 letters; 24 is the bound, and a run cannot send one past it.
@@ -924,6 +976,13 @@ test('every id, name and answer is bounded where src/egress bounds it: taken at 
     ['a grant id', 'proxy.grant.issued', { ...GRANT, grantId: longRef('g') }, { ...GRANT, grantId: `${longRef('g')}g` }],
     ['a run id', 'proxy.grant.issued', { ...GRANT, runId: longRef('r') }, { ...GRANT, runId: `${longRef('r')}r` }],
     ['a binding id', 'egress.degraded', { schemaVersion: 1, check: 'binding', bindingId: longBinding(0), reason: 'r' }, { schemaVersion: 1, check: 'binding', bindingId: `${longBinding(0)}x`, reason: 'r' }],
+    // RepoSlug's owner is at most 39 characters (routes.ts OWNER), so a row naming a longer one names a repository no grant holds.
+    [
+      "a repository's owner",
+      'proxy.grant.issued',
+      { ...GRANT, routes: [{ bindingId: 'github', host: 'github.com', profiles: ['git-fetch'], repos: [`${'o'.repeat(39)}/x`] }] },
+      { ...GRANT, routes: [{ bindingId: 'github', host: 'github.com', profiles: ['git-fetch'], repos: [`${'o'.repeat(40)}/x`] }] },
+    ],
   ]
   for (const [what, type, atLimit, onePast] of pairs) {
     assert.equal(parses(type, atLimit), true, `${what} at its limit: ${why(type, atLimit)}`)
@@ -991,7 +1050,7 @@ test('an upstream row is a deny exactly when nothing of the request left: a cred
   assert.equal(parses('proxy.decision', { ...SENT_PUSH_ROW, verdict: 'deny', sent: false }), true)
   assert.equal(parses('proxy.decision', { ...SENT_PUSH_ROW, verdict: 'allow', sent: false }), false, 'a request that never left was recorded as an allow')
   // Every refusal the upstream can meet after the head may come with sent; none other may.
-  // The session's own (a challenge) is the host's answer, so it never comes without.
+  // The session's own (a challenge, a head it cannot pass on) are the host's answer, so neither comes without.
   for (const refusal of PROXY_UPSTREAM_REFUSALS) {
     const row = defined({ ...SENT_PUSH_ROW, refusal, ...(refusal === 'denied-address' ? { address: '192.168.5.2', denial: 'private' } : refusal === 'host-address' ? { address: '81.2.69.160' } : {}) })
     const afterSend = (PROXY_REFUSALS_AFTER_SEND as readonly string[]).includes(refusal)
@@ -1006,13 +1065,18 @@ test('an upstream row is a deny exactly when nothing of the request left: a cred
   }
 })
 
-test("a coalesced deny stands for requests that had exactly its fields, and an overflow row names its reason, its count and a not-a-host deny's host refusal alone", () => {
+test("a coalesced deny stands for requests that had exactly its fields, and an overflow row names its reason, its count and a not-a-host, use-route or second-host deny's host refusal alone", () => {
   const ok: ReadonlyArray<Record<string, unknown>> = [
     { ...DENY_ROW, count: 7 },
     { ...DENY_ROW, reason: 'not-allowed', hostRefusal: undefined, host: '192-168-5-2.example', method: 'GET', bindingId: undefined, count: 3 },
     OVERFLOW_ROW,
-    // Keyed by host refusal as well as reason: a flood of typos does not hide a probe of 192.168.5.2 or host.lima.internal.
+    // Keyed by host refusal as well as reason: a flood of typos does not hide a probe of 192.168.5.2 or host.lima.internal,
+    // nor a flood of tunnels to real hosts a CONNECT to one.
     ...PROXY_HOST_REFUSALS.map((hostRefusal) => ({ ...OVERFLOW_ROW, reason: 'not-a-host', hostRefusal })),
+    ...PROXY_HOST_REFUSALS.map((hostRefusal) => ({ ...OVERFLOW_ROW, reason: 'use-route', hostRefusal })),
+    ...PROXY_HOST_REFUSALS.map((hostRefusal) => ({ ...OVERFLOW_ROW, reason: 'second-host', hostRefusal })),
+    { ...OVERFLOW_ROW, reason: 'use-route' },
+    { ...OVERFLOW_ROW, reason: 'second-host' },
     { ...OVERFLOW_ROW, count: 1 },
     // A flood of pushes to a ref outside the run's prefix, on a bound route: coalesced under its host and binding (E8).
     { ...DENY_ROW, reason: 'push-ref', hostRefusal: undefined, host: 'github.com', method: 'POST', bindingId: 'github', count: 37 },
@@ -1032,6 +1096,9 @@ test("a coalesced deny stands for requests that had exactly its fields, and an o
     ['an overflow row naming a binding', { ...OVERFLOW_ROW, bindingId: 'github' }],
     ['a not-a-host overflow row naming no host refusal', { ...OVERFLOW_ROW, reason: 'not-a-host' }],
     ['an overflow row of another reason naming a host refusal', { ...OVERFLOW_ROW, hostRefusal: 'ip-literal' }],
+    ['a port overflow row naming a host refusal', { ...OVERFLOW_ROW, reason: 'port', hostRefusal: 'ip-literal' }],
+    ['a use-route overflow row naming its host', { ...OVERFLOW_ROW, reason: 'use-route', host: 'github.com' }],
+    ['a use-route overflow row naming its method', { ...OVERFLOW_ROW, reason: 'use-route', method: 'CONNECT', hostRefusal: 'ip-literal' }],
     ['an overflow row with decide()\'s clause', { ...OVERFLOW_ROW, why: 'the host is neither credential-free nor bound for this run' }],
     ["an overflow row with decide()'s clause after the kernel's", { ...OVERFLOW_ROW, why: `${PROXY_OVERFLOW_WHY}; the host is neither credential-free nor bound for this run` }],
     // An overflow of one request is still counted by reason alone: what a coalesced row may not name, it may not either.
@@ -1050,9 +1117,12 @@ test("a coalesced deny stands for requests that had exactly its fields, and an o
     assert.match(why('proxy.decision', row), /only a policy deny stands for more than one request/)
   }
   // PROXY_DENY_KEYS_PER_SECOND's doc counts what overflow rows add to a
-  // second: one per deny reason but not-a-host, one per host refusal.
-  assert.equal(PROXY_DENY_REASONS.length - 1, 21)
+  // second: one per deny reason the host refusal does not key, 12 for
+  // not-a-host (one per host refusal), and 13 each for use-route and
+  // second-host (one per host refusal, and one where a host was read).
+  assert.equal(PROXY_DENY_REASONS.length - PROXY_DENIES_BY_HOST_REFUSAL.length, 19)
   assert.equal(PROXY_HOST_REFUSALS.length, 12)
+  assert.deepEqual([...PROXY_DENIES_BY_HOST_REFUSAL].sort(), ['not-a-host', 'second-host', 'use-route'])
   // Likewise an overflow: a deny of the policy's alone, not only because an allow names a path.
   for (const row of [{ ...ALLOW_ROW, overflow: true }, { ...UPSTREAM_ROW, overflow: true }]) {
     assert.match(why('proxy.decision', row), /only a policy deny overflows/)
@@ -1145,8 +1215,17 @@ test('a policy deny names at most what decide() had read when its reason stopped
   }
   // The probes, by name: what a CONNECT, an unreadable target or a wrong port never read.
   const refused: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
-    ['a CONNECT naming a host', deny('use-route', { method: 'CONNECT', host: 'github.com' })],
     ['a CONNECT naming a binding', deny('use-route', { method: 'CONNECT', ...binding })],
+    ['a CONNECT naming a host and why it was none', deny('use-route', { method: 'CONNECT', host: 'github.com', hostRefusal: 'ip-literal' })],
+    ['a userinfo target naming a host and why it was none', deny('second-host', { method: 'GET', host: 'github.com', hostRefusal: 'special-use' })],
+    ['a wrong port saying why its host was none', deny('port', { method: 'GET', hostRefusal: 'ip-literal' })],
+    ['an unreadable target saying why its host was none', deny('target', { method: 'GET', hostRefusal: 'ip-literal' })],
+    ['a not-allowed deny saying why its host was none', deny('not-allowed', { method: 'GET', hostRefusal: 'ip-literal' })],
+    // decide() denies a CONNECT use-route before anything else, and only a CONNECT.
+    ['a use-route deny of a GET', deny('use-route', { method: 'GET', hostRefusal: 'ip-literal' })],
+    ['a CONNECT denied for its target', deny('target', { method: 'CONNECT' })],
+    ['a CONNECT denied for its host', deny('not-a-host', { method: 'CONNECT' })],
+    ['a CONNECT denied for its method', deny('method', { method: 'CONNECT', ...host })],
     ['a CONNECT naming a path', deny('use-route', { method: 'CONNECT', ...pathed('/') })],
     ['an unreadable target naming a host', deny('target', host)],
     ['an unreadable target naming a binding and a path', deny('target', { ...binding, ...pathed('/op/fixture.git/info/refs') })],
@@ -1159,6 +1238,15 @@ test('a policy deny names at most what decide() had read when its reason stopped
   ]
   for (const [what, row] of refused) assert.equal(parses('proxy.decision', row), false, `${what} was recorded`)
   const taken: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
+    // A CONNECT names where it was headed: a real host, or why its host was none.
+    ['a CONNECT naming a host', deny('use-route', { method: 'CONNECT', host: 'github.com' })],
+    ['a CONNECT to pmmcp, by its host refusal', deny('use-route', { method: 'CONNECT', hostRefusal: 'ip-literal' })],
+    ['a CONNECT to pmmcp by name, by its host refusal', deny('use-route', { method: 'CONNECT', hostRefusal: 'special-use' })],
+    ['a CONNECT whose method was not recorded', deny('use-route', { hostRefusal: 'ip-literal' })],
+    ['a CONNECT a broken grant left unjudged', deny('malformed', { method: 'CONNECT' })],
+    // So does a userinfo target, past its userinfo.
+    ['a userinfo target naming the host past it', deny('second-host', { method: 'GET', host: 'registry.npmjs.org' })],
+    ['a userinfo target before pmmcp, by its host refusal', deny('second-host', { method: 'GET', hostRefusal: 'ip-literal' })],
     // parseTarget reads the host before the port, and a port or path refusal names it.
     ['a wrong port naming its host', deny('port', { method: 'GET', host: 'example.com' })],
     ['a path deny naming its host and path', deny('path', { method: 'GET', host: 'registry.npmjs.org', ...pathed('/a/../b') })],
@@ -1168,10 +1256,19 @@ test('a policy deny names at most what decide() had read when its reason stopped
     ['an upstream deny of a route', UPSTREAM_ROW],
   ]
   for (const [what, row] of taken) assert.equal(parses('proxy.decision', row), true, `${what}: ${why('proxy.decision', row)}`)
+  // A host refusal rides exactly the reasons PROXY_DENIES_BY_HOST_REFUSAL names, coalesced too, and never beside a host.
+  for (const reason of PROXY_DENY_REASONS) {
+    const refusal = deny(reason, { hostRefusal: 'ip-literal' })
+    assert.equal(parses('proxy.decision', refusal), listed(PROXY_DENIES_BY_HOST_REFUSAL, reason), `${reason} naming a host refusal: ${why('proxy.decision', refusal)}`)
+    assert.equal(parses('proxy.decision', { ...refusal, count: 5 }), listed(PROXY_DENIES_BY_HOST_REFUSAL, reason), `${reason} coalesced with a host refusal`)
+    assert.equal(parses('proxy.decision', deny(reason, { ...host, hostRefusal: 'ip-literal' })), false, `${reason} naming a host and a host refusal`)
+  }
   // The tables are of deny reasons, and nested as decide() reads: the host, then the port, then the path, then a route.
-  for (const reason of [...PROXY_DENIES_BEFORE_PATH, ...PROXY_DENIES_ON_A_ROUTE]) assert.ok(listed(PROXY_DENY_REASONS, reason), reason)
+  for (const reason of [...PROXY_DENIES_BEFORE_PATH, ...PROXY_DENIES_ON_A_ROUTE, ...PROXY_DENIES_BY_HOST_REFUSAL]) assert.ok(listed(PROXY_DENY_REASONS, reason), reason)
   for (const reason of PROXY_DENIES_BEFORE_HOST) assert.ok(listed(PROXY_DENIES_BEFORE_PATH, reason), reason)
   for (const reason of PROXY_DENIES_ON_A_ROUTE) assert.equal(listed(PROXY_DENIES_BEFORE_PATH, reason), false, reason)
+  // A reason that names a host refusal reads no route: it stopped at a host.
+  for (const reason of PROXY_DENIES_BY_HOST_REFUSAL) assert.equal(listed(PROXY_DENIES_ON_A_ROUTE, reason), false, reason)
 })
 
 test('no identifier a row names is one the redaction pass would censor: a grant naming one is not issued, and nothing stores a host, a repository or a binding as [REDACTED]', (t) => {
@@ -1360,7 +1457,7 @@ test("the egress rows name src/egress's vocabulary exactly, and take a sample of
   // Copied, not imported (types.ts says why); held equal here.
   assert.deepEqual([...PROXY_ALLOW_REASONS], [...ALLOW_REASONS])
   assert.deepEqual([...PROXY_DENY_REASONS], [...DENY_REASONS])
-  // The upstream's refusals, then the one the session gives itself.
+  // The upstream's refusals, then the session's own.
   assert.deepEqual([...PROXY_UPSTREAM_REFUSALS], [...UPSTREAM_REFUSALS, ...SESSION_REFUSALS])
   assert.deepEqual([...PROXY_REFUSALS_AFTER_SEND], [...UPSTREAM_REFUSALS_AFTER_SEND, ...SESSION_REFUSALS])
   assert.deepEqual([...PROXY_HOST_REFUSALS], [...HOST_REFUSALS])
@@ -1379,7 +1476,8 @@ test("the egress rows name src/egress's vocabulary exactly, and take a sample of
     assert.equal(parses('proxy.grant.issued', { ...GRANT, allow: [host], routes: [] }), true, host)
   }
   // A repository row refuses what RepoSlug refuses, in the one spelling a row holds (lower case).
-  for (const raw of ['op/fixture', 'op/fixture.git', 'op/.git', 'op/..', 'op/.', 'op/...', 'op/.github', 'op/a.git-x', 'op/git', 'op/x.gi', '-op/x', 'op/x/y', 'op/', '/x', 'op']) {
+  // The owner at its edges too: 39 characters taken, 40 refused, and one starting with anything but a letter or a digit refused.
+  for (const raw of ['op/fixture', 'op/fixture.git', 'op/.git', 'op/..', 'op/.', 'op/...', 'op/.github', 'op/a.git-x', 'op/git', 'op/x.gi', '-op/x', 'op/x/y', 'op/', '/x', 'op', `${'o'.repeat(39)}/x`, `${'o'.repeat(40)}/x`, '_op/x', '.op/x', 'o_p/x', 'o.p/x']) {
     const route = { bindingId: 'github', host: 'github.com', profiles: ['git-fetch'], repos: [raw] }
     assert.equal(parses('proxy.grant.issued', { ...GRANT, routes: [route] }), RepoSlug.safeParse(raw).success, raw)
   }
@@ -1392,7 +1490,7 @@ test("the egress rows name src/egress's vocabulary exactly, and take a sample of
 })
 
 test('the copies the egress rows hold of src/egress and the event log are held to their sources', () => {
-  // upstream.ts passes on an error code of exactly the shape a row takes, so every one it passes on can be recorded.
+  // upstream.ts passes on an error code of exactly the shape a row takes, so every one it passes on has a row's shape (one in a credential's shape is refused there too, and no node or OpenSSL code is one).
   assert.equal(`${EGRESS_ERROR_CODE.source}/${EGRESS_ERROR_CODE.flags}`, `${ERROR_CODE.source}/${ERROR_CODE.flags}`)
   assert.equal(EGRESS_REQUEST_TARGET_MAX_BYTES, MAX_TARGET)
   assert.equal(EGRESS_CENSOR, CENSOR)

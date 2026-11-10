@@ -577,12 +577,18 @@ export const ProbeRecordedPayload = z
 // grant EgressGrant would refuse), the schema holds them to what src/egress
 // can produce, and test/egress-policy.test.ts records a deny of every reason
 // decide() gives with exactly the fields it gave. It does not hold every
-// field decide() may or may not have read: a method deny names a host when a
-// route or a credential-free host refused the method, and none when the
-// method was no token, and the row may name it or not either way. It cannot
-// hold a row to the request itself: that the host, method and path a row
-// names are the ones the worker sent is the session's to get right (E8), and
-// the schema checks only that the fields agree.
+// field decide() may or may not have read, where one reason is given both
+// before and after a field is read: a path on a second-host deny (userinfo is
+// refused before the path is read, a Host header naming another host after),
+// on a method deny (a credential-free host and a route read it, the token
+// check reads the target first but its path is the session's to keep or
+// not), and on a malformed one (a grant that does not parse is refused before
+// the target is read, headers that are no record after it); a host on any
+// deny a host is read for, which the session drops when it is in a
+// credential's shape. The row may name such a field or not. It cannot hold a
+// row to the request itself: that the host, method and path a row names are
+// the ones the worker sent is the session's to get right (E8), and the
+// schema checks only that the fields agree.
 
 /** decide()'s reasons to allow (src/egress/policy.ts ALLOW_REASONS). */
 export const PROXY_ALLOW_REASONS = Object.freeze(['allow-host', 'git-fetch', 'git-push', 'github-pulls'] as const)
@@ -615,18 +621,35 @@ export const PROXY_DENY_REASONS = Object.freeze([
 
 /**
  * The deny reasons decide() gives before it has read a host (policy.ts
- * judgeHead, routes.ts parseTarget): a CONNECT, a target it cannot read, and
- * a host that is none. A row of one names no host, and so no binding.
+ * judgeHead, routes.ts parseTarget): a target it cannot read, and a host that
+ * is none. A row of one names no host, and so no binding. (A CONNECT names
+ * the host its authority names, routes.ts namedHost, and is not among them.)
+ * parseTarget reads an absolute-form target's host before its length, its
+ * characters and a fragment, so a 'target' deny of one in absolute form is
+ * of an egress host whose target no request line holds (a fragment, a
+ * character outside printable ASCII, more than MAX_TARGET), and names no host
+ * all the same; a probe of a host that is none is not-a-host first.
  */
-export const PROXY_DENIES_BEFORE_HOST = Object.freeze(['use-route', 'target', 'not-a-host'] as const)
+export const PROXY_DENIES_BEFORE_HOST = Object.freeze(['target', 'not-a-host'] as const)
 
 /**
- * The deny reasons decide() gives before it has read a path: those before the
- * host, and a port other than 443, which parseTarget refuses once it has read
- * the host and before it reads the path. A row of one names no path, and so
- * no length and no service.
+ * The deny reasons decide() gives before it has read a path: a CONNECT,
+ * whose authority has none, those before the host, and a port other than 443,
+ * which parseTarget refuses once it has read the host and before it reads the
+ * path. A row of one names no path, and so no length and no service.
  */
-export const PROXY_DENIES_BEFORE_PATH = Object.freeze([...PROXY_DENIES_BEFORE_HOST, 'port'] as const)
+export const PROXY_DENIES_BEFORE_PATH = Object.freeze(['use-route', ...PROXY_DENIES_BEFORE_HOST, 'port'] as const)
+
+/**
+ * The deny reasons whose row says why the host the request named was none
+ * (`hostRefusal`, host.ts's reason): not-a-host always, and a CONNECT
+ * (use-route) or a userinfo target (second-host) whose host routes.ts
+ * namedHost refused. A row of one names a host or a host refusal, never both.
+ * Their overflow rows are counted by host refusal as well as by reason, so a
+ * probe of 192.168.5.2 is its own count in every spelling decide() reads a
+ * host in.
+ */
+export const PROXY_DENIES_BY_HOST_REFUSAL = Object.freeze(['use-route', 'not-a-host', 'second-host'] as const)
 
 /**
  * The deny reasons decide() can give once a request has reached a bound
@@ -789,10 +812,11 @@ export const EGRESS_REASON_BYTES = 2_048
 export const EGRESS_TARGET_MAX_BYTES = 8_192
 
 /**
- * The longest request-target parseTarget reads at all, scheme and host
- * included (src/egress/routes.ts MAX_TARGET): a longer one is denied
- * 'target' before a path is read, so no row's path and query, `?` included,
- * add up to more.
+ * The longest request-target parseTarget reads past its host, scheme and
+ * host included (src/egress/routes.ts MAX_TARGET): a longer one is denied
+ * before a path is read, for its userinfo or its host (second-host,
+ * not-a-host) when either refuses it and as 'target' otherwise, so no row's
+ * path and query, `?` included, add up to more.
  */
 export const EGRESS_REQUEST_TARGET_MAX_BYTES = 8_492
 
@@ -836,18 +860,20 @@ const CUT_MARK = '\u2026'
 /**
  * The most distinct deny rows the session (E8) keeps for one grant in one
  * second. Past them, the rest of that second's denies are counted on
- * overflow rows, one per deny reason and, for not-a-host, one per host
- * refusal, both closed lists: so a grant writes at most this many deny rows
- * a second, plus 21 (the deny reasons but not-a-host) plus 12 (the host
- * refusals), however many requests its container sends. Allowed requests are
- * not among them: each is its own row, as many as egress.limits.maxRequests
- * lets a grant make.
+ * overflow rows, one per deny reason and, for the reasons
+ * PROXY_DENIES_BY_HOST_REFUSAL names, one per host refusal (or none, where a
+ * host was read), all closed lists: so a grant writes at most this many deny
+ * rows a second, plus 19 (the other deny reasons), plus 12 (not-a-host's host
+ * refusals), plus 13 each for use-route and second-host (a host refusal, or
+ * none), however many requests its container sends. Allowed requests are not
+ * among them: each is its own row, as many as egress.limits.maxRequests lets
+ * a grant make.
  */
 export const PROXY_DENY_KEYS_PER_SECOND = 16
 
 /** An overflow row's why: the kernel's clause, saying what the row does not record. */
 export const PROXY_OVERFLOW_WHY =
-  "denies past the second's bound on distinct rows, counted by reason, and a not-a-host deny by its host refusal too: their hosts, methods, paths, bindings and clauses are not recorded"
+  "denies past the second's bound on distinct rows, counted by reason, and a not-a-host, use-route or second-host deny by its host refusal too: their hosts, methods, paths, bindings and clauses are not recorded"
 
 /**
  * The most repositories one grant row names, across its routes. With every
@@ -914,6 +940,7 @@ const isAfterSend = (refusal: string): boolean => (PROXY_REFUSALS_AFTER_SEND as 
 const isBeforeHost = (reason: string): boolean => (PROXY_DENIES_BEFORE_HOST as readonly string[]).includes(reason)
 const isBeforePath = (reason: string): boolean => (PROXY_DENIES_BEFORE_PATH as readonly string[]).includes(reason)
 const isOnARoute = (reason: string): boolean => (PROXY_DENIES_ON_A_ROUTE as readonly string[]).includes(reason)
+const isByHostRefusal = (reason: string): boolean => (PROXY_DENIES_BY_HOST_REFUSAL as readonly string[]).includes(reason)
 /** The bytes of `?service=<service>`: an info/refs request's whole query. */
 const serviceQueryBytes = (service: string): number => `?service=${service}`.length
 const INFO_REFS = '/info/refs'
@@ -952,21 +979,47 @@ const ROUTE_SHAPES: ReadonlyMap<string, readonly RouteShape[]> = new Map([
   ['github-pulls', [{ method: 'POST', before: '/repos', git: false, after: '/pulls' }]],
 ])
 
-/** A character a repository's owner or name holds (routes.ts OWNER, REPO_NAME): never a slash. */
-const REPO_CHARACTERS = '[a-z0-9._-]+'
+/**
+ * Whether `literals`, the text between a path part's EGRESS_CENSOR marks,
+ * spell `text` whole, each mark standing for one or more characters: the
+ * first literal a prefix, the last a suffix, each between found in order,
+ * leftmost, at least one character after the one before. For marks that
+ * stand for any run of characters the leftmost find is exact (a later one
+ * only leaves less room for what follows), so each literal is searched for
+ * once, in order: no backtracking, whatever a row holds.
+ */
+function spells(literals: readonly string[], text: string): boolean {
+  const first = literals[0] ?? ''
+  if (literals.length === 1) return first === text
+  const last = literals[literals.length - 1] ?? ''
+  if (!text.startsWith(first)) return false
+  let at = first.length
+  for (let i = 1; i < literals.length - 1; i++) {
+    const literal = literals[i] ?? ''
+    const found = text.indexOf(literal, at + 1)
+    if (found === -1) return false
+    at = found + literal.length
+  }
+  return text.length - last.length >= at + 1 && text.endsWith(last)
+}
 
 /**
- * The repository part of a path as a pattern, read as matchRoute reads it,
- * without case: its text exactly, but for each span the redaction pass
- * censored, which stands for one or more repository characters. No
- * credential shape the pass censors matches a slash in a path (the two that
- * may hold one need a space first), and none runs on into a `.git` after it
- * (EGRESS_TOKEN_PATTERNS), so a censored span stays inside the owner or the
- * name, and the slash between them and a `.git` after the name survive it.
+ * Whether the repository part of a path spells `repo` (lower-case
+ * owner/name), as matchRoute reads it, without case: its text exactly, but
+ * for each span the redaction pass censored, which stands for one or more
+ * characters. No credential shape the pass censors matches a slash in a path
+ * (the two that may hold one need a space first), and none runs on into a
+ * `.git` after it (EGRESS_TOKEN_PATTERNS), so a censored span stays inside the
+ * owner or the name, and the slash between them and a `.git` after the name
+ * survive it: owner and name are spelled apart, each wholly of repository
+ * characters, so a span may stand for any run of them.
  */
-function spelledRepo(named: string): RegExp {
-  const parts = named.split(EGRESS_CENSOR).map((part) => part.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'))
-  return new RegExp(`^${parts.join(REPO_CHARACTERS)}$`, 'i')
+function spellsRepo(named: string, repo: string): boolean {
+  const parts = named.split('/')
+  const slash = repo.indexOf('/')
+  if (parts.length !== 2 || slash === -1) return false
+  const literals = (part: string): string[] => part.split(EGRESS_CENSOR).map((literal) => literal.toLowerCase())
+  return spells(literals(parts[0] ?? ''), repo.slice(0, slash)) && spells(literals(parts[1] ?? ''), repo.slice(slash + 1))
 }
 
 /**
@@ -975,14 +1028,16 @@ function spelledRepo(named: string): RegExp {
  * it, without case and with an optional `.git`; the rest is compared exactly.
  * A span the redaction pass censored no longer spells what it held, so it is
  * read as any run of repository characters, and what survived the censor is
- * still compared: `/evil/[REDACTED]/info/refs` is no path of op/fixture.
+ * still compared: `/evil/[REDACTED]/info/refs` is no path of op/fixture, and
+ * `/op/x[REDACTED]/info/refs` none of op/x, the span standing for no `.git`.
  */
 function isRouteOf(reason: string, method: string, path: string, repo: string): boolean {
   return (ROUTE_SHAPES.get(reason) ?? []).some((shape) => {
     const start = `${shape.before}/`
     if (method !== shape.method || !path.startsWith(start) || !path.endsWith(shape.after)) return false
-    const spelled = spelledRepo(path.slice(start.length, path.length - shape.after.length))
-    return spelled.test(repo) || (shape.git && spelled.test(`${repo}.git`))
+    const named = path.slice(start.length, path.length - shape.after.length)
+    // A `.git` survives the censor (spellsRepo), so it is read as text, never as what a span stood for.
+    return spellsRepo(named, repo) || (shape.git && named.toLowerCase().endsWith('.git') && spellsRepo(named.slice(0, -4), repo))
   })
 }
 
@@ -1003,16 +1058,39 @@ function isRouteOf(reason: string, method: string, path: string, repo: string): 
  * the host, the method and the binding. At most PROXY_DENY_KEYS_PER_SECOND
  * keys are kept per grant per second; past them, the rest of that second's
  * denies are counted on overflow rows (`overflow: true`), one per reason and,
- * for not-a-host, one per host refusal. An overflow row names its reason, its
- * count and a not-a-host deny's host refusal, nothing else, and says so in
- * PROXY_OVERFLOW_WHY. parseTarget reads the host before the port, so a
- * loopback probe is not-a-host whatever port it names (192.168.5.2:8766,
- * 192.168.5.2:7777 and host.lima.internal:8766 as well as 192.168.5.2), and
- * only an egress host on a wrong port is a port deny, which names that host.
- * Among a flood of other denies a probe is therefore its own row, or a count
- * under not-a-host and its own host refusal (ip-literal for 192.168.5.2,
- * special-use for host.lima.internal), never a count under another host's,
- * and never one a typo shares.
+ * for a reason PROXY_DENIES_BY_HOST_REFUSAL names, one per host refusal. An
+ * overflow row names its reason, its count and that host refusal, nothing
+ * else, and says so in PROXY_OVERFLOW_WHY. parseTarget reads an
+ * absolute-form target's host before the rest of it (its length, its
+ * characters, a fragment, the port and the path), so a loopback probe in the
+ * absolute form it reads (http:// or https://, lower-case) is not-a-host
+ * whatever port it names and whatever follows its host (192.168.5.2:8766, 192.168.5.2:7777 and host.lima.internal:8766 as
+ * well as 192.168.5.2, with a path or none, a fragment, or past MAX_TARGET:
+ * http://192.168.5.2:8766/mcp#x is ip-literal), and only an egress host on a
+ * wrong port is a port deny, which names that host. A CONNECT (the spelling an
+ * HTTPS client under HTTPS_PROXY uses) is use-route, and a target with
+ * userinfo second-host; each names the host its authority names past any
+ * userinfo or, when that is none, host.ts's reason
+ * (PROXY_DENIES_BY_HOST_REFUSAL): CONNECT 192.168.5.2:8766 is a use-route deny
+ * with hostRefusal ip-literal, CONNECT github.com:443 one with host
+ * github.com. Among a flood of other denies a probe is therefore its own row,
+ * or a count under its reason and its own host refusal (ip-literal for
+ * 192.168.5.2, special-use for host.lima.internal), never a count under
+ * another host's, and never one a typo or a tunnel to a real host shares. Two
+ * requests name no destination, so the row says only that such a request was
+ * refused. A target deny: a target that is not absolute form as parseTarget
+ * reads it (origin-form, whose Host header alone names a host; an upper-case
+ * scheme), in which nothing is read as a host, or one in absolute form whose
+ * host is an egress host and whose text no request line holds (a fragment, a
+ * character outside printable ASCII, more than MAX_TARGET:
+ * http://registry.npmjs.org/react#readme), a typo of a real host, never a
+ * probe. And a CONNECT whose target is no authority (CONNECT
+ * http://192.168.5.2:8766/, or 192.168.5.2:8766/ with its slash), a use-route
+ * deny with neither host nor host refusal (routes.ts namedHost). A target with
+ * no path after its host is no such request: parseTarget reads it with path /
+ * (http://github.com, http://github.com?x), and its authority ends at a
+ * `#`, so http://github.com#x is a target deny (its host an egress host) and
+ * http://192.168.5.2:8766#x not-a-host.
  *
  * `stage: 'upstream'` is the upstream's refusal of a request decide() allowed:
  * it follows that request's allow row, keeps its allow reason and fields,
@@ -1037,8 +1115,11 @@ function isRouteOf(reason: string, method: string, path: string, repo: string): 
  * route one of its profile's shapes (ROUTE_SHAPES) on the repository it
  * names. A deny names at most what decide() had read when it stopped: no host
  * before the host (PROXY_DENIES_BEFORE_HOST; a not-a-host deny says why in
- * `hostRefusal`), no path before the path (PROXY_DENIES_BEFORE_PATH), a
- * binding only past a bound route (PROXY_DENIES_ON_A_ROUTE), and never a
+ * `hostRefusal`, as a use-route or second-host deny does when the host it
+ * named was none, never beside a host), no path before the path
+ * (PROXY_DENIES_BEFORE_PATH), a binding only past a bound route
+ * (PROXY_DENIES_ON_A_ROUTE), a CONNECT only as use-route (or malformed, when
+ * the grant did not parse), and never a
  * repository, which an EgressDenied does not carry (its path, when kept,
  * spells the one asked for). A binding is found only from a host, and a
  * service is the query of a path. An uncut, uncensored path is `pathBytes`
@@ -1081,7 +1162,7 @@ export const ProxyDecisionPayload = z
     const allowed = isAllowReason(row.reason)
     const policyDeny = row.stage === 'policy' && row.verdict === 'deny'
     const overflow = row.overflow === true
-    const notAHost = row.stage === 'policy' && row.reason === 'not-a-host'
+    const notAHost = policyDeny && row.reason === 'not-a-host'
 
     if (row.stage === 'policy') {
       if (row.verdict === 'allow' && !allowed) issue('a policy allow names one of the reasons decide() allows for')
@@ -1112,26 +1193,38 @@ export const ProxyDecisionPayload = z
       // Stated for itself: an allow or an upstream row always names its host,
       // method and path, so the check beneath refuses one as well.
       if (!policyDeny) issue('only a policy deny overflows')
-      // Its key is the reason, and a not-a-host deny's host refusal, which the
-      // rules beneath require there and refuse elsewhere: both closed lists.
-      // A repository no deny names (beneath).
+      // Its key is the reason, and the host refusal of a reason
+      // PROXY_DENIES_BY_HOST_REFUSAL names, which the rules beneath require
+      // for not-a-host and refuse for every other reason: closed lists. A
+      // repository no deny names (beneath).
       const named = [row.method, row.host, row.path, row.pathBytes, row.queryBytes, row.service, row.bindingId]
-      if (named.some((field) => field !== undefined)) issue("an overflow row names its reason, its count and a not-a-host deny's host refusal alone")
+      if (named.some((field) => field !== undefined)) issue('an overflow row names its reason, its count and, where its reason is keyed by one, its host refusal alone')
       if (row.why !== PROXY_OVERFLOW_WHY) issue('an overflow row says what it counted by, in PROXY_OVERFLOW_WHY')
     }
 
     // A host that was none, a binding found from a host, and an answer that was refused.
-    if (row.hostRefusal !== undefined && !(row.stage === 'policy' && row.reason === 'not-a-host')) {
-      issue('hostRefusal says why a not-a-host deny read no host')
+    if (row.hostRefusal !== undefined && !(policyDeny && isByHostRefusal(row.reason))) {
+      issue("hostRefusal says why the host a not-a-host, use-route or second-host deny named was none")
     }
+    if (row.hostRefusal !== undefined && row.host !== undefined) issue('a deny names the host it read or why it read none, never both')
     if (notAHost && row.hostRefusal === undefined) issue("a not-a-host deny says why the target's host was none, on an overflow row too")
+    // decide() denies a CONNECT use-route before it reads anything else, so a
+    // CONNECT row is use-route, or malformed (a grant that does not parse is
+    // judged first); and a use-route row is a CONNECT, its method as written
+    // kept when it is METHOD_SHAPE's.
+    if (policyDeny && row.method === 'CONNECT' && row.reason !== 'use-route' && row.reason !== 'malformed') {
+      issue('a CONNECT is denied use-route, or malformed when nothing could be judged')
+    }
+    if (row.reason === 'use-route' && row.method !== undefined && row.method !== 'CONNECT') issue('a use-route deny is a CONNECT')
     // What a deny had read when its reason stopped decide() (PROXY_DENIES_*).
     // An upstream row keeps its allow's fields, so only a policy deny is held here.
     if (policyDeny) {
       if (isBeforeHost(row.reason) && row.host !== undefined) {
-        issue('a deny decide() gives before it reads a host names none: a CONNECT, a target it cannot read, a host that is none')
+        issue('a deny decide() gives before it reads a host names none: a target it cannot read, a host that is none')
       }
-      if (isBeforePath(row.reason) && row.path !== undefined) issue('a deny decide() gives before it reads a path names none: parseTarget refuses the port before the path')
+      if (isBeforePath(row.reason) && row.path !== undefined) {
+        issue("a deny decide() gives before it reads a path names none: a CONNECT's authority has none, and parseTarget refuses the port before the path")
+      }
       if (row.bindingId !== undefined && !isOnARoute(row.reason)) issue('a deny names a binding only for a reason decide() gives past a bound route')
       if (row.repo !== undefined) issue('a deny names no repository: decide() denies with none, and the path, when kept, spells the one asked for')
     }

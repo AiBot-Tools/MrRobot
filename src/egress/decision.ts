@@ -13,7 +13,14 @@
 //     copy, a structural clone, a JSON round-trip, a Proxy and
 //     Object.create(EgressAllow.prototype) all fail EgressAllow.is. The
 //     instance, the class and its prototype are frozen, so neither the fields
-//     the upstream checks nor `is` itself can be replaced after the fact.
+//     the upstream checks nor `is` itself can be replaced after the fact. The
+//     brand is on the instance before the constructor's body runs, so
+//     nothing may run a caller's code there before the key is checked: every
+//     public field is assigned in the body after the check, none by an
+//     initializer, which under [[Set]] semantics for class fields
+//     (useDefineForClassFields false, the default below ES2022) would call a
+//     setter that Reflect.construct's newTarget put on the prototype, handing
+//     it a branded, unfrozen instance.
 //   * Which request it is for: the host and port, the method and path, the
 //     Content-Type and Content-Encoding the request was sent with (each as
 //     decide() read it, or none), and the body as decide() saw it (none, a
@@ -40,6 +47,13 @@
 //     is sent, and test/egress-policy.test.ts is where that is caught.
 //   * Anything about the bytes past the leading ones decide() judged (a
 //     push's pack), which nothing read.
+//   * Anything about the headers but the two content ones. Some of what
+//     decide() judges is in headers (an override header, the framing, a
+//     second Host), and the upstream sends whatever head the session hands
+//     it, checking only the content headers and its own (upstream.ts
+//     UPSTREAM_OWNED_HEADERS). That the head sent is the one decide() judged,
+//     stripped, is the session's to get right: it hands decide() and the
+//     upstream the same record (session.ts headerRecord).
 //   * Who called mintEgressAllow. Nothing at run time can say; a hygiene
 //     test pins the files that name mintEgressAllow and the files that import
 //     this module, because the guarantee is only as good as that list: this
@@ -95,7 +109,8 @@ export class EgressAllow {
   /** Private, so freezing the instance leaves it writable: set by spend(), never cleared. */
   #spent = false
   readonly #leading: Uint8Array | undefined
-  readonly verdict = 'allow' as const
+  /** Assigned in the body after the key check, never by an initializer (the header says why). */
+  readonly verdict: 'allow'
   readonly host: EgressHost
   readonly port: number
   readonly method: string
@@ -129,6 +144,7 @@ export class EgressAllow {
       leading = given === undefined || given.length === 0 ? undefined : new Uint8Array(given)
     }
     this.#leading = leading
+    this.verdict = 'allow'
     this.host = host
     this.port = port
     this.method = method

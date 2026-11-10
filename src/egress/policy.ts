@@ -11,13 +11,30 @@
 // field of it is attacker-chosen text, read once and parsed, never trusted:
 //
 //   * A CONNECT is denied 'use-route', whatever it names: egress has no
-//     tunnel mode, and a tunnel's bytes are opaque to every check below.
-//   * The target must be absolute-form, its host an EgressHost, its port none
-//     or 443, its path one spelling (routes.ts parseTarget), judged in that
-//     order: a target whose host is none is 'not-a-host' whatever port it
-//     names, and a deny for the port or the path names the host it read. A
-//     Host header naming another host, or userinfo, is a second host.
-//   * The body's framing is read from the headers as node:http read it: one
+//     tunnel mode, and a tunnel's bytes are opaque to every check below. The
+//     deny names the host its authority names, or host.ts's reason it is none
+//     (routes.ts namedHost), so a CONNECT to 192.168.5.2:8766, the spelling an
+//     HTTPS client under HTTPS_PROXY uses, is recorded as a probe of an
+//     address, apart from a CONNECT to a real host.
+//   * The target must be absolute-form, its host an EgressHost, its text what
+//     a request line holds, its port none or 443, its path one spelling
+//     (routes.ts parseTarget), judged in that order: a target whose host is
+//     none is 'not-a-host' whatever port it names and whatever follows its
+//     host (a fragment, a character no request line has, a length past
+//     MAX_TARGET), and a deny for the port or the path names the host it
+//     read. A Host header naming another host, or userinfo, is a second host;
+//     a userinfo deny names the host past the userinfo, or why it is none, as
+//     a CONNECT's does. Only then is the method read, a token of upper-case
+//     letters, so a deny for it names the host too. A target that is not
+//     absolute-form (origin-form, an upper-case scheme) is 'target', and names
+//     no host: nothing in it is read as one. So is one whose host is an
+//     egress host and whose text holds a fragment, a character no request
+//     line has or more than MAX_TARGET: a 'target' row names no host, and is
+//     never a probe of a host that is none.
+//   * Every header is read under one name however it is spelt
+//     (canonicalHeaderName: `Content_Encoding` and `content.encoding` are
+//     Content-Encoding), as a backend that folds names reads it. The body's
+//     framing is read from the headers as node:http read it: one
 //     Content-Length, or Transfer-Encoding: chunked, never both, never two.
 //     Content-Type and Content-Encoding are each sent once or not at all.
 //   * A header that asks a host to act on another method or path than the
@@ -76,6 +93,7 @@ import {
   matchRoute,
   MAX_COMMAND_LIST,
   MAX_PULLS_BODY,
+  namedHost,
   parseTarget,
   RepoSlug,
   ROUTE_REFUSALS,
@@ -189,11 +207,11 @@ export interface EgressDenied {
   readonly reason: DenyReason
   /** A clause; never holds the input. */
   readonly why: string
-  /** The target's host, once it read as one. */
+  /** The target's host, once it read as one (never on a 'target' deny); a CONNECT's, or a userinfo target's past the userinfo (routes.ts namedHost). */
   readonly host: EgressHost | undefined
   /** The route the request reached, once one did. */
   readonly bindingId: string | undefined
-  /** host.ts's reason, for 'not-a-host'. */
+  /** host.ts's reason the host was none: always for 'not-a-host', and for a 'use-route' or 'second-host' whose host namedHost refused. Never beside a host. */
   readonly hostRefusal: HostRefusal | undefined
 }
 
@@ -234,7 +252,25 @@ type HeadVerdict =
 
 const denied = (decision: EgressDenied): HeadVerdict => ({ kind: 'decided', decision })
 
-/** The worker's headers, by lower-case name, each with every value it was sent; none when the record is no headers. */
+/**
+ * A header's name as a host may read it: lower case, and every character but
+ * a letter or a digit a hyphen. node:http's parser keeps any token as a name,
+ * and many backends fold names into one variable (Rack's and Puma's HTTP_*,
+ * which read `X_HTTP_Method_Override` as the override header,
+ * CVE-2024-45614's class; a CGI gateway, whose git-http-backend reads
+ * HTTP_CONTENT_ENCODING for `Content_Encoding` or `Content.Encoding`), so a
+ * name decide() did not read as one header is one there. decide() reads every
+ * header under this name, so an alias is the same header to the override
+ * check, to the framing, to the content headers and to sending one twice;
+ * the session strips by it too (session.ts). An alias that reaches an allow
+ * (a lone `Content_Type`) is refused by the upstream, which compares the
+ * content headers by their own names and so finds the judged one missing.
+ */
+export function canonicalHeaderName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, '-')
+}
+
+/** The worker's headers, by canonical name (canonicalHeaderName), each with every value sent under any spelling of it; none when the record is no headers. */
 function readHeaders(given: unknown): ReadonlyMap<string, readonly string[]> | undefined {
   // An array is rawHeaders' shape, name and value in turn: no record of names.
   if (typeof given !== 'object' || given === null || Array.isArray(given)) return undefined
@@ -245,8 +281,8 @@ function readHeaders(given: unknown): ReadonlyMap<string, readonly string[]> | u
     else if (value === undefined) continue
     else if (Array.isArray(value) && value.every((v): v is string => typeof v === 'string')) values = [...value]
     else return undefined
-    const lower = name.toLowerCase()
-    headers.set(lower, [...(headers.get(lower) ?? []), ...values])
+    const canonical = canonicalHeaderName(name)
+    headers.set(canonical, [...(headers.get(canonical) ?? []), ...values])
   }
   return headers
 }
@@ -420,12 +456,14 @@ function judgeHead(grant: unknown, method: unknown, target: unknown, headersGive
   if (!parsedGrant.success) return denied(deny('malformed', 'the grant is not one EgressGrant reads'))
   if (typeof method !== 'string' || typeof target !== 'string') return denied(deny('malformed', 'the method or the target is not text'))
   if (method.toUpperCase() === 'CONNECT') {
-    return denied(deny('use-route', 'egress opens no tunnel: a request is sent in absolute form and routed'))
+    // Where it was headed, for the row: a probe of the Mac's loopback is told from a tunnel to a real host.
+    return denied(deny('use-route', 'egress opens no tunnel: a request is sent in absolute form and routed', namedHost(target)))
   }
-  if (!/^[A-Z]{1,16}$/.test(method)) return denied(deny('method', 'the method is not an upper-case token'))
   const parsed = parseTarget(target)
   if (!parsed.ok) return denied(deny(parsed.reason, parsed.why, { host: parsed.host, hostRefusal: parsed.hostRefusal }))
   const host = parsed.host
+  // After the target, so a deny for the method names where the request was headed.
+  if (!/^[A-Z]{1,16}$/.test(method)) return denied(deny('method', 'the method is not an upper-case token', { host }))
   const headers = readHeaders(headersGiven)
   if (headers === undefined) return denied(deny('malformed', 'the headers are not a record of text', { host }))
   if (!sameHost(headers, parsed)) return denied(deny('second-host', 'the Host header names another host or port than the target', { host }))

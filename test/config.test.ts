@@ -1030,6 +1030,19 @@ test('an egress binding: Bearer or Basic (x-access-token unless it names a user)
   for (const basicUser of ['', 'x:y', 'x y', '-x', 'x\n', 'é']) {
     invalid(() => parse(withBindings({ git: binding({ basicUser }) })), `basicUser ${JSON.stringify(basicUser)}`)
   }
+  // A token written as the user (the https://<token>@github.com habit) is a
+  // secret in a committed file: refused, naming the key and never the value.
+  for (const basicUser of [`ghp_${'a1'.repeat(18)}`, `gho_${'B2'.repeat(18)}`, 'sk-abcdefghijklmnop', 'xoxb-111111111111', 'AKIAABCDEFGHIJKLMNOP']) {
+    const message = invalid(() => parse(withBindings({ git: binding({ basicUser }) })), `basicUser in a credential's shape ${basicUser.slice(0, 4)}`)
+    assert.match(message, /the basicUser is in the shape of a credential: kernel\.yaml is committed and holds no secrets/)
+    assert.match(message, /"git",\s*"basicUser"/)
+    assert.equal(message.includes(basicUser), false, 'the refusal echoes the value')
+  }
+  // A user name is kept, the shipped default and a bot's alike.
+  for (const basicUser of ['x-access-token', 'aos-bot', 'ghp', 'sk-short']) {
+    const kept = parse(withBindings({ git: binding({ basicUser }) })).egress.bindings['git']
+    assert.equal(kept?.scheme === 'Basic' ? kept.basicUser : undefined, basicUser)
+  }
   for (const scheme of ['none', 'bearer', 'Token', 'Digest', undefined]) {
     const message = invalid(() => parse(withBindings({ git: binding({ scheme }) })), `scheme ${String(scheme)}`)
     assert.match(message, /scheme is Bearer or Basic/, String(scheme))

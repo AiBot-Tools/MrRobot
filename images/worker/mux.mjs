@@ -108,8 +108,10 @@
 // the first: node resumes the command's pipes itself once the command exits
 // (child_process's flushStdio), so a pause made once does not hold. So it
 // buffers at most one stdin chunk, and beyond stdout's high-water mark at
-// most one chunk from each flow's socket and each of the command's pipes
-// (and its own small frames), whatever either end sends.
+// most one chunk from each source (each flow's socket, each of the
+// command's pipes) each time that source is resumed, node resuming the
+// pipes once more at the exit (and its own small frames), whatever either
+// end sends.
 //
 // The end. When the command exits, its process group is killed, and its exit
 // status is sent once its stdout and stderr have closed (an exit frame: the

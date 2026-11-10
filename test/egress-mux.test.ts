@@ -67,6 +67,7 @@ import {
 import { EgressGrant } from '../src/egress/policy.js'
 import { createEgressSession, type SessionLimits } from '../src/egress/session.js'
 import { createUpstream } from '../src/egress/upstream.js'
+import { differential, type WalkMove } from './helpers/frame-order.js'
 import { withStore } from './helpers/store.js'
 
 const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '')
@@ -330,6 +331,30 @@ test('it matches src/egress/frame.ts on the shared vectors', () => {
   }
   assert.deepEqual([...met.receive].sort(), [...MUX_MEETS.receive].sort(), 'receive')
   assert.deepEqual([...met.send].sort(), [...MUX_MEETS.send].sort(), 'send')
+})
+
+/** An inline-codec end moved along a walk's path: each send sent, each receive decoded, none refused. */
+function muxEndAt(path: readonly WalkMove[]): mux.MuxChannel {
+  const channel = new mux.MuxChannel()
+  for (const move of path) {
+    const f = { type: move.type, flow: move.flow, payload: move.payload }
+    if (move.side === 'send') channel.send(f)
+    else {
+      const { error } = channel.receive(mux.encodeFrame(f))
+      if (error !== undefined) throw new Error(`the walk's path was refused: ${error.message}`)
+    }
+  }
+  return channel
+}
+
+test('the inline codec refuses every probe, in every state the walk reaches, each way, by the first rule the evaluator finds it breaks', () => {
+  // The same evaluator and walk frame.ts is held to (test/helpers/frame-order.ts):
+  // the vectors carry one witness for each place two rules meet, and the
+  // inline copy reaches a pair along its own code paths, so every probe frame
+  // at every state a mux end can reach is held to the first rule broken.
+  const { states, checks, mismatches } = differential('mux', muxEndAt)
+  assert.deepEqual(mismatches, [], 'the inline codec and the evaluator disagree')
+  assert.ok(states > 100 && checks > 10_000, `${String(states)} states, ${String(checks)} checks`)
 })
 
 test("the inline codec agrees with frame.ts's mux end on random conversations, received in random pieces", () => {
@@ -617,6 +642,8 @@ interface RunOptions {
   readonly flushTimeoutMs?: number
   readonly exitGraceMs?: number
   readonly exitGraceMaxMs?: number
+  /** Pass none of flushTimeoutMs, exitGraceMs and exitGraceMaxMs, so the mux runs on its own bounds, as the image does. */
+  readonly ownBounds?: boolean
 }
 
 interface Run {
@@ -654,10 +681,14 @@ function start(o: RunOptions = {}): Run {
     connect: o.connect ?? NO_ROUTE,
     lookup: o.lookup ?? NO_DNS,
     probeTimeoutMs: o.probeTimeoutMs ?? 1_000,
-    flushTimeoutMs: o.flushTimeoutMs ?? 1_000,
-    exitGraceMs: o.exitGraceMs ?? 1_000,
-    // Past every wait below: a test that reaches it names its own.
-    exitGraceMaxMs: o.exitGraceMaxMs ?? 10_000,
+    ...(o.ownBounds === true
+      ? {}
+      : {
+          flushTimeoutMs: o.flushTimeoutMs ?? 1_000,
+          exitGraceMs: o.exitGraceMs ?? 1_000,
+          // Past every wait below: a test that reaches it names its own.
+          exitGraceMaxMs: o.exitGraceMaxMs ?? 10_000,
+        }),
     listen:
       o.listen ??
       ((host, port, onConnection) => {
@@ -1010,6 +1041,59 @@ test("the grace's clock runs on from where it stopped: a descendant that fills s
   const waited = Date.now() - exitedAt
   assert.ok(waited < 2_000, `the status crossed ${String(waited)} ms after the exit`)
   assert.deepEqual([...(kernel.of('exit')[0]?.payload ?? [])], [0])
+  assert.equal(await exits(run.done), mux.MUX_EXIT.ok)
+  assert.equal(kernel.error, undefined)
+
+  // And from where it stopped, not from nothing: a stopped clock keeps what
+  // it had left, so after a drain the grace runs on, and a descendant's
+  // output written then still crosses. A slow kernel costs no output.
+  const kept = await running({ exitGraceMs: 400, outputHighWaterMark: 16 })
+  kept.child.exitHeld(0)
+  await ticks()
+  kept.kernel.fromMux.hold()
+  kept.child.stderr.write('0123456789abcdef')
+  await sleep(100)
+  kept.kernel.fromMux.release()
+  await sleep(100)
+  assert.deepEqual([kept.child.stdout.destroyed, kept.child.stderr.destroyed], [false, false], 'the grace ended at the drain: the stopped clock lost what it had left')
+  kept.child.stderr.write('after the drain\n')
+  await until(() => kept.kernel.of('exit').length === 1, 'the exit frame once the rest of the grace ran')
+  assert.equal(kept.kernel.output('stderr'), '0123456789abcdefafter the drain\n')
+  assert.equal(await exits(kept.done), mux.MUX_EXIT.ok)
+  assert.equal(kept.kernel.error, undefined)
+})
+
+test("the mux's own bounds are the plan's, and a run that names none runs on them: the status crosses EXIT_GRACE_MS after the exit", async () => {
+  // The plan's values (E9 notes, rounds 3 and 4), which W1 and the
+  // kernel's idle and wallclock bounds are reasoned from.
+  assert.deepEqual(
+    { EXIT_GRACE_MS: mux.EXIT_GRACE_MS, EXIT_GRACE_MAX_MS: mux.EXIT_GRACE_MAX_MS, FLUSH_TIMEOUT_MS: mux.FLUSH_TIMEOUT_MS, PROBE_TIMEOUT_MS: mux.PROBE_TIMEOUT_MS },
+    { EXIT_GRACE_MS: 2_000, EXIT_GRACE_MAX_MS: 20_000, FLUSH_TIMEOUT_MS: 5_000, PROBE_TIMEOUT_MS: 2_000 },
+  )
+  // Every test but this one names its own bounds, so the image's fall back to
+  // these by the lines that read them, each to its own constant.
+  const source = readFileSync(new URL('../images/worker/mux.mjs', import.meta.url), 'utf8')
+  for (const line of [
+    'this.#flushTimeoutMs = options.flushTimeoutMs ?? FLUSH_TIMEOUT_MS',
+    'this.#exitGraceMs = options.exitGraceMs ?? EXIT_GRACE_MS',
+    'this.#exitGraceMaxMs = options.exitGraceMaxMs ?? EXIT_GRACE_MAX_MS',
+    'const timeoutMs = options.timeoutMs ?? PROBE_TIMEOUT_MS',
+  ]) {
+    assert.equal(source.split('\n').filter((l) => l.trim() === line).length, 1, line)
+  }
+  // And run on them: the grace holds the status about EXIT_GRACE_MS after the
+  // exit, so a descendant's last output, read in the poll phase after the
+  // timers, is never cut by a grace that ends at once.
+  const run = await running({ ownBounds: true })
+  const { kernel, child } = run
+  const exitedAt = Date.now()
+  child.exitHeld(0)
+  await sleep(100)
+  child.stderr.write('a last word, 100 ms after the exit\n')
+  await until(() => kernel.of('exit').length === 1, 'the exit frame after the grace', 4_000)
+  const waited = Date.now() - exitedAt
+  assert.ok(waited >= 1_900 && waited < 3_000, `the status crossed ${String(waited)} ms after the exit`)
+  assert.equal(kernel.output('stderr'), 'a last word, 100 ms after the exit\n')
   assert.equal(await exits(run.done), mux.MUX_EXIT.ok)
   assert.equal(kernel.error, undefined)
 })

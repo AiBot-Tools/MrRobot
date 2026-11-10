@@ -318,11 +318,14 @@ test('EgressHost refuses every special-use name and every name beneath one', () 
     'host.lima.internal', 'host.docker.internal', 'gateway.docker.internal', 'kubernetes.docker.internal', 'x.internal',
     'localhost.localdomain', 'router.home.arpa', '1.0.0.127.in-addr.arpa', 'b.a.ip6.arpa',
     'x.invalid', 'x.test', 'duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion', 'x.alt',
+    // The router and private-network conventions, whose names a home router answers with LAN addresses.
+    'router.lan', 'nas.home', 'x.corp', 'wiki.intranet', 'db.private', 'localhost6.localdomain6', 'intranet', 'HOME.',
   ]) {
     refusedAs(input, 'special-use')
   }
+  for (const suffix of ['lan', 'home', 'corp', 'intranet', 'private', 'localdomain6']) assert.ok(SPECIAL_USE.includes(suffix), suffix)
   // A special-use word inside a public name is just a label.
-  for (const host of ['localhost.example.com', 'local.example.com', 'internal.github.com', 'test.github.com', 'internalx.com', 'xlocal.com']) {
+  for (const host of ['localhost.example.com', 'local.example.com', 'internal.github.com', 'test.github.com', 'internalx.com', 'xlocal.com', 'home.example.com', 'lan.example', 'homes.example', 'private.example.org']) {
     admittedAs(host, host)
   }
 })
@@ -434,11 +437,18 @@ const PURE_IMPORTS: Readonly<Record<string, readonly string[]>> = {
  * it, with no import at all: the process object (env, getBuiltinModule,
  * binding), the global object under both its names, fetch, WebSocket and
  * XMLHttpRequest, require, and eval, Function and `constructor`, which reaches
- * Function from any value (`[].constructor.constructor('return process')`).
+ * Function from any value (`[].constructor.constructor('return process')`);
+ * and Reflect and the prototype accessors (getPrototypeOf, `__proto__`,
+ * getOwnPropertyDescriptor(s), getOwnPropertyNames), which reach it from any
+ * function without naming `constructor` as a word.
  */
 const IMPURE_NAMES: ReadonlySet<string> = new Set([
   'process', 'globalThis', 'global', 'fetch', 'require', 'eval', 'Function', 'WebSocket', 'XMLHttpRequest', 'constructor',
+  'Reflect', 'getPrototypeOf', '__proto__', 'getOwnPropertyDescriptor', 'getOwnPropertyDescriptors', 'getOwnPropertyNames',
 ])
+
+/** An impure name as a word of a string: not inside a longer name, nor a hyphenated one ('not-global-unicast' is clean). */
+const IMPURE_WORDS: readonly RegExp[] = [...IMPURE_NAMES].map((name) => new RegExp(`(?<![\\w$-])${name}(?![\\w$-])`))
 
 /**
  * What a file does that a pure module may not, read from its syntax tree
@@ -451,10 +461,14 @@ const IMPURE_NAMES: ReadonlySet<string> = new Set([
  * identifier in IMPURE_NAMES wherever it stands (a destructuring of process,
  * `fetch ('...')` with a space, a property named `constructor`), import.meta,
  * and any string in code that spells one of those names or a `node:` module,
- * the way `x['constructor']` reaches one with no identifier. A tripwire for
- * natural code, not a proof: a name built from parts is beyond any static
- * scan, but with every way to a loader or the global object refused, it has
- * nothing to be looked up on.
+ * or holds one as a word ('return process'), the way `x['constructor']`
+ * reaches one with no identifier. A property looked up by a name built at run
+ * time (`isIP['constr' + 'uctor']`) and a computed key are offences too:
+ * every way to a loader or the global object by name is refused, but Function
+ * stays reachable from any function value a pure module holds (isIP,
+ * BlockList, z) through its prototype chain, and a name built from parts
+ * looks it up with no name at all. A tripwire for natural code, not a proof:
+ * a reviewer reads by eye what no static scan can.
  */
 function impurities(path: string, text: string): { readonly offences: string[]; readonly imported: string[] } {
   const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
@@ -490,8 +504,12 @@ function impurities(path: string, text: string): { readonly offences: string[]; 
     if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) offence(node, 'imports a module at run time')
     if (ts.isMetaProperty(node)) offence(node, 'reads import.meta')
     if (ts.isIdentifier(node) && IMPURE_NAMES.has(node.text)) offence(node, `names ${node.text}`)
+    if (ts.isElementAccessExpression(node) && !ts.isStringLiteralLike(node.argumentExpression) && !ts.isNumericLiteral(node.argumentExpression)) {
+      offence(node, 'looks a property up by a name built at run time')
+    }
+    if (ts.isComputedPropertyName(node)) offence(node, 'names a property by a computed key')
     const spelled = ts.isStringLiteralLike(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node)
-    if (spelled && (IMPURE_NAMES.has(node.text) || node.text.startsWith('node:'))) offence(node, `spells ${node.text}`)
+    if (spelled && (IMPURE_WORDS.some((word) => word.test(node.text)) || node.text.startsWith('node:'))) offence(node, `spells ${node.text}`)
     ts.forEachChild(node, visit)
   }
   visit(source)
@@ -547,6 +565,21 @@ test('the purity scan finds every way a module reaches I/O: another module or na
     "new XMLHttpRequest()",
     "export const here = import.meta.url",
     'const m = `node:${"fs"}`',
+    // A builtin by its bare name, which only the import() and import-type
+    // branches catch: no string here spells node: or an impure name.
+    "const fs = await import('fs')",
+    "type F = typeof import('fs')",
+    // Function, reached from an allowlisted import through its prototype chain
+    // by a name built at run time: each form is caught by one rule alone.
+    "import { isIP } from 'node:net'\nReflect.get(Object.getPrototypeOf(isIP), 'constr' + 'uctor')('return process')()",
+    "import { isIP } from 'node:net'\nconst F = isIP['constr' + 'uctor']",
+    "import { isIP } from 'node:net'\nconst keys = Reflect.ownKeys(isIP)",
+    "import { isIP } from 'node:net'\nconst p = Object.getPrototypeOf(isIP)",
+    "import { isIP } from 'node:net'\nconst p = isIP.__proto__",
+    "import { isIP } from 'node:net'\nconst d = Object.getOwnPropertyDescriptors(isIP)",
+    "const o = { ['constr' + 'uctor']: 1 }",
+    "const code = 'return process.versions.node'",
+    "const code = 'return globalThis'",
   ]
   for (const form of reaches) assert.notDeepEqual(impurities('probe.ts', form).offences, [], form)
 
@@ -560,6 +593,9 @@ test('the purity scan finds every way a module reaches I/O: another module or na
     "const reason = 'not-global-unicast' // process.env, fetch(), require('node:fs')\n/* globalThis, import('node:fs') */",
     "export const GLOBAL_UNICAST = '2000::/3'\nconst processed = 1, fetched = 2, globals = [processed, fetched]",
     'const why = `holds a character no ${"hostname"} has`',
+    // A word inside a hyphenated reason or a longer word, and an index or a key by literal.
+    "const why = 'a not-global-unicast answer, processed as required'",
+    "const parts = ['a', 'b']\nconst first = parts[0]\nconst o = { 'k': 1 }\nconst v = o['k']",
   ]
   for (const form of clean) assert.deepEqual(impurities('probe.ts', form).offences, [], form)
   assert.deepEqual(impurities('probe.ts', clean[0] ?? '').imported, ['node:net BlockList', 'node:net isIPv4', 'node:net isIPv6'])

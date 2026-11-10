@@ -62,7 +62,9 @@
 //   * One request, framed here. Host is the decided host, Connection is
 //     close, and the body's framing is the upstream's: a head that names
 //     Host, Connection, Content-Length, Transfer-Encoding, any other
-//     hop-by-hop header or one header twice in two cases is refused, as are a
+//     hop-by-hop header, Expect (node:http writes a head naming it at once,
+//     before the body is held to what decide() judged) or one header twice
+//     in two cases is refused, as are a
 //     method that is not an upper-case token or is CONNECT and a path that is
 //     not origin-form. Every body passes through a gate that takes bytes
 //     only, so an objectMode body's object fails the request as a stream
@@ -187,15 +189,20 @@ export const UPSTREAM_REFUSALS_AFTER_SEND = Object.freeze(['head', 'aborted', 'u
 
 /**
  * Headers the upstream sets itself (host, connection, and the body's framing,
- * content-length and transfer-encoding) and the other hop-by-hop headers: a
- * head that names one, in any case, is refused rather than having it dropped,
- * so a caller that forgot to strip one learns it. Frozen: read on every
- * request.
+ * content-length and transfer-encoding), the other hop-by-hop headers, and
+ * Expect: node:http writes the whole head the moment a request naming Expect
+ * is made (ClientRequest's _storeHeader sends it at once, to wait for the
+ * 100), before a byte of the body has been held to the leading bytes decide()
+ * judged, so a push whose command list differs would reach the host head
+ * first. A head that names one, in any case, is refused rather than having it
+ * dropped, so a caller that forgot to strip one learns it (the session strips
+ * Expect). Frozen: read on every request.
  */
 export const UPSTREAM_OWNED_HEADERS: readonly string[] = Object.freeze([
   'host',
   'connection',
   'content-length',
+  'expect',
   'keep-alive',
   'proxy-connection',
   'proxy-authenticate',
@@ -367,7 +374,9 @@ function refused(
  * case and bounded, as ETIMEOUT, ECONNREFUSED and CERT_HAS_EXPIRED are.
  * proxy.decision's `code` takes exactly this shape (src/events/types.ts
  * EGRESS_ERROR_CODE, held equal by test/events-types.test.ts), so every code
- * passed on can be recorded.
+ * passed on has a row's shape; one in a credential's shape (an AWS key id is
+ * upper case and twenty characters) is refused there too, as every
+ * identifier a row names is, and no node or OpenSSL code is one.
  */
 export const ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/
 

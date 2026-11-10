@@ -46,6 +46,7 @@ import { networkInterfaces, type NetworkInterfaceInfo } from 'node:os'
 import { duplexPair, PassThrough, Readable, type Duplex } from 'node:stream'
 import { checkServerIdentity, connect as tlsConnect } from 'node:tls'
 import { fileURLToPath } from 'node:url'
+import { runInThisContext } from 'node:vm'
 import ts from 'typescript'
 
 import { addressDenial, carriedAddresses } from '../src/egress/addr.js'
@@ -463,6 +464,50 @@ test('an allow is an EgressAllow decide() minted over one request: frozen with i
   assert.equal(EgressAllow.is({ verdict: 'allow', host: GITHUB, port: 443 }), false)
 })
 
+/**
+ * Construct an EgressAllow without the key, through Reflect.construct with a
+ * newTarget whose prototype has a setter for every public field: what a
+ * caller holding the class (allow.constructor) would try. The instances any
+ * setter was handed, each of them branded if the brand was on it first.
+ */
+function forge(Allow: unknown): unknown[] {
+  const handed: unknown[] = []
+  const Fake = function Fake(): void {} as unknown as { prototype: object }
+  for (const field of ['verdict', 'host', 'port', 'method', 'path', 'content', 'body']) {
+    Object.defineProperty(Fake.prototype, field, {
+      set(this: unknown) {
+        handed.push(this)
+      },
+      configurable: true,
+    })
+  }
+  assert.throws(() => Reflect.construct(Allow as new (...args: unknown[]) => unknown, [Symbol('aos.egressAllow.mint'), { host: GITHUB, port: 443, method: 'GET', path: '/' }], Fake as unknown as new () => unknown), TypeError)
+  return handed
+}
+
+test('an allow cannot be captured half-made: no caller code runs before the key is checked, whichever semantics class fields compile to', () => {
+  // As the kernel runs it (tsconfig's target, define semantics).
+  assert.deepEqual(forge(EgressAllow), [])
+  // As it would compile with [[Set]] semantics for class fields
+  // (useDefineForClassFields false, the default below ES2022): a field with
+  // an initializer becomes an assignment in the constructor, ahead of its
+  // body, which a setter on newTarget's prototype would see on an instance
+  // already branded. Run in this context, so its private brand is checked by
+  // its own `is`.
+  const compiled = ts.transpileModule(readFileSync(`${REPO}/src/egress/decision.ts`, 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, useDefineForClassFields: false },
+  }).outputText
+  const exports: Record<string, unknown> = {}
+  ;(runInThisContext(`(function (exports) {\n${compiled}\n})`) as (exports: Record<string, unknown>) => void)(exports)
+  const Compiled = exports['EgressAllow'] as { is(value: unknown): boolean }
+  const handed = forge(Compiled)
+  assert.deepEqual(handed.filter((value) => Compiled.is(value)), [], 'a setter was handed a branded instance before the key was checked')
+  assert.deepEqual(handed, [])
+  // The compiled module is the real one: it mints an allow its own is() reads.
+  const mint = exports['mintEgressAllow'] as (judged: object) => unknown
+  assert.equal(Compiled.is(mint({ host: GITHUB, port: 443, method: 'GET', path: '/' })), true)
+})
+
 test('decision.ts is pure and takes nothing but the EgressHost type', () => {
   const path = 'src/egress/decision.ts'
   const source = ts.createSourceFile(path, readFileSync(`${REPO}/${path}`, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
@@ -659,6 +704,22 @@ test("a body whose leading bytes decide() judged is sent only if it begins with 
     assert.equal(wire(d), '', `${label}: something was written`)
     assert.equal(w.seen.length, 0, label)
     assert.equal(stream.destroyed, true, label)
+  }
+
+  // A head naming Expect (curl, and so git, sends 100-continue on a large
+  // POST) is one node:http writes whole when the request is made, before a
+  // byte of the body is held to the judged ones: refused as the upstream's
+  // own header, before anything is dialled, so not even the head of a push
+  // whose command list differs reaches the host.
+  for (const name of ['Expect', 'expect']) {
+    const w = world()
+    const stream = Readable.from([Buffer.from(OTHER_COMMANDS + PACK, 'latin1')])
+    const head = { ...PUSH, headers: { ...PUSH.headers, [name]: '100-continue' } }
+    const refusal = refusedAs(await within(name, 2_000, createUpstream(w.deps).request(judged(total), head, { body: { stream, length: total } })), 'head', name)
+    assert.equal(refusal.sent, false, name)
+    assert.deepEqual(w.dialled.map((d) => wire(d)), [], `${name}: something was dialled or written`)
+    assert.equal(w.seen.length, 0, name)
+    assert.equal(stream.destroyed, true, name)
   }
 })
 
@@ -1090,7 +1151,7 @@ test('one request is one resolution, one dial and one socket: a redirect is hand
 
 test('the head cannot set Host, Connection, framing or a hop-by-hop header, name one header twice, or carry a method or path HTTP would read another way', async () => {
   const heads: ReadonlyArray<readonly [string, UpstreamHead]> = [
-    ...['Host', 'host', 'HOST', 'Connection', 'Content-Length', 'content-length', 'Keep-Alive', 'Proxy-Connection', 'Proxy-Authorization', 'Transfer-Encoding', 'TE', 'Trailer', 'Upgrade'].map(
+    ...['Host', 'host', 'HOST', 'Connection', 'Content-Length', 'content-length', 'Keep-Alive', 'Proxy-Connection', 'Proxy-Authorization', 'Transfer-Encoding', 'TE', 'Trailer', 'Upgrade', 'Expect', 'EXPECT'].map(
       (name) => [name, { ...GET, headers: { [name]: 'x' } }] as const,
     ),
     ['Authorization in two cases', { ...GET, headers: { Authorization: 'Bearer one', authorization: 'Bearer two' } }],

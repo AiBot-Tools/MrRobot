@@ -54,6 +54,24 @@ import {
 } from '../src/egress/frame.js'
 import { redactString } from '../src/events/redact.js'
 import { EGRESS_DETAIL_BYTES, PROXY_LIMITS, ProxyGrantRevokedPayload } from '../src/events/types.js'
+import {
+  CHECK_ORDER,
+  differential,
+  EV_RULES,
+  EV_TYPE_OF,
+  EV_TYPES,
+  evApply,
+  evBroken,
+  evFresh,
+  otherEnd,
+  pairsOf,
+  probesAt,
+  SIDES,
+  WALK_LIMITS,
+  walkStates,
+  type Side,
+  type WalkMove,
+} from './helpers/frame-order.js'
 
 const VECTORS_PATH = new URL('./fixtures/egress-frame-vectors.json', import.meta.url)
 const MINIMAL_CONFIG = new URL('./fixtures/config/minimal.yaml', import.meta.url)
@@ -441,9 +459,6 @@ interface Snapshot {
 }
 const snapshot = (c: FrameChannel): Snapshot => ({ openFlows: c.openFlows, flowsOpened: c.flowsOpened, limits: c.limits, failure: c.failure })
 
-/** Which way a refusal was met: decoding what the other end sent (finish() included), or holding this end's own send. */
-type Side = 'receive' | 'send'
-const SIDES: readonly Side[] = ['receive', 'send']
 
 /** A refused frame as the wire spelt it: its type (none for a type byte that names none) and its payload's length. */
 interface Refused {
@@ -572,213 +587,25 @@ const MEETS: Record<ChannelRole, Record<Side, readonly FrameRefusal[]>> = {
 
 // ── a second evaluator, for the check order ──────────────────────────────────
 //
-// The rules as frame.ts's CHECK ORDER table states them, each judged on its
-// own whatever the rules before it found, written out here rather than read
-// from frame.ts. It says which rules a frame breaks, never which one refuses
-// it: that is the first of them in the check order. So it can say what a
-// check-order script's last frame breaks (its name must list exactly that),
-// and, walked over the states an end can reach, every place two rules meet.
-
-/** The check order, written out: FRAME_REFUSALS lists it, then finish()'s two. */
-const CHECK_ORDER: readonly FrameRefusal[] = [
-  'unknown-type', 'direction', 'channel-flow', 'flow-zero', 'ready-twice', 'not-ready', 'go-twice', 'before-go',
-  'length', 'oversize', 'after-exit', 'flow-order', 'max-flows', 'unopened-flow', 'closed-flow', 'after-close',
-  'after-end', 'peer-closed', 'go-value',
-]
-
-interface EvRule {
-  readonly code: number
-  readonly from: readonly ChannelRole[]
-  readonly channel: boolean
-  readonly min: number
-  readonly max: number | 'frameMaxBytes'
-}
-
-/** frame.ts's table of types, written out: code, sender, flow 0 or a flow, payload length. */
-const EV_RULES: Readonly<Record<FrameType, EvRule>> = {
-  ready: { code: 0x01, from: ['mux'], channel: true, min: 0, max: 4096 },
-  go: { code: 0x02, from: ['kernel'], channel: true, min: 8, max: 8 },
-  open: { code: 0x10, from: ['mux'], channel: false, min: 0, max: 0 },
-  data: { code: 0x11, from: ['kernel', 'mux'], channel: false, min: 1, max: 'frameMaxBytes' },
-  end: { code: 0x12, from: ['kernel', 'mux'], channel: false, min: 0, max: 0 },
-  close: { code: 0x13, from: ['kernel', 'mux'], channel: false, min: 0, max: 0 },
-  stdout: { code: 0x20, from: ['mux'], channel: true, min: 1, max: 'frameMaxBytes' },
-  stderr: { code: 0x21, from: ['mux'], channel: true, min: 1, max: 'frameMaxBytes' },
-  exit: { code: 0x22, from: ['mux'], channel: true, min: 1, max: 1 },
-}
-const EV_TYPES = Object.keys(EV_RULES) as FrameType[]
-const EV_TYPE_OF: ReadonlyMap<number, FrameType> = new Map(EV_TYPES.map((t) => [EV_RULES[t].code, t]))
-const otherEnd = (role: ChannelRole): ChannelRole => (role === 'kernel' ? 'mux' : 'kernel')
-
-interface EvFlow {
-  readonly kernel: { ended: boolean; closed: boolean }
-  readonly mux: { ended: boolean; closed: boolean }
-}
-
-/** One end's state: what has crossed, and the flows not yet retired. */
-interface EvState {
-  readonly role: ChannelRole
-  ready: boolean
-  go: boolean
-  exited: boolean
-  last: number
-  readonly flows: Map<number, EvFlow>
-  limits: FrameLimits | undefined
-}
-
-const evFresh = (role: ChannelRole, limits: FrameLimits | undefined): EvState => ({
-  role, ready: false, go: false, exited: false, last: 0, flows: new Map(), limits,
-})
-const evCopy = (s: EvState): EvState => ({
-  ...s,
-  flows: new Map([...s.flows].map(([id, f]) => [id, { kernel: { ...f.kernel }, mux: { ...f.mux } }])),
-})
-const evKey = (s: EvState): string =>
-  JSON.stringify([s.ready, s.go, s.exited, s.last, s.limits ?? null, [...s.flows].map(([id, f]) => [id, f.kernel, f.mux])])
-
-/** The limits a go payload names, if it is 8 bytes naming each in range. */
-function evGoLimits(payload: Uint8Array): FrameLimits | undefined {
-  if (payload.length !== 8) return undefined
-  const view = Buffer.from(payload)
-  const frameMaxBytes = view.readUInt32BE(0)
-  const maxFlows = view.readUInt32BE(4)
-  const inRange = frameMaxBytes >= 1 && frameMaxBytes <= 1_048_576 && maxFlows >= 1 && maxFlows <= 256
-  return inRange ? { frameMaxBytes, maxFlows } : undefined
-}
-
-/**
- * Every rule a frame `from` sends breaks at an end in state `s`, each judged
- * on its own. `payload` is the frame's payload if it is at hand; go-value is
- * judged only on a go of 8 bytes whose payload is.
- */
-function evBroken(s: EvState, from: ChannelRole, code: number, flow: number, length: number, payload: Uint8Array | undefined): Set<FrameRefusal> {
-  const out = new Set<FrameRefusal>()
-  const type = EV_TYPE_OF.get(code)
-  if (type === undefined) out.add('unknown-type')
-  if (type !== 'ready' && !s.ready) out.add('not-ready')
-  if (type !== 'ready' && type !== 'go' && !s.go) out.add('before-go')
-  if (type === undefined) return out
-  const rule = EV_RULES[type]
-  if (!rule.from.includes(from)) out.add('direction')
-  if (rule.channel && flow !== 0) out.add('channel-flow')
-  if (!rule.channel && flow === 0) out.add('flow-zero')
-  if (type === 'ready' && s.ready) out.add('ready-twice')
-  if (type === 'go' && s.go) out.add('go-twice')
-  if (length < rule.min || (rule.max !== 'frameMaxBytes' && length > rule.max)) out.add('length')
-  if (rule.max === 'frameMaxBytes' && s.limits !== undefined && length > s.limits.frameMaxBytes) out.add('oversize')
-  if ((type === 'open' || type === 'stdout' || type === 'stderr' || type === 'exit') && s.exited) out.add('after-exit')
-  if (type === 'open' && flow !== s.last + 1) out.add('flow-order')
-  if (type === 'open' && s.limits !== undefined && s.flows.size >= s.limits.maxFlows) out.add('max-flows')
-  if (type === 'data' || type === 'end' || type === 'close') {
-    const state = s.flows.get(flow)
-    if (flow > s.last) out.add('unopened-flow')
-    if (flow <= s.last && state === undefined) out.add('closed-flow')
-    if (state?.[from].closed === true) out.add('after-close')
-    if (type !== 'close' && state?.[from].ended === true) out.add('after-end')
-    if (type !== 'close' && from === s.role && state?.[otherEnd(from)].closed === true) out.add('peer-closed')
-  }
-  if (type === 'go' && length === 8 && payload !== undefined) {
-    const named = evGoLimits(payload)
-    const held = s.limits
-    if (named === undefined || (held !== undefined && (named.frameMaxBytes !== held.frameMaxBytes || named.maxFlows !== held.maxFlows))) {
-      out.add('go-value')
-    }
-  }
-  return out
-}
-
-/** A frame that broke nothing changes the state both ends share. */
-function evApply(s: EvState, from: ChannelRole, type: FrameType, flow: number, payload: Uint8Array): void {
-  if (type === 'ready') s.ready = true
-  if (type === 'go') {
-    s.go = true
-    s.limits ??= evGoLimits(payload)
-  }
-  if (type === 'exit') s.exited = true
-  if (type === 'open') {
-    s.last = flow
-    s.flows.set(flow, { kernel: { ended: false, closed: false }, mux: { ended: false, closed: false } })
-  }
-  const state = s.flows.get(flow)
-  if (state !== undefined && type === 'end') state[from].ended = true
-  if (state !== undefined && type === 'close') {
-    state[from].closed = true
-    if (state.kernel.closed && state.mux.closed) s.flows.delete(flow)
-  }
-}
-
-/** One frame's place in the check order: the first rule it breaks and each other one, as "X before Y". */
-function pairsOf(breaks: ReadonlySet<FrameRefusal>): string[] {
-  const [first, ...rest] = CHECK_ORDER.filter((r) => breaks.has(r))
-  return first === undefined ? [] : rest.map((later) => `${first} before ${later}`)
-}
-
-/** What drives the walk: one payload of each type that breaks nothing, so every move is a frame an end may send. */
-const EV_MOVES: Readonly<Record<FrameType, Uint8Array>> = {
-  ready: text('ok'),
-  go: Uint8Array.of(0, 0, 0, 4, 0, 0, 0, 2),
-  open: new Uint8Array(0),
-  data: text('a'),
-  end: new Uint8Array(0),
-  close: new Uint8Array(0),
-  stdout: text('a'),
-  stderr: text('a'),
-  exit: Uint8Array.of(0),
-}
+// test/helpers/frame-order.ts holds it (the rules as frame.ts's CHECK ORDER
+// table states them, each judged on its own, and the walk of the states an
+// end can reach), shared with test/egress-mux.test.ts, which holds the mux's
+// inline codec to the same evaluator.
 
 /**
  * Every place two rules meet at one end, each way: "X before Y" wherever some
- * frame the end can meet breaks both, X the first it breaks. A walk of every
- * state the end can reach with frameMaxBytes 4 and maxFlows 2, moved only by
- * frames that break nothing, and at each state every frame of one of each
- * kind: every type byte (and one that names none), flow 0 to two past the
- * last opened, and payloads of 0, 1, 5, 8 and 4097 bytes, which fall below
- * every type's least, inside data's and exit's, past frameMaxBytes 4 and
- * exit's 1, at go's 8 and past ready's 4096, a go of 8 naming the channel's
- * limits, others in range and one out of it. Two flows reach the cap, and no
- * rule reads a flow but the one a frame names and how many are open, so a
- * walk that opens more finds nothing new (one that opens up to four, five
- * times the states, was run when this was written: the same pairs).
+ * frame the end can meet breaks both, X the first it breaks. Every probe
+ * (probesAt) at every state the walk reaches (walkStates, with frameMaxBytes
+ * 4 and maxFlows 2).
  */
 function derivePairs(role: ChannelRole): Record<Side, Set<string>> {
   const out: Record<Side, Set<string>> = { receive: new Set(), send: new Set() }
-  const LIMITS = { frameMaxBytes: 4, maxFlows: 2 }
-  const MOST_OPENED = 2
-  const start = evFresh(role, role === 'kernel' ? LIMITS : undefined)
-  const seen = new Map<string, EvState>([[evKey(start), start]])
-  const queue: EvState[] = [start]
-  const goPayloads = [EV_MOVES.go, Uint8Array.of(0, 0, 0, 5, 0, 0, 0, 2), Uint8Array.of(0, 0, 0, 0, 0, 0, 0, 2)]
-  for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
-    const s = next
+  walkStates(role, (s) => {
     for (const side of SIDES) {
       const from = side === 'send' ? role : otherEnd(role)
-      // send() takes only a frame encodeFrame can spell: no unknown type.
-      const codes = side === 'send' ? EV_TYPES.map((t) => EV_RULES[t].code) : [0x00, ...EV_TYPES.map((t) => EV_RULES[t].code)]
-      for (const code of codes) {
-        for (let flow = 0; flow <= s.last + 2; flow++) {
-          for (const length of [0, 1, 5, 8, 4097]) {
-            const payloads = code === EV_RULES.go.code && length === 8 ? goPayloads : [new Uint8Array(length)]
-            for (const payload of payloads) {
-              for (const pair of pairsOf(evBroken(s, from, code, flow, length, payload))) out[side].add(pair)
-            }
-          }
-        }
-      }
-      for (const type of EV_TYPES) {
-        for (let flow = 0; flow <= s.last + 1; flow++) {
-          const payload = EV_MOVES[type]
-          if (evBroken(s, from, EV_RULES[type].code, flow, payload.length, payload).size > 0) continue
-          if (type === 'open' && flow > MOST_OPENED) continue
-          const moved = evCopy(s)
-          evApply(moved, from, type, flow, payload)
-          const key = evKey(moved)
-          if (seen.has(key)) continue
-          seen.set(key, moved)
-          queue.push(moved)
-        }
-      }
+      for (const p of probesAt(s, side)) for (const pair of pairsOf(evBroken(s, from, p.code, p.flow, p.length, p.payload))) out[side].add(pair)
     }
-  }
+  })
   return out
 }
 
@@ -1046,6 +873,36 @@ test('the vectors pin the check order: a script for each place two rules meet, a
     ['mux', 'send', 'ready-twice before length'],
   ] as const) {
     assert.ok(named[role][side].has(pair), `${role} ${side}: ${pair}`)
+  }
+})
+
+/** A frame.ts end of `role`, moved along a walk's path: each send sent, each receive decoded, none refused. */
+function frameEndAt(role: ChannelRole, path: readonly WalkMove[]): FrameChannel {
+  const channel = role === 'kernel' ? kernelEnd(WALK_LIMITS) : new FrameChannel({ role: 'mux' })
+  for (const move of path) {
+    const f = { type: move.type, flow: move.flow, payload: move.payload }
+    if (move.side === 'send') channel.send(f)
+    else {
+      const { error } = channel.receive(encodeFrame(f))
+      if (error !== undefined) throw new Error(`the walk's path was refused: ${error.message}`)
+    }
+  }
+  return channel
+}
+
+test('frame.ts refuses every probe, in every state the walk reaches, each way and at both ends, by the first rule the evaluator finds it breaks', () => {
+  // The vectors hold one witness for each place two rules meet. frame.ts
+  // reaches one pair along different code paths (frameMaxBytes or a fixed
+  // length, an open against data, end or close, before ready or between
+  // ready and go), and a reorder on a path no witness takes passes every
+  // vector: an oversize stdout before ready revoked as limit, not as the
+  // violation it is. So every probe frame at every reachable state is held to
+  // the evaluator: frame.ts's refusal is the first rule broken, or none.
+  for (const role of CHANNEL_ROLES) {
+    const { states, checks, mismatches } = differential(role, (path) => frameEndAt(role, path))
+    assert.deepEqual(mismatches, [], `${role}: frame.ts and the evaluator disagree`)
+    // The walk is real: past the handshake, flows opened, ended, closed and retired, the cap and exit.
+    assert.ok(states > 100 && checks > 10_000, `${role}: ${String(states)} states, ${String(checks)} checks`)
   }
 })
 

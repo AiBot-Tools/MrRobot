@@ -57,7 +57,10 @@ export type HostRefusal = (typeof HOST_REFUSALS)[number]
 
 /**
  * Names refused with every name beneath them: each is answered, if at all,
- * by something on the Mac, a VM or the local network, never by public DNS.
+ * by something on the Mac, a VM or the local network, never by public DNS. A
+ * home router's resolver answers the router conventions with LAN addresses,
+ * which on an IPv6 LAN are global unicast, the residual E1 leaves to E2:
+ * refused here by name, before anything resolves.
  *
  *   localhost    the loopback name (RFC 6761); resolvers may answer any
  *                *.localhost with 127.0.0.1 without asking anyone
@@ -66,6 +69,13 @@ export type HostRefusal = (typeof HOST_REFUSALS)[number]
  *                host.docker.internal (the Mac's loopback as a VM sees it),
  *                gateway.docker.internal, kubernetes.docker.internal
  *   localdomain  the /etc/hosts and router convention for the local network
+ *   localdomain6 its IPv6 twin (localhost6.localdomain6 in /etc/hosts)
+ *   lan          a router's default local domain (OpenWrt's, among others)
+ *   home         a home router's local domain, and a TLD ICANN will not
+ *                delegate for the name collisions that makes
+ *   corp         a corporate network's, which ICANN will not delegate either
+ *   intranet     a private network's (RFC 6762 Appendix G)
+ *   private      likewise (RFC 6762 Appendix G)
  *   arpa         infrastructure: home.arpa is residential networks (RFC
  *                8375), and the reverse-DNS names (in-addr.arpa, ip6.arpa)
  *                name addresses, which egress never names
@@ -83,6 +93,12 @@ export const SPECIAL_USE: readonly string[] = Object.freeze([
   'local',
   'internal',
   'localdomain',
+  'localdomain6',
+  'lan',
+  'home',
+  'corp',
+  'intranet',
+  'private',
   'arpa',
   'invalid',
   'test',

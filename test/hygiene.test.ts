@@ -312,9 +312,14 @@ test('node:child_process is imported only by src/sandbox/docker.ts and five test
   // ends a grandchild, and only node's own spawn shows the command gets no
   // stdin and no shell. It is the one test file that imports the mux: read
   // from the syntax tree (an import however it is laid out, a re-export, an
-  // import() of a string), and no test loads a module by an import() of
-  // anything but a string, which no specifier shows, nor names the mux's
-  // file at all, as createRequire or a URL would be handed it.
+  // import() of a string, its specifier decoded as the loader decodes a URL
+  // and compared without case), and no test loads a module by an import() of
+  // anything but a string, which no specifier shows. The text check for the
+  // mux's file name is a tripwire for the natural way to hand createRequire or
+  // a Worker URL the mux, not a proof: a name built from parts at run time is
+  // beyond it (createRequire cannot load the mux, whose top-level await it
+  // refuses, and a Worker cannot hand back spawnCommand), and a reviewer
+  // reads that by eye.
   assert.deepEqual(importersOfModule(TEST, 'images/worker/mux.mjs'), ['test/egress-mux.test.ts'])
   assert.deepEqual(computedImports(TEST), [])
   assert.deepEqual(TEST.filter((f) => f.text.includes('mux.mjs')).map((f) => f.path), ['test/egress-mux.test.ts'])
@@ -324,9 +329,15 @@ test('node:child_process is imported only by src/sandbox/docker.ts and five test
     "import { spawnCommand }\n  from\n  '../images/worker/mux.mjs'",
     "export { spawnCommand } from '../images/worker/mux.mjs'",
     "const mux = await import(\n  '../images/worker/mux.mjs'\n)",
+    // Percent-encoded, which tsx decodes as a URL, and in another case, which APFS loads as the mux.
+    "// @ts-expect-error\nimport { spawnCommand } from '../images/worker/mu%78.mjs'",
+    "import { spawnCommand } from '../images/worker/MUX.mjs'",
+    "import { spawnCommand } from '../images/%77orker/mux.mjs'",
   ]) {
     assert.deepEqual(importersOfModule([reached(text)], 'images/worker/mux.mjs'), ['test/egress-frame.test.ts'], text)
   }
+  // A specifier that does not decode is kept as written, and names no module.
+  assert.deepEqual(importersOfModule([reached("import x from '../images/worker/mux%zz.mjs'")], 'images/worker/mux.mjs'), [])
   for (const text of ["const mux = await import(new URL('../images/worker/' + 'mux.mjs', import.meta.url).href)", 'const m = await import(name)']) {
     assert.deepEqual(computedImports([reached(text)]), [`test/egress-frame.test.ts: ${text.slice(text.indexOf('import('))}`], text)
   }
@@ -397,7 +408,7 @@ test('src/egress never imports src/secrets: no file under it reaches src/secrets
   const reached = reachedFrom(EGRESS.map((f) => f.path), SRC)
   // The walk is real: the session reaches the event store and the logger.
   assert.ok(reached.has('src/events/store.ts') && reached.has('src/log.ts'), `the import walk reaches nothing: ${[...reached].join(', ')}`)
-  assert.deepEqual([...reached].filter((p) => p.startsWith('src/secrets/')).sort(), [], 'src/egress reaches src/secrets')
+  assert.deepEqual([...reached].filter((p) => p.toLowerCase().startsWith('src/secrets/')).sort(), [], 'src/egress reaches src/secrets')
   for (const file of EGRESS) {
     const reach = secretsReach(file)
     assert.deepEqual(reach, [], `${file.path} reaches src/secrets: ${reach.join('; ')}`)
@@ -450,10 +461,29 @@ function imageFiles(dir: string, root = REPO): SourceFile[] {
  * specifier does not show, as `what  text` lines: each import, re-export and
  * import() specifier in code; each `from '...'` and `import('...')` anywhere
  * in the text, comments included, which is how a JSDoc type import is
- * spelt; an import() of anything but a string; and require, createRequire,
- * getBuiltinModule, process.binding and process.dlopen by name. The caller
- * keeps the specifiers that are not node: builtins.
+ * spelt; an import() of anything but a string; require, createRequire,
+ * getBuiltinModule, process.binding and process.dlopen by name; a string in
+ * code that is one of those names (process['getBuiltinModule'] names none);
+ * any element access on process (process['getBuiltin' + 'Module'] spells
+ * none either); and process handed on whole (Reflect.get(process, ...),
+ * `const p = process`), whose members are then looked up out of the scan's
+ * sight. A tripwire for natural code, not a proof. The caller keeps the
+ * specifiers that are not node: builtins.
  */
+/** The names a loader goes by: what moduleUses refuses as a string as well as a name. */
+const LOADER_NAMES = /^(?:require|createRequire|getBuiltinModule|binding|dlopen)$/
+
+/** Whether a string is a module specifier (import, export, import() or import('x') in a type), which the specifier scan reads instead. */
+function isModuleSpecifier(node: ts.Node): boolean {
+  const parent = node.parent
+  return (
+    ((ts.isImportDeclaration(parent) || ts.isExportDeclaration(parent)) && parent.moduleSpecifier === node) ||
+    (ts.isCallExpression(parent) && parent.expression.kind === ts.SyntaxKind.ImportKeyword) ||
+    ts.isLiteralTypeNode(parent) ||
+    ts.isExternalModuleReference(parent)
+  )
+}
+
 function moduleUses(file: SourceFile): { specifiers: string[]; loaders: string[] } {
   const source = ts.createSourceFile(file.path, file.text, ts.ScriptTarget.Latest, true, /\.[cm]?ts$/.test(file.path) ? ts.ScriptKind.TS : ts.ScriptKind.JS)
   const specifiers: string[] = []
@@ -472,6 +502,13 @@ function moduleUses(file: SourceFile): { specifiers: string[]; loaders: string[]
       loaders.push(`${node.text}: ${node.parent.getText(source)}`)
     } else if (ts.isPropertyAccessExpression(node) && node.name.text === 'binding' && node.expression.getText(source) === 'process') {
       loaders.push(`process.binding: ${node.getText(source)}`)
+    } else if (ts.isStringLiteralLike(node) && LOADER_NAMES.test(node.text) && !isModuleSpecifier(node)) {
+      loaders.push(`a loader's name as a string: ${node.parent.getText(source)}`)
+    } else if (ts.isElementAccessExpression(node) && node.expression.getText(source) === 'process') {
+      loaders.push(`process looked up by a name in brackets: ${node.getText(source)}`)
+    } else if (ts.isIdentifier(node) && node.text === 'process' && !(ts.isPropertyAccessExpression(node.parent) && node.parent.expression === node) && !ts.isElementAccessExpression(node.parent)) {
+      // Handed on whole (Reflect.get(process, ...), const p = process), its members are looked up where no scan reads them.
+      loaders.push(`process handed on whole: ${node.parent.getText(source)}`)
     }
     ts.forEachChild(node, visit)
   }
@@ -516,6 +553,11 @@ test('images/worker imports only node: builtins', (t) => {
   writeFileSync(join(tree, 'images', 'worker', 'mux.mjs'), "import net from 'node:net'\n")
   writeFileSync(join(tree, 'images', 'publish', 'run.mjs'), "const cp = process.getBuiltinModule('node:child_process')\n")
   assert.deepEqual(imageLoaders(tree), ['images/publish/run.mjs: getBuiltinModule: process.getBuiltinModule'])
+  // In brackets, by a literal or a name built from parts, as well as by name.
+  writeFileSync(join(tree, 'images', 'publish', 'run.mjs'), "const cp = process['getBuiltinModule']('node:child_process')\n")
+  assert.notDeepEqual(imageLoaders(tree), [], "process['getBuiltinModule'] in another image file")
+  writeFileSync(join(tree, 'images', 'worker', 'helper.mjs'), "const cp = Reflect.get(process, 'getBuiltin' + 'Module')('node:child_process')\n")
+  assert.ok(imageLoaders(tree).some((l) => l.startsWith('images/worker/helper.mjs')), 'Reflect.get(process, ...) in a second worker file')
 
   // The scan sees each way a module gets in, and passes a node: builtin.
   const probe = (text: string): { specifiers: string[]; loaders: string[] } => moduleUses({ path: 'images/worker/probe.mjs', text, lines: text.split('\n') })
@@ -535,14 +577,26 @@ test('images/worker imports only node: builtins', (t) => {
     "const b = process.binding('fs')",
     "/** @import { ZodType } from 'zod' */\nconst x = 1",
     "/** @type {import('../../src/egress/frame.js').Frame} */\nlet f",
+    // A loader in brackets: by its name as a string, or by a name built from parts.
+    "const cp = process['getBuiltinModule']('node:child_process')",
+    "const cp = process['getBuiltin' + 'Module']('node:child_process')",
+    "const b = process['binding']('fs')",
+    "const name = 'createRequire'\nimport * as m from 'node:module'\nconst r = m[name](import.meta.url)",
+    "const cp = Reflect.get(process, 'getBuiltin' + 'Module')('node:child_process')",
+    "const p = process\nconst cp = p.getBuiltinModule('node:child_process')",
   ]) {
     assert.notDeepEqual(outside(text), [], text)
   }
   assert.deepEqual(outside("import net from 'node:net'\nimport { lookup } from 'node:dns/promises'\n/** @import { Readable } from 'node:stream' */"), [])
 })
 
-/** A path with a `secrets` directory in it, in either separator. */
-const SECRETS_PATH = /(?:^|[\\/])secrets(?:[\\/]|$)/
+/**
+ * A path with a `secrets` directory in it, in either separator and in any
+ * case: the operator's APFS volume is case-insensitive, so '../Secrets/' and
+ * '../SECRETS/' load src/secrets there, as the .env loader and isUnder
+ * already assume.
+ */
+const SECRETS_PATH = /(?:^|[\\/])secrets(?:[\\/]|$)/i
 /** node:module, whose createRequire loads a module by a path no import declaration spells. */
 const LOADER_MODULE = /^(?:node:)?module$/
 
@@ -563,7 +617,7 @@ function secretsReach(file: SourceFile): string[] {
   const out: string[] = []
   const at = (node: ts.Node): string => `${String(source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1)}  ${node.getText(source)}`
   const names = (text: string): boolean => SECRETS_PATH.test(text) || LOADER_MODULE.test(text)
-  for (const target of relativeImports(file)) if (target.startsWith('src/secrets/')) out.push(`resolves to ${target}`)
+  for (const target of relativeImports(file)) if (target.toLowerCase().startsWith('src/secrets/')) out.push(`resolves to ${target}`)
   const visit = (node: ts.Node): void => {
     let spec: ts.Node | undefined
     if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier !== undefined) spec = node.moduleSpecifier
@@ -577,7 +631,7 @@ function secretsReach(file: SourceFile): string[] {
   return out
 }
 
-test('the secrets-reach scan sees a relative import of any form, an absolute or file: specifier, node:module and createRequire, and a path held in a variable', () => {
+test('the secrets-reach scan sees a relative import of any form, in any case or percent-encoded, an absolute or file: specifier, node:module and createRequire, and a path held in a variable', () => {
   // Each of these, in a lower layer, would reach the broker or the .env
   // loader. The last group is what a resolved relative import cannot see.
   const reaches = [
@@ -595,6 +649,15 @@ test('the secrets-reach scan sees a relative import of any form, an absolute or 
     "const req = process.getBuiltinModule('node:module').createRequire(import.meta.url)",
     "const where = '../secrets/broker.js'\nconst b = await import(where)",
     'const b = await import(`../secrets/${"broker"}.js`)',
+    // In another case, which APFS loads as src/secrets: as a variable (which
+    // tsc never resolves) and as a re-export.
+    "const where = '../Secrets/broker.js'\nconst b = await import(where)",
+    "export * from '../SECRETS/broker.js'",
+    "export { SecretsBroker } from '../SECRETS/broker.js'",
+    "import { SecretsBroker } from '../Secrets/broker.js'",
+    // Percent-encoded, which the loader decodes as a URL, and in another case besides.
+    "import { SecretsBroker } from '../secret%73/broker.js'",
+    "import { SecretsBroker } from '../Secret%73/broker.js'",
   ]
   for (const text of reaches) {
     assert.notDeepEqual(secretsReach({ path: 'src/egress/probe.ts', text, lines: text.split('\n') }), [], text)
@@ -731,7 +794,17 @@ const SCRIPTS = files('scripts')
 function relativeImports(file: SourceFile): string[] {
   const out: string[] = []
   const add = (spec: string): void => {
-    if (spec.startsWith('.')) out.push(posix.normalize(posix.join(posix.dirname(file.path), spec)).replace(/\.js$/, '.ts'))
+    if (!spec.startsWith('.')) return
+    // As the loader reads it: a relative specifier is a URL, so tsx and node
+    // load '../images/worker/mu%78.mjs' as mux.mjs. One that does not decode
+    // is kept as written, and loads nothing.
+    let decoded = spec
+    try {
+      decoded = decodeURIComponent(spec)
+    } catch {
+      // kept as written
+    }
+    out.push(posix.normalize(posix.join(posix.dirname(file.path), decoded)).replace(/\.js$/, '.ts'))
   }
   const visit = (node: ts.Node): void => {
     if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier !== undefined && ts.isStringLiteral(node.moduleSpecifier)) {
@@ -746,9 +819,15 @@ function relativeImports(file: SourceFile): string[] {
   return out
 }
 
-/** The files in `pool` that import `target` (a repo-relative .ts path, or a path as it is spelt for any other file: images/worker/mux.mjs) directly. */
+/**
+ * The files in `pool` that import `target` (a repo-relative .ts path, or a
+ * path as it is spelt for any other file: images/worker/mux.mjs) directly,
+ * compared without case: the operator's APFS volume is case-insensitive, so
+ * '../images/worker/MUX.mjs' loads the mux there.
+ */
 function importersOfModule(pool: readonly SourceFile[], target: string): string[] {
-  return pool.filter((f) => relativeImports(f).includes(target)).map((f) => f.path).sort()
+  const wanted = target.toLowerCase()
+  return pool.filter((f) => relativeImports(f).some((t) => t.toLowerCase() === wanted)).map((f) => f.path).sort()
 }
 
 /** Each import() in `pool` of anything but a string, as `path: import(...)`: a module it loads shows in no specifier, so relativeImports cannot resolve it. */

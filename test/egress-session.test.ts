@@ -36,7 +36,7 @@ import { parse as parseYaml } from 'yaml'
 
 import { MAX_TIMER_MS, parseKernelConfig } from '../src/config.js'
 import { readAllRows } from '../src/events/chain.js'
-import { PAYLOAD_SCHEMAS, PROXY_DENY_KEYS_PER_SECOND, PROXY_DENY_REASONS, PROXY_LIMITS, PROXY_OVERFLOW_WHY } from '../src/events/types.js'
+import { EGRESS_DETAIL_BYTES, PAYLOAD_SCHEMAS, PROXY_DENY_KEYS_PER_SECOND, PROXY_DENY_REASONS, PROXY_LIMITS, PROXY_OVERFLOW_WHY } from '../src/events/types.js'
 import { encodeFrame, exitPayload, FrameChannel, FRAME_TYPE_CODES, type Frame, type FrameLimits, readGoPayload } from '../src/egress/frame.js'
 import { EgressGrant } from '../src/egress/policy.js'
 import {
@@ -52,6 +52,7 @@ import {
   type SessionEndReason,
   type SessionOutcome,
   type SessionRevokeReason,
+  withLoss,
 } from '../src/egress/session.js'
 import { createUpstream, UPSTREAM_OWNED_HEADERS, type Upstream } from '../src/egress/upstream.js'
 import type { AppendInput, EventStore } from '../src/events/store.js'
@@ -608,6 +609,36 @@ test('a routed request reaches the fake upstream with exactly one injected heade
   assert.deepEqual(h.kills, [])
 })
 
+test('a worker header spelt as another a backend folds it into (Proxy_Authorization, X_Forwarded_For, X.Real.IP) is stripped as that one is, and a Connection naming one names it', async (t) => {
+  // Rack's HTTP_* and a CGI gateway read every non-alphanumeric of a name as
+  // one separator, so these are the headers they alias there
+  // (policy.ts canonicalHeaderName), and the strip is held to those names.
+  const h = harness(t)
+  await h.mux.handshake()
+  const aliases = WORKER_ONLY.filter((name) => name.includes('-')).flatMap((name) => [name.replaceAll('-', '_'), name.replaceAll('-', '.').toUpperCase()])
+  const answer = await h.mux.exchange(
+    http('GET', FETCH, [
+      ['Host', 'github.com'],
+      ...aliases.map((name) => [name, `worker ${name}`] as const),
+      // Each way round: the Connection names X_Hop and the header is X-Hop,
+      // and the Connection names Y-Hop and the header is Y_Hop.
+      ['Connection', 'X_Hop, Y-Hop'],
+      ['X-Hop', 'named by Connection, in another spelling'],
+      ['Y_Hop', 'named by Connection, in another spelling'],
+      ['User-Agent', 'git/2.47.1'],
+    ]),
+  )
+  assert.equal(statusOf(answer), 200, answer)
+  const seen = h.seen[0]
+  assert.ok(seen !== undefined)
+  for (const name of aliases) assert.deepEqual(headerValues(seen, name.toLowerCase()), [], `${name} reached the host`)
+  assert.deepEqual(headerValues(seen, 'x-hop'), [], 'a header the Connection named in another spelling reached the host')
+  assert.deepEqual(headerValues(seen, 'y_hop'), [], 'a header spelt as one the Connection named reached the host')
+  assert.deepEqual(headerValues(seen, 'authorization'), [BEARER])
+  assert.deepEqual(headerValues(seen, 'user-agent'), ['git/2.47.1'])
+  await h.end('exited')
+})
+
 test('proxy.decision is appended before the upstream sees a byte', async (t) => {
   const h = harness(t)
   await h.mux.handshake()
@@ -761,7 +792,7 @@ test('a ready the kernel refuses ends the grant before go: the command never run
   assert.match((await doneOf(thrown.session)).detail ?? '', /the ready judge threw/)
 })
 
-test('an upstream 401 or 403 is answered 502, with no challenge, so git never prompts, and recorded as challenged; a cookie and hop-by-hop headers are not passed on', async (t) => {
+test('an upstream 401 or 403 is answered 502, with no challenge, so git never prompts, and recorded as challenged; a cookie, a challenge and hop-by-hop headers are not passed on, in any spelling a folding client reads', async (t) => {
   for (const status of [401, 403]) {
     const h = harness(t, {
       serve: (_req, res) => res.writeHead(status, { 'www-authenticate': 'Basic realm="GitHub"', 'content-type': 'text/plain' }).end('Bad credentials'),
@@ -823,6 +854,33 @@ test('an upstream 401 or 403 is answered 502, with no challenge, so git never pr
   assert.match(answer, /\r\nconnection: close\r\n/i)
   assert.equal(bodyOf(answer), 'body')
   await h.end('exited')
+
+  // The host's headers in a spelling a folding client reads as those
+  // (policy.ts canonicalHeaderName): Set_Cookie is Set-Cookie there, and a
+  // Connection naming X_Hop names X-Hop, each way round, so each is stripped
+  // as the one it aliases is.
+  const aliased = harness(t, {
+    serve: (_req, res) =>
+      res
+        .writeHead(200, [
+          'Content-Type', 'text/plain',
+          'Set_Cookie', 'user_session=operator-session; HttpOnly',
+          'WWW_Authenticate', 'Basic realm="GitHub"',
+          'Proxy_Authenticate', 'Basic realm="proxy"',
+          'Connection', 'keep-alive, X_Hop, Y-Hop',
+          'X-Hop', 'named-x',
+          'Y_Hop', 'named-y',
+          'X-GitHub-Request-Id', 'ABCD',
+        ])
+        .end('body'),
+  })
+  await aliased.mux.handshake()
+  const folded = await aliased.mux.exchange(http('GET', FETCH))
+  assert.equal(statusOf(folded), 200, folded)
+  assert.doesNotMatch(folded, /set.cookie|operator-session|www.authenticate|proxy.authenticate|realm|x.hop|y.hop|named-/i)
+  assert.match(folded, /X-GitHub-Request-Id: ABCD/)
+  assert.equal(bodyOf(folded), 'body')
+  await aliased.end('exited')
 })
 
 test('a routed push reaches the fake upstream with the judged Content-Type and no Content-Encoding; a worker request whose two records disagree is refused, not sent', async (t) => {
@@ -1007,8 +1065,16 @@ test('a deny of every reason the session can meet is recorded as a proxy.decisio
   assert.equal(byReason('not-a-host')?.['hostRefusal'], 'ip-literal')
   assert.equal(byReason('not-a-host')?.['host'], undefined)
   assert.equal(denied.filter((r) => r['reason'] === 'not-a-host')[1]?.['hostRefusal'], 'special-use')
+  // A CONNECT names where it was headed: pmmcp by address, so its host refusal.
   assert.equal(byReason('use-route')?.['method'], 'CONNECT')
   assert.equal(byReason('use-route')?.['host'], undefined)
+  assert.equal(byReason('use-route')?.['hostRefusal'], 'ip-literal')
+  // Userinfo names the host past it; a Host header naming another, the target's.
+  const second = denied.filter((r) => r['reason'] === 'second-host')
+  assert.deepEqual(second.map((r) => [r['host'], r['hostRefusal'], r['path']]), [
+    ['registry.npmjs.org', undefined, undefined],
+    ['registry.npmjs.org', undefined, '/'],
+  ])
   assert.equal(byReason('path')?.['host'], 'registry.npmjs.org')
   assert.equal(byReason('path')?.['path'], undefined)
   assert.equal(byReason('push-ref')?.['bindingId'], 'github')
@@ -1049,6 +1115,15 @@ test('deny rows are coalesced: one row per key per second with its count, overfl
   for (const target of ['http://192.168.5.2:8766/', 'http://10.0.0.1/', 'http://host.lima.internal/']) {
     assert.equal(statusOf(await h.mux.exchange(http('GET', target))), 403)
   }
+  // A CONNECT, as an HTTPS client under HTTPS_PROXY probes, and userinfo:
+  // counted by the host refusal of where each was headed, so a probe of
+  // pmmcp is never one count with a tunnel to a real host.
+  for (const authority of ['192.168.5.2:8766', 'github.com:443', '192.168.5.2:7777', 'host.lima.internal:8766']) {
+    assert.equal(statusOf(await h.mux.exchange(http('CONNECT', authority, [['Host', authority]]))), 403)
+  }
+  for (const target of ['http://x@192.168.5.2:8766/mcp', 'http://x@example.com/']) {
+    assert.equal(statusOf(await h.mux.exchange(http('GET', target))), 403)
+  }
   h.clock.advance(DENY_WINDOW_MS)
   const window = rows(h.store, 'proxy.decision').slice(1)
   const keyed = window.filter((r) => r['overflow'] === undefined)
@@ -1060,6 +1135,11 @@ test('deny rows are coalesced: one row per key per second with its count, overfl
       ['not-allowed', undefined, extra],
       ['not-a-host', 'ip-literal', 2],
       ['not-a-host', 'special-use', 1],
+      ['use-route', 'ip-literal', 2],
+      ['use-route', undefined, 1],
+      ['use-route', 'special-use', 1],
+      ['second-host', 'ip-literal', 1],
+      ['second-host', undefined, 1],
     ],
   )
   for (const row of overflow) {
@@ -1107,6 +1187,26 @@ test('deny rows are coalesced: one row per key per second with its count, overfl
     ],
   )
   await split.end('exited')
+})
+
+test('a probe of the Mac\'s loopback with a fragment or past MAX_TARGET is a not-a-host row, never one count with a fragment typo of a real host', async (t) => {
+  const h = harness(t, { limits: { maxDenied: 100 } })
+  await h.mux.handshake()
+  // node:http hands the session the target as written, its `#x` and its length included.
+  const long = `http://192.168.5.2:8766/${'a'.repeat(9_000)}`
+  for (const target of ['http://192.168.5.2:8766/mcp#x', long, 'http://registry.npmjs.org/react#readme', 'http://registry.npmjs.org/react#install']) {
+    assert.equal(statusOf(await h.mux.exchange(http('GET', target))), 403, target.slice(0, 64))
+  }
+  h.clock.advance(DENY_WINDOW_MS)
+  assert.deepEqual(
+    rows(h.store, 'proxy.decision').map((r) => [r['reason'], r['host'], r['hostRefusal'], r['path'], r['count']]),
+    [
+      ['not-a-host', undefined, 'ip-literal', undefined, 2],
+      ['target', undefined, undefined, undefined, 2],
+    ],
+  )
+  for (const row of rows(h.store, 'proxy.decision')) assert.equal(PAYLOAD_SCHEMAS['proxy.decision'].safeParse(row).success, true)
+  await h.end('exited')
 })
 
 test('a deny row the store refuses ends the grant in error, after the rest of its window is on record', async (t) => {
@@ -1256,6 +1356,27 @@ test("a decision row the store refuses once the revocation has begun keeps the r
     assert.deepEqual(h.kills, [])
   })
 
+  await t.test("the caller's end() while its channel is still open and a request is upstream: the refused row ends the grant in error, unkilled", async (t) => {
+    // end() waits on the channel (END_DRAIN_MS) before the revocation
+    // begins, so a row refused in that wait is one refused while the grant
+    // is served: the kernel's bug ends it in error, not with the caller's
+    // reason, and the caller's verdict on the container stands (no kill).
+    const h = harness(t, { serve: () => undefined, failAppend: upstreamRows })
+    await h.mux.handshake()
+    h.mux.open().write(http('GET', FETCH))
+    await until(() => h.seen.length === 1, 'the host to read the request')
+    // The channel's input is left open: on the session's clock END_DRAIN_MS never passes here.
+    const ending = h.session.end('wallclock')
+    const outcome = await doneOf(h.session)
+    assert.deepEqual(await ending, outcome)
+    assert.equal(outcome.reason, 'error')
+    assert.equal(outcome.detail, '1 decision row could not be appended')
+    assert.deepEqual([outcome.totals.allowed, outcome.totals.refused, outcome.totals.failed], [1, 0, 1])
+    assert.deepEqual(shape(h.store), [['proxy.decision', 'policy'], ['proxy.grant.revoked', undefined]])
+    assert.equal(rows(h.store, 'proxy.grant.revoked').length, 1)
+    assert.deepEqual(h.kills, [])
+  })
+
   await t.test('a deny, then the caller ends the grant: the window the revocation closes last is refused', async (t) => {
     const h = harness(t, { failAppend: (input) => input.type === 'proxy.decision' })
     await h.mux.handshake()
@@ -1267,6 +1388,27 @@ test("a decision row the store refuses once the revocation has begun keeps the r
     assert.deepEqual(shape(h.store), [['proxy.grant.revoked', undefined]])
     assert.deepEqual(h.kills, [])
   })
+})
+
+test("a revocation's detail and the count of lost rows fit the revoked row together: the reason's own detail is cut to leave the count room, in UTF-8 bytes", () => {
+  const totals = { flows: 2, requests: 3, allowed: 2, denied: 1, refused: 0, failed: 0, sentBytes: 1_024, receivedBytes: 65_536, durationMs: 4_200 }
+  const revoked = (detail: string): boolean =>
+    PAYLOAD_SCHEMAS['proxy.grant.revoked'].safeParse({ schemaVersion: 1, grantId: GRANT_ID, reason: 'violation', totals, detail }).success
+  assert.equal(revoked('x'.repeat(EGRESS_DETAIL_BYTES + 1)), false, 'the revoked row takes a detail past its bound')
+  for (const lost of [1, 2, 99_999]) {
+    const loss = `${String(lost)} decision row${lost === 1 ? '' : 's'} could not be appended`
+    for (const detail of ['x'.repeat(EGRESS_DETAIL_BYTES - 1), 'x'.repeat(EGRESS_DETAIL_BYTES), 'é'.repeat(EGRESS_DETAIL_BYTES), 'a frame named flow 0']) {
+      const joined = withLoss(detail, lost) ?? ''
+      assert.ok(Buffer.byteLength(joined, 'utf8') <= EGRESS_DETAIL_BYTES, `${String(lost)} lost, a detail of ${String(detail.length)}: ${String(Buffer.byteLength(joined, 'utf8'))} bytes`)
+      assert.ok(joined.endsWith(`; ${loss}`), joined.slice(-80))
+      assert.equal(revoked(joined), true, `${String(lost)} lost: the revoked row refuses the detail`)
+    }
+    assert.equal(withLoss(undefined, lost), loss)
+  }
+  // Nothing lost: the detail as recordable() bounds it, or none.
+  assert.equal(withLoss('a frame named flow 0', 0), 'a frame named flow 0')
+  assert.equal(withLoss(undefined, 0), undefined)
+  assert.ok(Buffer.byteLength(withLoss('x'.repeat(2_000), 0) ?? '', 'utf8') <= EGRESS_DETAIL_BYTES)
 })
 
 test('per-grant limits revoke with reason limit naming each, after the decisions made under the grant', async (t) => {
@@ -1423,6 +1565,40 @@ test('per-grant limits revoke with reason limit naming each, after the decisions
       await until(() => second.kernelClosed, "the kernel's close of the second flow")
       await read(h)
       await runsFromNow(h)
+    })
+
+    await t.test("not the kernel's own end of a flow: an answer that ends with no byte of its own leaves the bound where the last frame put it", async (t) => {
+      // HTTP/1.0, so the answer to the worker is delimited by its end, and
+      // the kernel's end of the flow, 4 s after the last data either way,
+      // carries no byte: the end is the kernel's doing, not the container's.
+      let held: ServerResponse | undefined
+      const h = harness(t, {
+        ...idle,
+        serve: (_req, res) => {
+          res.writeHead(200, { 'content-type': 'text/plain' }).write('first')
+          held = res
+        },
+      })
+      await h.mux.handshake()
+      h.mux.open().hangUpOnEnd = false
+      const side = h.mux.open()
+      side.hangUpOnEnd = false
+      side.write(`GET ${FETCH} HTTP/1.0\r\nHost: github.com\r\n\r\n`)
+      await until(() => side.text().includes('first'), 'the first of the answer')
+      await read(h)
+      h.clock.advance(4_000)
+      const before = side.chunks.length
+      held?.end()
+      await until(() => side.kernelEnded, "the kernel's end of the flow")
+      await read(h)
+      assert.equal(side.chunks.length, before, 'the end carried a byte of its own')
+      // Revoked idleMs after the last frame before the end, not after the end.
+      h.clock.advance(999)
+      assert.deepEqual(h.kills, [], 'the grant was revoked before idleMs after the last frame')
+      h.clock.advance(1)
+      assert.deepEqual(h.kills, [1], "the kernel's end reset the idle bound")
+      const outcome = await doneOf(h.session)
+      assert.deepEqual([outcome.reason, outcome.limit], ['limit', 'idleMs'])
     })
 
     await t.test('an answer still arriving, the kernel sending its data', async (t) => {
@@ -1775,13 +1951,23 @@ test('CONNECT is denied use-route with a 403, and a second request on one flow c
   await h.mux.handshake()
   const connect = await h.mux.exchange(http('CONNECT', 'github.com:443', [['Host', 'github.com:443']]))
   assert.equal(statusOf(connect), 403, connect)
+  // Within the second's bound, a CONNECT to pmmcp and one to a real host are two rows, each naming where it was headed.
+  assert.equal(statusOf(await h.mux.exchange(http('CONNECT', '192.168.5.2:8766', [['Host', '192.168.5.2:8766']]))), 403)
+  h.clock.advance(DENY_WINDOW_MS)
+  assert.deepEqual(
+    rows(h.store, 'proxy.decision').map((r) => [r['reason'], r['method'], r['host'], r['hostRefusal'], r['count']]),
+    [
+      ['use-route', 'CONNECT', 'github.com', undefined, 1],
+      ['use-route', 'CONNECT', undefined, 'ip-literal', 1],
+    ],
+  )
   // Two requests in one write: the second cuts the flow, and only the first is judged.
   const piped = h.mux.open()
   piped.write(http('GET', 'http://example.com/a') + http('GET', 'http://example.com/b'))
   await until(() => piped.kernelClosed, 'the pipelined flow')
   const outcome = await h.end('exited')
-  assert.equal(outcome.totals.requests, 2)
-  assert.equal(outcome.totals.denied, 2)
+  assert.equal(outcome.totals.requests, 3)
+  assert.equal(outcome.totals.denied, 3)
 })
 
 test('end() records one revocation after every decision, with totals that add up; stdout, stderr and exit are kept; a cut stream is a violation only when the container exited', async (t) => {

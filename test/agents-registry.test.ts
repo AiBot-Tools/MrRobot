@@ -895,12 +895,69 @@ test('spawnEphemeral refuses a tier that is no integer from 0 to 3 before any ot
   assert.match(rejected[0]?.payload ?? '', /requested tier NaN is not a tier/)
   assert.equal(store.query({ type: 'agent.spawned' }).length, 0)
 
-  // Every tier the template admits still spawns; below 2, without its egress.
+  // Every tier the template admits still spawns; below 2, without its
+  // egress, and at 0 without its tools (tier 0 holds none).
   for (const tier of [0, 1, 2]) {
     const childId = `ok-${String(tier)}`
-    const child = reg.spawnEphemeral({ templateId: 'worker-template', childId, tier, ...(tier < 2 ? { egressAllow: [] } : {}) })
+    const child = reg.spawnEphemeral({ templateId: 'worker-template', childId, tier, ...(tier < 2 ? { egressAllow: [] } : {}), ...(tier === 0 ? { toolsAllow: [] } : {}) })
     assert.equal(child.manifest.tier, tier)
   }
+  assert.equal(store.query({ type: 'agent.spawned' }).length, 3)
+})
+
+/** A template holding a read tool and a write tool, no egress: tier 2, the least that may hold the write one. */
+const TOOLED_TEMPLATE_YAML = `
+id: tooled-template
+version: 1
+kind: template
+role: worker
+soul: worker.md
+tier: 2
+model:
+  primary: anthropic/claude-sonnet-5
+tools:
+  servers: [pmmcp]
+  allow: [pmmcp.recall, pmmcp.remember]
+egress:
+  allow: []
+memory:
+  projectId: aos/shared
+`
+
+test("a child that lowers its tier is held to that tier's tool rules, as a loaded manifest is, and an archived template is no spawn source", (t) => {
+  const store = withStore(t)
+  const reg = registry(store)
+  reg.load(agentsDir(t, { 'tooled-template': TOOLED_TEMPLATE_YAML }))
+  const refused: ReadonlyArray<readonly [string, Parameters<AgentRegistry['spawnEphemeral']>[0], RegExp]> = [
+    // Tier 1 holds read tools only: the template's write tool, kept, is one no tier 1 manifest may load with.
+    ['tier 1 keeping the write tool', { templateId: 'tooled-template', childId: 'low-1', tier: 1 }, /^spawn rejected: tools\.allow names pmmcp\.remember, which is write risk, but tier 1 may hold read\. /],
+    ['tier 0 keeping a read tool', { templateId: 'tooled-template', childId: 'low-2', tier: 0, toolsAllow: ['pmmcp.recall'] }, /^spawn rejected: tools\.allow names pmmcp\.recall, which is read risk, but tier 0 may hold no tools\. /],
+  ]
+  for (const [what, request, why] of refused) {
+    assert.throws(() => reg.spawnEphemeral(request), (e: unknown) => e instanceof ConfigError && why.test(e.message), what)
+    assert.equal(reg.get(request.childId), undefined, `${what} registered a child`)
+  }
+  // Narrowed to what the tier holds, each spawns.
+  assert.deepEqual(reg.spawnEphemeral({ templateId: 'tooled-template', childId: 'ok-1', tier: 1, toolsAllow: ['pmmcp.recall'] }).manifest.tools.allow, ['pmmcp.recall'])
+  assert.deepEqual(reg.spawnEphemeral({ templateId: 'tooled-template', childId: 'ok-0', tier: 0, toolsAllow: [] }).manifest.tools.allow, [])
+  assert.equal(reg.spawnEphemeral({ templateId: 'tooled-template', childId: 'ok-2' }).manifest.tier, 2)
+
+  // Archived, a template is retired with everything it held: no child inherits from it.
+  reg.archive('tooled-template', mintHumanActor('conn-1'))
+  assert.throws(
+    () => reg.spawnEphemeral({ templateId: 'tooled-template', childId: 'late-1', tier: 1, toolsAllow: ['pmmcp.recall'] }),
+    /spawn rejected: template tooled-template is archived: an archived template is no spawn source$/,
+  )
+  assert.equal(reg.get('late-1'), undefined)
+  const rows = store.query({ type: 'agent.spawn.rejected' }).map((row) => JSON.parse(row.payload) as { reason: string })
+  assert.deepEqual(
+    rows.map((row) => row.reason.replace(/\. .*$/, '')),
+    [
+      'tools.allow names pmmcp.remember, which is write risk, but tier 1 may hold read',
+      'tools.allow names pmmcp.recall, which is read risk, but tier 0 may hold no tools',
+      'template tooled-template is archived: an archived template is no spawn source',
+    ],
+  )
   assert.equal(store.query({ type: 'agent.spawned' }).length, 3)
 })
 
@@ -1080,6 +1137,10 @@ test("a spawn request entry in a credential's shape, or in no egress shape at al
     // An EgressHost, but not in the one spelling a template holds.
     [{ egressAllow: ['Docs.Example.COM'] }, 'Docs.Example', ALLOW, '0'],
     [{ egressAllow: ['192.168.5.2'] }, '192.168.5.2', ALLOW, '0'],
+    // No string at all: refused by its index, never handed to the host parser
+    // or the redaction pass, which would throw a TypeError and leave no row.
+    [{ egressAllow: [42 as unknown as string] }, '42', ALLOW, '0'],
+    [{ egressBind: ['github-git', null as unknown as string] }, 'null', BIND, '1'],
   ]
   for (const [i, [request, raw, why, index]] of cases.entries()) {
     const childId = `scout-${String(i)}`

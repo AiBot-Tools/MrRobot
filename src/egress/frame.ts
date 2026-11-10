@@ -135,14 +135,20 @@
 // a payload (truncated-payload).
 //
 // The shared vectors (test/fixtures/egress-frame-vectors.json), which hold
-// the mux's inline codec (E9) as well, pin this order at both ends. Wherever
-// one frame can break two rules, X the first it breaks and Y another, at an
-// end and a way (receiving or sending) that can meet it, a "check order"
-// script there ends with a frame that breaks exactly the rules its name lists
-// and is refused by the first. test/egress-frame.test.ts walks the states an
-// end can reach (under limits small enough to reach every one that matters:
-// the cap, a retired flow, exit) with a second evaluator of the rules above,
-// finds each such place, and holds the vectors' names and frames to it.
+// the mux's inline codec (E9) as well, carry one witness for each place two
+// rules meet: wherever one frame can break two rules, X the first it breaks
+// and Y another, at an end and a way (receiving or sending) that can meet it,
+// a "check order" script there ends with a frame that breaks exactly the
+// rules its name lists and is refused by the first. One witness per pair
+// does not pin the order on every code path that reaches the pair (a type's
+// fixed length or frameMaxBytes, before ready or between ready and go), so
+// test/egress-frame.test.ts holds this file, and test/egress-mux.test.ts the
+// inline codec, to a second evaluator of the rules above
+// (test/helpers/frame-order.ts) in every state an end can reach under limits
+// small enough to reach every one that matters (the cap, a retired flow,
+// exit): every probe frame, each way, is refused by the first rule the
+// evaluator finds it breaks, or by none. The walk also finds each place two
+// rules meet and holds the vectors' names and frames to it.
 //
 // send() holds this end to the same rules, and to one more: once the other
 // end's close has arrived on a flow, only this end's close may follow

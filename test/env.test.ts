@@ -475,24 +475,37 @@ test('the guard reads a host as node does: a padded, bracketed or zoned loopback
         'dns.lookup': (...args: unknown[]) => void reached.push(`lookup ${String(args[0])}`),
         'dgram.Socket.prototype.send': (...args: unknown[]) => void reached.push(`send ${String(args[2])}`),
         'dgram.Socket.prototype.connect': (...args: unknown[]) => void reached.push(`udp connect ${String(args[1])}`),
+        'dns.Resolver.prototype.resolve4': (...args: unknown[]) => void reached.push(`resolve4 ${String(args[0])}`),
       },
       () => {
+        const resolver = new dns.Resolver()
         for (const host of NAMES_NOT_LOOPBACK) {
           assert.throws(() => net.connect({ host, port: 9 }), blockedAt('socket connect', host), `net.connect ${JSON.stringify(host)}`)
+          // A socket's own connect(port, host), the form that reads the host after the port.
+          assert.throws(() => new net.Socket().connect(9, host), blockedAt('socket connect', host), `Socket.connect(9, ${JSON.stringify(host)})`)
           assert.throws(() => dns.lookup(host, none), blockedAt('dns lookup', host), `dns.lookup ${JSON.stringify(host)}`)
           assert.throws(() => udp.send('x', 53, host), blockedAt('udp send', host), `udp send ${JSON.stringify(host)}`)
           assert.throws(() => udp.connect(53, host), blockedAt('udp connect', host), `udp connect ${JSON.stringify(host)}`)
         }
-        // allowHost admits the name as spelt: a padded one is another name to getaddrinfo.
+        // allowHost admits the name as spelt: a padded one is another name to
+        // getaddrinfo, and to a Resolver's query, which asks the system's
+        // servers (a Kelvin sign is no K, however toLowerCase folds it).
         for (const host of [' a.example', 'a.example ', 'a.example\n', '\u212A.example']) {
           assert.throws(() => net.connect({ host, port: 443 }), blockedAt('socket connect', host), `net.connect ${JSON.stringify(host)}`)
           assert.throws(() => dns.lookup(host, none), blockedAt('dns lookup', host), `dns.lookup ${JSON.stringify(host)}`)
+          assert.throws(
+            () => resolver.resolve4(host, none),
+            (e: unknown) => e instanceof NetworkBlocked && e.message.startsWith(`test network guard: refused dns query to ${host} via `),
+            `Resolver.resolve4 ${JSON.stringify(host)}`,
+          )
         }
         assert.deepEqual(reached, [], 'nothing reached the layer under the guard')
         for (const host of [...LOOPBACK_AS_GIVEN, 'A.Example']) {
           net.connect({ host, port: 9 })
           dns.lookup(host, none)
         }
+        // An allowed name as spelt, ASCII case aside, is queried.
+        resolver.resolve4('K.example', none)
         udp.send('x', 53, '::1')
         udp.connect(53, 'localhost')
       },
@@ -502,7 +515,7 @@ test('the guard reads a host as node does: a padded, bracketed or zoned loopback
   }
   assert.deepEqual(
     reached,
-    [...[...LOOPBACK_AS_GIVEN, 'A.Example'].flatMap((host) => [`connect ${host}`, `lookup ${host}`]), 'send ::1', 'udp connect localhost'],
+    [...[...LOOPBACK_AS_GIVEN, 'A.Example'].flatMap((host) => [`connect ${host}`, `lookup ${host}`]), 'resolve4 K.example', 'send ::1', 'udp connect localhost'],
   )
   // A URL's hostname spells an IPv6 address in brackets: fetch alone reads it unbracketed.
   assert.equal(new URL('http://[::1]:9/').hostname, '[::1]')

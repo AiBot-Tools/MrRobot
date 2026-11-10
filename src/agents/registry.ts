@@ -232,25 +232,40 @@ export class AgentRegistry {
             `${manifest.role}. Kernel tools are for the orchestrator only.`,
         )
       }
-      const allowed = RISKS_BY_TIER[manifest.tier] ?? []
-      if (!allowed.includes(view.risk)) {
-        throw new ConfigError(
-          `${source}: tools.allow names ${ref}, which is ${view.risk} risk, but tier ` +
-            `${String(manifest.tier)} may hold ${allowed.length === 0 ? 'no tools' : allowed.join(' or ')}. ` +
-            'Raise the tier deliberately or drop the tool.',
-        )
-      }
     }
-
-    if (manifest.tier === 0 && manifest.tools.allow.length > 0) {
-      throw new ConfigError(`${source}: tier 0 means no tools, but tools.allow is not empty`)
-    }
+    const tiered = this.#tierToolProblem(manifest)
+    if (tiered !== undefined) throw new ConfigError(`${source}: ${tiered}`)
 
     // Throws with the cap it exceeded and by how much. A manifest may only lower.
     resolveCaps(this.#deps.budgets, manifest.budget ?? {})
 
     const egress = this.#egressProblem(manifest)
     if (egress !== undefined) throw new ConfigError(`${source}: ${egress}`)
+  }
+
+  /**
+   * Why `manifest`'s tier may not hold the tools it lists, or undefined: a
+   * tool's risk is one its tier holds (RISKS_BY_TIER), and tier 0 holds none.
+   * Asked at load and of every spawned child, since a child that lowers its
+   * tier and keeps the template's tools would hold what no loaded manifest
+   * may. The tools are the template's (a spawn admits no other), so naming
+   * one repeats nothing a caller wrote.
+   */
+  #tierToolProblem(manifest: AgentManifest): string | undefined {
+    for (const ref of manifest.tools.allow) {
+      const dot = ref.indexOf('.')
+      const view = resolveView(this.#deps.toolViews, ref.slice(0, dot), ref.slice(dot + 1))
+      const allowed = RISKS_BY_TIER[manifest.tier] ?? []
+      if (!allowed.includes(view.risk)) {
+        return (
+          `tools.allow names ${ref}, which is ${view.risk} risk, but tier ` +
+          `${String(manifest.tier)} may hold ${allowed.length === 0 ? 'no tools' : allowed.join(' or ')}. ` +
+          'Raise the tier deliberately or drop the tool.'
+        )
+      }
+    }
+    if (manifest.tier === 0 && manifest.tools.allow.length > 0) return 'tier 0 means no tools, but tools.allow is not empty'
+    return undefined
   }
 
   /**
@@ -395,6 +410,12 @@ export class AgentRegistry {
     if (template === undefined || template.manifest.kind !== 'template') {
       return this.#rejectSpawn(input.templateId, `no template named ${input.templateId}`)
     }
+    // An archived template is retired, with whatever it held (a binding's
+    // credential among it): no child inherits from it. Its id is a loaded
+    // manifest's, so naming it repeats nothing a caller wrote.
+    if (template.status !== 'active') {
+      return this.#rejectSpawn(input.templateId, `template ${input.templateId} is archived: an archived template is no spawn source`)
+    }
 
     const t = template.manifest
     const tier = input.tier ?? t.tier
@@ -472,10 +493,13 @@ export class AgentRegistry {
       ...(t.spawn === undefined ? {} : { spawn: { templates: [], maxChildren: 0, maxDepth: 1 } }),
     }
 
-    // The template passed this at load; a child that lowered its tier below
-    // egress's while keeping the template's hosts would not.
+    // The template passed these at load; a child that lowered its tier below
+    // egress's while keeping the template's hosts, or below a tool's risk
+    // while keeping the template's tools, would not.
     const egressProblem = this.#egressProblem(manifest)
     if (egressProblem !== undefined) return this.#rejectSpawn(input.templateId, egressProblem)
+    const toolProblem = this.#tierToolProblem(manifest)
+    if (toolProblem !== undefined) return this.#rejectSpawn(input.templateId, toolProblem)
 
     const record: AgentRecord = { manifest, status: 'active', dir: template.dir }
     // Logged, then registered: an append that throws (a closed store, a row

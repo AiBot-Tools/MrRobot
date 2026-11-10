@@ -35,6 +35,7 @@ import { EgressAllow } from '../src/egress/decision.js'
 import { EgressHost } from '../src/egress/host.js'
 import {
   ALLOW_REASONS,
+  canonicalHeaderName,
   decide,
   DENY_REASONS,
   EgressGrant,
@@ -48,6 +49,8 @@ import {
   isBranchName,
   MAX_COMMAND_LIST,
   MAX_PULLS_BODY,
+  MAX_TARGET,
+  namedHost,
   parseTarget,
   RepoSlug,
   ROUTE_REFUSALS,
@@ -56,9 +59,13 @@ import {
 import { createUpstream, type UpstreamDeps, type UpstreamResolver } from '../src/egress/upstream.js'
 import { recordable } from '../src/events/bound.js'
 import {
+  EGRESS_PATH_BYTES,
   EGRESS_WHY_BYTES,
+  METHOD_SHAPE,
   PAYLOAD_SCHEMAS,
   PROXY_DENIES_BEFORE_HOST,
+  PROXY_DENIES_BEFORE_PATH,
+  PROXY_DENIES_BY_HOST_REFUSAL,
   PROXY_DENIES_ON_A_ROUTE,
   PROXY_DENY_REASONS,
 } from '../src/events/types.js'
@@ -388,7 +395,8 @@ test('a host not in allow, a non-443 upstream and CONNECT are denied', () => {
     ['host.lima.internal', 'special-use'],
     ['host.docker.internal', 'special-use'],
     ['localhost', 'special-use'],
-    ['intranet', 'single-label'],
+    ['printer', 'single-label'],
+    ['nas.home', 'special-use'],
     ['', 'empty'],
   ] as const) {
     const decision = decide(EXEC, request('GET', `http://${host}/`))
@@ -398,17 +406,22 @@ test('a host not in allow, a non-443 upstream and CONNECT are denied', () => {
   denies(decide(EXEC, request('GET', 'http://[::1]:443/')), 'not-a-host', '[::1]:443')
 })
 
-test('the host is judged before the port: a probe of the Mac\'s loopback is not-a-host whatever port it names, and a wrong port names its host', () => {
+test('the host is judged before the port: a probe of the Mac\'s loopback is not-a-host whatever port it names, a wrong port names its host, and a CONNECT or userinfo names where it was headed', () => {
   // The targets the image's self-test and the Phase 2 exit name (E9, L2): pmmcp and the control plane, by address and by name.
   for (const [target, refusal] of [
     ['http://192.168.5.2:8766/mcp', 'ip-literal'],
+    // With no path after the host: the host is read first, so it is not-a-host, never a target deny that names nothing.
+    ['http://192.168.5.2:8766', 'ip-literal'],
+    ['http://192.168.5.2:8766?x', 'ip-literal'],
+    ['http://host.lima.internal:8766', 'special-use'],
     ['https://192.168.5.2:7777/', 'ip-literal'],
     ['http://192.168.5.2:443/', 'ip-literal'],
     ['http://127.0.0.1:7777/', 'ip-literal'],
     ['http://host.lima.internal:8766/mcp', 'special-use'],
     ['http://host.docker.internal:8766/mcp', 'special-use'],
     ['http://localhost:3128/', 'special-use'],
-    ['http://intranet:8080/', 'single-label'],
+    ['http://printer:8080/', 'single-label'],
+    ['http://router.lan:80/', 'special-use'],
   ] as const) {
     for (const grant of [EXEC, PUBLISH]) {
       const decision = decide(grant, request('GET', target))
@@ -431,6 +444,81 @@ test('the host is judged before the port: a probe of the Mac\'s loopback is not-
     const parsed = parseTarget(target)
     assert.equal(!parsed.ok && parsed.reason === 'port' ? parsed.host : undefined, host, target)
   }
+  // A CONNECT's authority and a userinfo target's host past the userinfo are
+  // read the same way, for the row alone: the host, or why it is none.
+  for (const [authority, named] of [
+    ['192.168.5.2:8766', { hostRefusal: 'ip-literal' }],
+    ['192.168.5.2', { hostRefusal: 'ip-literal' }],
+    ['[::1]:8766', { hostRefusal: 'ip-literal' }],
+    ['host.docker.internal:8766', { hostRefusal: 'special-use' }],
+    ['GitHub.com.:443', { host: 'github.com' }],
+    ['user:pw@github.com:443', { host: 'github.com' }],
+    ['github.com@192.168.5.2:8766', { hostRefusal: 'ip-literal' }],
+    ['192.168.5.2:8766@github.com', { host: 'github.com' }],
+    // Past the last `@`, as a URL parser reads it, not the first.
+    ['x@github.com@192.168.5.2:8766', { hostRefusal: 'ip-literal' }],
+    ['github.com:443:443', { hostRefusal: 'port' }],
+    ['', { hostRefusal: 'empty' }],
+    ['user@', { hostRefusal: 'empty' }],
+  ] as const) {
+    assert.deepEqual(namedHost(authority), named, authority)
+    const decision = decide(EXEC, request('CONNECT', authority))
+    denies(decision, 'use-route', `CONNECT ${authority}`)
+    const expected: { readonly host?: string; readonly hostRefusal?: string } = named
+    assert.deepEqual(
+      { host: decision.host, hostRefusal: decision.verdict === 'deny' ? decision.hostRefusal : 'allowed' },
+      { host: expected.host, hostRefusal: expected.hostRefusal },
+      authority,
+    )
+  }
+  // Text that is no authority names nothing.
+  for (const text of ['http://192.168.5.2:8766/', '192.168.5.2:8766/', '192.168.5.2:8766/mcp', 'github.com?x', 'github.com#x']) {
+    assert.equal(namedHost(text), undefined, text)
+    // So a CONNECT to it is a use-route deny that names no destination, neither a host nor a host refusal.
+    const decision = decide(EXEC, request('CONNECT', text))
+    denies(decision, 'use-route', `CONNECT ${text}`)
+    assert.deepEqual({ host: decision.host, hostRefusal: decision.verdict === 'deny' ? decision.hostRefusal : 'allowed' }, { host: undefined, hostRefusal: undefined }, text)
+  }
+  // A target with no path after its host is read with path /, never refused for the path it lacks.
+  for (const target of ['http://github.com', 'http://github.com?x', 'http://registry.npmjs.org']) {
+    const parsed = parseTarget(target)
+    assert.equal(parsed.ok ? parsed.path : parsed.reason, '/', target)
+  }
+  // The host before the target's length, its characters and a fragment: a
+  // probe that also holds a fragment (node:http delivers `#x` as written), a
+  // character no request line has, or more than MAX_TARGET is refused for its
+  // host or its userinfo, never as a target deny that a typo of a real host
+  // shares. The authority ends at a `#`, as a URL parser reads it.
+  const long = 'a'.repeat(MAX_TARGET)
+  for (const [target, reason, named] of [
+    ['http://192.168.5.2:8766/mcp#x', 'not-a-host', { hostRefusal: 'ip-literal' }],
+    ['http://192.168.5.2:8766#x', 'not-a-host', { hostRefusal: 'ip-literal' }],
+    ['http://host.lima.internal:8766/mcp#x', 'not-a-host', { hostRefusal: 'special-use' }],
+    [`http://192.168.5.2:8766/${long}`, 'not-a-host', { hostRefusal: 'ip-literal' }],
+    [`http://host.docker.internal:8766/mcp?${long}#x`, 'not-a-host', { hostRefusal: 'special-use' }],
+    ['http://192.168.5.2:8766/m\ncp', 'not-a-host', { hostRefusal: 'ip-literal' }],
+    ['http://192.168.5.2:8766/m cp', 'not-a-host', { hostRefusal: 'ip-literal' }],
+    ['http://x@192.168.5.2:8766/mcp#x', 'second-host', { hostRefusal: 'ip-literal' }],
+    [`http://x@github.com/${long}`, 'second-host', { host: 'github.com' }],
+  ] as const) {
+    for (const grant of [EXEC, PUBLISH]) {
+      const decision = decide(grant, request('GET', target))
+      denies(decision, reason, JSON.stringify(target.slice(0, 64)))
+      const expected: { readonly host?: string; readonly hostRefusal?: string } = named
+      assert.deepEqual(
+        { host: decision.host, hostRefusal: decision.verdict === 'deny' ? decision.hostRefusal : 'allowed' },
+        { host: expected.host, hostRefusal: expected.hostRefusal },
+        target.slice(0, 64),
+      )
+    }
+  }
+  // An egress host's target that no request line holds is a target deny,
+  // and names no host: a typo of a real host, never a probe.
+  for (const target of ['http://registry.npmjs.org/react#readme', 'http://github.com#x', 'http://github.com:8766#x', `http://registry.npmjs.org/${long}`, 'http://registry.npmjs.org/re\tact']) {
+    const decision = decide(EXEC, request('GET', target))
+    denies(decision, 'target', JSON.stringify(target.slice(0, 64)))
+    assert.deepEqual({ host: decision.host, hostRefusal: decision.verdict === 'deny' ? decision.hostRefusal : 'allowed' }, { host: undefined, hostRefusal: undefined }, target.slice(0, 64))
+  }
   // The port before the path: a wrong port with a dot segment is a port deny, and nothing of its path was read.
   denies(decide(EXEC, request('GET', 'http://registry.npmjs.org:8080/a/../b')), 'port', 'a wrong port and a dot segment')
   // And a path deny names the host whose path it refused.
@@ -442,51 +530,101 @@ test('the host is judged before the port: a probe of the Mac\'s loopback is not-
   }
 })
 
-test('every deny decide() gives is a proxy.decision row with exactly the host, binding and host refusal it names', () => {
+test('every deny decide() gives is a proxy.decision row with exactly the host, binding and host refusal it names, and a path only where it read one', () => {
   const prefix = `refs/heads/aos/${RUN}/`
   const RECEIVE = { 'content-type': 'application/x-git-receive-pack-request' }
-  const cases: ReadonlyArray<readonly [string, EgressDecision]> = [
-    ['malformed, a method that is no text', decide(EXEC, { method: 1, target: 'http://registry.npmjs.org/', headers: {} } as unknown as EgressRequest)],
-    ['malformed, headers that are no record', decide(EXEC, request('GET', 'http://registry.npmjs.org/', ['host', 'x'] as unknown as EgressHeaders))],
-    ['malformed, more read than the push declares', decide(PUBLISH, request('POST', 'http://github.com/op/fixture.git/git-receive-pack', { ...RECEIVE, 'content-length': '4' }, bytes(commandList([[OLD, NEW, `${prefix}f`]]))))],
-    ['use-route', decide(EXEC, request('CONNECT', '192.168.5.2:8766'))],
-    ['not-allowed', decide(EXEC, request('GET', 'http://example.com/'))],
-    ['repo', decide(EXEC, request('GET', 'http://github.com/evil/other.git/info/refs?service=git-upload-pack'))],
-    ['not-granted', decide(EXEC, request('GET', 'http://github.com/op/fixture.git/info/refs?service=git-receive-pack'))],
-    ['body, on a credential-free host', decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { 'content-length': '0' }))],
-    ['body, on a route', decide(EXEC, request('GET', 'http://github.com/op/fixture.git/info/refs?service=git-upload-pack', { 'content-length': '2' }))],
-    ['content-type, sent twice', decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { 'content-type': ['a/b', 'c/d'] }))],
-    ['content-type, on a route', decide(EXEC, request('POST', 'http://github.com/op/fixture/git-upload-pack', { ...UPLOAD_HEADERS, 'content-type': 'text/plain' }))],
-    ['content-encoding, sent twice', decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { 'content-encoding': ['gzip', 'br'] }))],
-    ['content-encoding, on a route', push(commandList([[OLD, NEW, `${prefix}f`]]), { 'content-encoding': 'gzip' })],
-    ['override-header', decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { 'x-http-method-override': 'DELETE' }))],
-    ['target', decide(EXEC, request('GET', '/react'))],
-    ['not-a-host, pmmcp by address', decide(EXEC, request('GET', 'http://192.168.5.2:8766/mcp'))],
-    ['not-a-host, the control plane by address', decide(EXEC, request('GET', 'https://192.168.5.2:7777/'))],
-    ['not-a-host, pmmcp by name', decide(EXEC, request('GET', 'http://host.lima.internal:8766/mcp'))],
-    ['port', decide(EXEC, request('GET', 'https://example.com:8080/'))],
-    ['port, on a bound host', decide(EXEC, request('GET', 'http://github.com:8443/op/fixture.git/info/refs?service=git-upload-pack'))],
-    ['second-host, userinfo', decide(EXEC, request('GET', 'http://user@registry.npmjs.org/'))],
-    ['second-host, the Host header', decide(EXEC, request('GET', 'http://registry.npmjs.org/', { host: 'example.com' }))],
-    ['path', decide(EXEC, request('GET', 'http://registry.npmjs.org/a/../b'))],
-    ['path, on a bound host', decide(EXEC, request('GET', 'http://github.com/op/%2e%2e/x'))],
-    ['no-route', decide(EXEC, request('GET', 'http://github.com/user/keys'))],
-    ['method, no token', decide(EXEC, request('get', 'http://registry.npmjs.org/'))],
-    ['method, on a credential-free host', decide(EXEC, request('POST', 'http://registry.npmjs.org/react', { 'content-length': '2' }))],
-    ['method, on a route', decide(EXEC, request('POST', 'http://github.com/op/fixture.git/info/refs?service=git-upload-pack'))],
-    ['query', decide(EXEC, request('GET', 'http://github.com/op/fixture.git/info/refs?service=git-upload-archive'))],
-    ['push-commands', push(pkt('not a command') + '0000')],
-    ['push-ref', push(commandList([[OLD, NEW, 'refs/heads/main']]))],
-    ['push-delete', push(commandList([[OLD, ZERO, `${prefix}f`]]))],
-    ['pulls-body', pulls(JSON.stringify({ ...PR, draft: 'yes', extra: 1 }))],
-    ['pulls-head', pulls(JSON.stringify({ ...PR, head: 'evil:x' }))],
+  const PUSH_TARGET = 'http://github.com/op/fixture.git/git-receive-pack'
+  const PULLS_TARGET = 'http://api.github.com/repos/op/fixture/pulls'
+  /** What a deny names, exactly: each case's own, not a union over the cases of its reason. */
+  interface Named { readonly host?: string; readonly bindingId?: string; readonly hostRefusal?: string }
+  const registry = { host: 'registry.npmjs.org' }
+  const github = { host: 'github.com' }
+  const routed = { host: 'github.com', bindingId: 'github' }
+  const api = { host: 'api.github.com', bindingId: 'github-api' }
+  // Each case: its label (its reason first), the decision, the request's method and target as the session read them, and what the deny names.
+  const cases: ReadonlyArray<readonly [string, EgressDecision, string | undefined, string | undefined, Named]> = [
+    ['malformed, a method that is no text', decide(EXEC, { method: 1, target: 'http://registry.npmjs.org/', headers: {} } as unknown as EgressRequest), undefined, undefined, {}],
+    ['malformed, headers that are no record', decide(EXEC, request('GET', 'http://registry.npmjs.org/', ['host', 'x'] as unknown as EgressHeaders)), 'GET', 'http://registry.npmjs.org/', registry],
+    ['malformed, more read than the push declares', decide(PUBLISH, request('POST', PUSH_TARGET, { ...RECEIVE, 'content-length': '4' }, bytes(commandList([[OLD, NEW, `${prefix}f`]])))), 'POST', PUSH_TARGET, routed],
+    // A CONNECT names where it was headed: a probe of pmmcp is told from a tunnel to a real host.
+    ['use-route, pmmcp by address', decide(EXEC, request('CONNECT', '192.168.5.2:8766')), 'CONNECT', '192.168.5.2:8766', { hostRefusal: 'ip-literal' }],
+    ['use-route, the control plane by address', decide(EXEC, request('CONNECT', '192.168.5.2:7777')), 'CONNECT', '192.168.5.2:7777', { hostRefusal: 'ip-literal' }],
+    ['use-route, pmmcp by name', decide(EXEC, request('CONNECT', 'host.lima.internal:8766')), 'CONNECT', 'host.lima.internal:8766', { hostRefusal: 'special-use' }],
+    ['use-route, the loopback in IPv6', decide(EXEC, request('CONNECT', '[::1]:8766')), 'CONNECT', '[::1]:8766', { hostRefusal: 'ip-literal' }],
+    ['use-route, a real host', decide(EXEC, request('CONNECT', 'GitHub.com:443')), 'CONNECT', 'GitHub.com:443', github],
+    ['use-route, a host not in the grant', decide(EXEC, request('CONNECT', 'example.com:443')), 'CONNECT', 'example.com:443', { host: 'example.com' }],
+    ['use-route, in lower case', decide(EXEC, request('connect', '192.168.5.2:8766')), 'connect', '192.168.5.2:8766', { hostRefusal: 'ip-literal' }],
+    ['use-route, a target that is no authority', decide(EXEC, request('CONNECT', 'http://192.168.5.2:8766/')), 'CONNECT', 'http://192.168.5.2:8766/', {}],
+    ['not-allowed', decide(EXEC, request('GET', 'http://example.com/')), 'GET', 'http://example.com/', { host: 'example.com' }],
+    ['repo', decide(EXEC, request('GET', 'http://github.com/evil/other.git/info/refs?service=git-upload-pack')), 'GET', 'http://github.com/evil/other.git/info/refs?service=git-upload-pack', github],
+    ['not-granted', decide(EXEC, request('GET', 'http://github.com/op/fixture.git/info/refs?service=git-receive-pack')), 'GET', 'http://github.com/op/fixture.git/info/refs?service=git-receive-pack', routed],
+    ['body, on a credential-free host', decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { 'content-length': '0' })), 'GET', 'http://registry.npmjs.org/react', registry],
+    ['body, on a route', decide(EXEC, request('GET', 'http://github.com/op/fixture.git/info/refs?service=git-upload-pack', { 'content-length': '2' })), 'GET', 'http://github.com/op/fixture.git/info/refs?service=git-upload-pack', routed],
+    ['body, framed two ways', decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { 'content-length': '2', 'transfer-encoding': 'chunked' })), 'GET', 'http://registry.npmjs.org/react', registry],
+    ['content-type, sent twice', decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { 'content-type': ['a/b', 'c/d'] })), 'GET', 'http://registry.npmjs.org/react', registry],
+    ['content-type, on a route', decide(EXEC, request('POST', 'http://github.com/op/fixture/git-upload-pack', { ...UPLOAD_HEADERS, 'content-type': 'text/plain' })), 'POST', 'http://github.com/op/fixture/git-upload-pack', routed],
+    ['content-encoding, sent twice', decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { 'content-encoding': ['gzip', 'br'] })), 'GET', 'http://registry.npmjs.org/react', registry],
+    ['content-encoding, on a route', push(commandList([[OLD, NEW, `${prefix}f`]]), { 'content-encoding': 'gzip' }), 'POST', PUSH_TARGET, routed],
+    ['override-header', decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { 'x-http-method-override': 'DELETE' })), 'GET', 'http://registry.npmjs.org/react', registry],
+    ['override-header, on a route', decide(EXEC, request('GET', 'http://github.com/op/fixture.git/info/refs?service=git-upload-pack', { 'x-original-url': '/x' })), 'GET', 'http://github.com/op/fixture.git/info/refs?service=git-upload-pack', github],
+    // A target decide() cannot read names no destination at all.
+    ['target, origin-form', decide(EXEC, request('GET', '/react', { host: '192.168.5.2:8766' })), 'GET', '/react', {}],
+    ['target, an upper-case scheme', decide(EXEC, request('GET', 'HTTP://192.168.5.2:8766/')), 'GET', 'HTTP://192.168.5.2:8766/', {}],
+    ['not-a-host, pmmcp by address', decide(EXEC, request('GET', 'http://192.168.5.2:8766/mcp')), 'GET', 'http://192.168.5.2:8766/mcp', { hostRefusal: 'ip-literal' }],
+    ['not-a-host, the control plane by address', decide(EXEC, request('GET', 'https://192.168.5.2:7777/')), 'GET', 'https://192.168.5.2:7777/', { hostRefusal: 'ip-literal' }],
+    ['not-a-host, pmmcp by name', decide(EXEC, request('GET', 'http://host.lima.internal:8766/mcp')), 'GET', 'http://host.lima.internal:8766/mcp', { hostRefusal: 'special-use' }],
+    ['port', decide(EXEC, request('GET', 'https://example.com:8080/')), 'GET', 'https://example.com:8080/', { host: 'example.com' }],
+    ['port, on a bound host', decide(EXEC, request('GET', 'http://github.com:8443/op/fixture.git/info/refs?service=git-upload-pack')), 'GET', 'http://github.com:8443/op/fixture.git/info/refs?service=git-upload-pack', github],
+    // Userinfo names the host past it, as a URL parser reads it, or why it is none.
+    ['second-host, userinfo', decide(EXEC, request('GET', 'http://user@registry.npmjs.org/')), 'GET', 'http://user@registry.npmjs.org/', registry],
+    ['second-host, userinfo before pmmcp', decide(EXEC, request('GET', 'http://registry.npmjs.org@192.168.5.2:8766/mcp')), 'GET', 'http://registry.npmjs.org@192.168.5.2:8766/mcp', { hostRefusal: 'ip-literal' }],
+    ['second-host, userinfo before pmmcp by name', decide(EXEC, request('GET', 'http://x:y@host.lima.internal:8766/')), 'GET', 'http://x:y@host.lima.internal:8766/', { hostRefusal: 'special-use' }],
+    ['second-host, the Host header', decide(EXEC, request('GET', 'http://registry.npmjs.org/', { host: 'example.com' })), 'GET', 'http://registry.npmjs.org/', registry],
+    ['path', decide(EXEC, request('GET', 'http://registry.npmjs.org/a/../b')), 'GET', 'http://registry.npmjs.org/a/../b', registry],
+    ['path, on a bound host', decide(EXEC, request('GET', 'http://github.com/op/%2e%2e/x')), 'GET', 'http://github.com/op/%2e%2e/x', github],
+    ['no-route', decide(EXEC, request('GET', 'http://github.com/user/keys')), 'GET', 'http://github.com/user/keys', github],
+    // The method is read once the target is, so a deny for it names where the request was headed.
+    ['method, no token', decide(EXEC, request('get', 'http://registry.npmjs.org/')), 'get', 'http://registry.npmjs.org/', registry],
+    ['method, a token with a hyphen', decide(EXEC, request('M-SEARCH', 'http://example.com/')), 'M-SEARCH', 'http://example.com/', { host: 'example.com' }],
+    ['method, on a credential-free host', decide(EXEC, request('POST', 'http://registry.npmjs.org/react', { 'content-length': '2' })), 'POST', 'http://registry.npmjs.org/react', registry],
+    ['method, on a route', decide(EXEC, request('POST', 'http://github.com/op/fixture.git/info/refs?service=git-upload-pack')), 'POST', 'http://github.com/op/fixture.git/info/refs?service=git-upload-pack', github],
+    ['query', decide(EXEC, request('GET', 'http://github.com/op/fixture.git/info/refs?service=git-upload-archive')), 'GET', 'http://github.com/op/fixture.git/info/refs?service=git-upload-archive', github],
+    ['push-commands', push(pkt('not a command') + '0000'), 'POST', PUSH_TARGET, routed],
+    ['push-ref', push(commandList([[OLD, NEW, 'refs/heads/main']])), 'POST', PUSH_TARGET, routed],
+    ['push-delete', push(commandList([[OLD, ZERO, `${prefix}f`]])), 'POST', PUSH_TARGET, routed],
+    ['pulls-body', pulls(JSON.stringify({ ...PR, draft: 'yes', extra: 1 })), 'POST', PULLS_TARGET, api],
+    ['pulls-head', pulls(JSON.stringify({ ...PR, head: 'evil:x' })), 'POST', PULLS_TARGET, api],
   ]
+  const SERVICES = new Map([
+    ['service=git-upload-pack', 'git-upload-pack'],
+    ['service=git-receive-pack', 'git-receive-pack'],
+  ])
   const hosted = new Set<string>()
   const bound = new Set<string>()
-  for (const [label, decision] of cases) {
+  const refusing = new Set<string>()
+  const pathed = new Set<string>()
+  for (const [label, decision, method, target, named] of cases) {
     assert.equal(decision.verdict, 'deny', label)
     if (decision.verdict !== 'deny') continue
     assert.ok(label.startsWith(decision.reason), `${label} was denied ${decision.reason}`)
+    assert.deepEqual(
+      { host: decision.host, bindingId: decision.bindingId, hostRefusal: decision.hostRefusal },
+      { host: named.host, bindingId: named.bindingId, hostRefusal: named.hostRefusal },
+      label,
+    )
+    // The path the session keeps: the one parseTarget read, when it read one
+    // (session.ts pathFields), and none for a reason PROXY_DENIES_BEFORE_PATH
+    // names, which must therefore never be given with one read.
+    const parsed = target === undefined ? undefined : parseTarget(target)
+    const path =
+      parsed?.ok === true
+        ? {
+            path: recordable(parsed.path, EGRESS_PATH_BYTES),
+            pathBytes: parsed.path.length,
+            queryBytes: parsed.query === undefined ? 0 : parsed.query.length + 1,
+            ...(decision.reason !== 'query' && parsed.query !== undefined && parsed.path.endsWith('/info/refs') ? { service: SERVICES.get(parsed.query) } : {}),
+          }
+        : {}
     // The row the session (E8) writes from the decision, naming exactly what it named.
     const row = Object.fromEntries(
       Object.entries({
@@ -496,23 +634,34 @@ test('every deny decide() gives is a proxy.decision row with exactly the host, b
         verdict: 'deny',
         reason: decision.reason,
         count: 1,
+        method: method !== undefined && METHOD_SHAPE.test(method) ? method : undefined,
         host: decision.host,
         bindingId: decision.bindingId,
         hostRefusal: decision.hostRefusal,
+        ...path,
         why: recordable(decision.why, EGRESS_WHY_BYTES),
       }).filter(([, value]) => value !== undefined),
     )
-    const parsed = PAYLOAD_SCHEMAS['proxy.decision'].safeParse(row)
-    assert.equal(parsed.success, true, `${label}: ${parsed.success ? '' : parsed.error.issues.map((i) => i.message).join('; ')}`)
+    const accepted = PAYLOAD_SCHEMAS['proxy.decision'].safeParse(row)
+    assert.equal(accepted.success, true, `${label}: ${accepted.success ? '' : accepted.error.issues.map((i) => i.message).join('; ')}`)
     if (decision.host !== undefined) hosted.add(decision.reason)
     if (decision.bindingId !== undefined) bound.add(decision.reason)
+    if (decision.hostRefusal !== undefined) refusing.add(decision.reason)
+    if ('path' in path) pathed.add(decision.reason)
   }
   // Every deny reason was given, and the rows' tables are exactly decide()'s:
-  // every reason not before the host was given with a host, and every reason
-  // the rows let name a binding was given with one.
+  // every reason not before the host was given with a host, every reason the
+  // rows let name a binding was given with one, every reason the rows let say
+  // why a host was none was given with one, and every reason not before the
+  // path was given with a path read, but `path`, whose path parseTarget
+  // refused and the session therefore keeps none of.
+  const outside = (table: readonly string[]): string[] => PROXY_DENY_REASONS.filter((r) => !table.includes(r)).sort()
   assert.deepEqual(new Set(cases.map(([, d]) => d.reason)), new Set(PROXY_DENY_REASONS))
-  assert.deepEqual([...hosted].sort(), PROXY_DENY_REASONS.filter((r) => !(PROXY_DENIES_BEFORE_HOST as readonly string[]).includes(r)).sort())
+  assert.deepEqual([...hosted].sort(), outside(PROXY_DENIES_BEFORE_HOST))
   assert.deepEqual([...bound].sort(), [...PROXY_DENIES_ON_A_ROUTE].sort())
+  assert.deepEqual([...refusing].sort(), [...PROXY_DENIES_BY_HOST_REFUSAL].sort())
+  assert.deepEqual([...pathed, 'path'].sort(), outside(PROXY_DENIES_BEFORE_PATH))
+  for (const reason of PROXY_DENIES_BEFORE_PATH) assert.equal(pathed.has(reason), false, `${reason} was given with a path read`)
 })
 
 test('path normalisation refuses %2f, %2e, .., a double slash and a second host, and never rewrites a path it admits', () => {
@@ -850,8 +999,13 @@ test('a header that names another method or path than the request line is denied
   allows(pulls(pr), 'github-pulls', 'the pull request, no override')
   allows(decide(EXEC, request('GET', infoRefs, { 'x-request-id': 'r1', accept: '*/*' })), 'git-fetch', 'info/refs with headers decide() does not judge')
   allows(decide(EXEC, request('GET', free, { 'user-agent': 'npm/11' })), 'allow-host', 'a credential-free GET')
-  for (const name of ['X-HTTP-Method-Override', 'x-http-method', 'X-Method-Override', 'X-Original-URL', 'x-rewrite-url', 'X-HTTP-METHOD-OVERRIDE']) {
-    for (const value of ['DELETE', 'GET', '/op/fixture/settings', '', ['PUT']] as const) {
+  for (const name of [
+    'X-HTTP-Method-Override', 'x-http-method', 'X-Method-Override', 'X-Original-URL', 'x-rewrite-url', 'X-HTTP-METHOD-OVERRIDE',
+    // Aliases a backend that folds names reads as the same header (Rack's HTTP_*, CVE-2024-45614's class).
+    'X_HTTP_Method_Override', 'x_original_url', 'X.HTTP.Method', 'x-method_override',
+  ]) {
+    // Sent twice too, as headersDistinct and a raw record hold a repeated header.
+    for (const value of ['DELETE', 'GET', '/op/fixture/settings', '', ['PUT'], ['DELETE', 'PUT']] as const) {
       const extra: EgressHeaders = { [name]: value }
       const label = `${name}: ${JSON.stringify(value)}`
       denies(push(list, extra), 'override-header', `a push, ${label}`)
@@ -870,6 +1024,41 @@ test('a header that names another method or path than the request line is denied
   assert.deepEqual(leadingNeed(PUBLISH, pushHead), { kind: 'none' })
   // A host the grant does not reach is still not-allowed: the header says nothing of where a request may go.
   denies(decide(EXEC, request('GET', 'http://example.com/', { 'x-original-url': '/admin' })), 'not-allowed', 'an unlisted host')
+})
+
+test('every header is read under the one name a backend that folds names reads, so an alias is the header it aliases: to the framing, the content headers and sending one twice', () => {
+  const list = commandList([[OLD, NEW, `refs/heads/aos/${RUN}/f`]])
+  const pr = JSON.stringify(PR)
+  // A push judged plain and sent gzip under another spelling: a CGI gateway
+  // hands git-http-backend HTTP_CONTENT_ENCODING for any of them.
+  for (const name of ['Content_Encoding', 'content.encoding', 'CONTENT~ENCODING', 'content_encoding']) {
+    denies(push(list, { [name]: 'gzip' }), 'content-encoding', `a push with ${name}`)
+    denies(pulls(pr, { [name]: 'gzip' }), 'content-encoding', `a pull request with ${name}`)
+    // Beside the real one, it is the header sent twice.
+    denies(decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { 'content-encoding': 'gzip', [name]: 'br' })), 'content-encoding', `Content-Encoding and ${name}`)
+  }
+  // Framing under another spelling, beside the real one: never both.
+  for (const name of ['Transfer_Encoding', 'transfer.encoding']) {
+    denies(push(list, { [name]: 'chunked' }), 'body', `a push with Content-Length and ${name}`)
+  }
+  denies(decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { 'content-length': '0', content_length: '5' })), 'body', 'Content-Length twice, in two spellings')
+  // A second Content-Type in another spelling is a Content-Type sent twice.
+  denies(push(list, { Content_Type: 'text/plain' }), 'content-type', 'a push with a second Content-Type alias')
+  // A lone alias of a header decide() reads is read as that header, and the
+  // allow holds the upstream to it under its own name, which the head that
+  // carries only the alias does not have: refused there, not sent.
+  const aliased = decide(EXEC, request('POST', 'http://github.com/op/fixture/git-upload-pack', { Content_Type: 'application/x-git-upload-pack-request', 'transfer-encoding': 'chunked' }))
+  assert.equal(allows(aliased, 'git-fetch', 'upload-pack under an alias of Content-Type').content.type, 'application/x-git-upload-pack-request')
+  // The fold itself: lower case, every character but a letter or a digit a hyphen.
+  for (const [name, canonical] of [
+    ['Content-Type', 'content-type'],
+    ['X_HTTP_Method_Override', 'x-http-method-override'],
+    ['content.encoding', 'content-encoding'],
+    ["a!#$%&'*+.^_`|~z", `a${'-'.repeat(14)}z`],
+    ['ETag', 'etag'],
+  ] as const) {
+    assert.equal(canonicalHeaderName(name), canonical, name)
+  }
 })
 
 test('the grant is strict: a host both free and bound, a repository in two routes, an unknown profile, a run id no ref holds, a non-EgressHost or a non-repo is refused; decide() denies malformed on a grant that does not parse', () => {
@@ -1175,7 +1364,7 @@ const PURE_IMPORTS: Readonly<Record<string, Readonly<Record<string, readonly str
     './host.js': ['EgressHost', 'HostRefusal'],
     './routes.js': [
       'EGRESS_PROFILES', 'EgressProfileName', 'judgeCommands', 'judgePullsBody', 'matchRoute', 'MAX_COMMAND_LIST', 'MAX_PULLS_BODY',
-      'parseTarget', 'RepoSlug', 'ROUTE_REFUSALS', 'RUN_REF', 'scanCommandList', 'EgressProfile', 'ParsedTarget',
+      'namedHost', 'parseTarget', 'RepoSlug', 'ROUTE_REFUSALS', 'RUN_REF', 'scanCommandList', 'EgressProfile', 'ParsedTarget',
     ],
   },
 }

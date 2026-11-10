@@ -18,9 +18,10 @@
 //   A walk of the raw document rejects any key whose name looks like a
 //   secret, or that names part of a JavaScript object (`__proto__`, which
 //   the schema would drop, and `constructor` and `prototype`, as a
-//   precaution), naming the path. CLAUDE.md says kernel.yaml holds no secrets; this makes
-//   that structural rather than a habit, and the path is named because "there
-//   is a secret somewhere in your config" is not an actionable error.
+//   precaution), naming the path. CLAUDE.md says kernel.yaml holds no
+//   secrets; this makes that structural rather than a habit, and the path is
+//   named because "there is a secret somewhere in your config" is not an
+//   actionable error.
 //
 // Every numeric field is positive and no field admits "unlimited". A budget
 // that can be switched off is not a budget.
@@ -362,7 +363,9 @@ const Sandbox = z
 //   (credentialNames, src/secrets/dotenv.ts); the installer mints none. It
 //   names a credential of its own: never a bearer the kernel holds for
 //   another use, which it would send to the binding's host (the control
-//   token and MCP bearers here, a provider's key by bindingKeyProblem).
+//   token and MCP bearers here; a provider's key by bindingKeyProblem, once
+//   the wiring task calls it at boot, where kernel.yaml and providers.yaml
+//   are both read: nothing calls it yet).
 //
 //   Every identifier a grant row records (a binding's id, its host, its
 //   repositories) must be one the redaction pass leaves alone: the store
@@ -473,6 +476,15 @@ const EgressBinding = z
     binding.repos.forEach((repo, i) => {
       if (censoredInLog(repo)) issue(['repos', i], `the repository ${CENSORED_WHY}`)
     })
+    // Half of the Basic credential, and the one half kernel.yaml holds: the
+    // https://<token>@github.com habit puts the token here, in a file that is
+    // committed to a public repository. The value is never echoed.
+    if (binding.scheme === 'Basic' && censoredInLog(binding.basicUser)) {
+      issue(
+        ['basicUser'],
+        'the basicUser is in the shape of a credential: kernel.yaml is committed and holds no secrets; put the token in .env under envVar, and keep basicUser a user name (x-access-token for GitHub)',
+      )
+    }
   })
 
 export type EgressBinding = z.output<typeof EgressBinding>
@@ -599,7 +611,8 @@ export const KernelConfig = z
     // the kernel already holds would be sent to the binding's host: the
     // control plane's token, or an MCP server's (pmmcp's among them).
     // Providers' keys are in providers.yaml, which this schema never sees:
-    // bindingKeyProblem holds a binding to those, where both files are read.
+    // bindingKeyProblem will hold a binding to those once W1 calls it where
+    // both files are read (nothing calls it yet).
     const held = new Map<string, string>([[config.control.tokenEnv, "the control plane's bearer (control.tokenEnv)"]])
     for (const [server, entry] of Object.entries(config.mcp.servers)) {
       if (entry.tokenEnv !== undefined) held.set(entry.tokenEnv, `mcp server ${server}'s bearer (mcp.servers.${server}.tokenEnv)`)

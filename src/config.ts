@@ -36,7 +36,7 @@ import { BINDING_ID } from './egress/policy.js'
 import { EGRESS_PROFILES, EgressProfileName, PUSH_ROOT, RepoSlug } from './egress/routes.js'
 import { DENY_KEYS, redactString } from './events/redact.js'
 import type { ProvidersFile } from './models/registry.js'
-import { isDockerNetworkMode, isImageId, isNetworkName, isUnprivilegedUser, memoryBytes } from './sandbox/limits.js'
+import { isDockerNetworkMode, isImageId, isNetworkName, isNoNetwork, isUnprivilegedUser, memoryBytes } from './sandbox/limits.js'
 
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
 
@@ -264,15 +264,18 @@ const Goals = z
 const SandboxDomain = z
   .object({
     dockerHost: z.string().startsWith('unix://'),
-    // A plain name: docker reads `name=host` as host (sandbox/limits.ts), and
-    // probe() would inspect a network of that literal name. Nor one docker
-    // keeps for itself: host, bridge and default are never internal, and
-    // docker refuses to recreate one --internal. Nor any of those in another
-    // case: a plain HOST names a network of that name, but docker's key=value
-    // spelling lower-cases (name=HOST is host). probe() refuses every such
-    // name without inspecting it, and the run-args audit refuses each run on
-    // one, with container:<id>; this refuses them earlier, so that no kernel
-    // boots on a domain whose every run would be refused. `none` passes.
+    // The domain's internal network. No run is put on it (every run is
+    // --network none); probe() proves it Internal=true on the domain's VM, as
+    // defence in depth. A plain name: docker reads `name=host` as host
+    // (sandbox/limits.ts), and probe() would inspect a network of that literal
+    // name. Nor one docker keeps for itself: host, bridge and default are never
+    // internal, and docker refuses to recreate one --internal; none is no
+    // network at all, the one every run is on already, and no internal network
+    // to prove. Nor any of those in another case: a plain HOST names a network
+    // of that name, but docker's key=value spelling lower-cases (name=HOST is
+    // host). probe() refuses every such name without inspecting it, with
+    // container:<id>; this refuses them earlier, so that no kernel boots on a
+    // domain whose sandbox probe() would report degraded.
     network: z.string().refine(isNetworkName, {
       message:
         'a sandbox domain network must be a plain network name (a letter or digit, then letters, digits, _, . or -): ' +
@@ -282,6 +285,12 @@ const SandboxDomain = z
         'a sandbox domain network may not be host, bridge or default, nor any of them in another case: docker keeps ' +
         'those names for networks of its own, none of them internal, and refuses to recreate one --internal; a plain ' +
         "HOST names a separate network called HOST, but docker's key=value spelling lower-cases (name=HOST is host)",
+    }).refine((value) => !isNoNetwork(value), {
+      message:
+        'a sandbox domain network may not be none, nor none in another case: every run is on --network none already, ' +
+        "and a domain's network is its own internal one beside it, which the sandbox probe proves Internal=true as " +
+        "defence in depth; docker's none is no network to prove internal, and a plain NONE names a separate network " +
+        "called NONE, but docker's key=value spelling lower-cases (name=NONE is none)",
     }),
     // Absolute, a ~ path, or RELATIVE TO THE REPOSITORY ROOT (resolved in
     // parseKernelConfig) — never relative to whatever directory the daemon

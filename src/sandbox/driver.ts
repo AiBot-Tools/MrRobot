@@ -8,9 +8,9 @@
 //
 // Invariant 9 lives in the drivers that implement this, not here: read-only
 // root, all capabilities dropped, no new privileges, non-root user, pid and
-// memory and cpu caps, an internal network, mounts confined to the domain's
-// mountRoot after symlink resolution, and a hard wallclock. Never privileged,
-// never the docker socket, never the home directory.
+// memory and cpu caps, no network (docker's --network none), mounts confined
+// to the domain's mountRoot after symlink resolution, and a hard wallclock.
+// Never privileged, never the docker socket, never the home directory.
 //
 // `probe()` reports availability rather than throwing, because a kernel with
 // no container runtime must still boot degraded and say why.
@@ -51,7 +51,10 @@ export const CAPTURE_MAX_BYTES = 16 * MAX_LOGGED_OUTPUT
  */
 export const CONTAINER_PREFIX = 'aos-run-'
 
-/** Isolation domain. Each maps to its own VM and its own internal network. */
+/**
+ * Isolation domain. Each maps to its own VM; its internal network is kept and
+ * probed as defence in depth, and no run is put on it.
+ */
 export type SandboxDomain = 'trusted' | 'hostile'
 
 export interface SandboxLimits {

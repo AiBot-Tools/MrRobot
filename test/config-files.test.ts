@@ -203,6 +203,78 @@ test('scripts/colima-up.sh exists, is executable, and its header says NEEDS VALI
   assert.equal(body.includes('docker --context'), false, 'a docker context lives in ~/.docker unless DOCKER_CONFIG moved it')
 })
 
+test("README and CLAUDE.md give one reason containers cannot reach pmmcp: --network none, with each domain's internal network probed as defence in depth, and the kernel's egress engine, not a proxy, denying the Mac's loopback", () => {
+  // The egress plan's S1 (the operator, 2026-11-09): every run is --network
+  // none, so no container has a route anywhere. The aos-<domain> networks and
+  // the probe's Internal=true check stay, but only as defence in depth: no
+  // run is put on them, so they are no longer why a container cannot reach
+  // pmmcp, and the old design's egress proxy does not exist.
+  const flat = (text: string): string => text.replace(/\s+/g, ' ')
+  const readme = read('README.md')
+  const start = readme.indexOf('Until then, access rests on the two conditions the operator set')
+  const end = readme.indexOf("pmmcp's other keys", start)
+  assert.ok(start > 0 && end > start, "README has no pmmcp access section ending at pmmcp's other keys")
+  const section = flat(readme.slice(start, end))
+  const [contained = '', denied = ''] = section.split('- **').slice(1)
+  assert.ok(contained.startsWith('Containers stay off it.** '), section)
+  for (const fact of ['Every container runs with `--network none`', 'no route at all, so no container has a route there', 'the sandbox probe still refuses a domain whose docker network is not `--internal`, as defence in depth: no run is put on it']) {
+    assert.ok(contained.includes(fact), `README's containers bullet does not say: ${fact}`)
+  }
+  assert.ok(denied.startsWith("The kernel's egress engine denies it** (`src/egress`, not wired yet)"), section)
+  assert.ok(denied.includes("a worker's one way out is that engine, over its run's `docker -i` channel"), denied)
+  for (const name of ['`192.168.5.2`', '`host.lima.internal`', '`host.docker.internal`']) assert.ok(denied.includes(name), `README's egress bullet does not name ${name}`)
+  assert.doesNotMatch(section, /egress proxy|proxy sidecar|not `--internal`, so no container/, 'README still gives the old design as the reason')
+
+  // CLAUDE.md's paired fact gives the same reason.
+  const claude = flat(read('CLAUDE.md'))
+  assert.ok(
+    claude.includes('Containers are kept off it by `--network none` (the `aos-<domain>` internal networks and their probe stay as defence in depth)'),
+    "CLAUDE.md's pmmcp fact does not keep containers off it by --network none",
+  )
+  assert.doesNotMatch(claude, /Containers are kept off it by internal networks/)
+
+  // And what both say stays is what kernel.yaml ships: each domain names its
+  // own internal network, which no run is put on.
+  const config = parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO })
+  assert.deepEqual([config.sandbox.domains.trusted.network, config.sandbox.domains.hostile.network], ['aos-trusted', 'aos-hostile'])
+})
+
+test("README names no egress proxy, and its sandbox record says the internal network kept containers off pmmcp only until 2026-11-09", () => {
+  // The accepted design (the operator, 2026-11-09) has no proxy at all: the
+  // kernel's egress engine, over each run's docker -i channel, with every run
+  // on --network none. A README line that names a proxy, or says in the
+  // present tense that a domain's internal network is what stands between a
+  // container and pmmcp, tells the next reader to build or trust the old
+  // design. The stub's id, `egress-proxy`, is the one name left: the egress
+  // plan's W1 retires it, with the stub, in one commit.
+  const flat = (text: string): string => text.replace(/\s+/g, ' ')
+  const readme = flat(read('README.md'))
+  assert.doesNotMatch(readme.replaceAll('`egress-proxy`', ''), /egress proxy|proxy sidecar|Phase 2 proxy|no proxy/i)
+  assert.ok(
+    readme.includes("pmmcp fetch URLs itself and so would route around the kernel's egress engine)"),
+    "README's scrape_context pin does not say it would route around the kernel's egress engine",
+  )
+
+  // The dated record of 2026-10-21 ran its container on the domain's internal
+  // network, which was every run's network then; it says that it no longer is.
+  assert.ok(
+    readme.includes("uid 65534, on the domain's internal network (every run's network until 2026-11-09; since then every run is `--network none`)"),
+    "README's sandbox record does not date the internal network it ran on",
+  )
+  const start = readme.indexOf('- **The VMs themselves reach pmmcp.**')
+  const end = readme.indexOf('- **', start + 1)
+  assert.ok(start > 0 && end > start, "README's sandbox record has no 'The VMs themselves reach pmmcp' bullet")
+  const bullet = readme.slice(start, end)
+  for (const fact of [
+    'Until 2026-11-09 the internal network was the only thing between a container and pmmcp',
+    "since then every run is `--network none`, and a worker's one way out is the kernel's egress engine, over its run's `docker -i` channel",
+    "The egress engine runs on the Mac itself, so its refusal of the Mac's loopback is what keeps a worker's flows off pmmcp",
+  ]) {
+    assert.ok(bullet.includes(fact), `README's 'The VMs themselves reach pmmcp' bullet does not say: ${fact}\n${bullet}`)
+  }
+  assert.doesNotMatch(bullet, /Today the internal network is/, bullet)
+})
+
 test('.npmrc keeps npm\'s cache in the program folder', () => {
   // npm resolves a relative path config against the shell's cwd
   // (@npmcli/config parse-field.js), so the README says to run npm from the root.
@@ -370,8 +442,9 @@ test('agents/*/agent.yaml parse against the shipped providers and tool-views; th
   assert.equal(ceo.manifest.version, 2, 'adding tools is a version bump, with v1 frozen in history/')
   assert.ok(read('agents/ceo/history/agent.v1.yaml').includes('version: 1'))
   assert.deepEqual(ceo.manifest.tools.servers, ['pmmcp'])
-  // Egress is empty too: the Phase 2 proxy does not exist, so a host here
-  // would imply an allowance nothing is present to enforce.
+  // Egress is empty too: the kernel's egress engine (src/egress) is not wired
+  // yet (egress plan W1), so a host here would imply an allowance nothing is
+  // present to enforce.
   assert.deepEqual(ceo.manifest.egress.allow, [])
   // Every fallback must be a ref the router will actually serve. Placeholders
   // are refused (D28), so a chain naming one is decorative.

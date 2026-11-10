@@ -580,6 +580,45 @@ test('the catalog is well-formed: unique ids, real test files, and controls that
   assert.deepEqual(all.filter((id, i) => all.indexOf(id) !== i), [], 'a mutant id is reused across suites')
 })
 
+test("the sandbox suite says what a domain network kernel.yaml should refuse does since --network none: the kernel boots degraded by probe(), which refuses it by name, and no run is refused", () => {
+  // A why is what the operator reads when the mutant survives, so it must say
+  // what the code would then do. Since the egress plan's S1 the builder never
+  // reads a domain's network (every run is --network none) and probe() refuses
+  // a name no domain may name without inspecting it (domainNetwork), advising
+  // only `docker network create --internal aos-<domain>`: so with kernel.yaml's
+  // refusal gone, no run is refused and no `docker network rm` is advised. The
+  // behaviour each why describes is held by test/sandbox-docker.test.ts:
+  // 'worker argv carries --network none exactly once and never the domain
+  // network' and 'probe refuses a domain network no domain may name without
+  // inspecting it, and never advises recreating it'.
+  const sandbox = CATALOG.find((s) => s.name === 'sandbox')
+  assert.ok(sandbox, 'the catalog has no sandbox suite')
+  const refusals = sandbox.mutants.filter((mu) => mu.file === 'src/config.ts' && /isNetworkName|isDockerNetworkMode|isNoNetwork/.test(mu.from))
+  assert.deepEqual(refusals.map((mu) => mu.id), ['Z63', 'Z69', 'Z159'], "kernel.yaml's domain-network refinements are not the three this test reads")
+  for (const mu of refusals) {
+    assert.ok(mu.why.includes('so the kernel boots with its sandbox degraded by probe()'), `${mu.id}: ${mu.why}`)
+    assert.ok(mu.why.endsWith('and no internal network is kept beside --network none'), `${mu.id}: ${mu.why}`)
+    assert.doesNotMatch(mu.why, /every run|inspects|advi[sc]e/, `${mu.id}: ${mu.why}`)
+  }
+  const z63 = refusals[0]?.why ?? ''
+  assert.ok(z63.includes('which refuses it by name rather than inspecting it'), z63)
+  // No why in the suite says what S1 ended: a run refused for its domain's
+  // network, or probe() advising a domain of a predefined network be recreated.
+  for (const mu of sandbox.mutants) {
+    assert.doesNotMatch(mu.why, /every run is refused|advises recreating/, `${mu.id}: ${mu.why}`)
+  }
+
+  // Nor does the comment of the config test that kills Z69 (host, bridge,
+  // default and none refused in kernel.yaml): it says what Z69's why says.
+  const configTest = readFileSync(join(REPO_ROOT, 'test', 'config.test.ts'), 'utf8')
+  const title = "test('a sandbox domain network may not be host, bridge, default or none, in any case', () => {\n"
+  const at = configTest.indexOf(title)
+  assert.ok(at > 0, 'test/config.test.ts has no test refusing host, bridge, default and none')
+  const comment = [...configTest.slice(at + title.length).matchAll(/^ {2}\/\/ ?(.*)\n/gmy)].map((m) => m[1]).join(' ')
+  assert.ok(comment.includes('probe() would degrade the kernel, refusing it by name without inspecting it (domainNetwork), and no internal network would be kept beside --network none'), comment)
+  assert.doesNotMatch(comment, /docker network rm|advise/, comment)
+})
+
 test('no mutant that could steer an entry point at a credentials file runs beside a test that spawns entry points from this checkout', () => {
   // entrypoints.test.ts spawns the daemon, the CLI and eval from
   // shadowCheckout()'s copy, against a trap .env. That copy is the first line;

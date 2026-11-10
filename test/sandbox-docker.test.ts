@@ -19,8 +19,10 @@
 //   Let a second --mount or a -v through and a spec field smuggles in a bind
 //   the confinement never saw.
 //   Pass the process environment and every provider key the operator exported
-//   lands inside a worker (invariant 2), which is exactly what the Phase 2
-//   egress proxy exists to prevent and must not be possible before it ships.
+//   lands inside a worker (invariant 2), which is the failure the kernel's
+//   egress engine (src/egress) exists to prevent in Phase 2, by injecting each
+//   credential at the kernel's edge and never in the container, and which must
+//   not be possible before it ships.
 //   Send a kill to any socket but the one whose daemon holds the container
 //   and the answer is "No such container", swallowed as the normal race: the
 //   run outlives its hard wallclock and nobody is told. Ask the VMs one after
@@ -60,25 +62,32 @@
 //   syslog, --read-only=false) only because RUN_OPTIONS does not list them,
 //   and the edit that lists one reaches docker with it; read docker's options
 //   past the image and `grep -e` is refused as an environment; take any
-//   --network value and a container sits on a network probe() never proved
-//   internal; take the domain's value without reading it as docker does and
-//   `name=host` is the VM's own network stack. Refuse a domain of host as an
-//   option the builder never emits, or advise recreating it --internal, and
-//   the operator is sent after a smuggled flag or a command docker refuses.
-//   Build a hostile run against the trusted domain's config and it goes on a
-//   network its own VM never checked.
+//   --network value but none, the domain's internal network among them, and a
+//   container sits on a network, with peers, an address on the VM and a
+//   resolver; read a --network without reading it as docker does and
+//   `name=host` is the VM's own network stack. Let a domain name none, host
+//   or name=host without refusing it by name, or advise recreating it
+//   --internal, and the operator is sent after a command docker refuses.
+//   Build a hostile run against the trusted domain's config and it is
+//   confined to a share its own VM never mounts.
+//   Run a docker command docker.ts's header does not name, on any path, a
+//   catch's as much as a healthy daemon's, and its case for a driver with no
+//   HOME and no credential helper (what it runs pulls nothing) is made about
+//   another driver.
 
 import './helpers/guard.js'
 
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { userInfo } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { finished } from 'node:stream/promises'
 import { setFlagsFromString } from 'node:v8'
 import { runInNewContext } from 'node:vm'
+
+import ts from 'typescript'
 
 import { tmpdir } from './helpers/tmpdir.js'
 import { ConfigError, NotImplementedError } from '../src/errors.js'
@@ -193,7 +202,7 @@ function valueOf(args: readonly string[], flag: string): string | undefined {
 
 // ── the flag set ───────────────────────────────────────────────────────────
 
-test('run args contain --read-only, --cap-drop=ALL, --security-opt=no-new-privileges, --user, --pids-limit, --memory, --cpus, --network <internal>, --tmpfs, --init, --rm, --name', (t) => {
+test('run args contain --read-only, --cap-drop=ALL, --security-opt=no-new-privileges, --user, --pids-limit, --memory, --cpus, --network none, --tmpfs, --init, --rm, --name', (t) => {
   const f = fixture(t)
   const args = argsFor(f)
 
@@ -206,7 +215,7 @@ test('run args contain --read-only, --cap-drop=ALL, --security-opt=no-new-privil
   assert.equal(valueOf(args, '--pids-limit'), '256')
   assert.equal(valueOf(args, '--memory'), '2g')
   assert.equal(valueOf(args, '--cpus'), '2')
-  assert.equal(valueOf(args, '--network'), 'aos-internal')
+  assert.equal(valueOf(args, '--network'), 'none')
   assert.equal(valueOf(args, '--tmpfs'), '/tmp:rw,noexec,nosuid,nodev,size=64m')
   assert.ok(args.includes('--init'), '--init')
   assert.ok(args.includes('--rm'), '--rm')
@@ -341,7 +350,7 @@ test('the audit reads the --mount value as docker does and admits only type=bind
   const args = argsFor(f)
   const at = args.indexOf('--mount') + 1
   const withMount = (value: string): string[] => args.map((a, i) => (i === at ? value : a))
-  assert.doesNotThrow(() => auditRunArgs(args, home, ws, f.domain.network, IMAGE_ID))
+  assert.doesNotThrow(() => auditRunArgs(args, home, ws, IMAGE_ID))
 
   const bad = [
     `type=bind,source=${ws},source=/etc,target=${WORKSPACE_TARGET}`, // docker keeps the last source
@@ -364,7 +373,7 @@ test('the audit reads the --mount value as docker does and admits only type=bind
     '',
   ]
   for (const value of bad) {
-    assert.throws(() => auditRunArgs(withMount(value), home, ws, f.domain.network, IMAGE_ID), ConfigError, JSON.stringify(value))
+    assert.throws(() => auditRunArgs(withMount(value), home, ws, IMAGE_ID), ConfigError, JSON.stringify(value))
   }
   // A workspace that itself holds a double quote or a line break, written into
   // the value as the builder writes it, splits at its commas into exactly the
@@ -373,7 +382,7 @@ test('the audit reads the --mount value as docker does and admits only type=bind
   // because docker's CSV reader would not read that value as this split does.
   for (const quoted of ['/w/a"b', '/w/a\nb']) {
     assert.throws(
-      () => auditRunArgs(withMount(`type=bind,source=${quoted},target=${WORKSPACE_TARGET}`), home, quoted, f.domain.network, IMAGE_ID),
+      () => auditRunArgs(withMount(`type=bind,source=${quoted},target=${WORKSPACE_TARGET}`), home, quoted, IMAGE_ID),
       /holds a double quote or a control character, so docker would not split it at its commas/,
       JSON.stringify(quoted),
     )
@@ -381,7 +390,7 @@ test('the audit reads the --mount value as docker does and admits only type=bind
   // And the case a template comparison misses: the workspace carries the tail.
   const tail = `${ws},source=/etc`
   assert.throws(
-    () => auditRunArgs(withMount(`type=bind,source=${tail},target=${WORKSPACE_TARGET}`), home, tail, f.domain.network, IMAGE_ID),
+    () => auditRunArgs(withMount(`type=bind,source=${tail},target=${WORKSPACE_TARGET}`), home, tail, IMAGE_ID),
     /names source twice/,
   )
 })
@@ -437,16 +446,16 @@ test('the image slot cannot carry a docker option: everything before the image i
   const args = argsFor(f)
   for (const dropped of ['--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges', '--init']) {
     assert.throws(
-      () => auditRunArgs(args.filter((a) => a !== dropped), home, f.realWorkspace, f.domain.network, IMAGE_ID),
+      () => auditRunArgs(args.filter((a) => a !== dropped), home, f.realWorkspace, IMAGE_ID),
       new RegExp(`carry ${dropped} 0 time\\(s\\)`),
       dropped,
     )
   }
-  assert.throws(() => auditRunArgs(args.slice(0, args.indexOf(IMAGE_ID)), home, f.realWorkspace, f.domain.network, IMAGE_ID), /name no image/)
+  assert.throws(() => auditRunArgs(args.slice(0, args.indexOf(IMAGE_ID)), home, f.realWorkspace, IMAGE_ID), /name no image/)
   // And the argv is a `docker run`: the walk starts after it, and `create`
   // (or any other command) would be judged as though it were run.
   assert.throws(
-    () => auditRunArgs(['create', ...args.slice(1)], home, f.realWorkspace, f.domain.network, IMAGE_ID),
+    () => auditRunArgs(['create', ...args.slice(1)], home, f.realWorkspace, IMAGE_ID),
     /docker args must start with run \(found "create"\)/,
   )
 })
@@ -507,7 +516,7 @@ test('argv runs a sha256 image id with --pull=never; the audit refuses a tag or 
   // Exactly one --pull=never: missing (an edit that drops it, or an argv the
   // builder did not make) and a second copy are both refused by the count.
   assert.throws(
-    () => auditRunArgs(args.filter((a) => a !== '--pull=never'), home, f.realWorkspace, f.domain.network, IMAGE_ID),
+    () => auditRunArgs(args.filter((a) => a !== '--pull=never'), home, f.realWorkspace, IMAGE_ID),
     /carry --pull=never 0 time\(s\) before the image; the builder emits it exactly once/,
   )
   assert.throws(
@@ -542,7 +551,7 @@ test('argv runs a sha256 image id with --pull=never; the audit refuses a tag or 
   ] as const) {
     assert.throws(() => argsFor(f, { image: inline, command: [IMAGE_ID] }), pulled(JSON.stringify(inline), why), inline)
     assert.throws(
-      () => auditRunArgs(args.map((a) => (a === '--pull=never' ? inline : a)), home, f.realWorkspace, f.domain.network, IMAGE_ID),
+      () => auditRunArgs(args.map((a) => (a === '--pull=never' ? inline : a)), home, f.realWorkspace, IMAGE_ID),
       pulled(JSON.stringify(inline), why),
       `${inline} in place of the builder's`,
     )
@@ -578,10 +587,10 @@ test('argv runs a sha256 image id with --pull=never; the audit refuses a tag or 
       e.message.includes('with --pull=never, and never pulls one') &&
       e.message.includes('scripts/build-worker-image.sh'),
   )
-  assert.throws(() => auditRunArgs(args, home, f.realWorkspace, f.domain.network, undefined), /sandbox\.imageId is not set/)
+  assert.throws(() => auditRunArgs(args, home, f.realWorkspace, undefined), /sandbox\.imageId is not set/)
   // While the argv the builder made, against the id it was built for, passes.
-  assert.doesNotThrow(() => auditRunArgs(args, home, f.realWorkspace, f.domain.network, IMAGE_ID))
-  assert.throws(() => auditRunArgs(args, home, f.realWorkspace, f.domain.network, other), /which is not the pinned sandbox\.imageId/)
+  assert.doesNotThrow(() => auditRunArgs(args, home, f.realWorkspace, IMAGE_ID))
+  assert.throws(() => auditRunArgs(args, home, f.realWorkspace, other), /which is not the pinned sandbox\.imageId/)
 })
 
 test('the audit refuses every env, publish, tty, extra-host, dns, namespace-widening and unconfined flag, and a second or unexpected --network', (t) => {
@@ -621,6 +630,8 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
   const HOST_NETWORK = /^puts the container on the VM's own network stack, which reaches the Mac at 192\.168\.5\.2/
   const BRIDGE = /^puts the container on docker's default bridge, which has a route off the VM/
   const NOT_PLAIN = /^names no plain network \(a letter or digit/
+  const SECOND_NETWORK = /^names a network beside the builder's --network none, where a worker is on no network at all$/
+  const NET = /^is --network under another name, a network beside the builder's --network none, where a worker is on no network at all$/
   const vmNamespace = (what: string): RegExp => new RegExp(`^shares the VM's ${what} namespace with the container`)
   const theirNamespace = (what: string): RegExp => new RegExp(`^shares another container's ${what} namespace with this one`)
   const SECCOMP_OFF = /^removes the seccomp filter/
@@ -679,9 +690,11 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
     ['--link', ['other:db', 'alpine'], '--link', /^joins another container's network and copies its environment into this one/],
     // A second network in another spelling, and the networks docker gives a
     // meaning of its own, in every spelling.
-    ['--net', ['aos-internal', 'alpine'], '--net', /^is --network under another name/],
-    ['--net=host', ['alpine'], '--net', /^is --network under another name/],
-    ['--network=aos-internal', ['alpine'], '"--network=aos-internal"', /^attaches a second network/],
+    ['--net', ['aos-internal', 'alpine'], '--net', NET],
+    ['--net=host', ['alpine'], '--net', NET],
+    ['--net=none', ['alpine'], '--net', NET],
+    ['--network=aos-internal', ['alpine'], '"--network=aos-internal"', SECOND_NETWORK],
+    ['--network=none', ['alpine'], '"--network=none"', SECOND_NETWORK],
     ['--network=host', ['alpine'], '"--network=host"', HOST_NETWORK],
     ['--network', ['host', 'alpine'], '--network "host"', HOST_NETWORK],
     ['--network', ['container:abc', 'alpine'], '--network "container:abc"', /^puts the container in another container's network namespace/],
@@ -805,7 +818,8 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
     ['--group-add', ['0', 'alpine'], '--group-add', GROUP],
     ['--group-add=root', ['alpine'], '--group-add', GROUP],
     // The VM's dockerd ships the container's output wherever the log options
-    // say, 192.168.5.2 (the Mac) among them, off the internal network.
+    // say, 192.168.5.2 (the Mac) among them, over the VM's own route, which
+    // the container's --network none does not cover.
     ['--log-driver', ['syslog', 'alpine'], '--log-driver', LOG_DRIVER],
     ['--log-driver=gelf', ['alpine'], '--log-driver', LOG_DRIVER],
     ['--log-opt', ['syslog-address=udp://192.168.5.2:514', 'alpine'], '--log-opt', LOG_OPT],
@@ -924,88 +938,89 @@ test('the audit refuses every env, publish, tty, extra-host, dns, namespace-wide
     /docker args contain --device, which invariant 9 forbids/,
   )
 
-  // Exactly one --network: a second as the builder writes its own is counted.
-  assert.throws(
-    () => argsFor(f, { image: '--network', command: ['aos-other', 'alpine'] }),
-    /carry --network 2 time\(s\) before the image/,
-  )
-  // And the one there is the network the builder was handed, which probe()
-  // proved internal: not merely a well-formed name.
+  // Exactly one --network: a second as the builder writes its own is counted,
+  // a second none among them.
+  for (const second of ['aos-other', 'none']) {
+    assert.throws(
+      () => argsFor(f, { image: '--network', command: [second, 'alpine'] }),
+      /carry --network 2 time\(s\) before the image/,
+      second,
+    )
+  }
+  // And the one there is none, as spelled (egress plan S1): not merely a
+  // well-formed name, and not a domain's internal network either, which
+  // probe() proves has no route off the VM but which every container on it
+  // shares, with an address on the VM and a resolver. A plain NONE is a
+  // network called NONE to docker, which compares a network name as spelled.
   const args = argsFor(f)
   const onNetwork = (value: string): string[] => args.map((a, i) => (args[i - 1] === '--network' ? value : a))
-  assert.doesNotThrow(() => auditRunArgs(args, home, f.realWorkspace, 'aos-internal', IMAGE_ID))
-  for (const value of ['aos-hostile', 'aos-internal2', 'AOS-INTERNAL', 'none']) {
+  assert.doesNotThrow(() => auditRunArgs(args, home, f.realWorkspace, IMAGE_ID))
+  for (const value of ['aos-internal', 'aos-hostile', 'aos-trusted', 'NONE', 'None', 'nonE', 'none2', 'none-']) {
     assert.throws(
-      () => auditRunArgs(onNetwork(value), home, f.realWorkspace, 'aos-internal', IMAGE_ID),
+      () => auditRunArgs(onNetwork(value), home, f.realWorkspace, IMAGE_ID),
       (e: unknown) =>
         e instanceof ConfigError &&
-        e.message === `docker args put the container on network ${JSON.stringify(value)}; invariant 9 needs the domain's internal network "aos-internal"`,
+        e.message === `docker args put the container on network ${JSON.stringify(value)}; invariant 9 needs --network none, no network at all`,
       JSON.stringify(value),
     )
   }
-  assert.throws(
-    () => auditRunArgs(args, home, f.realWorkspace, 'aos-hostile', IMAGE_ID),
-    /put the container on network "aos-internal"; invariant 9 needs the domain's internal network "aos-hostile"/,
-  )
-  // No value at all is no plain network name, and is refused as one.
-  assert.throws(() => auditRunArgs(onNetwork(''), home, f.realWorkspace, 'aos-internal', IMAGE_ID), named('--network ""', NOT_PLAIN))
-  // A domain that names a network docker gives a meaning of its own is
-  // refused although the value matches what the builder was handed: the
-  // modes, and anything but a plain name, which docker may read as its
-  // key=value syntax (name=host is host, its fields lower-cased). The refusal
-  // names the domain's network: the --network carrying it is the builder's
-  // own, which the walk's refusal would call one the builder never emits.
-  const domainNamed =
-    (network: string) =>
-    (e: unknown): boolean =>
-      e instanceof ConfigError &&
-      e.message.startsWith(`the domain network ${JSON.stringify(network)} is not one a domain may name: as --network it `) &&
-      e.message.endsWith("; invariant 9 needs the domain's own internal network") &&
-      !e.message.includes('never emits')
-  assert.throws(
-    () => auditRunArgs(onNetwork('host'), home, f.realWorkspace, 'host', IMAGE_ID),
-    (e: unknown) =>
-      domainNamed('host')(e) &&
-      (e as Error).message.includes("it puts the container on the VM's own network stack, which reaches the Mac at 192.168.5.2;"),
-  )
-  // A plain HOST is a network of that name to docker, not host mode, and the
-  // refusal says why it is refused anyway rather than calling it host mode.
-  assert.throws(
-    () => auditRunArgs(onNetwork('HOST'), home, f.realWorkspace, 'HOST', IMAGE_ID),
-    (e: unknown) =>
-      domainNamed('HOST')(e) &&
-      (e as Error).message.includes("it spells host in another case, which docker reads as a network of that name, but docker's key=value spelling lower-cases (name=HOST is host)") &&
-      !(e as Error).message.includes('own network stack'),
-  )
-  // Refused before every other check reads the argv, so a domain network
-  // that would read there as a forbidden flag, the docker socket, a -v or a
-  // second --mount is still refused as the domain's, the config to change.
+  // No value at all is no plain network name, and is refused as one; and a
+  // mode docker gives a name of its own, in the builder's own --network, is
+  // refused for what it widens, before the value is held to none.
+  assert.throws(() => auditRunArgs(onNetwork(''), home, f.realWorkspace, IMAGE_ID), named('--network ""', NOT_PLAIN))
+  assert.throws(() => auditRunArgs(onNetwork('host'), home, f.realWorkspace, IMAGE_ID), named('--network "host"', HOST_NETWORK))
+  assert.throws(() => auditRunArgs(onNetwork('bridge'), home, f.realWorkspace, IMAGE_ID), named('--network "bridge"', BRIDGE))
+  assert.throws(() => auditRunArgs(onNetwork('name=none'), home, f.realWorkspace, IMAGE_ID), named('--network "name=none"', NOT_PLAIN))
+})
+
+test('worker argv carries --network none exactly once and never the domain network', (t) => {
+  // Egress plan S1 (the operator, 2026-11-09). A worker has no network at all:
+  // its one way out is the kernel's egress engine, over its run's docker -i
+  // channel. Each domain's internal network stays, and probe() still proves it
+  // internal, as defence in depth (below), but no run is put on it: it never
+  // reaches the argv, as --network or in any other element, on either domain.
+  const f = fixture(t)
+  const home = join(f.root, 'home')
+  /** Every network docker would read before the image, in any spelling. */
+  const networks = (args: readonly string[]): string[] => {
+    const options = args.slice(0, args.indexOf(IMAGE_ID))
+    return options.flatMap((a, i) => (a === '--network' ? [options[i + 1] ?? ''] : a.startsWith('--net') ? [a] : []))
+  }
+  for (const [name, domain] of [['trusted', f.domain], ['hostile', f.hostile]] as const) {
+    const args = buildRunArgs({ spec: spec(f, { domain: name }), domain, defaults: DEFAULTS, repoRoot: f.repoRoot, imageId: IMAGE_ID, home })
+    assert.deepEqual(networks(args), ['none'], name)
+    assert.equal(args.filter((a) => a === 'none').length, 1, name)
+    assert.equal(args.some((a) => a.includes(domain.network)), false, `${name}: ${domain.network} in ${JSON.stringify(args)}`)
+    assert.doesNotThrow(() => auditRunArgs(args, home, name === 'trusted' ? f.realWorkspace : f.realHostileWorkspace, IMAGE_ID), name)
+  }
+
+  // The builder does not read the domain's network at all: whatever a domain
+  // names, the argv is the one it builds for aos-internal. kernel.yaml and
+  // probe() refuse each of these as a domain's network (test/config.test.ts
+  // and the probe tests below); none of them can reach a container.
+  const reference = argsFor(f)
   for (const network of [
+    'aos-hostile',
     'host',
     'HOST',
     'bridge',
-    'Bridge',
     'default',
-    'DEFAULT',
+    'none',
+    'NONE',
     'container:abc',
     'name=host',
-    'NAME=HOST',
-    'name=bridge',
     'name=aos-internal,alias=x',
-    'name=aos-internal,driver-opt=com.docker.network.x=y',
     'aos internal',
-    'aos-internal,',
-    '-aos-internal',
     '',
     '--privileged',
     '/var/run/docker.sock',
     '-v',
     '--mount',
   ]) {
-    assert.throws(
-      () => buildRunArgs({ spec: spec(f), domain: { ...f.domain, network }, defaults: DEFAULTS, repoRoot: f.repoRoot, imageId: IMAGE_ID, home }),
-      domainNamed(network),
-      network,
+    assert.deepEqual(
+      buildRunArgs({ spec: spec(f), domain: { ...f.domain, network }, defaults: DEFAULTS, repoRoot: f.repoRoot, imageId: IMAGE_ID, home }),
+      reference,
+      JSON.stringify(network),
     )
   }
 })
@@ -1078,11 +1093,11 @@ test('the audit refuses a root --user and a --memory, --pids-limit or --cpus tha
   // the flag, wherever it came from.
   const args = argsFor(f)
   const swapped = (flag: string, value: string): string[] => args.map((a, i) => (args[i - 1] === flag ? value : a))
-  assert.doesNotThrow(() => auditRunArgs(swapped('--user', '1000:1000'), home, f.realWorkspace, f.domain.network, IMAGE_ID))
-  assert.throws(() => auditRunArgs(swapped('--user', '0:0'), home, f.realWorkspace, f.domain.network, IMAGE_ID), /--user "0:0"; invariant 9/)
-  assert.throws(() => auditRunArgs(swapped('--memory', '0'), home, f.realWorkspace, f.domain.network, IMAGE_ID), /--memory "0"; invariant 9/)
-  assert.throws(() => auditRunArgs(swapped('--pids-limit', '-1'), home, f.realWorkspace, f.domain.network, IMAGE_ID), /--pids-limit "-1"; invariant 9/)
-  assert.throws(() => auditRunArgs(swapped('--cpus', '0.0'), home, f.realWorkspace, f.domain.network, IMAGE_ID), /--cpus "0.0"; invariant 9/)
+  assert.doesNotThrow(() => auditRunArgs(swapped('--user', '1000:1000'), home, f.realWorkspace, IMAGE_ID))
+  assert.throws(() => auditRunArgs(swapped('--user', '0:0'), home, f.realWorkspace, IMAGE_ID), /--user "0:0"; invariant 9/)
+  assert.throws(() => auditRunArgs(swapped('--memory', '0'), home, f.realWorkspace, IMAGE_ID), /--memory "0"; invariant 9/)
+  assert.throws(() => auditRunArgs(swapped('--pids-limit', '-1'), home, f.realWorkspace, IMAGE_ID), /--pids-limit "-1"; invariant 9/)
+  assert.throws(() => auditRunArgs(swapped('--cpus', '0.0'), home, f.realWorkspace, IMAGE_ID), /--cpus "0.0"; invariant 9/)
 })
 
 // ── confinement ────────────────────────────────────────────────────────────
@@ -1323,11 +1338,11 @@ test('spawn env keys are exactly [DOCKER_CONFIG, DOCKER_HOST, PATH] with a poiso
   assert.equal(d.spawns[1]?.env['DOCKER_HOST'], 'unix:///tmp/colima-hostile.sock')
 })
 
-test('each run is built against its own domain: a hostile run goes on --network aos-hostile once, from the hostile mountRoot', (t) => {
-  // probe() proves each domain's network internal on that domain's VM. A run
-  // built against the other domain's config goes on a network its own VM
-  // never had checked, and the audit cannot see it: it compares the network
-  // with whatever domain the builder was handed.
+test('each run is built against its own domain: a hostile run goes on --network none once, from the hostile mountRoot', (t) => {
+  // Each domain's VM mounts its own mountRoot and nothing else, so a run built
+  // against the other domain's config is confined to a share its own VM never
+  // mounts. Either way it is on no network: never the domain's own, nor the
+  // other domain's (egress plan S1).
   const f = fixture(t)
   const d = driverFor(f)
   d.driver.run(spec(f, { domain: 'hostile', name: `${CONTAINER_PREFIX}h1` }))
@@ -1336,9 +1351,9 @@ test('each run is built against its own domain: a hostile run goes on --network 
     args.flatMap((a, i) => (a === '--network' ? [args[i + 1] ?? ''] : a.startsWith('--net') ? [a] : []))
 
   const [hostile, trusted] = d.spawns.map((s) => s.args)
-  assert.deepEqual(networks(hostile), ['aos-hostile'])
+  assert.deepEqual(networks(hostile), ['none'])
   assert.equal(valueOf(hostile ?? [], '--mount'), `type=bind,source=${f.realHostileWorkspace},target=${WORKSPACE_TARGET}`)
-  assert.deepEqual(networks(trusted), ['aos-internal'])
+  assert.deepEqual(networks(trusted), ['none'])
   assert.equal(valueOf(trusted ?? [], '--mount'), `type=bind,source=${f.realWorkspace},target=${WORKSPACE_TARGET}`)
 
   // And a hostile run is confined to the hostile mountRoot: the trusted
@@ -1396,6 +1411,8 @@ test('probe reports why when docker is unreachable', async (t) => {
 test('probe refuses a domain whose network is not internal, and checks each domain on its own VM', async (t) => {
   // In a Colima VM the Mac's loopback is 192.168.5.2, where pmmcp listens
   // unauthenticated. A network with a route out is a path to its vault tools.
+  // No run is put on a domain's network (every run is --network none, egress
+  // plan S1), but the networks and this proof stay, as defence in depth.
   const f = fixture(t)
   const d = driverFor(f)
   const internalOn = new Set(['unix:///tmp/colima-trusted.sock'])
@@ -1436,9 +1453,11 @@ test('probe refuses a domain network no domain may name without inspecting it, a
   // a predefined network. kernel.yaml refuses these names
   // (test/config.test.ts); a driver handed its domains another way meets this.
   // HOST among them: docker reads it as a network of that name, and the
-  // reason says so rather than calling it host mode.
+  // reason says so rather than calling it host mode. And none, in any case:
+  // the one every run is on already (egress plan S1), no internal network to
+  // prove, and predefined, so the advice would be a command docker refuses.
   const f = fixture(t)
-  for (const network of ['host', 'HOST', 'bridge', 'default', 'container:abc', 'name=host']) {
+  for (const network of ['host', 'HOST', 'bridge', 'default', 'container:abc', 'name=host', 'none', 'NONE', 'None']) {
     const d = driverFor({ ...f, hostile: { ...f.hostile, network } })
     const inspected: string[] = []
     d.setExec((args, env) => {
@@ -1455,6 +1474,21 @@ test('probe refuses a domain network no domain may name without inspecting it, a
     if (network === 'HOST') {
       assert.ok(why.includes('as --network it spells host in another case, which docker reads as a network of that name'), why)
       assert.equal(why.includes("VM's own network stack"), false, why)
+    }
+    if (network === 'none') {
+      assert.ok(
+        why.includes("as --network it is docker's none, no network at all, which every run is on already, and no internal network for probe() to prove."),
+        why,
+      )
+    }
+    if (network === 'NONE' || network === 'None') {
+      assert.ok(
+        why.includes(
+          "as --network it spells none in another case, which docker reads as a network of that name, but docker's key=value " +
+            `spelling lower-cases (name=${network} is none), so no case of none is admitted.`,
+        ),
+        why,
+      )
     }
     assert.ok(why.endsWith("Name the domain's own internal network in kernel.yaml (docker network create --internal aos-hostile)"), why)
     assert.equal(why.includes('docker network rm'), false, why)
@@ -1672,6 +1706,17 @@ test('kill is idempotent and sweepOrphans reaps only our containers', async (t) 
   assert.equal(killed.includes('someone-elses-container'), false)
 })
 
+/**
+ * A sweep's listing, known by what it asks for (the kernel's containers, by
+ * name) rather than by its command word: `docker container ls` lists what
+ * `docker ps` does, so a fake keyed on `ps` would fail such a sweep for what
+ * it returned, and only the argv pin and docker.ts's header tests may see the
+ * command it ran.
+ */
+function listsOrphans(args: readonly string[]): boolean {
+  return args.includes('--filter') && args.includes(`name=${CONTAINER_PREFIX}`) && args.includes('--format') && args.includes('{{.Names}}')
+}
+
 test('sweepOrphans asks each VM for names, never with --quiet, under which docker prints IDs', async (t) => {
   // The docker CLI ignores a custom --format when --quiet is set: it warns on
   // stderr and prints container IDs. A sweep that asked so would drop every
@@ -1682,7 +1727,7 @@ test('sweepOrphans asks each VM for names, never with --quiet, under which docke
   const f = fixture(t)
   const d = driverFor(f)
   d.setExec((args, env) => {
-    if (args[0] !== 'ps') return Promise.resolve({ stdout: '', stderr: '' })
+    if (!listsOrphans(args)) return Promise.resolve({ stdout: '', stderr: '' })
     const vm = env['DOCKER_HOST'] === HOSTILE_HOST ? 'h' : 't'
     if (args.includes('--quiet') || args.includes('-q')) {
       return Promise.resolve({
@@ -1694,7 +1739,7 @@ test('sweepOrphans asks each VM for names, never with --quiet, under which docke
   })
 
   assert.deepEqual(await d.driver.sweepOrphans(), [`${CONTAINER_PREFIX}t1`, `${CONTAINER_PREFIX}h1`])
-  const listed = d.execs.filter((e) => e.args[0] === 'ps')
+  const listed = d.execs.filter((e) => listsOrphans(e.args))
   assert.deepEqual(
     listed.map((e) => e.env['DOCKER_HOST']),
     [TRUSTED_HOST, HOSTILE_HOST],
@@ -1758,7 +1803,7 @@ test('sweepOrphans kills each orphan on the domain that listed it', async (t) =>
     [HOSTILE_HOST]: `${CONTAINER_PREFIX}h1\n${CONTAINER_PREFIX}h2\n`,
   }
   d.setExec((args, env) =>
-    args[0] === 'ps'
+    listsOrphans(args)
       ? Promise.resolve({ stdout: listed[env['DOCKER_HOST'] ?? ''] ?? '', stderr: '' })
       : Promise.resolve({ stdout: '', stderr: '' }),
   )
@@ -1869,14 +1914,14 @@ test('sweepOrphans lists every VM at once and kills each orphan at once, so a da
     const d = driverFor(f)
     d.setExec((args, env) => {
       const host = env['DOCKER_HOST'] ?? ''
-      if (args[0] === 'ps') return host === hung ? hang : Promise.resolve({ stdout: listed[host] ?? '', stderr: '' })
+      if (listsOrphans(args)) return host === hung ? hang : Promise.resolve({ stdout: listed[host] ?? '', stderr: '' })
       // The first orphan's kill never returns either.
       return args[2] === `${CONTAINER_PREFIX}${first}` ? hang : Promise.resolve({ stdout: '', stderr: '' })
     })
     void d.driver.sweepOrphans()
     await new Promise((resolve) => setImmediate(resolve))
     assert.deepEqual(
-      d.execs.filter((e) => e.args[0] === 'ps').map((e) => e.env['DOCKER_HOST']).sort(),
+      d.execs.filter((e) => listsOrphans(e.args)).map((e) => e.env['DOCKER_HOST']).sort(),
       [HOSTILE_HOST, TRUSTED_HOST],
       `${hung}: both VMs were not asked for their orphans`,
     )
@@ -1904,7 +1949,7 @@ test('sweepOrphans still sweeps one VM when the other cannot be listed', async (
     const d = driverFor(f)
     d.setExec((args, env) => {
       const host = env['DOCKER_HOST'] ?? ''
-      if (args[0] !== 'ps') return Promise.resolve({ stdout: '', stderr: '' })
+      if (!listsOrphans(args)) return Promise.resolve({ stdout: '', stderr: '' })
       if (host === down) {
         return Promise.reject(new Error(`Cannot connect to the Docker daemon at ${host}. Is the docker daemon running?`))
       }
@@ -1914,7 +1959,7 @@ test('sweepOrphans still sweeps one VM when the other cannot be listed', async (
     assert.deepEqual(killed, names.map((n) => `${CONTAINER_PREFIX}${n}`), `${down} down`)
     assert.deepEqual(killsSent(d), names.map((n) => `${up} ${CONTAINER_PREFIX}${n}`), `${down} down`)
     assert.deepEqual(
-      d.execs.filter((e) => e.args[0] === 'ps').map((e) => e.env['DOCKER_HOST']).sort(),
+      d.execs.filter((e) => listsOrphans(e.args)).map((e) => e.env['DOCKER_HOST']).sort(),
       [HOSTILE_HOST, TRUSTED_HOST],
       `${down} down`,
     )
@@ -1936,7 +1981,7 @@ test('sweepOrphans resolves only once every kill it sent has returned, and kill(
     }
   })
   d.setExec((args, env) =>
-    args[0] === 'ps'
+    listsOrphans(args)
       ? Promise.resolve({ stdout: env['DOCKER_HOST'] === HOSTILE_HOST ? `${CONTAINER_PREFIX}h1\n` : '', stderr: '' })
       : held,
   )
@@ -2580,6 +2625,366 @@ test('two kills of a hung run in one tick end it once, and a rerun of its name i
   await turns(3)
   assert.equal(result()?.killedBy, 'requested', 'a kill of the rerun did not end it')
   assert.deepEqual(fake.kills, [name, name, name])
+})
+
+/** A file's header, every line before its first import, as one line of prose. */
+function headerOf(rel: string): string {
+  const source = readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8')
+  return source
+    .slice(0, source.indexOf('\nimport '))
+    .split('\n')
+    .map((l) => l.replace(/^\/\/ ?/, ''))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+}
+
+/** docker.ts's file header. */
+function dockerHeader(): string {
+  return headerOf('src/sandbox/docker.ts')
+}
+
+/** The docker commands docker.ts's header says the driver runs, sorted. */
+function headerCommands(): string[] {
+  const listed = /It runs ((?:`[^`]+`, )+`[^`]+` and `[^`]+`), and nothing else/.exec(dockerHeader())
+  assert.ok(listed, `docker.ts's header no longer lists the commands it runs as this test reads them: ${dockerHeader()}`)
+  return [...(listed[1] ?? '').matchAll(/`([^`]+)`/g)].map((m) => m[1] ?? '').sort()
+}
+
+/** The commands the driver runs today, as the header names them. */
+const DRIVER_COMMANDS = ['image inspect', 'kill', 'network inspect', 'ps', 'run', 'version']
+
+/**
+ * docker's management commands, whose command is two words (`network
+ * inspect`, `image pull`, `container ls`); any other first word is a command
+ * on its own (`ps`, `kill`, `rm`).
+ */
+const MANAGEMENT = new Set([
+  'builder', 'buildx', 'checkpoint', 'compose', 'config', 'container', 'context', 'image', 'manifest',
+  'network', 'node', 'plugin', 'secret', 'service', 'stack', 'swarm', 'system', 'trust', 'volume',
+])
+
+/** The docker command an argv names, as docker reads it. */
+function dockerCommand(args: readonly string[]): string {
+  const [first = '', second = ''] = args
+  return MANAGEMENT.has(first) ? `${first} ${second}` : first
+}
+
+/**
+ * Every docker command docker.ts's source can run, read from its syntax tree
+ * rather than from the paths some test happens to drive: the command words of
+ * each argv literal handed to this.#options.execFile, on whatever path it
+ * stands, and of the argv literal buildRunArgs returns, which is the only argv
+ * this.#options.spawn may be handed. `unread` names each place the file reaches
+ * a process in a way this cannot read the command of: an argv that is not a
+ * literal led by its command's words, a binary other than this.#binary, a
+ * spawn of anything but buildRunArgs' argv, this.#options or one of its
+ * process functions taken as a value, or node:child_process called anywhere
+ * but realDockerDriver's forwarding of the argv it was handed. A command this
+ * cannot read is one the header's list cannot be held to.
+ */
+function dockerCommandsInSource(text: string): { readonly commands: readonly string[]; readonly unread: readonly string[] } {
+  const source = ts.createSourceFile('docker.ts', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const where = (node: ts.Node): string =>
+    `docker.ts:${String(source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1)}: ${node.getText(source).replace(/\s+/g, ' ').slice(0, 100)}`
+  const commands = new Set<string>()
+  const unread: string[] = []
+  const isThis = (node: ts.Node, name: string): node is ts.PropertyAccessExpression =>
+    ts.isPropertyAccessExpression(node) && node.expression.kind === ts.SyntaxKind.ThisKeyword && node.name.text === name
+  const visit = (node: ts.Node, each: (n: ts.Node) => void): void => {
+    each(node)
+    ts.forEachChild(node, (child) => {
+      visit(child, each)
+    })
+  }
+  const enclosing = (node: ts.Node, is: (n: ts.Node) => boolean): ts.Node | undefined => {
+    for (let n = node.parent; n !== undefined; n = n.parent) if (is(n)) return n
+    return undefined
+  }
+  // The command an argv literal names: its leading string literals, two of
+  // them for a management command.
+  const commandOf = (argv: ts.Expression | undefined): string | undefined => {
+    if (argv === undefined || !ts.isArrayLiteralExpression(argv)) return undefined
+    const lead: string[] = []
+    for (const el of argv.elements.slice(0, 2)) {
+      if (!ts.isStringLiteral(el) && !ts.isNoSubstitutionTemplateLiteral(el)) break
+      lead.push(el.text)
+    }
+    const [first] = lead
+    if (first === undefined || (MANAGEMENT.has(first) && lead.length < 2)) return undefined
+    return dockerCommand(lead)
+  }
+
+  // buildRunArgs' argv: its `const args = [...]`, returned as built.
+  const builder = source.statements.find(
+    (s): s is ts.FunctionDeclaration => ts.isFunctionDeclaration(s) && s.name?.text === 'buildRunArgs',
+  )
+  let runCommand: string | undefined
+  if (builder?.body === undefined) unread.push('docker.ts: no function buildRunArgs')
+  else {
+    visit(builder.body, (n) => {
+      if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === 'args') {
+        runCommand = commandOf(n.initializer)
+        if (runCommand === undefined) unread.push(where(n))
+      }
+      if (ts.isReturnStatement(n) && enclosing(n, ts.isFunctionLike) === builder) {
+        if (n.expression === undefined || !ts.isIdentifier(n.expression) || n.expression.text !== 'args') unread.push(where(n))
+      }
+    })
+    if (runCommand === undefined) unread.push('docker.ts: buildRunArgs builds no `const args = [...]`')
+  }
+
+  const PROCESS = new Set(['spawn', 'execFile', 'execFileAsync'])
+  const realDriver = source.statements.find(
+    (s): s is ts.FunctionDeclaration => ts.isFunctionDeclaration(s) && s.name?.text === 'realDockerDriver',
+  )
+  visit(source, (n) => {
+    // this.#options is only ever read through, or set once in the constructor.
+    if (isThis(n, '#options')) {
+      const p = n.parent
+      const readThrough = ts.isPropertyAccessExpression(p) && p.expression === n
+      const set = ts.isBinaryExpression(p) && p.left === n && p.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        enclosing(n, ts.isFunctionLike)?.kind === ts.SyntaxKind.Constructor
+      if (!readThrough && !set) unread.push(where(p))
+      return
+    }
+    // Its process functions, only ever called, by docker, with an argv read here.
+    if (ts.isPropertyAccessExpression(n) && isThis(n.expression, '#options') && (n.name.text === 'execFile' || n.name.text === 'spawn')) {
+      const call = n.parent
+      if (!ts.isCallExpression(call) || call.expression !== n) return void unread.push(where(call))
+      const [binary, argv] = call.arguments
+      if (binary === undefined || !isThis(binary, '#binary')) return void unread.push(where(call))
+      if (n.name.text === 'execFile') {
+        const command = commandOf(argv)
+        if (command === undefined) return void unread.push(where(call))
+        commands.add(command)
+        return
+      }
+      // spawn: an argv the enclosing method took from buildRunArgs.
+      const method = enclosing(call, ts.isFunctionLike)
+      let fromBuilder = false
+      if (argv !== undefined && ts.isIdentifier(argv) && method !== undefined) {
+        visit(method, (m) => {
+          if (
+            ts.isVariableDeclaration(m) && ts.isIdentifier(m.name) && m.name.text === argv.text &&
+            m.initializer !== undefined && ts.isCallExpression(m.initializer) &&
+            ts.isIdentifier(m.initializer.expression) && m.initializer.expression.text === 'buildRunArgs'
+          ) fromBuilder = true
+        })
+      }
+      if (!fromBuilder || runCommand === undefined) return void unread.push(where(call))
+      commands.add(runCommand)
+      return
+    }
+    // node:child_process by its one import, which takes execFile and spawn by
+    // those names and nothing else, and named in no other string: a third
+    // function, an alias or the whole module is a way to run what no argv
+    // read here names.
+    if ((ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) && /^(?:node:)?child_process$/.test(n.text)) {
+      const decl = n.parent
+      const clause = ts.isImportDeclaration(decl) && decl.moduleSpecifier === n ? decl.importClause : undefined
+      const bindings = clause?.namedBindings
+      const only =
+        clause !== undefined && clause.name === undefined && bindings !== undefined && ts.isNamedImports(bindings) &&
+        bindings.elements.every((el) => el.propertyName === undefined && (el.name.text === 'execFile' || el.name.text === 'spawn'))
+      if (!only) unread.push(where(decl))
+      return
+    }
+    // node:child_process's functions, and the promisified one: imported,
+    // promisified, declared, and called only by realDockerDriver, forwarding
+    // the argv it was handed (`[...args]`), which the class above built.
+    if (ts.isIdentifier(n) && PROCESS.has(n.text)) {
+      const p = n.parent
+      const named =
+        (ts.isPropertyAccessExpression(p) && p.name === n) ||
+        ((ts.isPropertyAssignment(p) || ts.isPropertySignature(p)) && p.name === n) ||
+        ts.isImportSpecifier(p) ||
+        (ts.isVariableDeclaration(p) && p.name === n)
+      const promisified = ts.isCallExpression(p) && ts.isIdentifier(p.expression) && p.expression.text === 'promisify' && p.arguments[0] === n
+      const argv = ts.isCallExpression(p) ? p.arguments[1] : undefined
+      const spread = argv !== undefined && ts.isArrayLiteralExpression(argv) ? argv.elements : undefined
+      const forwarded =
+        ts.isCallExpression(p) && p.expression === n && p.arguments.length === 3 &&
+        realDriver !== undefined && enclosing(p, (x) => x === realDriver) !== undefined &&
+        spread?.length === 1 && spread[0] !== undefined && ts.isSpreadElement(spread[0])
+      if (!named && !promisified && !forwarded) unread.push(where(p))
+    }
+  })
+  return { commands: [...commands].sort(), unread }
+}
+
+const DOCKER_SOURCE = readFileSync(new URL('../src/sandbox/docker.ts', import.meta.url), 'utf8')
+
+test("docker.ts's header names every docker command its source can run, and no other", () => {
+  // The header says why the driver needs no HOME and no credential helper:
+  // what it runs pulls nothing. A list that leaves a command out is that
+  // argument made about another driver. So the list is held to the source,
+  // every argv on every path, an error path as much as a healthy one, rather
+  // than to what a test happens to reach.
+  const { commands, unread } = dockerCommandsInSource(DOCKER_SOURCE)
+  assert.deepEqual(unread, [], 'docker.ts reaches a process in a way this test cannot read the docker command of')
+  assert.deepEqual(headerCommands(), commands, "the commands docker.ts's header names are not the ones its source can run")
+  assert.deepEqual(commands, DRIVER_COMMANDS)
+})
+
+test('the source scan reads a docker command on any path, and refuses a process call it cannot read', () => {
+  // The scan above is what holds the header, so it is held here to the edits
+  // it exists to see: each is made to docker.ts's text in memory, never on
+  // disk, and must change what the scan reports.
+  const edit = (from: string, to: string): string => {
+    assert.equal(DOCKER_SOURCE.split(from).length, 2, `docker.ts no longer holds, once, ${JSON.stringify(from)}`)
+    return DOCKER_SOURCE.replace(from, to)
+  }
+  const sweepCatch = '    } catch {\n      return []\n    }\n'
+  const killCatch = '    } catch {\n      // "No such container" is the normal outcome'
+  const pull = "await this.#options.execFile(this.#binary, ['image', 'pull', 'alpine'], { env: this.#env(domain) })"
+  // docker.ts's one process import, and the module it names, read from the
+  // file rather than spelt here: test/hygiene.test.ts counts a test that
+  // spells an import of that module as one that imports it.
+  const processImport = DOCKER_SOURCE.split('\n').find((l) => l.startsWith('import { execFile, spawn } from ')) ?? ''
+  const processModule = /from '([^']+)'/.exec(processImport)?.[1] ?? ''
+  assert.ok(processModule.endsWith('child_process'), `docker.ts's process import is not the one this test reads: ${processImport}`)
+  const cases: [string, string, Partial<{ commands: string[]; unread: RegExp }>][] = [
+    ['a pull in the sweep\'s catch', edit(sweepCatch, `    } catch {\n      ${pull}\n      return []\n    }\n`), { commands: [...DRIVER_COMMANDS, 'image pull'].sort() }],
+    ['an rm in the kill\'s catch', edit(killCatch, "    } catch {\n      await this.#options.execFile(this.#binary, ['rm', '-f', name], { env: this.#env(domain) })\n      // \"No such container\" is the normal outcome"), { commands: [...DRIVER_COMMANDS, 'rm'].sort() }],
+    ['a management command with no second word', edit(sweepCatch, "    } catch {\n      await this.#options.execFile(this.#binary, ['image', name], { env: this.#env(domain) })\n      return []\n    }\n"), { unread: /\['image', name\]/ }],
+    ['an argv built at run time', edit(sweepCatch, "    } catch {\n      await this.#options.execFile(this.#binary, ['image', 'pull'].slice(), { env: this.#env(domain) })\n      return []\n    }\n"), { unread: /\.slice\(\)/ }],
+    ['another binary', edit(sweepCatch, "    } catch {\n      await this.#options.execFile('/bin/sh', ['ps'], { env: this.#env(domain) })\n      return []\n    }\n"), { unread: /'\/bin\/sh'/ }],
+    ['execFile taken as a value', edit(sweepCatch, "    } catch {\n      const run = this.#options.execFile\n      await run(this.#binary, ['image', 'pull', 'alpine'], { env: this.#env(domain) })\n      return []\n    }\n"), { unread: /run = this\.#options\.execFile/ }],
+    ['#options taken whole', edit(sweepCatch, "    } catch {\n      const { execFile } = this.#options\n      await execFile(this.#binary, ['image', 'pull', 'alpine'], { env: this.#env(domain) })\n      return []\n    }\n"), { unread: /this\.#options/ }],
+    ['child_process called in the class', edit(sweepCatch, "    } catch {\n      await execFileAsync('docker', ['image', 'pull', 'alpine'])\n      return []\n    }\n"), { unread: /execFileAsync\('docker'/ }],
+    ['a spawn of an argv not built by buildRunArgs', edit('    const child = this.#options.spawn(this.#binary, args, { env: this.#env(spec.domain) })', "    const child = this.#options.spawn(this.#binary, ['image', 'pull', 'alpine'], { env: this.#env(spec.domain) })"), { unread: /this\.#options\.spawn\(this\.#binary, \['image'/ }],
+    ['a third child_process function imported', edit(processImport, processImport.replace('{ execFile, spawn }', '{ exec, execFile, spawn }')), { unread: /import \{ exec, execFile, spawn \}/ }],
+    ['child_process imported under an alias', edit(processImport, processImport.replace('spawn }', 'spawn as start }')), { unread: /spawn as start/ }],
+    ['child_process reached by name', edit(sweepCatch, `    } catch {\n      void process.getBuiltinModule('${processModule}')\n      return []\n    }\n`), { unread: /getBuiltinModule\(/ }],
+    ['buildRunArgs returning another argv', edit('  auditRunArgs(args, home, workspace, input.imageId)\n  return args\n', "  auditRunArgs(args, home, workspace, input.imageId)\n  return ['image', 'pull', spec.image]\n"), { unread: /return \['image', 'pull'/ }],
+  ]
+  for (const [label, text, expect] of cases) {
+    const scanned = dockerCommandsInSource(text)
+    if (expect.commands !== undefined) {
+      assert.deepEqual(scanned.unread, [], label)
+      assert.deepEqual(scanned.commands, expect.commands, label)
+    }
+    if (expect.unread !== undefined) {
+      assert.ok(scanned.unread.some((u) => expect.unread?.test(u) === true), `${label}: the scan read it: ${JSON.stringify(scanned)}`)
+    }
+  }
+})
+
+/** The kernel's orphans as the sweep below lists them, one per VM. */
+const ORPHAN = `${CONTAINER_PREFIX}orphan`
+
+/**
+ * Drive every entry point of a fresh spied driver against `answer` (probe; a
+ * run that exits; a run whose wallclock fires; a run whose CLI fails to start;
+ * a spawn that throws; a kill of a name no run holds, which asks both VMs; the
+ * orphan sweep), and return the docker command of every call that reached
+ * docker. Timers must be mocked: the wallclock is ticked, not waited for.
+ */
+async function driveEveryEntry(
+  t: TestContext,
+  f: Fixture,
+  answer: ScriptedExec,
+): Promise<{ readonly reached: readonly string[]; readonly calls: number; readonly probe: unknown; readonly swept: readonly string[] }> {
+  const d = driverFor(f)
+  d.setExec(answer)
+  const probe = await d.driver.probe()
+  const exited = d.driver.run(spec(f))
+  d.child.close(0, null)
+  await exited.result
+  const timed = d.driver.run(spec(f, { limits: { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 } }))
+  t.mock.timers.tick(5_000)
+  await turns(3)
+  d.child.close(137, null)
+  await timed.result
+  const failed = d.driver.run(spec(f))
+  d.child.fail(new Error('spawn docker ENOENT'))
+  await failed.result
+  d.failNextSpawn(new Error('spawn E2BIG'))
+  assert.throws(() => d.driver.run(spec(f)), /E2BIG/)
+  await d.driver.kill(`${CONTAINER_PREFIX}gone`)
+  const swept = await d.driver.sweepOrphans()
+  // Long enough for a command a catch sends after its refusal to arrive.
+  await turns(3)
+  return {
+    reached: [...new Set([...d.spawns, ...d.execs].map((call) => dockerCommand(call.args)))],
+    calls: d.execs.length,
+    probe,
+    swept,
+  }
+}
+
+test("every docker command the driver reaches, from a healthy daemon or one that refuses any call, is one docker.ts's header names", async (t) => {
+  // The source scan above holds the list to every argv in the file. This
+  // holds it to what reaches docker, the paths that run when a daemon fails
+  // as well as when it answers: each entry point is driven against a healthy
+  // daemon, one that refuses every call, and, for each call the healthy drive
+  // makes, one that refuses that call alone, so that every catch runs.
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = fixture(t)
+  // The orphans are listed for any command that asks for the kernel's
+  // containers by name, whatever its command word (listsOrphans), so a sweep
+  // that lists by another command still sweeps, and is caught by what it ran.
+  const healthy: ScriptedExec = (args, env) =>
+    listsOrphans(args) ? Promise.resolve({ stdout: `${ORPHAN}\n`, stderr: '' }) : healthyDaemon('29.5.2')(args, env)
+  const refused = (): Promise<never> => Promise.reject(new Error('Cannot connect to the Docker daemon at unix:///tmp/colima-trusted.sock'))
+
+  const first = await driveEveryEntry(t, f, healthy)
+  assert.deepEqual(first.probe, { ok: true, version: '29.5.2' })
+  assert.deepEqual(first.swept, [ORPHAN, ORPHAN])
+  const reached = new Set(first.reached)
+  const drives = [refused, ...Array.from({ length: first.calls }, (_, i): ScriptedExec => {
+    let seen = 0
+    return (args, env) => (++seen === i + 1 ? refused() : healthy(args, env))
+  })]
+  for (const answer of drives) for (const command of (await driveEveryEntry(t, f, answer)).reached) reached.add(command)
+
+  const sorted = [...reached].sort()
+  assert.deepEqual(headerCommands(), sorted, "the commands docker.ts's header names are not the ones the driver runs")
+  assert.deepEqual(sorted, DRIVER_COMMANDS)
+})
+
+test("the sandbox layer's prose names the accepted egress design: the kernel's egress engine over the -i channel, no proxy, and a domain network no run is put on", () => {
+  // The operator accepted the egress design on 2026-11-09: no proxy
+  // container, no sidecar, no listener in any VM; the kernel's egress engine
+  // (src/egress) over each run's docker -i channel, with every worker on
+  // --network none. Each domain's internal network is kept and probed as
+  // defence in depth, and no run is put on it. Prose that names the old
+  // design tells the next reader to build it.
+  const read = (rel: string): string => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8')
+  const OLD_DESIGN = /egress proxy|proxy sidecar|Phase 2 proxy/i
+  // Every file of the sandbox layer, as the directory holds it, so a new one
+  // is read the day it lands, and the script that makes its VMs and networks.
+  const layer = readdirSync(new URL('../src/sandbox/', import.meta.url))
+    .filter((name) => name.endsWith('.ts'))
+    .sort()
+    .map((name) => `src/sandbox/${name}`)
+  for (const rel of ['src/sandbox/apple-container.ts', 'src/sandbox/confine.ts', 'src/sandbox/docker.ts', 'src/sandbox/driver.ts', 'src/sandbox/limits.ts']) {
+    assert.ok(layer.includes(rel), `the sandbox layer read from src/sandbox/ lacks ${rel}: ${layer.join(', ')}`)
+  }
+  for (const rel of [...layer, 'scripts/colima-up.sh']) assert.doesNotMatch(read(rel), OLD_DESIGN, rel)
+  const credentialsOut =
+    "which is the failure the kernel's egress engine (src/egress) exists to prevent in Phase 2, by injecting each credential at the kernel's edge and never in the container"
+  assert.ok(dockerHeader().includes(credentialsOut), "docker.ts's header does not name the kernel's egress engine as what keeps a worker's credentials out")
+  // This file's header, whose falsifiers say the same of the environment a
+  // worker must never inherit.
+  const ownHeader = headerOf('test/sandbox-docker.test.ts')
+  assert.doesNotMatch(ownHeader, OLD_DESIGN, "test/sandbox-docker.test.ts's header names the old design")
+  assert.ok(ownHeader.includes(credentialsOut), "test/sandbox-docker.test.ts's header does not name the kernel's egress engine as what keeps a worker's credentials out")
+
+  // driver.ts's SandboxDomain: a VM of its own, and an internal network that
+  // is kept and probed, not the network its runs are on.
+  const driver = read('src/sandbox/driver.ts')
+  const at = driver.indexOf('export type SandboxDomain')
+  assert.ok(at > 0, 'driver.ts no longer declares SandboxDomain')
+  const doc = driver.slice(driver.lastIndexOf('/**', at), at).replace(/^\s*\/?\*+\/?/gm, '').replace(/\s+/g, ' ').trim()
+  assert.equal(doc, 'Isolation domain. Each maps to its own VM; its internal network is kept and probed as defence in depth, and no run is put on it.')
+
+  // colima-up.sh's network comment says the same of the network it makes.
+  const script = read('scripts/colima-up.sh')
+  const comment = /^ {2}# --internal: [\s\S]*?(?=^ {2}local network=)/m.exec(script)?.[0].replace(/^\s*# ?/gm, '').replace(/\s+/g, ' ').trim() ?? ''
+  for (const fact of ['No worker is attached to it: every run is --network none', "the kernel's egress engine, over its run's docker -i channel", 'as defence in depth']) {
+    assert.ok(comment.includes(fact), `colima-up.sh's network comment does not say: ${fact}\n${comment}`)
+  }
 })
 
 // ── what a run writes ──────────────────────────────────────────────────────

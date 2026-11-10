@@ -13,15 +13,25 @@
 // an unconfined security option, a device, another runtime, kernel parameters
 // or cgroup parent, a supplementary group, a log driver, a writable root
 // filesystem, another mount or network, a pull) in any spelling docker reads,
-// exactly one --network, the domain's, by a plain name, and exactly one
-// --pull=never before an image that is the pinned sandbox.imageId — and a
-// future edit that widens any of those throws rather than producing a
-// container.
+// exactly one --network, and that one none, and exactly one --pull=never
+// before an image that is the pinned sandbox.imageId — and a future edit that
+// widens any of those throws rather than producing a container.
+//
+// A container has no network at all: --network none gives it a loopback
+// interface of its own and nothing else, so no route, no resolver, no address
+// on any network of the VM's and no peer there. A worker's one way out is
+// the kernel's egress engine (src/egress), over its own run's `docker run -i`
+// channel, and that is not wired yet (egress plan S2 and W1): until it is, a
+// worker reaches nothing. Each domain's internal network (aos-trusted and
+// aos-hostile in kernel.yaml) stays all the same, and probe() still proves it
+// Internal=true on that domain's own VM, as defence in depth, the operator's
+// decision of 2026-11-09, to be revisited at the Phase 2 exit: no run is put
+// on it, and the audit refuses a run on any network but none.
 //
 // The image is run by its id, never by a name. A tag is whatever image was
 // last given it on that VM, so it pins nothing, and a name the VM lacks is
-// pulled by default, by the VM's daemon over the VM's own route out, which the
-// internal network does not cover: what then runs is whatever the registry
+// pulled by default, by the VM's daemon over the VM's own route out, which no
+// container's --network covers: what then runs is whatever the registry
 // serves. So the image is the sha256 id the operator pinned, with
 // --pull=never, and while no id is pinned the driver reports itself degraded
 // and builds no run at all. The probe also asks each VM for the pinned id and
@@ -41,14 +51,17 @@
 // So omitting HOME is not a compatibility risk, it is the stronger posture:
 // the endpoint depends solely on kernel config, and no edit to a dotfile can
 // redirect a kernel container at another daemon. Credential helpers would
-// matter only for registry pulls, which this driver never does — it runs
-// `run`, `kill`, `version` and `ps` against a locally built image, by its id
-// and with --pull=never.
+// matter only for registry pulls, which this driver never does. It runs
+// `version`, `network inspect`, `image inspect`, `run`, `kill` and `ps`, and
+// nothing else, and the image it runs is a locally built one, by its id and
+// with --pull=never.
 //
 // The whole process environment is never passed. A worker that inherited the
 // kernel's environment would receive every provider key the operator exported
-// (invariant 2), which is the failure the egress proxy exists to prevent in
-// Phase 2 and which must not be possible before it ships.
+// (invariant 2), which is the failure the kernel's egress engine (src/egress)
+// exists to prevent in Phase 2, by injecting each credential at the kernel's
+// edge and never in the container, and which must not be possible before it
+// ships.
 
 import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
@@ -65,6 +78,7 @@ import {
   isImageId,
   isDockerNetworkMode,
   isNetworkName,
+  isNoNetwork,
   isPidsLimit,
   isUnprivilegedUser,
   memoryBytes,
@@ -187,7 +201,9 @@ function sharesNamespace(what: string, joinsContainers: boolean): Widens {
  * the modes it gives a name of its own (host, container:<id>, bridge,
  * default), none of them internal, and any value that is not a plain network
  * name (sandbox/limits.ts), which its CLI may read as key=value fields whose
- * `name=` can say host. `none` is a plain name and no network at all.
+ * `name=` can say host. `none` is a plain name and no network at all: the
+ * builder's own --network, which this admits, and the audit then holds the one
+ * --network to (assertTheNetwork). A domain may not name it (domainNetwork).
  *
  * Docker compares the plain mode names case-sensitively (NetworkMode.IsHost is
  * n == "host"), so a plain `HOST` names a network called HOST. Only the
@@ -213,6 +229,32 @@ function networkMode(value: string): string | undefined {
     )
   }
   return undefined
+}
+
+/**
+ * Why a domain may not name `network` as its internal network, or undefined
+ * when it may: whatever networkMode refuses in a --network, and docker's none,
+ * in any case. No run is put on a domain's network (every one is on none); it
+ * is kept beside none as defence in depth, and probe() inspects it for
+ * Internal=true. none is no network to inspect so: it is a predefined network
+ * of docker's, not one created --internal, which docker neither removes nor
+ * recreates, so probe()'s advice to recreate it would be a command docker
+ * refuses, and a domain that named it would have no internal network at all.
+ * Docker compares the name as spelled, so a plain NONE names a network called
+ * NONE, but its key=value spelling lower-cases (name=NONE is none), so no case
+ * of none is admitted, as with host, bridge and default (isNoNetwork).
+ */
+function domainNetwork(network: string): string | undefined {
+  const mode = networkMode(network)
+  if (mode !== undefined) return mode
+  if (!isNoNetwork(network)) return undefined
+  if (network === 'none') {
+    return "is docker's none, no network at all, which every run is on already, and no internal network for probe() to prove"
+  }
+  return (
+    "spells none in another case, which docker reads as a network of that name, but docker's key=value spelling " +
+    `lower-cases (name=${network} is none), so no case of none is admitted`
+  )
 }
 
 /**
@@ -345,24 +387,23 @@ function pulls(value: string | undefined): string | undefined {
  * past that exact match, and so are named here. `--detach` is here because
  * the run's hard wallclock lives as long as the docker client does: a client
  * that returns at once clears it. `--group-add`, the log options and
- * `--read-only=false` undo, by another route, what --user, the internal
- * network and --read-only give, and a `--pull` other than never undoes the
- * pinned image id. A second `--network` or `--mount` written as
- * the builder writes its own is caught by the count of each option, and the
- * one --network value is then held to the domain's. A domain that names
- * host, bridge or `name=host` is refused before this list is read
- * (auditRunArgs), as the domain's network rather than as an option the
- * builder never emits, though this rule would refuse the builder's own
- * `--network` carrying it too.
+ * `--read-only=false` undo, by another route, what --user, --network none and
+ * --read-only give, and a `--pull` other than never undoes the pinned image
+ * id. A second `--network` or `--mount` written as the builder writes its own
+ * is caught by the count of each option, and the one --network value is then
+ * held to none (assertTheNetwork). A second one in any other spelling is
+ * refused here, and not for what docker would make of it beside none (which a
+ * later docker may read otherwise): a worker is on no network at all.
  */
 const WIDENING: ReadonlyMap<string, string | Widens> = new Map<string, string | Widens>([
   ['--env', "sets variables in the container's environment, where no credential may be (invariant 2)"],
   [
     '--network',
     (value, inline) =>
-      networkMode(value ?? '') ?? (inline ? 'attaches a second network, and docker attaches every network it is given' : undefined),
+      networkMode(value ?? '') ??
+      (inline ? "names a network beside the builder's --network none, where a worker is on no network at all" : undefined),
   ],
-  ['--net', 'is --network under another name, and docker attaches every network it is given'],
+  ['--net', "is --network under another name, a network beside the builder's --network none, where a worker is on no network at all"],
   ['--add-host', "writes a name into the container's /etc/hosts, host.lima.internal for the Mac among them"],
   ['--dns', "sets the container's resolver configuration"],
   ['--publish', 'publishes a container port on the VM'],
@@ -395,7 +436,8 @@ const WIDENING: ReadonlyMap<string, string | Widens> = new Map<string, string | 
   [
     '--log-driver',
     "has the VM's dockerd ship the container's output through a driver the builder never chose: syslog, gelf, fluentd " +
-      'or splunk send it to an address such as 192.168.5.2, the Mac, off the internal network',
+      "or splunk send it to an address such as 192.168.5.2, the Mac, over the VM's own route, which the container's " +
+      '--network none does not cover',
   ],
   ['--log-opt', "configures the container's log driver, the address it ships the container's output to among them"],
   ['--read-only', writableRoot],
@@ -451,6 +493,11 @@ function widening(arg: string, next: string | undefined): { readonly named: stri
 
 export interface DomainConfig {
   readonly dockerHost: string
+  /**
+   * The domain's internal network, which probe() proves Internal=true on the
+   * domain's own VM, as defence in depth. No run is put on it: buildRunArgs
+   * never reads it, and every run is --network none.
+   */
   readonly network: string
   readonly mountRoot: string
 }
@@ -528,10 +575,13 @@ export function buildRunArgs(input: BuildArgsInput): string[] {
     defaults.memory,
     '--cpus',
     String(defaults.cpus),
-    // An internal network has no route off the VM. Phase 2's egress proxy is
-    // what will give a container the internet, one allowed hostname at a time.
+    // No network at all: a loopback of its own, and no route, resolver or
+    // peer. The one way out is the kernel's egress engine over this run's
+    // docker -i channel (egress plan S2, W1), one allowed host at a time. Not
+    // the domain's internal network: probe() still proves that one internal,
+    // as defence in depth, but no run is put on it.
     '--network',
-    domain.network,
+    'none',
     // PID 1 that reaps zombies and forwards signals, so a kill actually kills.
     '--init',
     // The root is read-only, so scratch space has to come from somewhere that
@@ -551,7 +601,7 @@ export function buildRunArgs(input: BuildArgsInput): string[] {
     ...spec.command,
   ]
 
-  auditRunArgs(args, home, workspace, domain.network, input.imageId)
+  auditRunArgs(args, home, workspace, input.imageId)
   return args
 }
 
@@ -561,28 +611,17 @@ export function buildRunArgs(input: BuildArgsInput): string[] {
  * This is deliberately a separate pass over the finished array rather than a
  * set of conditions spread through the builder: it catches a widening
  * introduced anywhere above, including in `spec.command`.
+ *
+ * It takes no network: the one --network must be none whatever the domain
+ * names (assertTheNetwork), and a domain's own network never reaches the argv.
+ * What a domain may name is kernel.yaml's to refuse, and probe()'s.
  */
 export function auditRunArgs(
   args: readonly string[],
   home: string,
   workspace: string,
-  network: string,
   imageId: string | undefined,
 ): void {
-  // The builder writes the domain's network into its own --network. A domain
-  // that names a network docker reads as no network of that name (host,
-  // bridge, `name=host`), or any other value a domain may not name, is refused
-  // first, as the domain's: every check below would refuse one too, but as
-  // what it reads like in the argv (a --privileged, a second mount, an option
-  // the builder never emits) rather than as the config that put it there.
-  const domainMode = networkMode(network)
-  if (domainMode !== undefined) {
-    throw new ConfigError(
-      `the domain network ${JSON.stringify(network)} is not one a domain may name: as --network it ` +
-        `${domainMode}; invariant 9 needs the domain's own internal network`,
-    )
-  }
-
   for (const arg of args) {
     for (const bad of FORBIDDEN_FLAGS) {
       if (arg === bad || arg.startsWith(`${bad}=`)) {
@@ -699,10 +738,10 @@ export function auditRunArgs(
   assertTheImage(args[at] ?? '', imageId)
 
   // Each once, by the count above, so this is the value docker uses — and,
-  // for --network, the one network it attaches.
+  // for --network, the container's one network mode.
   for (const option of CAP_VALUES.keys()) assertCapValue(option, values.get(option) ?? '')
   assertTheMount(mount ?? '', workspace)
-  assertTheNetwork(values.get('--network') ?? '', network)
+  assertTheNetwork(values.get('--network') ?? '')
 }
 
 /**
@@ -717,22 +756,26 @@ function assertTheImage(image: string, imageId: string | undefined): void {
 }
 
 /**
- * The one --network value must be the domain's network as the builder was
- * handed it. probe() proves THAT network internal (`docker network inspect`),
- * so a container put on any other is on a network nobody checked.
+ * The one --network value must be none, exactly: no network at all, so the
+ * container has its own loopback and nothing else (invariant 9, as the
+ * operator worded it on 2026-11-09). Any other value is a network, and every
+ * network gives a container something none does not: an address on the VM,
+ * docker's embedded resolver, and peers, the domain's internal network among
+ * them, which probe() proves has no route off the VM but which every other
+ * container on it shares. The domain's network is not an alternative: no run
+ * is put on it.
  *
- * What docker makes of the value is not judged here: auditRunArgs has
- * already refused a domain network of host, bridge or default in any case,
- * container:<id>, or anything but a plain network name, and WIDENING's
- * --network rule has refused the same in every --network before the image,
- * whatever the domain says. This holds the value that is left to the one
- * network it must be.
+ * Compared as spelled, since docker compares a network name so: a plain NONE
+ * is a network called NONE. What docker makes of any other value is not
+ * judged here: WIDENING's --network rule has already refused host, bridge,
+ * default, container:<id> and anything but a plain name in every --network
+ * before the image. This holds the value that is left to the one it must be.
  */
-function assertTheNetwork(value: string, network: string): void {
-  if (value !== network) {
+function assertTheNetwork(value: string): void {
+  if (value !== 'none') {
     throw new ConfigError(
-      `docker args put the container on network ${JSON.stringify(value)}; invariant 9 needs the domain's internal network ` +
-        JSON.stringify(network),
+      `docker args put the container on network ${JSON.stringify(value)}; invariant 9 needs --network none, ` +
+        'no network at all',
     )
   }
 }
@@ -1011,23 +1054,26 @@ export class DockerDriver implements SandboxDriver {
       return { ok: false, why: e instanceof Error ? e.message : String(e) }
     }
 
-    // Invariant 9's "internal network", PROVEN per domain rather than assumed
-    // from the name in kernel.yaml. Inside a Colima VM the Mac's loopback is
-    // 192.168.5.2 (`host.lima.internal`, per Lima's user-mode network docs),
-    // and pmmcp listens there unauthenticated: a container on a network with a
-    // route out could call its vault and admin tools. `--internal` removes the
+    // Each domain's internal network, PROVEN internal on its own VM rather
+    // than assumed from the name in kernel.yaml. No run is put on it: every
+    // run is --network none (buildRunArgs). It is kept, and proved, as
+    // defence in depth (the operator's decision of 2026-11-09, until the
+    // Phase 2 exit), so that a container that ever lands on it has no route
+    // out. Inside a Colima VM the Mac's loopback is 192.168.5.2
+    // (`host.lima.internal`, per Lima's user-mode network docs), and pmmcp
+    // listens there unauthenticated: a container on a network with a route
+    // out could call its vault and admin tools. `--internal` removes the
     // route; a network created by hand without it looks identical by name.
     for (const domain of DOMAINS) {
       const network = this.#options.domains[domain].network
-      // A name docker keeps for a network of its own (host, bridge, default),
-      // or reads as more than a name, is not a network `inspect` can vouch
-      // for, and docker refuses to remove or create the predefined ones, so
-      // the advice below would be a command that cannot run. Any other name
-      // the audit refuses as a domain's (auditRunArgs), a case variant of
-      // those among them, is refused here too, without inspecting it.
-      // kernel.yaml refuses these names; a driver handed its domains by
-      // another path meets this.
-      const notByName = networkMode(network)
+      // A name docker keeps for a network of its own (host, bridge, default,
+      // and none, which every run is on already), or reads as more than a
+      // name, in any case, is not a network `inspect` can vouch for, and
+      // docker refuses to remove or create the predefined ones, so the advice
+      // below would be a command that cannot run. Each is refused here
+      // without inspecting it (domainNetwork). kernel.yaml refuses these
+      // names; a driver handed its domains by another path meets this.
+      const notByName = domainNetwork(network)
       if (notByName !== undefined) {
         return {
           ok: false,

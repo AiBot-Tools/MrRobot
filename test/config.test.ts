@@ -623,11 +623,12 @@ test('sandbox.imageId must be sha256:<64 hex>', () => {
 })
 
 test('a sandbox domain network must be a plain network name: name=host and the like are refused at boot', () => {
-  // Invariant 9's internal network. The docker CLI reads a --network value
-  // holding = as key=value fields, lower-cased, whose name= is the network,
-  // so `name=host` is the VM's own network stack, while probe() inspects a
-  // network of that literal name. The run-args audit refuses it again
-  // (test/sandbox-docker.test.ts).
+  // The domain's internal network, which no run is put on (every run is
+  // --network none) and probe() proves internal, as defence in depth. The
+  // docker CLI reads a --network value holding = as key=value fields,
+  // lower-cased, whose name= is the network, so `name=host` is the VM's own
+  // network stack, while probe() inspects a network of that literal name.
+  // probe() refuses it again (test/sandbox-docker.test.ts).
   for (const network of ['name=host', 'NAME=HOST', 'name=aos-trusted,alias=x', 'container:abc', 'aos trusted', '-aos', '']) {
     for (const domain of ['trusted', 'hostile'] as const) {
       const doc = fixture('valid.yaml') as { sandbox: { domains: Record<string, { network: string }> } }
@@ -641,8 +642,9 @@ test('a sandbox domain network must be a plain network name: name=host and the l
       )
     }
   }
-  // A plain name passes, `none` among them (the egress plan's S1 runs on it).
-  for (const network of ['aos-trusted', 'aos_hostile.2', 'none', '0net']) {
+  // A plain name passes (none, a plain name too, is refused below for what
+  // it is: the test after this one).
+  for (const network of ['aos-trusted', 'aos_hostile.2', 'nones', '0net']) {
     const doc = fixture('valid.yaml') as { sandbox: { domains: Record<string, { network: string }> } }
     const entry = doc.sandbox.domains['trusted']
     assert.ok(entry !== undefined)
@@ -651,15 +653,16 @@ test('a sandbox domain network must be a plain network name: name=host and the l
   }
 })
 
-test('a sandbox domain network may not be host, bridge or default, in any case; none still passes', () => {
+test('a sandbox domain network may not be host, bridge, default or none, in any case', () => {
   // Plain names, but docker's own, and not one of them internal: probe()
-  // would degrade the kernel and advise `docker network rm host && docker
-  // network create --internal host`, which docker refuses for a predefined
-  // network. Refused without regard to case, as the run-args audit refuses
-  // them (test/sandbox-docker.test.ts), so no name boots that every run
-  // refuses. Docker reads a plain HOST as a network of that name, not as
-  // host, so the message gives the reason a case variant is refused: the
-  // key=value spelling, which lower-cases.
+  // would degrade the kernel, refusing it by name without inspecting it
+  // (domainNetwork), and no internal network would be kept beside --network
+  // none; docker keeps these names for networks of its own and refuses to
+  // recreate one --internal. Refused here without regard to case, as probe()
+  // refuses them (test/sandbox-docker.test.ts), so no name boots that the
+  // probe reports degraded. Docker reads a plain HOST as a network of that
+  // name, not as host, so the message gives the reason a case variant is
+  // refused: the key=value spelling, which lower-cases.
   for (const network of ['host', 'HOST', 'bridge', 'Bridge', 'default', 'DEFAULT']) {
     for (const domain of ['trusted', 'hostile'] as const) {
       const doc = fixture('valid.yaml') as { sandbox: { domains: Record<string, { network: string }> } }
@@ -678,8 +681,32 @@ test('a sandbox domain network may not be host, bridge or default, in any case; 
       )
     }
   }
+  // Egress plan S1: none, docker's no network at all, is every run's
+  // --network already. A domain's network is its own internal one beside it,
+  // kept and proved Internal=true as defence in depth, and none is no network
+  // to prove, nor one docker recreates --internal; probe() refuses it too
+  // (test/sandbox-docker.test.ts). In any case, as host is: a plain NONE names
+  // a network of that name, but name=NONE is none. The message is none's own,
+  // not host's.
+  for (const network of ['none', 'NONE', 'None', 'nOnE']) {
+    for (const domain of ['trusted', 'hostile'] as const) {
+      const doc = fixture('valid.yaml') as { sandbox: { domains: Record<string, { network: string }> } }
+      const entry = doc.sandbox.domains[domain]
+      assert.ok(entry !== undefined)
+      entry.network = network
+      assert.throws(
+        () => parse(doc),
+        (e: unknown) =>
+          e instanceof Error &&
+          e.message.includes('a sandbox domain network may not be none, nor none in another case: every run is on --network none already') &&
+          e.message.includes("a plain NONE names a separate network called NONE, but docker's key=value spelling lower-cases (name=NONE is none)") &&
+          !e.message.includes('may not be host, bridge or default'),
+        `${domain}: ${JSON.stringify(network)}`,
+      )
+    }
+  }
   // Names that hold one of them pass: only the whole name is docker's.
-  for (const network of ['none', 'host-net', 'aos-bridge', 'defaults']) {
+  for (const network of ['none-net', 'aos-none', 'host-net', 'aos-bridge', 'defaults']) {
     const doc = fixture('valid.yaml') as { sandbox: { domains: Record<string, { network: string }> } }
     const entry = doc.sandbox.domains['hostile']
     assert.ok(entry !== undefined)

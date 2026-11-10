@@ -639,7 +639,7 @@ Also true, and not stubs so much as scope: `config/tool-views.yaml` pins
 **19 pmmcp tools closed** — the nine the schema forces, plus ten the operator
 pinned kernel-only after pmmcp's source was read (`forget`, the vault-adjacent
 tools, `repair_and_heal`, `index_git_history`, and `scrape_context`, which makes
-pmmcp fetch URLs itself and so would route around the Phase 2 egress proxy).
+pmmcp fetch URLs itself and so would route around the kernel's egress engine).
 Nothing is exposed to agents. Every other tool is kernel-only by the schema's
 literal default until the operator classifies it from `hub.tools.classified`.
 Before `recall` or `remember` is ever exposed: pmmcp treats a missing
@@ -686,8 +686,8 @@ host, and only a tier 2 or higher worker sandboxed in the trusted domain may
 hold either; a spawned child keeps a subset of its template's hosts and
 bindings, and only at tier 2 or more. No shipped manifest holds egress. Neither
 agent declares a `sandbox:` (the loop runs in process in this phase, so a domain
-would claim an isolation that does not happen), an `egress.allow` host (no proxy
-exists to enforce one), or a `schedule:` (the only routable model is a frontier
+would claim an isolation that does not happen), an `egress.allow` host (the
+kernel's egress engine is not wired to enforce one), or a `schedule:` (the only routable model is a frontier
 one, and an unattended run that can reach it can empty an envelope).
 
 Both carry `tools.allow: []`, which is the honest state and not an oversight:
@@ -1104,10 +1104,14 @@ Until then, access rests on the two conditions the operator set, which the
 kernel enforces or will enforce:
 
 - **Containers stay off it.** Inside a Colima VM the Mac's loopback is
-  `192.168.5.2` (`host.lima.internal`). The sandbox probe refuses a domain whose
-  docker network is not `--internal`, so no container has a route there.
-- **The Phase 2 egress proxy denies it**: `192.168.5.2`, `host.lima.internal`,
-  `host.docker.internal`.
+  `192.168.5.2` (`host.lima.internal`). Every container runs with
+  `--network none` (the operator, 2026-11-09): a loopback of its own and no
+  route at all, so no container has a route there. Each domain's internal
+  network stays, and the sandbox probe still refuses a domain whose docker
+  network is not `--internal`, as defence in depth: no run is put on it.
+- **The kernel's egress engine denies it** (`src/egress`, not wired yet): a
+  worker's one way out is that engine, over its run's `docker -i` channel, and
+  it refuses `192.168.5.2`, `host.lima.internal` and `host.docker.internal`.
 
 pmmcp's other keys (Qdrant's `service.api_key`, the dashboard token, the curator
 secret) live in 0600 files under `~/.persistent-memory-mcp`, made by pmmcp's own
@@ -1126,7 +1130,8 @@ The operator ran these against both Colima VMs: Colima 0.10.3 from Homebrew,
 from one uninterrupted `scripts/colima-up.sh` run. The container was `alpine:3.20`
 started with the driver's own `docker run` flags (`buildRunArgs` in
 `src/sandbox/docker.ts`, limits from `config/kernel.yaml`): uid 65534, on the
-domain's internal network, with the domain's `mountRoot` at `/workspace`. Both VMs
+domain's internal network (every run's network until 2026-11-09; since then every
+run is `--network none`), with the domain's `mountRoot` at `/workspace`. Both VMs
 gave identical results.
 
 | Check | Result |
@@ -1153,10 +1158,13 @@ Two results the Phase 2 design has to carry:
   domain's `mountRoot` as the operator. Anything on the Mac that reads a workspace
   is reading untrusted input.
 - **The VMs themselves reach pmmcp.** Inside the hostile VM, `host.lima.internal`
-  is `192.168.5.2`, and `192.168.5.2:8766` accepts a connection. Today the internal
-  network is the only thing between a container and pmmcp. Anything with a route
-  out of a VM reaches it unauthenticated: the default bridge, a network that is
-  not internal, the Phase 2 proxy itself, or an escape into the VM.
+  is `192.168.5.2`, and `192.168.5.2:8766` accepts a connection. Until 2026-11-09
+  the internal network was the only thing between a container and pmmcp; since
+  then every run is `--network none`, and a worker's one way out is the kernel's
+  egress engine, over its run's `docker -i` channel. Anything with a route out of
+  a VM reaches pmmcp unauthenticated: the default bridge, a network that is not
+  internal, or an escape into the VM. The egress engine runs on the Mac itself,
+  so its refusal of the Mac's loopback is what keeps a worker's flows off pmmcp.
 - **The gateway is the Mac's whole loopback, and the VMs share a network.**
   Lima's user-v2 network rewrites `192.168.5.2` to `127.0.0.1` on every port
   (`pkg/networks/usernet/gvproxy.go` at Lima v2.2.1). Every service listening on

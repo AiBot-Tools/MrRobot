@@ -1,13 +1,14 @@
-// The values a container's --user, resource caps and network may take
-// (invariant 9), and the one image it may run.
+// The values a container's --user and resource caps may take (invariant 9),
+// the networks a sandbox domain may name, and the one image a run may name.
 //
 // Each is checked twice: by the kernel.yaml schema, so the operator's file
 // cannot name one, and by the run-args audit (docker.ts), so no other path to
-// the driver can either. A shape check alone is not enough, because docker
-// reads well-formed values as the absence of the property: `--user 0:0` is
-// root, `--user 65534:0` is root's group, `--memory 0`, `--pids-limit 0` (or
-// -1) and `--cpus 0` are no limit at all, and `--network name=host` is the
-// VM's own network stack.
+// the driver can either; a domain's network, which no run is put on (every
+// run is --network none), by the schema and by the driver's probe(). A shape
+// check alone is not enough, because docker reads well-formed values as the
+// absence of the property: `--user 0:0` is root, `--user 65534:0` is root's
+// group, `--memory 0`, `--pids-limit 0` (or -1) and `--cpus 0` are no limit
+// at all, and `--network name=host` is the VM's own network stack.
 
 /**
  * The largest uid or gid admitted. runc refuses an id above 2^31 - 1, and
@@ -56,7 +57,8 @@ export function isCpus(value: string): boolean {
  * for its key=value syntax: CSV fields, each lower-cased, whose `name=` is the
  * network, so `name=host` and `NAME=HOST` are host, and `name=x,alias=y` adds
  * to the attachment. A plain name still admits the names docker gives a mode
- * of its own (host, bridge, default, none); the audit refuses those it must.
+ * of its own (host, bridge, default, none); the audit, the schema and probe()
+ * refuse those they must.
  */
 export function isNetworkName(value: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(value)
@@ -65,8 +67,8 @@ export function isNetworkName(value: string): boolean {
 /**
  * The plain names docker keeps for networks of its own: `host`, the VM's own
  * network stack, and `bridge` and `default`, its default bridge, which has a
- * route off the VM. None is internal, and docker refuses to remove or create
- * a predefined network, so none can be made a domain's.
+ * route off the VM. Not one of them is internal, and docker refuses to remove
+ * or create a predefined network, so not one can be made a domain's.
  *
  * Compared without regard to case, as the run-args audit (docker.ts) compares
  * them, though docker does not: it reads a plain mode name case-sensitively
@@ -74,16 +76,32 @@ export function isNetworkName(value: string): boolean {
  * that name. Its key=value spelling lower-cases, and `name=HOST` is host, so
  * no case of these is admitted.
  *
- * Two more are predefined in moby (IsPreDefinedNetwork) and left out here:
- * `none`, docker's name for no network at all, which the egress plan's S1
- * moves every worker onto (and which probe() should then not inspect for
- * Internal, since there is no network to inspect), and `ingress`, swarm's
- * routing mesh, which exists only on a swarm node. probe() still inspects a
- * domain that names either, and its advice for one would be a command docker
- * refuses; that is S1's to settle, or the operator's.
+ * Two more are predefined in moby (IsPreDefinedNetwork) and left out here.
+ * `none`, docker's name for no network at all, is every worker's --network
+ * (egress plan S1), so the run-args audit, which reads every --network with
+ * this, must admit it, though a domain may not name it (isNoNetwork). And
+ * `ingress`, swarm's routing mesh, exists only on a swarm node: probe() still
+ * inspects a domain that names it, and its advice for one would be a command
+ * docker refuses, which is the operator's to settle.
  */
 export function isDockerNetworkMode(value: string): boolean {
   return ['host', 'bridge', 'default'].includes(value.toLowerCase())
+}
+
+/**
+ * `none` in any case: docker's name for no network at all, which every
+ * worker runs on (--network none, the egress plan's S1), and so no network a
+ * sandbox domain may name. A domain's network is the internal one kept beside
+ * none as defence in depth, which probe() proves Internal=true; none is a
+ * predefined network of docker's, not one created --internal, which docker
+ * neither removes nor recreates, so a domain that named it would have no
+ * internal network to prove. Compared without regard to case, as
+ * isDockerNetworkMode is: a plain NONE names a network called NONE, but
+ * docker's key=value spelling lower-cases (name=NONE is none). The run-args
+ * audit does not use this: it holds the one --network to `none`, as spelled.
+ */
+export function isNoNetwork(value: string): boolean {
+  return value.toLowerCase() === 'none'
 }
 
 /**

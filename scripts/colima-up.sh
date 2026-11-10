@@ -71,7 +71,10 @@ up() {
   fi
 
   # --internal: containers on this network reach each other and nothing else.
-  # Egress belongs to the Phase 2 proxy sidecar, not to the default bridge.
+  # No worker is attached to it: every run is --network none, and a worker's
+  # one way out is the kernel's egress engine, over its run's docker -i
+  # channel. The network is kept, and the kernel's probe still proves it
+  # internal, as defence in depth.
   local network="aos-${profile}"
   if DOCKER_HOST="unix://${HOME}/.colima/${profile}/docker.sock" docker network inspect "${network}" >/dev/null 2>&1; then
     # An existing network is accepted only if it is internal. Inside the VM the

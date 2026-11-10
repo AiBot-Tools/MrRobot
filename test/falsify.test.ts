@@ -486,7 +486,9 @@ try {
   assert.equal(outs.filter((o) => o.includes('late')).length, 0, 'a driver missed the gate, so the race was not run')
   assert.equal(outs.filter((o) => o.includes('holding')).length, 1, outs.join('---'))
   for (const o of outs.filter((x) => !x.includes('holding'))) {
-    assert.match(o, /refused: .*(already in progress|starting on|removing a stale lock)/, o)
+    // takeLock's own refusal after its second try (runner.ts) is a refusal too: which
+    // one a loser meets depends on how the six writes interleave.
+    assert.match(o, /refused: .*(already in progress|starting on|removing a stale lock|starting at the same moment)/, o)
   }
   assert.equal(existsSync(join(root, '.falsify', 'lock.json')), false, 'the holder left its lock')
   assert.equal(existsSync(join(root, '.falsify', 'lock.break')), false)

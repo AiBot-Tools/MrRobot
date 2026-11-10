@@ -51,21 +51,61 @@
 // And a script may not describe a result the real driver cannot return: a
 // stream longer than its capture keeps, a cut with no stream near the cap, or
 // a kill that ends nothing followed by an exit of 137, which the real driver
-// credits to that kill (assertDriverShaped). Runtime code is tested against
+// credits to that kill (assertDriverShaped), or any stdout on a channel run,
+// whose stdout the real driver never reads. Runtime code is tested against
 // this fake, and could otherwise come to rely on a result shape it will never
 // meet.
+//
+// A spec is read once, at run()'s entry, and every decision is made from
+// that reading (readSpecOnce), as the real driver reads it: a field that
+// answers each read differently cannot have the fake judge one value and run
+// another. A spec whose fields are not of their types (a domain that is an
+// object, a command that is a string) is refused by that reading, in the
+// real driver's words, before anything starts and with no scripted exit
+// spent on it.
+//
+// A channel's output is a pipe into its container, as Node's child.stdin is:
+// ending it ends the container's stdin while the run goes on, and a write is
+// acknowledged only once the container's stdin has taken it, so a container
+// that reads nothing fills it and write() returns false.
+//
+// A channel (SandboxSpec.channel) is refused where the real driver refuses
+// it, on the hostile domain or as a value that is no boolean, in the same
+// words (channelRefusal), before anything starts. A channel run's result has
+// its channel, whose container ends a test plays the container with
+// (FakeSandbox.channels): what it writes to the container's stdout is the
+// channel's input, and what the kernel writes to the channel's output it
+// reads as the container's stdin. When the container exits the fake does what
+// Node does to a child that exits: it destroys the channel's output (a write
+// after that fails, as on the real driver, and what was written before stays
+// readable on the container's stdin, which then ends), ends the container's
+// stdout and resumes the input (flushStdio); and the result settles only once
+// the input has ended or been destroyed, as the real driver's settles only
+// once the docker CLI's pipes have closed. An 'error' on either stream of the
+// channel is heard, as the real driver hears it, and lands in the result's
+// stderr after the scripted stderr, in the real driver's words. A run that
+// does not hang exits inside run(): its container stdout is ended, and its
+// channel's output destroyed, before run() returns, so such a script stands
+// for a container that read nothing and wrote nothing to its channel, and a
+// write to its container stdout throws (FakeChannel.stdout). A script that
+// hangs is a container that runs until its kill or overrun.
 //
 // Nothing here executes anything. It never spawns a process, never touches
 // docker, and never reads the filesystem.
 
 import './guard.js'
 
+import { PassThrough, type Readable, Writable } from 'node:stream'
+
 import { ConfigError } from '../../src/errors.js'
 import {
   CAPTURE_MAX_BYTES,
   CONTAINER_PREFIX,
+  channelRefusal,
+  readSpecOnce,
   type ProbeResult,
   type RunningSandbox,
+  type SandboxChannel,
   type SandboxDriver,
   type SandboxResult,
   type SandboxSpec,
@@ -107,9 +147,33 @@ export interface FakeSandboxOptions {
   readonly imageId?: string | undefined
 }
 
+/** A channel run's container ends, for a test to play the container with. */
+export interface FakeChannel {
+  /** The run's name. */
+  readonly name: string
+  /**
+   * The container's stdout: what a test writes here is the channel's input.
+   * Ended by the fake when the container exits: for a run that hangs, when
+   * its kill or overrun ends it; for one that does not, inside run(), so it
+   * is already ended when run() returns, and such a script stands for a
+   * container that wrote nothing. A write to it after the container exited
+   * throws, naming the run, rather than being Node's write after end: script
+   * `hangs` for a container that writes to its channel.
+   */
+  readonly stdout: Writable
+  /**
+   * The container's stdin: what the kernel wrote to the channel's output.
+   * Ended when the container exits, as Node destroys a child's stdin then,
+   * and what was written before stays readable.
+   */
+  readonly stdin: Readable
+}
+
 export interface FakeSandbox extends SandboxDriver {
   /** Every spec passed to run(), in order. */
   readonly specs: SandboxSpec[]
+  /** Every channel run's container ends, in the order the runs started. */
+  readonly channels: FakeChannel[]
   /** Names passed to kill(), including repeats. */
   readonly kills: string[]
   /** End a hanging run as a wallclock overrun would, on a later macrotask. */
@@ -223,8 +287,122 @@ interface Hung {
   ending: boolean
 }
 
+/**
+ * Settle a channel run's result as the real driver's settles: once the
+ * container's stdout has ended and the input has been read to that end, or
+ * destroyed. The input is resumed first, as Node's flushStdio resumes a
+ * child's stdout when it exits, so what is still in it flows to whatever
+ * listens, and is lost to a reader not yet listening; one read through a
+ * 'readable' listener stays paused, as resume() leaves it, and holds the
+ * result until it is read to its end, as on the real driver.
+ */
+function settleOnInputEnd(input: PassThrough, settle: () => void): void {
+  if (!input.destroyed && !input.writableEnded) input.end()
+  input.resume()
+  if (input.readableEnded || input.destroyed) {
+    settle()
+    return
+  }
+  input.once('end', settle)
+  input.once('close', settle)
+}
+
+/**
+ * A channel run's pipes on the fake, from both ends: the channel its caller
+ * holds, the container's ends a test plays the container with, and what the
+ * real driver would have heard on the channel.
+ */
+interface FakePipes {
+  readonly channel: SandboxChannel
+  readonly container: FakeChannel
+  /**
+   * The container exits: what Node does to a child's pipes when it exits
+   * (its stdin destroyed, then its stdout resumed), and `settle` once the
+   * input has ended (settleOnInputEnd).
+   */
+  exit(settle: () => void): void
+  /** Every 'error' heard on the channel so far, in the real driver's words. */
+  heard(): string
+}
+
+function fakePipes(name: string): FakePipes {
+  /** The container's stdout, which the kernel reads as the channel's input. */
+  const input = new PassThrough()
+  /** The container's stdin, from which it reads what the kernel wrote. */
+  const stdin = new PassThrough()
+  /**
+   * The kernel's end of the container's stdin, as Node's child.stdin is: each
+   * write forwarded, and acknowledged once the container's stdin takes it, so
+   * that a container that reads nothing fills it as it fills a pipe.
+   * Destroyed when the container exits, as Node destroys a child's stdin, so
+   * that a write after that fails as it does on the real driver: its
+   * callback has the error, and the stream emits none.
+   */
+  const output = new Writable({
+    write(chunk: Buffer, _encoding, callback) {
+      stdin.write(chunk, callback)
+    },
+    final(callback) {
+      stdin.end()
+      callback()
+    },
+    destroy(error, callback) {
+      if (!stdin.destroyed && !stdin.writableEnded) stdin.end()
+      callback(error)
+    },
+  })
+  let exited = false
+  // The container's side of its stdout. A test's write to it once it has
+  // ended, by the container's exit or by the test's own end(), is a mistake in
+  // the test, never something a container does, so it throws where it is
+  // made, rather than becoming Node's write after end: an 'error' on the
+  // input, which the channel's listener below would hear as the kernel's, and
+  // which would destroy the input under the kernel's reader. Only the
+  // container's side writes to it: the kernel reads the input.
+  const late = (): never => {
+    throw new Error(
+      `fake sandbox: a write to the container stdout of ${name} after ` +
+        `${exited ? 'its container exited' : 'it was ended'}. A run scripted without hangs exits inside run(), so ` +
+        'its container writes nothing; script hangs: true, and end the run by kill or overrun, for a container ' +
+        'that writes to its channel',
+    )
+  }
+  const write = input.write.bind(input) as (...args: unknown[]) => boolean
+  input.write = ((...args: unknown[]): boolean => {
+    if (exited || input.writableEnded) late()
+    return write(...args)
+  }) as PassThrough['write']
+  const end = input.end.bind(input) as (...args: unknown[]) => PassThrough
+  input.end = ((...args: unknown[]): PassThrough => {
+    const [chunk] = args
+    if (chunk !== undefined && chunk !== null && typeof chunk !== 'function' && (exited || input.writableEnded)) late()
+    return end(...args)
+  }) as PassThrough['end']
+  // As the real driver hears each stream's 'error' from the moment it starts
+  // the run (docker.ts, channelOf), so that none throws in the kernel, and
+  // adds it to the run's stderr.
+  const heard: string[] = []
+  input.on('error', (error) => {
+    heard.push(`channel input: ${error.message}\n`)
+  })
+  output.on('error', (error) => {
+    heard.push(`channel output: ${error.message}\n`)
+  })
+  return {
+    channel: { input, output },
+    container: { name, stdout: input, stdin },
+    exit(settle) {
+      exited = true
+      output.destroy()
+      settleOnInputEnd(input, settle)
+    },
+    heard: () => heard.join(''),
+  }
+}
+
 export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
   const specs: SandboxSpec[] = []
+  const channels: FakeChannel[] = []
   const kills: string[] = []
   const script = options.script ?? []
   script.forEach(assertDriverShaped)
@@ -257,6 +435,7 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
   return {
     name: 'fake',
     specs,
+    channels,
     kills,
 
     async probe(): Promise<ProbeResult> {
@@ -268,14 +447,22 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
       return probe
     },
 
-    run(spec: SandboxSpec): RunningSandbox {
-      specs.push(spec)
+    run(given: SandboxSpec): RunningSandbox {
+      specs.push(given)
+      // Read once, and every decision below made from that reading, as the
+      // real driver reads it (readSpecOnce): `given` is read nowhere else.
+      const spec = readSpecOnce(given)
       // As the real driver does (buildRunArgs): a name without the prefix is
       // no container of the kernel's, and is refused before anything starts,
       // with no scripted exit spent on it.
       if (!spec.name.startsWith(CONTAINER_PREFIX)) {
         throw new ConfigError(`container name "${spec.name}" must start with ${CONTAINER_PREFIX}`)
       }
+      // As the real driver does (buildRunArgs): a channel on the hostile
+      // domain, or one that is no boolean, is refused before anything starts,
+      // with no scripted exit spent on it.
+      const refusedChannel = channelRefusal(spec)
+      if (refusedChannel !== undefined) throw new ConfigError(refusedChannel)
       // As the real driver's audit does (buildRunArgs): the image must be the
       // pinned id, exactly, and with none pinned no run is built at all.
       // Refused before anything starts, with no scripted exit spent on it.
@@ -297,15 +484,32 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
             `${String(index)} (${spec.name}) was requested. Extend the script or fix the caller.`,
         )
       }
+      const channel = spec.channel === true
+      if (channel && (scripted.stdout ?? '') !== '') {
+        throw new Error(
+          `scripted exit ${String(index - 1)}: stdout on a channel run (${spec.name}), whose stdout the real driver ` +
+            "never reads: it is the channel's input, and the result's stdout is empty. Write it to the run's " +
+            'FakeSandbox.channels entry instead.',
+        )
+      }
       started.set(spec.name, spec)
       running.add(spec.name)
 
+      // The channel's input is the container's stdout, and its output the
+      // container's stdin.
+      const pipes = channel ? fakePipes(spec.name) : undefined
+      if (pipes !== undefined) channels.push(pipes.container)
+
       const result = new Promise<SandboxResult>((resolve) => {
+        const settle = (ended: SandboxResult): void => {
+          if (pipes === undefined) resolve(ended)
+          else pipes.exit(() => resolve({ ...ended, stderr: ended.stderr + pipes.heard() }))
+        }
         if (scripted.hangs === true) {
-          pending.set(spec.name, { spec, scripted, resolve, overran: false, ending: false })
+          pending.set(spec.name, { spec, scripted, resolve: settle, overran: false, ending: false })
           return
         }
-        resolve(ownExit(spec, scripted, false))
+        settle(ownExit(spec, scripted, false))
       })
       // The name is free once the result has settled, and before any caller's
       // continuation of it runs: this reaction is the result's first, so it
@@ -317,7 +521,7 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
         running.delete(spec.name)
       })
 
-      return { name: spec.name, result }
+      return { name: spec.name, result, ...(pipes === undefined ? {} : { channel: pipes.channel }) }
     },
 
     async kill(name: string): Promise<void> {

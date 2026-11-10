@@ -70,6 +70,31 @@
 //   --internal, and the operator is sent after a command docker refuses.
 //   Build a hostile run against the trusted domain's config and it is
 //   confined to a share its own VM never mounts.
+//   Admit -i on a run that asks for no channel, or a channel on the hostile
+//   domain, and a run is joined to the kernel by a way nothing asked for, or
+//   the domain that must reach nothing gets a way out; read a channel run's
+//   stdout into the result and the bytes meant for its caller are consumed
+//   before it listens; leave a channel's 'error' unheard and a container that
+//   closes its stdin throws in the kernel; let the fake settle a channel run
+//   before its input has ended and runtime code tested against it awaits a
+//   result the real driver holds open. Read a spec's channel or domain at
+//   each decision rather than once, and a field that answers each read
+//   differently gives the hostile domain a channel; stop a run's wallclock
+//   at the CLI's close rather than its exit, and a caller holding a channel's
+//   input past the deadline reports an overrun that never happened; let the
+//   fake keep a channel's output open past its container's exit, or leave an
+//   'error' on its channel unheard, and code tested against it meets on the
+//   Mac what the fake never showed. Credit a kill sent after the CLI exited
+//   with the CLI's 137, and a channel run the OOM killer ended, torn down
+//   while its caller drains the input, reads as killed by the kernel. Leave a
+//   failed spawn's timer armed and its deadline kills the retry that reused
+//   the name. Read the spec again in the wallclock's timer and its kill goes
+//   to the other VM. Let the fake's output acknowledge a write its container
+//   never read, or keep the container's stdin open after the output ends,
+//   and code tested against it never meets backpressure or the end of a
+//   channel. Take a field that is not of its type, and a domain whose
+//   toString answers trusted and then hostile has a run built for one VM and
+//   spawned on the other; drop a field from the copy and no driver sees it.
 //   Run a docker command docker.ts's header does not name, on any path, a
 //   catch's as much as a healthy daemon's, and its case for a driver with no
 //   HOME and no credential helper (what it runs pulls nothing) is made about
@@ -82,7 +107,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { userInfo } from 'node:os'
 import { join } from 'node:path'
-import { PassThrough } from 'node:stream'
+import { PassThrough, Readable, Writable } from 'node:stream'
 import { finished } from 'node:stream/promises'
 import { setFlagsFromString } from 'node:v8'
 import { runInNewContext } from 'node:vm'
@@ -104,7 +129,7 @@ import {
   type DomainConfig,
 } from '../src/sandbox/docker.js'
 import { AppleContainerDriver } from '../src/sandbox/apple-container.js'
-import { CAPTURE_MAX_BYTES, type SandboxDriver, type SandboxResult, type SandboxSpec } from '../src/sandbox/driver.js'
+import { CAPTURE_MAX_BYTES, readSpecOnce, type SandboxDriver, type SandboxResult, type SandboxSpec } from '../src/sandbox/driver.js'
 import { fakeSandbox } from './helpers/fake-sandbox.js'
 
 const DEFAULTS: DockerDefaults = { user: '65534:65534', pidsLimit: 256, memory: '2g', cpus: 2 }
@@ -1208,11 +1233,14 @@ test('resolved real path, not the request string, is passed to docker', (t) => {
 
 interface FakeChild extends ChildLike {
   close(code: number | null, signal: string | null): void
+  /** As Node's child emits 'exit', before 'close', once the process has ended. */
+  exit(code: number | null, signal: string | null): void
   /** As Node's child emits 'error', for a spawn that started no process. */
   fail(error: Error): void
 }
 
-type ChildStreams = Pick<ChildLike, 'stdout' | 'stderr'>
+/** The child's pipes; stdin is none unless a test hands one, as most runs need none. */
+type ChildStreams = Pick<ChildLike, 'stdout' | 'stderr'> & Partial<Pick<ChildLike, 'stdin'>>
 
 const SILENT: ChildStreams = { stdout: { on: () => undefined }, stderr: { on: () => undefined } }
 
@@ -1223,11 +1251,15 @@ function fakeChild(streams: ChildStreams = SILENT): FakeChild {
     return child
   }
   const child: FakeChild = {
+    stdin: streams.stdin ?? null,
     stdout: streams.stdout,
     stderr: streams.stderr,
     on: on as ChildLike['on'],
     close(code, signal) {
       for (const cb of handlers['close'] ?? []) (cb as (c: number | null, s: string | null) => void)(code, signal)
+    },
+    exit(code, signal) {
+      for (const cb of handlers['exit'] ?? []) (cb as (c: number | null, s: string | null) => void)(code, signal)
     },
     fail(error) {
       for (const cb of handlers['error'] ?? []) (cb as (e: Error) => void)(error)
@@ -1363,6 +1395,779 @@ test('each run is built against its own domain: a hostile run goes on --network 
     /outside the domain mountRoot/,
   )
   assert.equal(d.spawns.length, 2)
+})
+
+// ── the channel ────────────────────────────────────────────────────────────
+
+/** How many times `option` stands before the image, where docker reads it. */
+function optionCount(args: readonly string[], option: string): number {
+  return args.slice(0, args.indexOf(IMAGE_ID)).filter((a) => a === option).length
+}
+
+/** The message a run() refusal throws, or '' when the run starts. */
+function runRefusal(driver: SandboxDriver, s: SandboxSpec): string {
+  try {
+    driver.run(s)
+  } catch (e) {
+    if (e instanceof ConfigError) return e.message
+    throw e
+  }
+  return ''
+}
+
+/** A spec whose channel is a value no caller's types admit, as one built outside the type system would carry. */
+function channelValued(f: Fixture, channel: unknown): SandboxSpec {
+  return Object.assign({}, spec(f), { channel })
+}
+
+test('a channel run passes -i and exposes the child stdio; a run without a channel has no -i; a hostile channel spec is refused', async (t) => {
+  // Egress plan S2. The channel is the CLI's own stdin and stdout, kept open
+  // to the container by docker's -i, and the one way the kernel's egress
+  // engine will reach a worker on --network none (W1). A run that asks for
+  // none must not carry -i, and a hostile run may not ask: the hostile
+  // domain reaches nothing at all.
+  const f = fixture(t)
+  const home = join(f.root, 'home')
+
+  // The argv: -i exactly once before the image on a channel run, and never on
+  // a run without one, whether its spec says false or nothing. --init on
+  // every run, channel or not (S2's call): what any command orphans is reaped
+  // and a SIGTERM ends it, not only the mux's.
+  const withChannel = argsFor(f, { channel: true })
+  assert.equal(optionCount(withChannel, '-i'), 1, 'a channel run carries -i once')
+  assert.equal(optionCount(withChannel, '--init'), 1, 'a channel run carries --init once')
+  assert.equal(valueOf(withChannel, '--network'), 'none')
+  assert.deepEqual(withChannel.slice(-3), [IMAGE_ID, 'node', '--version'])
+  assert.doesNotThrow(() => auditRunArgs(withChannel, home, f.realWorkspace, IMAGE_ID, true))
+  for (const [label, without] of [
+    ['channel unset', argsFor(f)],
+    ['channel false', argsFor(f, { channel: false })],
+  ] as const) {
+    assert.equal(without.includes('-i'), false, `${label}: -i`)
+    assert.equal(optionCount(without, '--init'), 1, `${label}: --init once`)
+    // Nothing but the -i tells the two apart.
+    assert.deepEqual(without, withChannel.filter((a) => a !== '-i'), label)
+  }
+
+  // The driver: a channel run's spawn carries -i, and its result carries the
+  // CLI's own stdout as the channel's input and its stdin as its output.
+  const stdin = new PassThrough()
+  const stdout = new PassThrough()
+  const stderr = new PassThrough()
+  const d = driverFor(f, { stdin, stdout, stderr })
+  const running = d.driver.run(spec(f, { channel: true }))
+  assert.equal(optionCount(d.spawns[0]?.args ?? [], '-i'), 1)
+  assert.ok(running.channel !== undefined, 'a channel run has a channel')
+  assert.equal(running.channel.input, stdout, "the channel's input is the CLI's stdout")
+  assert.equal(running.channel.output, stdin, "the channel's output is the CLI's stdin")
+  // The driver reads none of it: no listener, and the stream not flowing, so
+  // nothing the container writes is consumed before the caller listens.
+  assert.equal(stdout.listenerCount('data'), 0, "the driver listens on a channel run's stdout")
+  assert.equal(stdout.readableFlowing, null, "the driver set a channel run's stdout flowing")
+  assert.equal(stdin.destroyed, false, "the driver closed a channel run's stdin")
+  // Bytes both ways, as given: the container's stdout reaches the reader of
+  // the input, and what is written to the output reaches the container.
+  stdout.write(Buffer.from([0, 1, 2, 255]))
+  assert.deepEqual(running.channel.input.read(), Buffer.from([0, 1, 2, 255]))
+  running.channel.output.write(Buffer.from([7, 0, 9]))
+  assert.deepEqual(stdin.read(), Buffer.from([7, 0, 9]))
+  // Its stderr is still the driver's to keep; its stdout is not, so the
+  // result's is empty.
+  stderr.write('docker: a warning\n')
+  d.child.close(0, null)
+  const result = await running.result
+  assert.equal(result.stdout, '')
+  assert.equal(result.stderr, 'docker: a warning\n')
+  assert.equal(result.truncated, false)
+
+  // A run without a channel: no channel on its result, its stdin closed at
+  // once, and its stdout captured as ever.
+  const plainStdin = new PassThrough()
+  const plainOut = new PassThrough()
+  const plain = driverFor(f, { stdin: plainStdin, stdout: plainOut, stderr: new PassThrough() })
+  const ran = plain.driver.run(spec(f))
+  assert.equal('channel' in ran, false, 'a run without a channel has one')
+  assert.equal(plainStdin.destroyed, true, "a run without a channel left the CLI's stdin open")
+  assert.equal(plain.spawns[0]?.args.includes('-i'), false)
+  plainOut.end('ok\n')
+  await finished(plainOut)
+  plain.child.close(0, null)
+  assert.equal((await ran.result).stdout, 'ok\n')
+
+  // A hostile channel: refused by the builder and by the driver before
+  // anything starts, naming the domain. The same spec without the channel
+  // runs, so it is the channel that was refused.
+  const hostile = driverFor(f)
+  const asked = spec(f, { domain: 'hostile', channel: true })
+  assert.throws(
+    () => buildRunArgs({ spec: asked, domain: f.hostile, defaults: DEFAULTS, repoRoot: f.repoRoot, imageId: IMAGE_ID, home }),
+    /asks for a channel on the hostile domain, whose runs reach nothing at all/,
+  )
+  assert.match(runRefusal(hostile.driver, asked), /^container aos-run-abc123 asks for a channel on the hostile domain/)
+  assert.equal(hostile.spawns.length, 0, 'a refused hostile channel reached docker')
+  assert.equal(runRefusal(hostile.driver, spec(f, { domain: 'hostile', channel: false })), '')
+  assert.equal(hostile.spawns[0]?.args.includes('-i'), false)
+
+  // And a channel that is no boolean is refused, rather than read as either.
+  for (const value of ['true', 1, null, {}]) {
+    assert.match(
+      runRefusal(driverFor(f).driver, channelValued(f, value)),
+      new RegExp(`^container aos-run-abc123: channel must be true or false, and is a value of type ${typeof value}$`),
+      String(value),
+    )
+  }
+})
+
+test('the audit admits -i only on a run that asks for a channel, exactly once, and never in another spelling', (t) => {
+  const f = fixture(t)
+  const home = join(f.root, 'home')
+  const ws = f.realWorkspace
+  const withChannel = argsFor(f, { channel: true })
+  const without = argsFor(f)
+  const beforeImage = (args: readonly string[], ...extra: string[]): string[] => {
+    const at = args.indexOf(IMAGE_ID)
+    return [...args.slice(0, at), ...extra, ...args.slice(at)]
+  }
+  const noChannel = /carry -i before the image on a run that asks for no channel/
+
+  // A channel run's argv, audited as a run without one: refused, by default
+  // as when said, so that a caller that forgets to say is refused -i.
+  assert.throws(() => auditRunArgs(withChannel, home, ws, IMAGE_ID), noChannel)
+  assert.throws(() => auditRunArgs(withChannel, home, ws, IMAGE_ID, false), noChannel)
+  // A run without one, audited as a channel run: the -i it lacks.
+  assert.throws(() => auditRunArgs(without, home, ws, IMAGE_ID, true), /carry -i 0 time\(s\) before the image/)
+  // Twice is refused.
+  assert.throws(() => auditRunArgs(beforeImage(withChannel, '-i'), home, ws, IMAGE_ID, true), /carry -i 2 time\(s\)/)
+
+  // Smuggled through the image slot, -i is refused on a run without a
+  // channel, and is a second copy on a run with one.
+  assert.throws(() => argsFor(f, { image: '-i', command: [IMAGE_ID, 'node'] }), noChannel)
+  assert.throws(() => argsFor(f, { channel: true, image: '-i', command: [IMAGE_ID, 'node'] }), /carry -i 2 time\(s\)/)
+
+  // Every other spelling of an open stdin is no option the builder emits, on
+  // a channel run as on any other: only the builder's own -i is admitted.
+  const foreign = /before the image, which the builder never emits, and docker would obey it/
+  for (const spelling of ['--interactive', '--interactive=true', '-ii', '--attach=stdin', '-astdin']) {
+    for (const [channel, args] of [[true, withChannel], [false, without]] as const) {
+      assert.throws(() => auditRunArgs(beforeImage(args, spelling), home, ws, IMAGE_ID, channel), foreign, `${spelling}, channel ${String(channel)}`)
+    }
+  }
+  // A channel run that swaps its -i for --interactive carries no -i at all.
+  assert.throws(
+    () => auditRunArgs(withChannel.map((a) => (a === '-i' ? '--interactive' : a)), home, ws, IMAGE_ID, true),
+    foreign,
+  )
+
+  // After the image, -i is the command's (`sed -i`, `grep -i`), which docker
+  // passes on unread, and the audit too, with or without a channel.
+  for (const channel of [false, true]) {
+    const args = argsFor(f, { channel, command: ['sed', '-i', 's/a/b/', 'file'] })
+    assert.equal(optionCount(args, '-i'), channel ? 1 : 0, `channel ${String(channel)}`)
+    assert.deepEqual(args.slice(-5), [IMAGE_ID, 'sed', '-i', 's/a/b/', 'file'])
+  }
+})
+
+test("a channel run's pipes are its caller's: their errors are heard into stderr, never thrown, and a spawn that started nothing closes them", async (t) => {
+  const f = fixture(t)
+
+  // A container that closes its stdin makes the kernel's next write fail
+  // (EPIPE). The driver hears it from the start, so a caller whose listener
+  // comes late, or never, does not let it throw in the kernel: an 'error'
+  // nobody hears would be an uncaught exception in this test as there.
+  const stdin = new PassThrough()
+  const stdout = new PassThrough()
+  const d = driverFor(f, { stdin, stdout, stderr: new PassThrough() })
+  const running = d.driver.run(spec(f, { channel: true }))
+  stdin.destroy(new Error('write EPIPE'))
+  stdout.destroy(new Error('read ECONNRESET'))
+  await new Promise((resolve) => setImmediate(resolve))
+  d.child.close(0, null)
+  const result = await running.result
+  assert.equal(result.stderr, 'channel output: write EPIPE\nchannel input: read ECONNRESET\n')
+  assert.equal(result.stdout, '')
+
+  // A spawn that started no process: Node leaves its pipes pending, never to
+  // end, and the driver closes them, so the input has ended once the result
+  // settles, as a started run's has.
+  const failedIn = new PassThrough()
+  const failedOut = new PassThrough()
+  const failed = driverFor(f, { stdin: failedIn, stdout: failedOut, stderr: new PassThrough() })
+  const unstarted = failed.driver.run(spec(f, { channel: true }))
+  assert.equal(unstarted.channel?.input, failedOut)
+  failed.child.fail(new Error('spawn docker ENOENT'))
+  const why = await unstarted.result
+  assert.equal(why.exitCode, null)
+  assert.equal(why.stderr, 'spawn docker ENOENT')
+  assert.equal(failedOut.destroyed, true, "the channel's input was left open by a spawn that started nothing")
+  assert.equal(failedIn.destroyed, true, "the channel's output was left open by a spawn that started nothing")
+
+  // And a child given no pipes at all (Node's spawn that failed for want of
+  // file descriptors) has no channel to hand over; its 'error' ends the run.
+  const bare = driverFor(f, { stdin: null, stdout: null, stderr: null })
+  const pipeless = bare.driver.run(spec(f, { channel: true }))
+  assert.equal('channel' in pipeless, false)
+  bare.child.fail(new Error('spawn docker EMFILE'))
+  assert.equal((await pipeless.result).exitCode, null)
+})
+
+test('the fake and the real driver agree on the channel: refused in the same words, none on a run without one, and a channel run keeps no stdout', async (t) => {
+  // Runtime code (W1) is tested against the fake. Had the fake run a hostile
+  // channel, or given a channel to a run that asked for none, code that
+  // passed against it would meet a refusal, or no channel, on the Mac.
+  const f = fixture(t)
+
+  // Refused before anything starts, in the real driver's words, and with no
+  // scripted exit spent: the fake's first exit still answers the next run.
+  const real = driverFor(f)
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: 0 }, { hangs: true }, { hangs: true }] })
+  for (const refused of [spec(f, { domain: 'hostile', channel: true }), channelValued(f, 'true'), channelValued(f, 0)]) {
+    const said = runRefusal(real.driver, refused)
+    assert.notEqual(said, '', `the real driver ran ${JSON.stringify(refused.channel)} on ${refused.domain}`)
+    assert.equal(runRefusal(fake, refused), said)
+  }
+  assert.equal(real.spawns.length, 0)
+  assert.equal(fake.channels.length, 0)
+
+  // No channel on a run without one, on either.
+  const plainReal = real.driver.run(spec(f))
+  const plainFake = fake.run(spec(f))
+  assert.equal('channel' in plainReal, false)
+  assert.equal('channel' in plainFake, false)
+  real.child.close(0, null)
+  await Promise.all([plainReal.result, plainFake.result])
+
+  // A channel on a channel run, on either: an input to read and an output
+  // to write, and a result with no stdout, whatever the container wrote.
+  const io = { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() }
+  const realChannel = driverFor(f, io)
+  const channelReal = realChannel.driver.run(spec(f, { channel: true }))
+  const channelFake = fake.run(spec(f, { channel: true, name: `${CONTAINER_PREFIX}chan` }))
+  for (const running of [channelReal, channelFake]) {
+    assert.ok(running.channel?.input instanceof Readable)
+    assert.ok(running.channel.output instanceof Writable)
+  }
+  assert.equal(fake.channels.length, 1)
+  const container = fake.channels[0]
+  assert.ok(container !== undefined)
+  assert.equal(container.name, `${CONTAINER_PREFIX}chan`)
+  // The fake's container ends, both ways: what the container writes is the
+  // input, and what the kernel writes to the output the container reads.
+  container.stdout.write('from the container')
+  assert.equal(String(channelFake.channel?.input.read()), 'from the container')
+  channelFake.channel?.output.write('from the kernel')
+  assert.equal(String(container.stdin.read()), 'from the kernel')
+  io.stdout.end('frames, not output')
+  channelReal.channel?.input.resume()
+  await finished(io.stdout)
+  realChannel.child.close(0, null)
+  await fake.kill(`${CONTAINER_PREFIX}chan`)
+  for (const result of await Promise.all([channelReal.result, channelFake.result])) assert.equal(result.stdout, '')
+
+  // The fake settles a channel run only once its input has ended, as the
+  // real driver's CLI closes only once its pipes have: a reader that pauses
+  // on every chunk, with a chunk still unread, holds the result open.
+  const hung = fake.run(spec(f, { channel: true, name: `${CONTAINER_PREFIX}held` }))
+  const held = fake.channels[1]
+  const input = hung.channel?.input
+  assert.ok(held !== undefined && input !== undefined)
+  held.stdout.write('one chunk')
+  held.stdout.write('and another')
+  const got: string[] = []
+  input.on('data', (chunk) => {
+    got.push(String(chunk))
+    input.pause()
+  })
+  input.pause()
+  let settled = false
+  void hung.result.then(() => {
+    settled = true
+  })
+  await fake.kill(`${CONTAINER_PREFIX}held`)
+  // The kill ends the run on a later macrotask, which resumes the input, as
+  // Node resumes a child's stdout when it exits; the reader pauses again.
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(got, ['one chunk'])
+  assert.equal(settled, false, 'the fake settled a channel run whose input had not ended')
+  input.resume()
+  const result = await hung.result
+  assert.deepEqual(got, ['one chunk', 'and another'])
+  assert.equal(settled, true)
+  assert.equal(result.killedBy, 'requested')
+  assert.equal(result.stdout, '')
+
+  // And a script may not give a channel run stdout, which the real driver
+  // never keeps for one.
+  const scripted = fakeSandbox({ imageId: IMAGE_ID, script: [{ stdout: 'frames' }] })
+  assert.throws(() => scripted.run(spec(f, { channel: true })), /stdout on a channel run/)
+})
+
+/**
+ * `base`, with `field` read through a getter that answers `first` on its
+ * first read and `then` on every later one: a spec built outside the type
+ * system, as a getter or a Proxy would hand a driver, that a driver reading
+ * a field twice judges by one value and runs by another.
+ */
+function flipping(base: SandboxSpec, field: 'channel' | 'domain', first: unknown, then: unknown): SandboxSpec {
+  let reads = 0
+  const flipped = { ...base }
+  Object.defineProperty(flipped, field, { enumerable: true, get: () => (reads++ === 0 ? first : then) })
+  return flipped
+}
+
+/** `base` behind a Proxy that counts each read of each of its fields. */
+function counting(base: SandboxSpec): { readonly spec: SandboxSpec; readonly reads: Map<string, number> } {
+  const reads = new Map<string, number>()
+  const spec = new Proxy(base, {
+    get(target, key, receiver) {
+      if (typeof key === 'string') reads.set(key, (reads.get(key) ?? 0) + 1)
+      return Reflect.get(target, key, receiver) as unknown
+    },
+  })
+  return { spec, reads }
+}
+
+test('a spec is read once: a channel or a domain that answers each read differently is judged and run from one reading, by the builder, the driver and the fake', async (t) => {
+  // A spec the kernel builds is plain data, but a driver decides several
+  // things from one field: the domain picks the VM and its mountRoot and
+  // judges the channel, and the channel decides the -i and whether the
+  // result hands over the CLI's pipes. Read at each decision, a field that
+  // answers differently would have the hostile domain judged as having no
+  // channel and then given one, or judged as the trusted domain and then
+  // run on its own VM with a channel.
+  // The wallclock is fired below, so that what its timer does is made from
+  // the one reading too: its kill, aimed at a domain read again, would go to
+  // the other VM, swallowed there as "No such container".
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = fixture(t)
+  const home = join(f.root, 'home')
+  const hostile = spec(f, { domain: 'hostile' })
+
+  // The builder: a hostile channel that reads false and then true is built
+  // as it was judged, without -i.
+  const built = buildRunArgs({
+    spec: flipping(hostile, 'channel', false, true),
+    domain: f.hostile,
+    defaults: DEFAULTS,
+    repoRoot: f.repoRoot,
+    imageId: IMAGE_ID,
+    home,
+  })
+  assert.equal(optionCount(built, '-i'), 0, 'a hostile spec judged to have no channel was built with -i')
+
+  // The driver: the same spec runs on the hostile VM without -i, with no
+  // channel on its result, and its CLI's stdin closed.
+  const stdin = new PassThrough()
+  const d = driverFor(f, { stdin, stdout: new PassThrough(), stderr: new PassThrough() })
+  const ran = d.driver.run(flipping(hostile, 'channel', false, true))
+  assert.equal(d.spawns[0]?.env['DOCKER_HOST'], HOSTILE_HOST)
+  assert.equal(optionCount(d.spawns[0]?.args ?? [], '-i'), 0)
+  assert.equal('channel' in ran, false, 'a hostile run judged to have no channel was handed one')
+  assert.equal(stdin.destroyed, true)
+  d.child.close(0, null)
+  await ran.result
+
+  // A channel spec whose domain reads hostile and then trusted is judged on
+  // the hostile domain, and refused before docker is asked anything.
+  const asked = spec(f, { domain: 'hostile', channel: true })
+  const refusedOn = driverFor(f)
+  assert.match(runRefusal(refusedOn.driver, flipping(asked, 'domain', 'hostile', 'trusted')), /asks for a channel on the hostile domain/)
+  assert.equal(refusedOn.spawns.length, 0)
+  // And one whose domain reads trusted and then hostile runs on the trusted
+  // domain throughout: its VM, its mountRoot, its channel, and a kill aimed
+  // at it alone.
+  const io = { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() }
+  const trusted = driverFor(f, io)
+  const held = trusted.driver.run(flipping(spec(f, { channel: true }), 'domain', 'trusted', 'hostile'))
+  const [spawned] = trusted.spawns
+  assert.ok(spawned !== undefined)
+  assert.equal(spawned.env['DOCKER_HOST'], TRUSTED_HOST)
+  assert.equal(valueOf(spawned.args, '--mount'), `type=bind,source=${f.realWorkspace},target=${WORKSPACE_TARGET}`)
+  assert.equal(optionCount(spawned.args, '-i'), 1)
+  assert.equal(held.channel?.output, io.stdin)
+  await trusted.driver.kill(held.name)
+  assert.deepEqual(trusted.execs.map((e) => e.env['DOCKER_HOST']), [TRUSTED_HOST])
+  io.stdout.end()
+  held.channel?.input.resume()
+  trusted.child.close(137, null)
+  assert.equal((await held.result).killedBy, 'requested')
+  // Its wallclock as well: a run whose domain reads trusted and then hostile
+  // is killed at its deadline on the trusted VM, and on no other.
+  const timed = driverFor(f, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() })
+  const late = timed.driver.run(flipping(spec(f, { name: `${CONTAINER_PREFIX}timed` }), 'domain', 'trusted', 'hostile'))
+  assert.equal(timed.spawns[0]?.env['DOCKER_HOST'], TRUSTED_HOST)
+  t.mock.timers.tick(600_000)
+  assert.deepEqual(killsSent(timed), [`${TRUSTED_HOST} ${CONTAINER_PREFIX}timed`], "the wallclock's kill went to a domain read again")
+  timed.child.close(137, null)
+  assert.equal((await late.result).killedBy, 'wallclock')
+
+  // The fake, the same: no channel for the hostile spec read false first,
+  // and a refusal for the channel spec read hostile first.
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: 0 }] })
+  const fakeRan = fake.run(flipping(hostile, 'channel', false, true))
+  assert.equal('channel' in fakeRan, false, 'the fake handed a channel to a hostile run it judged to have none')
+  assert.equal(fake.channels.length, 0)
+  await fakeRan.result
+  assert.match(runRefusal(fake, flipping(asked, 'domain', 'hostile', 'trusted')), /asks for a channel on the hostile domain/)
+
+  // Each field of the spec is read once, and only once, by each of them.
+  const once = (label: string, reads: ReadonlyMap<string, number>): void => {
+    assert.deepEqual(
+      [...reads].filter(([, n]) => n !== 1),
+      [],
+      `${label} read a field of the spec more than once`,
+    )
+    for (const field of ['name', 'domain', 'channel', 'image', 'command', 'workspace', 'limits']) {
+      assert.equal(reads.get(field), 1, `${label}: ${field}`)
+    }
+  }
+  const forBuilder = counting(spec(f, { channel: true }))
+  buildRunArgs({ spec: forBuilder.spec, domain: f.domain, defaults: DEFAULTS, repoRoot: f.repoRoot, imageId: IMAGE_ID, home })
+  once('buildRunArgs', forBuilder.reads)
+  const forDriver = counting(spec(f, { channel: true, name: `${CONTAINER_PREFIX}counted` }))
+  const driven = driverFor(f, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() })
+  const counted = driven.driver.run(forDriver.spec)
+  // Its wallclock fires, and what the timer sends counts with the rest.
+  t.mock.timers.tick(600_000)
+  assert.deepEqual(killsSent(driven), [`${TRUSTED_HOST} ${CONTAINER_PREFIX}counted`])
+  await driven.driver.kill(counted.name)
+  counted.channel?.input.resume()
+  driven.child.close(137, null)
+  assert.equal((await counted.result).killedBy, 'wallclock')
+  once('the docker driver', forDriver.reads)
+  const forFake = counting(spec(f, { channel: true }))
+  const fakeCounted = fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: 0 }] })
+  await fakeCounted.run(forFake.spec).result
+  once('the fake', forFake.reads)
+})
+
+test('a spec field that is not of its type is refused before anything is decided from it, by the builder, the driver and the fake, in the same words', async (t) => {
+  // One reading holds only for a value that is what its type says. A domain
+  // that is an object is converted at each use as a property key: one whose
+  // toString answers trusted and then hostile would have the run built
+  // against the trusted domain's mountRoot and workspace, and spawned and
+  // killed on the hostile VM, however few times the field was read.
+  const f = fixture(t)
+  const home = join(f.root, 'home')
+  let conversions = 0
+  const shifty = { toString: () => (conversions++ === 0 ? 'trusted' : 'hostile') }
+  const typed = (over: Record<string, unknown>): SandboxSpec => Object.assign({}, spec(f), over)
+  const limits = spec(f).limits
+  const who = `container ${CONTAINER_PREFIX}abc123`
+  for (const [label, bad, said] of [
+    ['a domain whose toString flips', typed({ domain: shifty }), `${who}: domain must be 'trusted' or 'hostile', and is a value of type object`],
+    ['a domain in another case', typed({ domain: 'Trusted' }), `${who}: domain must be 'trusted' or 'hostile', and is another string`],
+    ['no domain', typed({ domain: undefined }), `${who}: domain must be 'trusted' or 'hostile', and is a value of type undefined`],
+    ['a name that is no string', typed({ name: { toString: () => `${CONTAINER_PREFIX}abc123` } }), 'a container spec: name must be a string, and is a value of type object'],
+    ['a runId that is no string', typed({ runId: 7 }), `${who}: runId must be a string, and is a value of type number`],
+    ['an agentId that is null', typed({ agentId: null }), `${who}: agentId must be a string, and is null`],
+    ['an image that is no string', typed({ image: { toString: () => IMAGE_ID } }), `${who}: image must be a string, and is a value of type object`],
+    ['a command that is a string', typed({ command: 'node --version' }), `${who}: command must be an array of strings, and is a value of type string`],
+    ['a command with an argument that is no string', typed({ command: ['node', 1] }), `${who}: command[1] must be a string, and is a value of type number`],
+    ['a workspace that is no string', typed({ workspace: { toString: () => f.workspace } }), `${who}: workspace must be a string, and is a value of type object`],
+    ['no limits', typed({ limits: null }), `${who}: limits must be an object, and is null`],
+    ['a wallclock that is a string', typed({ limits: { ...limits, wallclockMs: '5000' } }), `${who}: limits.wallclockMs must be a number, and is a value of type string`],
+    ['a pids cap that is missing', typed({ limits: { memoryMb: 1, cpus: 1, wallclockMs: 5_000 } }), `${who}: limits.pids must be a number, and is a value of type undefined`],
+  ] as const) {
+    conversions = 0
+    assert.throws(
+      () => buildRunArgs({ spec: bad, domain: f.domain, defaults: DEFAULTS, repoRoot: f.repoRoot, imageId: IMAGE_ID, home }),
+      (e: unknown) => e instanceof ConfigError && e.message === said,
+      `buildRunArgs: ${label}`,
+    )
+    const real = driverFor(f)
+    assert.equal(runRefusal(real.driver, bad), said, `the docker driver: ${label}`)
+    assert.equal(real.spawns.length, 0, `the docker driver spawned ${label}`)
+    // With no scripted exit spent: the fake's one exit still answers a run.
+    const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: 0 }] })
+    assert.equal(runRefusal(fake, bad), said, `the fake: ${label}`)
+    await fake.run(spec(f)).result
+  }
+  // Converted at no point: the refusal names the type and never the value.
+  assert.equal(conversions, 0)
+})
+
+test('readSpecOnce copies every field of a spec, and every field of its limits, and no other', () => {
+  // Required<SandboxSpec> has a test name every field, so that a field added
+  // to the interface fails to compile here until it is set; and one that
+  // readSpecOnce then dropped would be a field no driver ever sees, which
+  // for one that restricts a run fails open.
+  const full: Required<SandboxSpec> = {
+    name: `${CONTAINER_PREFIX}full`,
+    runId: 'run_full',
+    agentId: 'researcher',
+    domain: 'trusted',
+    image: IMAGE_ID,
+    command: ['node', '--version'],
+    workspace: '/work/proj',
+    limits: { memoryMb: 512, cpus: 1, pids: 64, wallclockMs: 5_000 },
+    channel: true,
+  }
+  const copy = readSpecOnce(full)
+  assert.deepEqual(Object.keys(copy).sort(), Object.keys(full).sort())
+  assert.deepEqual(Object.keys(copy.limits).sort(), Object.keys(full.limits).sort())
+  assert.deepEqual(copy, full)
+  assert.notEqual(copy.command, full.command)
+  assert.notEqual(copy.limits, full.limits)
+  assert.equal(Object.isFrozen(copy) && Object.isFrozen(copy.command) && Object.isFrozen(copy.limits), true)
+  // An absent channel stays absent rather than becoming an own key.
+  const { channel: _channel, ...withoutChannel } = full
+  assert.equal('channel' in readSpecOnce(withoutChannel), false)
+  // And a field no SandboxSpec has is not carried: a spec has no seam for
+  // extra arguments, mounts or environment.
+  assert.equal('env' in readSpecOnce(Object.assign({}, full, { env: { A: '1' } })), false)
+})
+
+test("a run's wallclock and duration end at the CLI's exit: a channel caller that holds the input past the deadline is no overrun", async (t) => {
+  // A channel run's CLI closes only once its stdout has ended, and its caller
+  // decides when that is: an egress session paused on a full flow, or
+  // draining, holds it. A container that exited in time is not overrun by
+  // the hold, and its wallclock sends no kill to a container that is gone.
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const f = fixture(t)
+  const limits = { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 }
+  for (const channel of [true, false]) {
+    const stdout = new PassThrough()
+    const d = driverFor(f, { stdin: new PassThrough(), stdout, stderr: new PassThrough() })
+    const running = d.driver.run(spec(f, { channel, limits }))
+    t.mock.timers.tick(4_000)
+    // The container exits on its own, a second before its wallclock, and the
+    // CLI with it; its stdout is held open past the deadline.
+    d.child.exit(0, null)
+    t.mock.timers.tick(10_000)
+    assert.deepEqual(d.execs, [], `channel ${String(channel)}: the wallclock sent a kill after the CLI had exited`)
+    stdout.end()
+    if (channel) running.channel?.input.resume()
+    d.child.close(0, null)
+    const result = await running.result
+    assert.equal(result.overran, undefined, `channel ${String(channel)}: overran`)
+    assert.equal(result.killedBy, undefined, `channel ${String(channel)}: killedBy`)
+    assert.equal(result.exitCode, 0)
+    assert.equal(result.durationMs, 4_000, `channel ${String(channel)}: the duration counts the hold`)
+  }
+
+  // A CLI that has not exited by its deadline is still killed by it, the
+  // exit coming after the kill and the close after that.
+  const d = driverFor(f, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() })
+  const late = d.driver.run(spec(f, { channel: true, limits }))
+  t.mock.timers.tick(5_000)
+  assert.deepEqual(d.execs[0]?.args, ['kill', '--signal=KILL', `${CONTAINER_PREFIX}abc123`])
+  t.mock.timers.tick(250)
+  d.child.exit(137, null)
+  late.channel?.input.resume()
+  d.child.close(137, null)
+  const killed = await late.result
+  assert.equal(killed.killedBy, 'wallclock')
+  assert.equal(killed.overran, true)
+  assert.equal(killed.durationMs, 5_250)
+})
+
+test('a channel run on the fake that does not hang exits inside run(): its container ends are closed when run() returns, and its result settles only once its input has ended', async (t) => {
+  // The fake's non-hanging script is a container that exits at once. Its
+  // result must still wait for its input to end, as the real driver's waits
+  // for the CLI's pipes; and what its container can no longer do (write to
+  // its stdout, read the kernel's writes) is refused as the real one is.
+  const f = fixture(t)
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: 3, stderr: 'bye\n' }] })
+  const running = fake.run(spec(f, { channel: true }))
+  const input = running.channel?.input
+  const output = running.channel?.output
+  const container = fake.channels[0]
+  assert.ok(input !== undefined && output !== undefined && container !== undefined)
+  const order: string[] = []
+  input.on('end', () => order.push('input end'))
+  void running.result.then(() => order.push('result'))
+
+  // Its container has exited: its stdout is ended, and a write to it throws,
+  // naming the run, rather than becoming an 'error' on the kernel's input.
+  assert.equal(container.stdout.writableEnded, true)
+  assert.throws(
+    () => container.stdout.write('late'),
+    /^Error: fake sandbox: a write to the container stdout of aos-run-abc123 after its container exited\. A run scripted without hangs/,
+  )
+  assert.throws(() => container.stdout.end('late'), /after its container exited/)
+  // Its channel's output is destroyed, as Node destroys a child's stdin when
+  // it exits: a write fails in its callback, and nothing throws.
+  assert.equal(output.destroyed, true)
+  const refused = await new Promise<Error | null | undefined>((resolve) => {
+    output.write('to nobody', resolve)
+  })
+  assert.match(String(refused), /Cannot call write after a stream was destroyed/)
+
+  const result = await running.result
+  assert.deepEqual(order, ['input end', 'result'], 'the fake settled a channel run before its input had ended')
+  assert.equal(result.exitCode, 3)
+  assert.equal(result.stdout, '')
+  assert.equal(result.stderr, 'bye\n')
+  assert.equal(input.destroyed || input.readableEnded, true)
+
+  // A test that ends a running container's stdout itself, and then writes
+  // to it, is told so too.
+  const hung = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }] })
+  const live = hung.run(spec(f, { channel: true }))
+  const ends = hung.channels[0]
+  assert.ok(ends !== undefined)
+  ends.stdout.end('last words')
+  assert.throws(() => ends.stdout.write('more'), /of aos-run-abc123 after it was ended\./)
+  const got: string[] = []
+  live.channel?.input.on('data', (chunk) => got.push(String(chunk)))
+  await hung.kill(live.name)
+  await live.result
+  assert.deepEqual(got, ['last words'])
+
+  // An input read through 'readable' stays paused when the container exits,
+  // as resume() leaves such a stream (RunningSandbox.result), and holds the
+  // result until it is read to its end.
+  const paced = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }] })
+  const reading = paced.run(spec(f, { channel: true }))
+  const pacedInput = reading.channel?.input
+  assert.ok(pacedInput !== undefined)
+  paced.channels[0]?.stdout.write('unread')
+  pacedInput.on('readable', () => undefined)
+  let settled = false
+  void reading.result.then(() => {
+    settled = true
+  })
+  await paced.kill(reading.name)
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(pacedInput.readableFlowing, false)
+  assert.equal(settled, false, "the fake settled a channel run whose 'readable' reader had not read its input")
+  assert.equal(String(pacedInput.read()), 'unread')
+  assert.equal(pacedInput.read(), null)
+  await reading.result
+})
+
+test("the fake ends a channel as the real driver's child does: its output destroyed at the container's exit, what was written kept, and every error heard into stderr in the real driver's words", async (t) => {
+  // Node destroys a child's stdin in its exit handler, before its stdout is
+  // flushed and before 'close' (checked on Node 22: stdin.destroyed in the
+  // 'exit' listener), and the docker driver hears each pipe's 'error' into
+  // the run's stderr. Runtime code that ends a session on the output's
+  // 'close', or meets a write that fails after the exit, meets the same on
+  // the fake.
+  const f = fixture(t)
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }, { hangs: true }] })
+  const running = fake.run(spec(f, { channel: true }))
+  const output = running.channel?.output
+  const container = fake.channels[0]
+  assert.ok(output !== undefined && container !== undefined)
+  let closed = false
+  output.on('close', () => {
+    closed = true
+  })
+  assert.equal(output.write('before the exit'), true)
+  assert.equal(output.destroyed, false, "the fake destroyed a running container's output")
+  await fake.kill(running.name)
+  await running.result
+  assert.equal(output.destroyed, true, "the channel's output outlived its container")
+  assert.equal(closed, true, "the channel's output emitted no 'close'")
+  const after = await new Promise<Error | null | undefined>((resolve) => {
+    output.write('after the exit', resolve)
+  })
+  assert.match(String(after), /Cannot call write after a stream was destroyed/)
+  // What the kernel wrote before the exit is what the container read, and
+  // its stdin then ended.
+  const read: string[] = []
+  for await (const chunk of container.stdin) read.push(String(chunk))
+  assert.deepEqual(read, ['before the exit'])
+
+  // Errors on the channel: a write after the kernel ended the output, and
+  // an input the kernel destroyed with an error. Neither throws, on either
+  // driver, and both land in the result's stderr, in the same words.
+  const real = driverFor(f, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() })
+  const onReal = real.driver.run(spec(f, { channel: true }))
+  const onFake = fake.run(spec(f, { channel: true, name: `${CONTAINER_PREFIX}errors` }))
+  for (const each of [onReal, onFake]) {
+    each.channel?.output.end()
+    each.channel?.output.write('after the end')
+    each.channel?.input.destroy(new Error('read ECONNRESET'))
+  }
+  await new Promise((resolve) => setImmediate(resolve))
+  real.child.close(0, null)
+  await fake.kill(onFake.name)
+  const [realResult, fakeResult] = await Promise.all([onReal.result, onFake.result])
+  assert.equal(realResult.stderr, 'channel output: write after end\nchannel input: read ECONNRESET\n')
+  assert.equal(fakeResult.stderr, realResult.stderr)
+})
+
+test("the fake's channel output is a pipe into its container: ending it ends the container's stdin while the run goes on, and a container that reads nothing holds the kernel's writes", async (t) => {
+  // What Node's child.stdin is on the real driver: an end that the container
+  // reads as the end of its stdin, while it runs on, and a write that is
+  // acknowledged only once the container's side has taken it, so that one
+  // that reads nothing fills the pipe and write() says so. Code tested
+  // against the fake (W1's egress session) may end the output to tell the
+  // mux it is done, or wait on 'drain'.
+  const f = fixture(t)
+  const turns = async (n: number): Promise<void> => {
+    for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve))
+  }
+  const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true }, { hangs: true }] })
+
+  // The end: the container's stdin ends, while the run still hangs.
+  const running = fake.run(spec(f, { channel: true }))
+  const container = fake.channels[0]
+  const output = running.channel?.output
+  assert.ok(container !== undefined && output !== undefined)
+  let settled = false
+  void running.result.then(() => {
+    settled = true
+  })
+  // By the output's 'finish' the end has reached the container, as a
+  // child's stdin, a socketpair, finishes once its shutdown has been sent:
+  // code that awaits finished(output) may take the mux to have its EOF. (The
+  // output's auto-destroy, just after 'finish', would end the container's
+  // stdin too, but only then.)
+  let endedAtFinish: boolean | undefined
+  output.once('finish', () => {
+    // The container's stdin is a PassThrough: its writable side is the end
+    // the kernel's pipe delivers into.
+    const { stdin } = container
+    endedAtFinish = stdin instanceof Writable && stdin.writableEnded
+  })
+  output.end('the last request')
+  const read: string[] = []
+  let ended = false
+  const reading = (async () => {
+    for await (const chunk of container.stdin) read.push(String(chunk))
+    ended = true
+  })()
+  await turns(3)
+  assert.equal(endedAtFinish, true, "the channel's output finished before its end had reached the container's stdin")
+  assert.equal(ended, true, "ending the channel's output left the container's stdin open")
+  assert.deepEqual(read, ['the last request'])
+  assert.equal(settled, false, 'the run ended with its stdin')
+  await fake.kill(running.name)
+  await running.result
+  await reading
+
+  // The pipe: written past what the container's stdin and the output can
+  // hold, with nothing read, write() says to wait, and the last write's
+  // callback waits until the container reads.
+  const full = fake.run(spec(f, { channel: true, name: `${CONTAINER_PREFIX}full` }))
+  const ends = fake.channels[1]
+  const out = full.channel?.output
+  assert.ok(ends !== undefined && out !== undefined)
+  const capacity = ends.stdin.readableHighWaterMark + out.writableHighWaterMark
+  const chunk = Buffer.alloc(1_024, 7)
+  let sent = 0
+  let acknowledged = 0
+  let refused = false
+  while (sent < 2 * capacity) {
+    if (!out.write(chunk, () => (acknowledged += chunk.length))) refused = true
+    sent += chunk.length
+    // Each write given its turns: what holds the rest is the container's
+    // stdin, full, and not a burst written in one tick.
+    await turns(2)
+  }
+  assert.equal(refused, true, 'the fake took every write from a container that reads nothing')
+  assert.ok(acknowledged < sent, 'the fake acknowledged writes no container had read')
+  const drained = new Promise((resolve) => out.once('drain', resolve))
+  ends.stdin.resume()
+  await drained
+  await turns(2)
+  assert.equal(acknowledged, sent, 'a write the container read was never acknowledged')
+  await fake.kill(full.name)
+  await full.result
 })
 
 test('wallclock fires docker kill by name', async (t) => {
@@ -2150,6 +2955,84 @@ test('a kill that ends nothing leaves the run its own exit: no killedBy, and the
   assert.equal(result.overran, true)
 })
 
+test("a kill sent after the CLI exited on its own ends nothing: the run reports its own 137, with no killedBy, on the real driver and the fake alike", async (t) => {
+  // The container is OOM-killed and the docker CLI exits 137 on its own. A
+  // channel run's CLI closes only once its caller has read the input to its
+  // end, and its name is held until then, so a kill sent then (a tear-down's)
+  // reaches a run that has already ended: it must not be credited with the
+  // 137, which would log a kernel kill of a run that ended by itself. A run
+  // without a channel has the same window, for as long as the CLI takes from
+  // its exit to its close.
+  const f = fixture(t)
+  for (const channel of [false, true]) {
+    const label = `channel ${String(channel)}`
+    const io = { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() }
+    const d = driverFor(f, io)
+    d.setExec((args) => Promise.reject(new Error(`Error response from daemon: No such container: ${args[2] ?? '?'}`)))
+    const running = d.driver.run(spec(f, { channel }))
+    d.child.exit(137, null)
+    await d.driver.kill(running.name)
+    // Sent, and to the run's own VM only: the name was still held.
+    assert.deepEqual(killsSent(d), [`${TRUSTED_HOST} ${running.name}`], label)
+    io.stdout.end()
+    if (channel) running.channel?.input.resume()
+    d.child.close(137, null)
+    const real = await running.result
+    assert.equal(real.killedBy, undefined, `${label}: a kill sent after the exit was credited with it`)
+    assert.equal(real.signal, null, label)
+    assert.equal(real.exitCode, 137, label)
+    assert.equal(real.overran, undefined, label)
+
+    // The fake: a run scripted to exit 137 on its own, then killed.
+    const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ exitCode: 137 }] })
+    const onFake = fake.run(spec(f, { channel }))
+    await fake.kill(onFake.name)
+    const faked = await onFake.result
+    const shape = (r: SandboxResult): unknown => ({ exitCode: r.exitCode, signal: r.signal, killedBy: r.killedBy, overran: r.overran })
+    assert.deepEqual(shape(faked), shape(real), label)
+  }
+
+  // A kill sent before the exit is still the CLI's 137 to credit.
+  const d = driverFor(f)
+  const before = d.driver.run(spec(f))
+  await d.driver.kill(before.name)
+  d.child.exit(137, null)
+  d.child.close(137, null)
+  const killed = await before.result
+  assert.equal(killed.killedBy, 'requested')
+  assert.equal(killed.signal, 'SIGKILL')
+})
+
+test("a spawn that started nothing clears its wallclock: a retry under the same name is not killed at the first run's deadline", async (t) => {
+  // A transient EAGAIN or EMFILE from spawn starts no process, so Node emits
+  // 'error' and never 'exit', and finish() is then the only thing that
+  // clears the run's timer. Left armed, it would fire at the first run's
+  // deadline and `docker kill` by name whatever then runs under the name,
+  // which the failure has freed: the retry.
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = fixture(t)
+  const d = driverFor(f)
+  const limits = { memoryMb: 1, cpus: 1, pids: 1, wallclockMs: 5_000 }
+  const first = d.driver.run(spec(f, { limits }))
+  d.child.fail(Object.assign(new Error('spawn docker EAGAIN'), { code: 'EAGAIN' }))
+  const failed = await first.result
+  assert.equal(failed.exitCode, null)
+  assert.equal(failed.stderr, 'spawn docker EAGAIN')
+
+  t.mock.timers.tick(2_000)
+  const retry = d.driver.run(spec(f, { limits }))
+  // 6 s in: a second past the first run's deadline, a second short of the
+  // retry's.
+  t.mock.timers.tick(4_000)
+  assert.deepEqual(killsSent(d), [], "the failed run's wallclock killed the retry under its name")
+  t.mock.timers.tick(1_000)
+  assert.deepEqual(killsSent(d), [`${TRUSTED_HOST} ${retry.name}`], "the retry's own wallclock")
+  d.child.close(137, null)
+  const ended = await retry.result
+  assert.equal(ended.killedBy, 'wallclock')
+  assert.equal(ended.overran, true)
+})
+
 test('a spawn that throws leaves no record: the name runs again, and a kill of it still asks every VM', async (t) => {
   // Node's spawn refuses some arguments synchronously (a NUL byte, for one),
   // and then nothing started. A record made before that throw would refuse
@@ -2856,7 +3739,7 @@ test('the source scan reads a docker command on any path, and refuses a process 
     ['a third child_process function imported', edit(processImport, processImport.replace('{ execFile, spawn }', '{ exec, execFile, spawn }')), { unread: /import \{ exec, execFile, spawn \}/ }],
     ['child_process imported under an alias', edit(processImport, processImport.replace('spawn }', 'spawn as start }')), { unread: /spawn as start/ }],
     ['child_process reached by name', edit(sweepCatch, `    } catch {\n      void process.getBuiltinModule('${processModule}')\n      return []\n    }\n`), { unread: /getBuiltinModule\(/ }],
-    ['buildRunArgs returning another argv', edit('  auditRunArgs(args, home, workspace, input.imageId)\n  return args\n', "  auditRunArgs(args, home, workspace, input.imageId)\n  return ['image', 'pull', spec.image]\n"), { unread: /return \['image', 'pull'/ }],
+    ['buildRunArgs returning another argv', edit('  auditRunArgs(args, home, workspace, input.imageId, channel)\n  return args\n', "  auditRunArgs(args, home, workspace, input.imageId, channel)\n  return ['image', 'pull', spec.image]\n"), { unread: /return \['image', 'pull'/ }],
   ]
   for (const [label, text, expect] of cases) {
     const scanned = dockerCommandsInSource(text)

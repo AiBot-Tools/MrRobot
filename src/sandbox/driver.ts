@@ -1,10 +1,20 @@
 // Sandbox driver interface.
 //
 // One process or container per run. The spec below is the whole surface a
-// driver is given: everything in it is either a hard limit or a confined
-// path, and there is deliberately no field for "extra arguments", "extra
-// mounts" or "environment" — those would be the seams through which an agent
-// widens its own container.
+// driver is given: everything in it is a hard limit, a confined path, or the
+// one switch `channel`, and there is deliberately no field for "extra
+// arguments", "extra mounts" or "environment" — those would be the seams
+// through which an agent widens its own container.
+//
+// `channel` opens no way out by itself. It keeps the container's stdin and
+// stdout open as one byte stream between the container and the kernel
+// (docker's -i), handed to the caller as RunningSandbox.channel, and what
+// crosses it is for the caller to decide: the kernel's egress engine
+// (src/egress), once it is wired (egress plan W1), and until then nothing
+// asks for one. A driver reads none of it and writes none of it. It is
+// refused on the hostile domain (channelRefusal), whose runs reach nothing at
+// all, and a run without one has no -i, and the kernel's end of its stdin is
+// closed at once.
 //
 // Invariant 9 lives in the drivers that implement this, not here: read-only
 // root, all capabilities dropped, no new privileges, non-root user, pid and
@@ -22,6 +32,9 @@
 // container cut its writes, keeps reading the rest so the container never
 // blocks on a full pipe, and says that it cut.
 
+import type { Readable, Writable } from 'node:stream'
+
+import { ConfigError } from '../errors.js'
 import { MAX_LOGGED_OUTPUT } from '../events/bound.js'
 
 /**
@@ -88,6 +101,162 @@ export interface SandboxSpec {
    */
   readonly workspace: string
   readonly limits: SandboxLimits
+  /**
+   * Keep the container's stdin and stdout open to the kernel as one byte
+   * stream, RunningSandbox.channel: docker's -i. Absent or false, the run
+   * has no -i, the container's stdin reads nothing, and its stdout is
+   * captured into the result. Admitted on the trusted domain only
+   * (channelRefusal): a hostile run reaches nothing at all, so it has no
+   * channel either.
+   */
+  readonly channel?: boolean
+}
+
+/**
+ * Why `spec` may not run with the channel it asks for, or undefined when it
+ * may: it asks for none (absent or false), or asks on the trusted domain. The
+ * hostile domain runs work nothing vouches for, and such a run reaches nothing
+ * at all: no network, and no channel to the kernel either (the egress plan
+ * the operator accepted on 2026-11-09). A value that is not a boolean is
+ * refused rather than read as either. The docker driver throws this before it
+ * builds anything (buildRunArgs), and the tests' fake driver throws it in the
+ * same words, so that code tested against the fake meets the refusal docker's
+ * driver gives. Both hand it the spec as readSpecOnce returned it, and decide
+ * whether the run has a channel from that same reading, never from the spec
+ * they were handed.
+ */
+export function channelRefusal(spec: Pick<SandboxSpec, 'name' | 'domain' | 'channel'>): string | undefined {
+  const asked: unknown = spec.channel
+  if (asked === undefined || asked === false) return undefined
+  if (asked !== true) {
+    return `container ${spec.name}: channel must be true or false, and is a value of type ${typeof asked}`
+  }
+  if (spec.domain === 'trusted') return undefined
+  return (
+    `container ${spec.name} asks for a channel on the ${String(spec.domain)} domain, whose runs reach nothing at ` +
+    'all: no network, and no channel to the kernel either. A channel is for the trusted domain only'
+  )
+}
+
+/**
+ * `spec` as plain data, each of its fields read exactly once, frozen. A
+ * driver decides several things from one field, and would otherwise read it
+ * each time: the domain picks the VM, its mountRoot and environment, and
+ * whether a channel is admitted (channelRefusal); the name is checked, held
+ * and killed by; the channel decides both the -i in the argv and whether the
+ * result hands over the CLI's pipes. The kernel builds a spec as plain data,
+ * but a field that is a getter, or a spec that is a Proxy, could answer each
+ * read differently: a channel that reads false when it is judged on the
+ * hostile domain and true when the pipes are handed over, or a domain that
+ * reads trusted when the channel is judged and hostile when the VM is
+ * chosen, would open a channel to the hostile domain. So a driver's run()
+ * takes its spec through this at its entry and decides only from what it
+ * returns, and so does buildRunArgs for a spec handed to it directly.
+ *
+ * One reading holds only for a value that is what its type says. A domain
+ * that is an object is converted at each use as a property key, and one
+ * whose toString answers trusted and then hostile would have a run built
+ * against the trusted domain's mountRoot and workspace and spawned and killed
+ * on the hostile VM, however few times the field was read. So each field is
+ * judged here, on the copy, and a spec is refused with a ConfigError, before
+ * anything is decided from it, when its name, runId, agentId, image or
+ * workspace is no string, its domain is neither 'trusted' nor 'hostile', its
+ * command is no array of strings, or its limits are not four numbers. Its
+ * channel is copied as read and judged by channelRefusal, in that one's own
+ * words.
+ *
+ * Every key of SandboxSpec is named, by a type that requires each one, and
+ * anything not taken out of that reading by name reaches the copy whole: a
+ * field added to the interface fails to compile here until it is read and
+ * judged, rather than being dropped from every driver's reading, which for a
+ * field that restricts a run would fail open.
+ */
+export function readSpecOnce(spec: SandboxSpec): SandboxSpec {
+  const read: { readonly [K in keyof Required<SandboxSpec>]: SandboxSpec[K] | undefined } = {
+    name: spec.name,
+    runId: spec.runId,
+    agentId: spec.agentId,
+    domain: spec.domain,
+    image: spec.image,
+    command: spec.command,
+    workspace: spec.workspace,
+    limits: spec.limits,
+    channel: spec.channel,
+  }
+  const { name, runId, agentId, domain, image, command, workspace, limits, channel, ...rest } = read
+  if (typeof name !== 'string') throw fieldRefusal('a container spec', 'name', 'a string', typeOf(name))
+  const who = `container ${name}`
+  if (typeof runId !== 'string') throw fieldRefusal(who, 'runId', 'a string', typeOf(runId))
+  if (typeof agentId !== 'string') throw fieldRefusal(who, 'agentId', 'a string', typeOf(agentId))
+  if (domain !== 'trusted' && domain !== 'hostile') {
+    const other: unknown = domain
+    const held = typeof other === 'string' ? 'another string' : typeOf(other)
+    throw fieldRefusal(who, 'domain', "'trusted' or 'hostile'", held)
+  }
+  if (typeof image !== 'string') throw fieldRefusal(who, 'image', 'a string', typeOf(image))
+  const argv = commandOnce(who, command)
+  if (typeof workspace !== 'string') throw fieldRefusal(who, 'workspace', 'a string', typeOf(workspace))
+  if (typeof limits !== 'object' || limits === null) throw fieldRefusal(who, 'limits', 'an object', typeOf(limits))
+  // The limits the same way, each of SandboxLimits' keys named.
+  const caps: { readonly [K in keyof Required<SandboxLimits>]: SandboxLimits[K] | undefined } = {
+    memoryMb: limits.memoryMb,
+    cpus: limits.cpus,
+    pids: limits.pids,
+    wallclockMs: limits.wallclockMs,
+  }
+  const { memoryMb, cpus, pids, wallclockMs, ...otherCaps } = caps
+  const judged = Object.freeze({
+    ...otherCaps,
+    memoryMb: limitOf(who, 'memoryMb', memoryMb),
+    cpus: limitOf(who, 'cpus', cpus),
+    pids: limitOf(who, 'pids', pids),
+    wallclockMs: limitOf(who, 'wallclockMs', wallclockMs),
+  })
+  return Object.freeze({
+    ...rest,
+    name,
+    runId,
+    agentId,
+    domain,
+    image,
+    command: argv,
+    workspace,
+    limits: judged,
+    ...(channel === undefined ? {} : { channel }),
+  })
+}
+
+/** A spec's command, copied element by element from one reading of it, frozen. */
+function commandOnce(who: string, command: unknown): readonly string[] {
+  // An array only: spread over a string, a command would be its characters.
+  if (!Array.isArray(command)) throw fieldRefusal(who, 'command', 'an array of strings', typeOf(command))
+  const copy: string[] = []
+  for (const arg of command) {
+    const each: unknown = arg
+    if (typeof each !== 'string') throw fieldRefusal(who, `command[${String(copy.length)}]`, 'a string', typeOf(each))
+    copy.push(each)
+  }
+  return Object.freeze(copy)
+}
+
+/** One of a spec's limits, which must be a number: a timer converts whatever it is given, once per timer. */
+function limitOf(who: string, field: keyof SandboxLimits, value: unknown): number {
+  if (typeof value !== 'number') throw fieldRefusal(who, `limits.${field}`, 'a number', typeOf(value))
+  return value
+}
+
+/**
+ * Why a spec field is refused, naming the field and what it held (`held`, its
+ * type from typeOf), never its value: what does not have the type it should
+ * may not even turn into a string the same way twice.
+ */
+function fieldRefusal(who: string, field: string, wanted: string, held: string): ConfigError {
+  return new ConfigError(`${who}: ${field} must be ${wanted}, and is ${held}`)
+}
+
+/** What a value is, by its type alone. */
+function typeOf(value: unknown): string {
+  return value === null ? 'null' : `a value of type ${typeof value}`
 }
 
 export type ExitSignal = 'SIGKILL' | 'SIGTERM' | null
@@ -111,12 +280,23 @@ export interface SandboxResult {
    * A run that outlived its wallclock and then exited on its own, its kill
    * having reached no daemon, reports this and no killedBy: it is the one
    * trace that invariant 9's hard wallclock did not hold, and a caller logs it.
+   *
+   * The run ends, for the wallclock, when the docker CLI exits, which it does
+   * once its container has: on a channel run the result settles only later,
+   * once the caller has read the channel's input to its end (RunningSandbox.
+   * result), and time the caller holds it after the exit is no time the
+   * container ran, so it never sets this.
    */
   readonly overran?: true
   /**
    * The first CAPTURE_MAX_BYTES bytes of each stream at most, decoded as UTF-8
    * and cut on a character boundary. A byte that is not UTF-8 decodes to
    * U+FFFD, so the text is at most CAPTURE_MAX_BYTES UTF-16 units long.
+   *
+   * On a channel run stdout is empty: the container's stdout is the
+   * channel's input (RunningSandbox.channel), which a driver never reads, so
+   * what the container wrote there is the caller's to keep, and `truncated`
+   * then speaks for stderr alone.
    */
   readonly stdout: string
   readonly stderr: string
@@ -129,13 +309,76 @@ export interface SandboxResult {
    * added here first, beside this one.
    */
   readonly truncated: boolean
+  /**
+   * From the start of the run to the docker CLI's exit (or, for a spawn that
+   * started nothing, its failure), as the wallclock counts it: on a channel
+   * run, not the time the caller then held the channel's input open, which
+   * the result waits for (see `overran`).
+   */
   readonly durationMs: number
+}
+
+/**
+ * A channel run's byte stream, from the kernel's side: `input` is the
+ * container's stdout, which the kernel reads, and `output` its stdin, which
+ * the kernel writes. Both are the runtime's own pipes, raw bytes both ways,
+ * and they end when the run does, whenever the container decides: a write
+ * after that is refused (EPIPE, or a destroyed stream once Node has closed a
+ * child's stdin on its exit). A driver listens for each stream's 'error'
+ * itself, from the moment it starts the run, so that no caller's listener
+ * coming late lets one throw in the kernel; what it hears before the run
+ * ends lands in the result's stderr.
+ *
+ * A caller ends a channel run with kill(name), never by destroying the input
+ * or leaving it unread. Destroying it closes the read end of the docker CLI's
+ * stdout, and the CLI's next copy of container output then fails with EPIPE
+ * (docker run catches every signal to relay it, so a broken pipe is a write
+ * error to it, not a death by SIGPIPE). The CLI is then expected to exit
+ * while its --rm container runs on unattached; its exit clears the run's
+ * wallclock, so the container runs past its hard wallclock with nothing to
+ * kill it (docker.ts, the wallclock note; README, "Still needs validation").
+ * An input left unread blocks the container on a full pipe until its
+ * wallclock (RunningSandbox.result). The output may be ended, which the
+ * container reads as the end of its stdin, but that ends the run only if
+ * the container reads it.
+ */
+export interface SandboxChannel {
+  readonly input: Readable
+  readonly output: Writable
 }
 
 export interface RunningSandbox {
   readonly name: string
-  /** Resolves when the container exits, is killed, or overruns. */
+  /**
+   * Resolves when the container exits, is killed, or overruns.
+   *
+   * On a channel run, only once the channel's input has ended as well: the
+   * docker CLI is done only once its pipes are. When the CLI exits, Node
+   * resumes the input (flushStdio), so an input read through 'data'
+   * listeners, or not read at all, flows to its end: what is still in it
+   * goes to the listeners it has, and is lost to a reader not yet listening.
+   * An input read through a 'readable' listener stays paused (resume()
+   * leaves such a stream so), and so does one its reader pauses again after
+   * that with bytes unread: either holds this open until it is read to its
+   * end. So a caller that takes the channel listens on its input at once,
+   * before it awaits this, and while the container runs it keeps reading, or
+   * the container blocks on a full pipe until its wallclock. The wallclock
+   * and durationMs stop at the CLI's exit, so the time the caller holds the
+   * input after that counts in neither.
+   */
   readonly result: Promise<SandboxResult>
+  /**
+   * Present on a run whose spec asked for a channel, and only there. Absent
+   * there too when the runtime gave the run no pipes, which Node does only
+   * for a spawn that failed for want of file descriptors and so started
+   * nothing; its result then says that it failed.
+   *
+   * Its caller ends the run with kill(name), whatever made it decide to (a
+   * protocol violation on the channel among them), and never by destroying
+   * or abandoning the input: that is expected to leave the container running
+   * past its wallclock (SandboxChannel).
+   */
+  readonly channel?: SandboxChannel
 }
 
 export type ProbeResult =
@@ -149,11 +392,16 @@ export interface SandboxDriver {
   /**
    * Throws a ConfigError, before starting anything, for a `spec.name` that
    * does not start with CONTAINER_PREFIX: such a name is no container of the
-   * kernel's, and the orphan sweep would never find it. And throws, before
+   * kernel's, and the orphan sweep would never find it. Throws one, before
+   * starting anything, for a spec whose channel channelRefusal refuses: one
+   * on the hostile domain, or one that is no boolean; and for a spec whose
+   * fields are not of their types (readSpecOnce). And throws, before
    * starting anything, while a run under `spec.name` from an earlier call has
    * not finished: the name is how kill() and the wallclock reach a container,
    * so it must name exactly one. The name stays held until the result has
-   * settled, and is free once `await result` has returned.
+   * settled, and is free once `await result` has returned. It reads `spec`
+   * once (readSpecOnce), and every one of these decisions, and the run, is
+   * made from that one reading.
    */
   run(spec: SandboxSpec): RunningSandbox
   /**

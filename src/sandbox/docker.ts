@@ -13,20 +13,24 @@
 // an unconfined security option, a device, another runtime, kernel parameters
 // or cgroup parent, a supplementary group, a log driver, a writable root
 // filesystem, another mount or network, a pull) in any spelling docker reads,
-// exactly one --network, and that one none, and exactly one --pull=never
-// before an image that is the pinned sandbox.imageId — and a future edit that
-// widens any of those throws rather than producing a container.
+// exactly one --network, and that one none, exactly one -i on a run that asks
+// for a channel and none on any other, and exactly one --pull=never before an
+// image that is the pinned sandbox.imageId — and a future edit that widens
+// any of those throws rather than producing a container.
 //
 // A container has no network at all: --network none gives it a loopback
 // interface of its own and nothing else, so no route, no resolver, no address
 // on any network of the VM's and no peer there. A worker's one way out is
 // the kernel's egress engine (src/egress), over its own run's `docker run -i`
-// channel, and that is not wired yet (egress plan S2 and W1): until it is, a
-// worker reaches nothing. Each domain's internal network (aos-trusted and
-// aos-hostile in kernel.yaml) stays all the same, and probe() still proves it
-// Internal=true on that domain's own VM, as defence in depth, the operator's
-// decision of 2026-11-09, to be revisited at the Phase 2 exit: no run is put
-// on it, and the audit refuses a run on any network but none.
+// channel: a spec's `channel`, which this driver opens on the trusted domain
+// only (egress plan S2) and hands to its caller as the CLI's own stdin and
+// stdout, reading none of it. Nothing asks for one yet, since the engine is
+// not wired (egress plan W1): until it is, a worker reaches nothing. Each
+// domain's internal network (aos-trusted and aos-hostile in kernel.yaml)
+// stays all the same, and probe() still proves it Internal=true on that
+// domain's own VM, as defence in depth, the operator's decision of
+// 2026-11-09, to be revisited at the Phase 2 exit: no run is put on it, and
+// the audit refuses a run on any network but none.
 //
 // The image is run by its id, never by a name. A tag is whatever image was
 // last given it on that VM, so it pins nothing, and a name the VM lacks is
@@ -64,6 +68,7 @@
 // ships.
 
 import { execFile, spawn } from 'node:child_process'
+import { Readable, Writable } from 'node:stream'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
@@ -86,8 +91,11 @@ import {
 import {
   CAPTURE_MAX_BYTES,
   CONTAINER_PREFIX,
+  channelRefusal,
+  readSpecOnce,
   type ProbeResult,
   type RunningSandbox,
+  type SandboxChannel,
   type SandboxDomain,
   type SandboxDriver,
   type SandboxResult,
@@ -133,6 +141,16 @@ const RUN_OPTIONS: ReadonlyMap<string, 'flag' | 'value'> = new Map([
   ['--workdir', 'value'],
   ['--pull=never', 'flag'],
 ])
+
+/**
+ * The one option only a channel run carries: docker's -i (--interactive),
+ * which keeps the container's stdin open and joined to the CLI's, so that
+ * the CLI's stdin and stdout are one byte stream to the container. The audit
+ * admits it exactly once on a run that asks for a channel, and never on any
+ * other; RUN_OPTIONS is every other run's whole list.
+ */
+const CHANNEL_OPTION = '-i'
+const CHANNEL_RUN_OPTIONS: ReadonlyMap<string, 'flag' | 'value'> = new Map([...RUN_OPTIONS, [CHANNEL_OPTION, 'flag']])
 
 /**
  * What makes docker's CSV reader split a --mount value other than at its
@@ -532,12 +550,25 @@ export interface BuildArgsInput {
  * path that reaches docker having skipped it.
  */
 export function buildRunArgs(input: BuildArgsInput): string[] {
-  const { spec, domain, defaults } = input
+  // Each of the spec's fields read once, and every decision below made from
+  // that one reading (driver.ts, readSpecOnce): a channel judged false and
+  // then emitted as -i, or a name checked for the prefix and then put in the
+  // argv as another, is a spec read twice.
+  const spec = readSpecOnce(input.spec)
+  const { domain, defaults } = input
   const home = input.home ?? homeDirectory()
 
   if (!spec.name.startsWith(CONTAINER_PREFIX)) {
     throw new ConfigError(`container name "${spec.name}" must start with ${CONTAINER_PREFIX}`)
   }
+
+  // A channel only where one is admitted (driver.ts, channelRefusal): never on
+  // the hostile domain, and never for a value that is no boolean. Refused
+  // before anything is resolved, as the fake driver refuses it, and decided
+  // from the same reading the refusal judged.
+  const refusedChannel = channelRefusal(spec)
+  if (refusedChannel !== undefined) throw new ConfigError(refusedChannel)
+  const channel = spec.channel === true
 
   // Resolved, proven to be inside the domain's mountRoot, and outside every
   // protected root. This is the path docker is given — never the request.
@@ -583,7 +614,14 @@ export function buildRunArgs(input: BuildArgsInput): string[] {
     '--network',
     'none',
     // PID 1 that reaps zombies and forwards signals, so a kill actually kills.
+    // On every run, with a channel or without: whatever the command, what it
+    // orphans is reaped rather than left a zombie against --pids-limit, and a
+    // SIGTERM ends it. A channel run's mux relies on it (images/worker/mux.mjs).
     '--init',
+    // The channel (SandboxSpec.channel): the container's stdin held open and
+    // joined to the CLI's, on a run that asks for one and on no other, which
+    // the audit holds it to.
+    ...(channel ? [CHANNEL_OPTION] : []),
     // The root is read-only, so scratch space has to come from somewhere that
     // cannot hold a setuid binary or be executed from.
     '--tmpfs',
@@ -601,7 +639,7 @@ export function buildRunArgs(input: BuildArgsInput): string[] {
     ...spec.command,
   ]
 
-  auditRunArgs(args, home, workspace, input.imageId)
+  auditRunArgs(args, home, workspace, input.imageId, channel)
   return args
 }
 
@@ -615,12 +653,18 @@ export function buildRunArgs(input: BuildArgsInput): string[] {
  * It takes no network: the one --network must be none whatever the domain
  * names (assertTheNetwork), and a domain's own network never reaches the argv.
  * What a domain may name is kernel.yaml's to refuse, and probe()'s.
+ *
+ * It takes whether the run asked for a channel, since that alone decides
+ * whether -i belongs: exactly once on a run with one, never on a run without.
+ * Without it, as by default, -i is refused. Which domain may have a channel
+ * is the builder's to refuse (channelRefusal), before an argv exists.
  */
 export function auditRunArgs(
   args: readonly string[],
   home: string,
   workspace: string,
   imageId: string | undefined,
+  channel = false,
 ): void {
   for (const arg of args) {
     for (const bad of FORBIDDEN_FLAGS) {
@@ -696,6 +740,9 @@ export function auditRunArgs(
   if (args[0] !== 'run') {
     throw new ConfigError(`docker args must start with run (found ${JSON.stringify(args[0] ?? '')})`)
   }
+  // Every option this run's argv may carry: a channel run's list is every
+  // other run's and -i.
+  const admitted = channel ? CHANNEL_RUN_OPTIONS : RUN_OPTIONS
   const seen = new Map<string, number>()
   const values = new Map<string, string>()
   let mount: string | undefined
@@ -708,7 +755,13 @@ export function auditRunArgs(
           `it ${widened.why}, which invariant 9 refuses in any spelling`,
       )
     }
-    const kind = RUN_OPTIONS.get(arg)
+    const kind = admitted.get(arg)
+    if (kind === undefined && arg === CHANNEL_OPTION) {
+      throw new ConfigError(
+        `docker args carry ${CHANNEL_OPTION} before the image on a run that asks for no channel: it would hold the ` +
+          "container's stdin open and joined to the CLI's, which only a channel run has",
+      )
+    }
     if (kind === undefined) {
       throw new ConfigError(
         `docker args carry ${JSON.stringify(arg)} before the image, which the builder never emits, and docker would obey it`,
@@ -722,7 +775,7 @@ export function auditRunArgs(
     }
     at++
   }
-  for (const option of RUN_OPTIONS.keys()) {
+  for (const option of admitted.keys()) {
     const n = seen.get(option) ?? 0
     if (n !== 1) {
       throw new ConfigError(
@@ -849,11 +902,21 @@ function assertTheMount(value: string, workspace: string): void {
 /**
  * The output streams' chunks are what Node's child pipes emit: a Buffer each,
  * or a string had an encoding been set on the stream (the driver sets none).
+ * stdin is the CLI's: a channel run's output (with stdout, a Readable then,
+ * its input), and closed at once on any other run.
  */
 export interface ChildLike {
+  readonly stdin: Writable | null
   readonly stdout: { on(event: 'data', cb: (chunk: Buffer | string) => void): void } | null
   readonly stderr: { on(event: 'data', cb: (chunk: Buffer | string) => void): void } | null
   on(event: 'close', cb: (code: number | null, signal: string | null) => void): unknown
+  /**
+   * The CLI's exit, which comes before 'close': Node closes a child only once
+   * its pipes have ended as well, and a channel run's stdout is its caller's
+   * to read, so the caller decides when that is. A spawn that started no
+   * process emits 'error' and no 'exit'.
+   */
+  on(event: 'exit', cb: (code: number | null, signal: string | null) => void): unknown
   on(event: 'error', cb: (error: Error) => void): unknown
 }
 
@@ -986,12 +1049,35 @@ function declaredLength(lead: number): number {
   return 1
 }
 
+/**
+ * A channel run's two pipes as the channel its caller reads and writes, or
+ * undefined when the child has them not: Node gives a child none only when
+ * its spawn failed for want of file descriptors, and that spawn's 'error'
+ * then ends the run. Each stream's 'error' is heard here at once, so that a
+ * container that closes its stdin (the kernel's next write then fails,
+ * EPIPE) never throws in the kernel for want of a listener, whoever reads the
+ * channel and whenever they start listening; what is heard goes to the run's
+ * stderr, as a spawn's error does.
+ */
+function channelOf(child: ChildLike, stderr: Capture): SandboxChannel | undefined {
+  const { stdin, stdout } = child
+  if (!(stdout instanceof Readable) || !(stdin instanceof Writable)) return undefined
+  stdout.on('error', (error) => {
+    stderr.add(`channel input: ${error.message}\n`)
+  })
+  stdin.on('error', (error) => {
+    stderr.add(`channel output: ${error.message}\n`)
+  })
+  return { input: stdout, output: stdin }
+}
+
 /** A run this driver is holding, by name. */
 interface Held {
   readonly domain: SandboxDomain
   /**
    * Mark the run as one kill(name) was sent for, unless its wallclock already
-   * fired. Whether that kill ended it is the CLI's exit to say (run()).
+   * fired or its CLI has already exited (the kill then ended nothing). Whether
+   * a kill sent before the exit ended it is the CLI's exit to say (run()).
    */
   requested(): void
 }
@@ -1153,7 +1239,13 @@ export class DockerDriver implements SandboxDriver {
     )
   }
 
-  run(spec: SandboxSpec): RunningSandbox {
+  run(given: SandboxSpec): RunningSandbox {
+    // Read once, here, and decided from that reading alone (driver.ts,
+    // readSpecOnce): the domain this picks the VM by, its mountRoot and its
+    // environment, the channel the builder judges and the one whose pipes the
+    // result hands over, and the name that is held and killed, are then one
+    // domain, one channel and one name. `given` is read nowhere else.
+    const spec = readSpecOnce(given)
     const domain = this.#options.domains[spec.domain]
     const args = buildRunArgs({
       spec,
@@ -1175,6 +1267,10 @@ export class DockerDriver implements SandboxDriver {
       )
     }
 
+    // buildRunArgs has refused any other value, and a channel off the trusted
+    // domain, judging this same reading: -i is in the argv exactly when this
+    // is true.
+    const channel = spec.channel === true
     const startedAt = Date.now()
     const stdout = new Capture()
     const stderr = new Capture()
@@ -1183,6 +1279,8 @@ export class DockerDriver implements SandboxDriver {
     /** The wallclock fired, whatever its kill then did. */
     let overran = false
     let settled = false
+    /** When the CLI exited: where the run's wallclock and duration end. */
+    let exitedAt: number | undefined
 
     const child = this.#options.spawn(this.#binary, args, { env: this.#env(spec.domain) })
     // Only once spawn has returned. A spawn that throws (Node refuses a NUL
@@ -1192,13 +1290,27 @@ export class DockerDriver implements SandboxDriver {
     this.#running.set(spec.name, {
       domain: spec.domain,
       requested: () => {
-        killSentBy ??= 'requested'
+        // A kill sent once the CLI has exited ends nothing: its container had
+        // ended on its own, and the exit the CLI gave is the run's own, which
+        // the result reports. A channel run's CLI closes only once its caller
+        // has read the input to its end, and its name is held until then, so
+        // a kill (a tear-down's, say) can come long after the exit.
+        if (exitedAt === undefined) killSentBy ??= 'requested'
       },
     })
-    // Bounded, and drained past the bound: see Capture.
-    child.stdout?.on('data', (chunk) => {
-      stdout.add(chunk)
-    })
+    // A channel run's stdin and stdout are its caller's, and the driver
+    // writes and reads neither: its stdout is not captured, and the result's
+    // stdout stays empty. Any other run's stdin is closed at once: without -i
+    // the CLI reads none of it, and a pipe into the run left open is a way in
+    // that nothing asked for.
+    const opened = channel ? channelOf(child, stderr) : undefined
+    if (opened === undefined) child.stdin?.destroy()
+    if (!channel) {
+      // Bounded, and drained past the bound: see Capture.
+      child.stdout?.on('data', (chunk) => {
+        stdout.add(chunk)
+      })
+    }
     child.stderr?.on('data', (chunk) => {
       stderr.add(chunk)
     })
@@ -1212,16 +1324,28 @@ export class DockerDriver implements SandboxDriver {
       // Not yet hard enough, and to be closed when runs are wired (plan W1,
       // W2): this is one `docker kill` that nothing waits on, #killOn swallows
       // every failure (a transient "Cannot connect to the Docker daemon" too,
-      // with no retry and no log line), and finish() below clears the timer
-      // when the docker CLI child closes, though a CLI that dies first is
-      // expected to leave its container running (the kill-by-name row of
-      // docs/plan/phase-0-bootstrap.md; README, "Still needs validation"). The
-      // deadline should stay armed until a kill by name succeeds or the daemon
-      // says the container is gone. Until then, a wallclock kill that ends
-      // nothing (it reached no daemon, and the container later exited on its
-      // own) leaves the result no killedBy (finish, below): `overran` is then
-      // the only trace of the breach, and W1 must log the run from it, not
-      // from killedBy.
+      // with no retry and no log line), and the timer is cleared when the
+      // docker CLI child exits ('exit', below; finish() clears it too, for a
+      // spawn that started nothing), though a CLI that dies first is expected
+      // to leave its container running (the kill-by-name row of
+      // docs/plan/phase-0-bootstrap.md; README, "Still needs validation"). A
+      // channel gives any caller a way to make it die first: a caller that
+      // destroys the channel's input (an egress session aborting on a
+      // protocol violation, say) closes the read end of the CLI's stdout, the
+      // CLI's next copy of container output fails with EPIPE (docker run
+      // catches every signal to relay it and relays no SIGPIPE, so Go returns
+      // the broken pipe as a write error rather than dying of it), and the
+      // CLI is expected to exit while its --rm container runs on unattached,
+      // its 'exit' clearing this timer. Not verified offline. Hence the
+      // channel's rule, a run is ended by kill(name) and never by destroying
+      // or abandoning its input (SandboxChannel), and the README row that
+      // asks what the CLI does then. The deadline should stay armed until a
+      // kill by name succeeds or the daemon says the container is gone, for
+      // this case as for a CLI killed from outside. Until then, a wallclock
+      // kill that ends nothing (it reached no daemon, and the container later
+      // exited on its own) leaves the result no killedBy (finish, below):
+      // `overran` is then the only trace of the breach, and W1 must log the
+      // run from it, not from killedBy.
       const timer = setTimeout(() => {
         killSentBy = 'wallclock'
         overran = true
@@ -1233,6 +1357,7 @@ export class DockerDriver implements SandboxDriver {
         if (settled) return
         settled = true
         clearTimeout(timer)
+        const endedAt = exitedAt ?? Date.now()
         // Duplicates are refused while this entry stands, so it is this run's.
         this.#running.delete(spec.name)
         // A kill the kernel sent ended the run only when the CLI's exit shows
@@ -1255,7 +1380,10 @@ export class DockerDriver implements SandboxDriver {
         // route, the OOM killer, after a kill that reached no daemon, is
         // credited to the kill: the CLI's exit cannot tell the two apart; the
         // fake refuses to script one, ignoresKill with exitCode 137.) A 137
-        // with no kill sent is the run's own, and reports no killedBy.
+        // with no kill sent is the run's own, and reports no killedBy; so is
+        // one whose only kill was sent after the CLI had exited (the run's
+        // `requested`, and the timer is cleared at the exit), which the fake
+        // gives for a kill of a run that has ended.
         const endedBy = exitCode === 137 ? killSentBy : undefined
         resolve({
           name: spec.name,
@@ -1266,20 +1394,39 @@ export class DockerDriver implements SandboxDriver {
           stdout: stdout.text(),
           stderr: stderr.text(),
           truncated: stdout.truncated || stderr.truncated,
-          durationMs: Date.now() - startedAt,
+          durationMs: endedAt - startedAt,
         })
       }
 
+      // The run ends, for its wallclock and its duration, when the CLI exits,
+      // which it does once its container has. Its result settles at 'close',
+      // once its pipes have ended too, and a channel run's stdout ends when
+      // its caller has read it: a caller that holds the input past the
+      // deadline, after a container that exited in time, would otherwise have
+      // the timer fire, send a kill to a container that is gone, and report a
+      // wallclock breach that never happened (SandboxResult.overran), with
+      // the hold counted as the run's time. On a run without a channel the
+      // two come together, as the driver drains its stdout itself.
+      child.on('exit', () => {
+        exitedAt ??= Date.now()
+        clearTimeout(timer)
+      })
       child.on('close', (code, signal) => {
         finish(code, signal)
       })
       child.on('error', (error) => {
         stderr.add(error.message)
+        // A spawn that started no process leaves Node's pipes pending, never
+        // to end. The channel's are closed here, so that its input has ended
+        // by the time the result settles, as a started run's has: its CLI
+        // closes only once its pipes have.
+        opened?.input.destroy()
+        opened?.output.destroy()
         finish(null, null)
       })
     })
 
-    return { name: spec.name, result }
+    return { name: spec.name, result, ...(opened === undefined ? {} : { channel: opened }) }
   }
 
   /**

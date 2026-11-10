@@ -150,7 +150,14 @@ export const EgressGrant = z
   })
 export type EgressGrant = z.output<typeof EgressGrant>
 
-/** The worker's headers as node:http parsed them (IncomingMessage.headersDistinct, or .headers). */
+/**
+ * The worker's headers, by lower-case name: the session (session.ts
+ * headerRecord) builds one null-prototype record from IncomingMessage's
+ * rawHeaders, every value kept in order, and hands decide() and the upstream
+ * head that record alone. Not headersDistinct, which throws on a header named
+ * `constructor` or `__proto__`, nor headers, which keeps only the first of two
+ * Content-Types.
+ */
 export type EgressHeaders = Readonly<Record<string, string | readonly string[] | undefined>>
 
 /** The worker's request as the session read it. Every field is untrusted. */

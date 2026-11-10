@@ -649,7 +649,16 @@ export const PROXY_DENIES_ON_A_ROUTE = Object.freeze([
   'pulls-head',
 ] as const)
 
-/** Why the upstream refused a request decide() allowed (src/egress/upstream.ts UPSTREAM_REFUSALS). */
+/**
+ * Why the upstream refused a request decide() allowed (src/egress/upstream.ts
+ * UPSTREAM_REFUSALS), then the ones the session gives itself
+ * (src/egress/session.ts SESSION_REFUSALS), each the host's answer, which the
+ * worker was answered 502 for: `challenged`, the host answered 401 or 403, so
+ * a binding whose credential expired or was revoked, or a push the host
+ * refused, is on record; `response-head`, the host answered with a head
+ * node:http will not write (a status below 100), so a request that left and
+ * failed is never a bare allow.
+ */
 export const PROXY_UPSTREAM_REFUSALS = Object.freeze([
   'not-decided',
   'not-a-host',
@@ -668,14 +677,20 @@ export const PROXY_UPSTREAM_REFUSALS = Object.freeze([
   'upstream-failed',
   'body-length',
   'idle-timeout',
+  'challenged',
+  'response-head',
 ] as const)
 
 /**
  * The refusals the upstream can meet after node:http took the request's head
- * to send (upstream.ts UPSTREAM_REFUSALS_AFTER_SEND): only with one of these
- * can an upstream row say the request was sent.
+ * to send (upstream.ts UPSTREAM_REFUSALS_AFTER_SEND), then the session's
+ * (`challenged`, `response-head`), which are met only once the host answered:
+ * only with one of these can an upstream row say the request was sent.
  */
-export const PROXY_REFUSALS_AFTER_SEND = Object.freeze(['head', 'aborted', 'upstream-failed', 'body-length', 'idle-timeout'] as const)
+export const PROXY_REFUSALS_AFTER_SEND = Object.freeze(['head', 'aborted', 'upstream-failed', 'body-length', 'idle-timeout', 'challenged', 'response-head'] as const)
+
+/** The session's own refusals (src/egress/session.ts SESSION_REFUSALS): each is the host's answer, so it never comes with an unsent request. */
+const PROXY_ANSWERED_REFUSALS: readonly string[] = Object.freeze(['challenged', 'response-head'])
 
 /** Why a target's host is no EgressHost (src/egress/host.ts HOST_REFUSALS). */
 export const PROXY_HOST_REFUSALS = Object.freeze([
@@ -853,9 +868,10 @@ const EGRESS_HOST_SHAPE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?
 const REPO_SHAPE = /^[a-z0-9][a-z0-9-]{0,38}\/[a-z0-9._-]{1,100}$/
 /** A container the kernel made: sandbox/driver.ts CONTAINER_PREFIX, then what docker admits in a name. */
 const SANDBOX_NAME_SHAPE = /^aos-run-[A-Za-z0-9_.-]{1,120}$/
-const AGENT_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
-/** A method as node:http reads one (http.METHODS: upper-case letters and a hyphen, as in M-SEARCH). */
-const METHOD_SHAPE = /^[A-Z][A-Z-]{0,23}$/
+/** An agent id a row is appended under: the egress session (src/egress/session.ts) parses its agentId with this one. */
+export const AGENT_SHAPE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/
+/** A method as node:http reads one (http.METHODS: upper-case letters and a hyphen, as in M-SEARCH); the session names a deny's method only in this shape. */
+export const METHOD_SHAPE = /^[A-Z][A-Z-]{0,23}$/
 /**
  * An origin-form path as parseTarget (routes.ts) admits one: a slash, then
  * printable ASCII with no space, no `?` and no `#`; and recordable()'s `…`
@@ -1010,6 +1026,9 @@ function isRouteOf(reason: string, method: string, path: string, repo: string): 
  * the body broke its length): the host may have acted on it, a push applied
  * or a pull request opened, so the verdict stays allow, and the row records a
  * request that left and failed. The log never calls a sent request a deny.
+ * `challenged` and `response-head` are the session's own (E8): the host
+ * answered 401 or 403, or with a head node:http will not write, which the
+ * worker reads as a 502, so the request was sent and the row is an allow.
  *
  * An allowed request is named in full: its host, method and path, how many
  * bytes its path and query held, and on a bound route the binding whose
@@ -1079,6 +1098,7 @@ export const ProxyDecisionPayload = z
           issue('an upstream row is a deny exactly when nothing of the request left: one that was sent is an allow that failed')
         }
         if (row.sent && !isAfterSend(row.refusal)) issue('only a refusal the upstream can meet after the head was written comes with a sent request')
+        if (!row.sent && PROXY_ANSWERED_REFUSALS.includes(row.refusal)) issue('a challenge, or a head the session could not pass on, is the host answering the request, so the request was sent')
       }
     }
 

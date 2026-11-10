@@ -347,6 +347,34 @@ test('dependency direction: src/runtime, src/models, src/mcp, src/agents, src/po
   assert.deepEqual(importersOf(SRC, './secrets/broker.js'), ['src/kernel.ts'])
 })
 
+test('src/egress never imports src/secrets: no file under it reaches src/secrets, directly or through anything it imports, however deep, and none names the broker or a SecretRef', () => {
+  // The session (src/egress/session.ts) parses what a hostile container
+  // sends and injects one credential header for it, through a closure the
+  // kernel builds over broker.use. That closure is the whole of its reach: a
+  // module under src/egress that could import the broker, a SecretRef or the
+  // .env loader, itself or through a module it imports, could resolve a
+  // credential for a request no binding names. The direct imports are
+  // scanned with secretsReach above; this follows every one of them.
+  const EGRESS = SRC.filter((f) => f.path.startsWith('src/egress/'))
+  assert.ok(EGRESS.some((f) => f.path === 'src/egress/session.ts'), 'the walk finds no session to hold to this')
+  const reached = reachedFrom(EGRESS.map((f) => f.path), SRC)
+  // The walk is real: the session reaches the event store and the logger.
+  assert.ok(reached.has('src/events/store.ts') && reached.has('src/log.ts'), `the import walk reaches nothing: ${[...reached].join(', ')}`)
+  assert.deepEqual([...reached].filter((p) => p.startsWith('src/secrets/')).sort(), [], 'src/egress reaches src/secrets')
+  for (const file of EGRESS) {
+    const reach = secretsReach(file)
+    assert.deepEqual(reach, [], `${file.path} reaches src/secrets: ${reach.join('; ')}`)
+    // By name too, in code (a comment saying why is not a reach).
+    const named: string[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isIdentifier(node) && /^(?:SecretRef|SecretsBroker|loadDotenv|oneCredential)$/.test(node.text)) named.push(node.text)
+      ts.forEachChild(node, visit)
+    }
+    visit(parsed(file))
+    assert.deepEqual(named, [], `${file.path} names ${named.join(', ')}`)
+  }
+})
+
 test('only decide() mints an egress allow: mintEgressAllow is named in src/egress/decision.ts and policy.ts alone, and only policy.ts and upstream.ts import it', () => {
   // The upstream resolves and dials only an EgressAllow, and the brand is the
   // proof that decide() judged the request. Anywhere else mintEgressAllow is

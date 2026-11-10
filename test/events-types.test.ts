@@ -16,6 +16,7 @@ import { ADDRESS_DENIALS } from '../src/egress/addr.js'
 import { EgressHost, HOST_REFUSALS } from '../src/egress/host.js'
 import { ALLOW_REASONS, BINDING_ID, DENY_REASONS } from '../src/egress/policy.js'
 import { EGRESS_PROFILES, matchRoute, MAX_PATH, MAX_TARGET, RepoSlug, RUN_REF } from '../src/egress/routes.js'
+import { SESSION_REFUSALS } from '../src/egress/session.js'
 import { ERROR_CODE, UPSTREAM_REFUSALS, UPSTREAM_REFUSALS_AFTER_SEND } from '../src/egress/upstream.js'
 import { MAX_LOGGED_OUTPUT, recordable } from '../src/events/bound.js'
 import { canonicalize } from '../src/events/canonical.js'
@@ -990,11 +991,18 @@ test('an upstream row is a deny exactly when nothing of the request left: a cred
   assert.equal(parses('proxy.decision', { ...SENT_PUSH_ROW, verdict: 'deny', sent: false }), true)
   assert.equal(parses('proxy.decision', { ...SENT_PUSH_ROW, verdict: 'allow', sent: false }), false, 'a request that never left was recorded as an allow')
   // Every refusal the upstream can meet after the head may come with sent; none other may.
+  // The session's own (a challenge) is the host's answer, so it never comes without.
   for (const refusal of PROXY_UPSTREAM_REFUSALS) {
     const row = defined({ ...SENT_PUSH_ROW, refusal, ...(refusal === 'denied-address' ? { address: '192.168.5.2', denial: 'private' } : refusal === 'host-address' ? { address: '81.2.69.160' } : {}) })
     const afterSend = (PROXY_REFUSALS_AFTER_SEND as readonly string[]).includes(refusal)
+    const answered = (SESSION_REFUSALS as readonly string[]).includes(refusal)
     assert.equal(parses('proxy.decision', row), afterSend, `${refusal} with a sent request: ${why('proxy.decision', row)}`)
-    assert.equal(parses('proxy.decision', { ...row, verdict: 'deny', sent: false }), true, `${refusal} before the head: ${why('proxy.decision', { ...row, verdict: 'deny', sent: false })}`)
+    assert.equal(parses('proxy.decision', { ...row, verdict: 'deny', sent: false }), !answered, `${refusal} before the head: ${why('proxy.decision', { ...row, verdict: 'deny', sent: false })}`)
+  }
+  // A challenge, or an answer the session could not pass on, recorded as
+  // unsent is refused for what it is, not only for its verdict.
+  for (const refusal of SESSION_REFUSALS) {
+    assert.match(why('proxy.decision', { ...SENT_PUSH_ROW, refusal, verdict: 'deny', sent: false }), /is the host answering the request, so the request was sent/, refusal)
   }
 })
 
@@ -1352,8 +1360,9 @@ test("the egress rows name src/egress's vocabulary exactly, and take a sample of
   // Copied, not imported (types.ts says why); held equal here.
   assert.deepEqual([...PROXY_ALLOW_REASONS], [...ALLOW_REASONS])
   assert.deepEqual([...PROXY_DENY_REASONS], [...DENY_REASONS])
-  assert.deepEqual([...PROXY_UPSTREAM_REFUSALS], [...UPSTREAM_REFUSALS])
-  assert.deepEqual([...PROXY_REFUSALS_AFTER_SEND], [...UPSTREAM_REFUSALS_AFTER_SEND])
+  // The upstream's refusals, then the one the session gives itself.
+  assert.deepEqual([...PROXY_UPSTREAM_REFUSALS], [...UPSTREAM_REFUSALS, ...SESSION_REFUSALS])
+  assert.deepEqual([...PROXY_REFUSALS_AFTER_SEND], [...UPSTREAM_REFUSALS_AFTER_SEND, ...SESSION_REFUSALS])
   assert.deepEqual([...PROXY_HOST_REFUSALS], [...HOST_REFUSALS])
   assert.deepEqual([...PROXY_ADDRESS_DENIALS], [...ADDRESS_DENIALS])
   assert.deepEqual([...PROXY_PROFILES], [...EGRESS_PROFILES])

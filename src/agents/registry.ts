@@ -6,8 +6,9 @@
 // The division of authority is the point:
 //
 //   spawnEphemeral   the CEO may do this, and the child is CLAMPED to the
-//                    template — never above its tier, never a host the
-//                    template does not list, never a tool it does not have.
+//                    template — never above its tier, never a host or a
+//                    binding the template does not list, never a tool it
+//                    does not have.
 //   requestPromotion the CEO may only ASK. It files an approval and changes
 //                    nothing, so a model cannot argue its way to more reach.
 //   promote/archive  a human only, proved by the HumanActor brand.
@@ -24,12 +25,15 @@ import { join } from 'node:path'
 import { parse as parseYaml } from 'yaml'
 
 import { assertHumanActor, type HumanActor } from '../control/actor.js'
+import { parseEgressHost, type EgressHost } from '../egress/host.js'
+import { BINDING_ID } from '../egress/policy.js'
 import { ConfigError } from '../errors.js'
+import { redactString } from '../events/redact.js'
 import type { EventStore } from '../events/store.js'
 import { resolveView, type ToolViewsFile } from '../mcp/tool-views.js'
 import { resolveCaps, type KernelBudgets } from '../runtime/budget.js'
 import { KERNEL_SERVER } from '../runtime/kernel-tools.js'
-import { parseManifest, type AgentManifest } from './manifest.js'
+import { parseManifest, Tier, type AgentManifest } from './manifest.js'
 
 export interface AgentRecord {
   readonly manifest: AgentManifest
@@ -53,6 +57,15 @@ export interface RegistryDeps {
    * which is the same failure one level up.
    */
   readonly budgets: KernelBudgets
+  /**
+   * kernel.yaml's egress bindings (config.egress.bindings), keyed by id: the
+   * ids a manifest's egress.bind may name, and the hosts its egress.allow may
+   * not. Only each binding's host is read. Required for the reason budgets
+   * is: a registry built without it would skip the bound-host check by
+   * omission, so a manifest could list as credential-free a host the
+   * operator bound.
+   */
+  readonly egressBindings: Readonly<Record<string, { readonly host: EgressHost }>>
 }
 
 /**
@@ -72,12 +85,81 @@ const RISKS_BY_TIER: Readonly<Record<number, readonly string[]>> = {
   3: ['read', 'write', 'irreversible'],
 }
 
+/** The tier egress starts at: tier 2 is the first that runs sandboxed in the trusted domain (plan D15). */
+const EGRESS_MIN_TIER = 2
+
+/**
+ * Freeze `record` and its manifest all the way down, and return the record.
+ *
+ * Object.freeze alone is shallow: on a record it fixes status while
+ * manifest.tier, egress.bind and every other list in the manifest stay
+ * writable, so whatever held a record could widen that agent's reach with no
+ * event row. Only kernel code holds records, so this is defense in depth,
+ * and it matters most for egress.bind, the credential-bearing routes the
+ * grant issuer reads from the record (egress plan W1).
+ */
+function freezeRecord(record: AgentRecord): AgentRecord {
+  freezeManifest(record.manifest)
+  return Object.freeze(record)
+}
+
+/**
+ * Freeze every object and array in a manifest, depth first. A manifest is
+ * zod output, plain objects, arrays and primitives with no cycles, so the walk
+ * ends. A part already frozen (a child's model, shared with its template) is
+ * walked again rather than trusted: Object.isFrozen is true of a shallow
+ * freeze too.
+ */
+function freezeManifest(value: unknown): void {
+  if (typeof value !== 'object' || value === null) return
+  for (const part of Object.values(value)) freezeManifest(part)
+  Object.freeze(value)
+}
+
+/**
+ * The index of the first requested entry a spawn refusal may not repeat, or
+ * -1. Such an entry is no string, or not in its field's shape (`shaped`), or
+ * is text redactString changes: a refusal naming one in a credential's shape
+ * would be stored censored in its agent.spawn.rejected row. None of these can
+ * be in a template's list, since a loaded manifest holds only entries that
+ * pass the same tests (the schema, and #egressProblem), so the refusal names
+ * the index alone, as the load path does.
+ */
+function unnameable(entries: readonly string[], shaped: (entry: string) => boolean): number {
+  return entries.findIndex((entry) => typeof entry !== 'string' || !shaped(entry) || redactString(entry) !== entry)
+}
+
+/** An egress host in its one spelling: what a template's allow list holds. */
+function isSpelledHost(host: string): boolean {
+  const seen = parseEgressHost(host)
+  return seen.ok && seen.host === host
+}
+
 export class AgentRegistry {
   readonly #agents = new Map<string, AgentRecord>()
   readonly #deps: RegistryDeps
+  /**
+   * Each binding's host, by id, copied at construction from the binding
+   * record's own keys. A manifest's id is looked up here, never in the
+   * record: a parsed record is a plain object, so `'constructor' in bindings`
+   * is true and `bindings['constructor']` is Object, and a manifest
+   * `bind: [constructor]` (a valid binding id) would pass as known with no
+   * host behind it (egress plan E6).
+   */
+  readonly #bindingHosts: ReadonlyMap<string, EgressHost>
+  /** The bindings on each host, so a refusal names whose host a manifest listed. */
+  readonly #boundHosts: ReadonlyMap<string, readonly string[]>
 
   constructor(deps: RegistryDeps) {
     this.#deps = deps
+    const hosts = new Map<string, EgressHost>()
+    const bound = new Map<string, string[]>()
+    for (const [id, binding] of Object.entries(deps.egressBindings)) {
+      hosts.set(id, binding.host)
+      bound.set(binding.host, [...(bound.get(binding.host) ?? []), id])
+    }
+    this.#bindingHosts = hosts
+    this.#boundHosts = bound
   }
 
   /** Load every agents/<id>/agent.yaml under `agentsDir`. */
@@ -166,11 +248,104 @@ export class AgentRegistry {
 
     // Throws with the cap it exceeded and by how much. A manifest may only lower.
     resolveCaps(this.#deps.budgets, manifest.budget ?? {})
+
+    const egress = this.#egressProblem(manifest)
+    if (egress !== undefined) throw new ConfigError(`${source}: ${egress}`)
+  }
+
+  /**
+   * Why `manifest` may not hold the egress it names, or undefined. Asked of
+   * every manifest at load and of every spawned child, since a child that
+   * narrows its tier below 2 and keeps the template's hosts would hold what
+   * no loaded manifest may.
+   *
+   * Egress (a host in allow, or a binding in bind) is for a worker's
+   * sandboxed run only:
+   *
+   *   * Never an orchestrator. It runs in process, not in a sandbox, and it
+   *     is the one agent that starts runs and writes goal trees: content it
+   *     fetched would steer delegation itself. A worker fetches; the
+   *     orchestrator delegates to one.
+   *   * Only in the trusted domain. Egress reaches a run only through the
+   *     channel of its sandbox, and the hostile domain gets no channel and no
+   *     egress (docs/design/agent-fleet.md); a manifest with no sandbox has no
+   *     run egress could reach.
+   *   * Tier 2 or more, the first tier that runs sandboxed in the trusted
+   *     domain (plan D15).
+   *
+   * Then each entry: a bind names a binding kernel.yaml holds (looked up in
+   * #bindingHosts, never the record; one in a credential's shape is refused
+   * without being repeated), and an allow host is no binding's host
+   * (a bound host is reached only through its binding's profiles and
+   * repositories, and a request to a host both bound and credential-free
+   * would not say whether a credential belongs on it), and is one the event
+   * log stores as written (a host in a credential's shape would be recorded
+   * censored, in a grant row naming nothing it could read back; events/types.ts
+   * refuses such a row, so a grant naming one could never be issued).
+   */
+  #egressProblem(manifest: AgentManifest): string | undefined {
+    const { allow, bind } = manifest.egress
+    if (allow.length === 0 && bind.length === 0) return undefined
+    const who = `${manifest.id} holds egress`
+
+    if (manifest.role === 'orchestrator') {
+      return (
+        `${who}, but it is role: orchestrator. Egress is for a worker's sandboxed run: the orchestrator runs in ` +
+        'process and starts every other run, so content it fetched would steer delegation. Drop egress, or give it to a worker.'
+      )
+    }
+    if (manifest.sandbox?.domain !== 'trusted') {
+      const has = manifest.sandbox === undefined ? 'declares no sandbox' : 'is sandboxed in the hostile domain'
+      return (
+        `${who}, but it ${has}. Egress reaches only a run sandboxed in the trusted domain; the hostile domain ` +
+        'gets no channel and no egress. Set sandbox.domain: trusted, or drop egress.'
+      )
+    }
+    // Written to fail closed: `tier < 2` is false for NaN, and a tier that
+    // is no number compares false whichever way the test is written.
+    if (!(manifest.tier >= EGRESS_MIN_TIER)) {
+      return (
+        `${who} at tier ${String(manifest.tier)}, but egress needs tier ${String(EGRESS_MIN_TIER)} or more, the first ` +
+        'that runs sandboxed in the trusted domain. Raise the tier deliberately or drop egress.'
+      )
+    }
+
+    for (const [i, id] of bind.entries()) {
+      // As for an allow host below, and before the id is named: an id in a
+      // credential's shape is no binding (kernel.yaml refuses one), and the
+      // refusal must not repeat it.
+      if (redactString(id) !== id) {
+        return (
+          `egress.bind[${String(i)}] is in the shape of a credential, so it names no binding: kernel.yaml refuses ` +
+          'such an id. Name a binding the operator configured'
+        )
+      }
+      if (!this.#bindingHosts.has(id)) {
+        return `egress.bind names ${id}, which is no binding in kernel.yaml's egress.bindings. A manifest binds only a credential the operator configured.`
+      }
+    }
+    for (const [i, host] of allow.entries()) {
+      // Before the host is named: a refusal must not echo text in a credential's shape.
+      if (redactString(host) !== host) {
+        return (
+          `egress.allow[${String(i)}] is a host in the shape of a credential, so the event log would store it censored, ` +
+          'a grant row naming nothing it could read back: rename it'
+        )
+      }
+      const owners = this.#boundHosts.get(host)
+      if (owners !== undefined) {
+        return (
+          `egress.allow lists ${host}, the host of binding${owners.length === 1 ? '' : 's'} ${owners.join(', ')} in kernel.yaml. A bound host is reached ` +
+          "only through a binding's profiles on its repositories, never credential-free: drop it from allow, and bind it if the agent needs it."
+        )
+      }
+    }
+    return undefined
   }
 
   #register(record: AgentRecord): void {
-    // Frozen: a record handed to a run must not be editable by it.
-    this.#agents.set(record.manifest.id, Object.freeze(record))
+    // Frozen to the last list: a record handed to a run must not be editable by it.
+    this.#agents.set(record.manifest.id, freezeRecord(record))
     this.#deps.store.append({
       type: 'agent.registered',
       agentId: record.manifest.id,
@@ -205,8 +380,17 @@ export class AgentRegistry {
     parentRunId?: string
     tier?: number
     egressAllow?: readonly string[]
+    egressBind?: readonly string[]
     toolsAllow?: readonly string[]
   }): AgentRecord {
+    // Before any other check: every later one compares the tier, and a
+    // comparison with NaN, or with a value that is no number, is false
+    // whichever way it is written, so `tier > t.tier` alone would admit it.
+    if (input.tier !== undefined && !Tier.safeParse(input.tier).success) {
+      const given = typeof input.tier === 'number' ? String(input.tier) : `of type ${typeof input.tier}`
+      return this.#rejectSpawn(input.templateId, `requested tier ${given} is not a tier: an integer from 0 to 3`)
+    }
+
     const template = this.#agents.get(input.templateId)
     if (template === undefined || template.manifest.kind !== 'template') {
       return this.#rejectSpawn(input.templateId, `no template named ${input.templateId}`)
@@ -221,12 +405,39 @@ export class AgentRegistry {
       )
     }
 
-    const egress = input.egressAllow ?? t.egress.allow
-    const outsideEgress = egress.filter((host) => !t.egress.allow.includes(host))
+    const egress: readonly string[] = input.egressAllow ?? t.egress.allow
+    // Before any requested entry is named, here and for bind below: the
+    // request is the caller's text, never shape-checked until now.
+    const unnamedHost = unnameable(egress, isSpelledHost)
+    if (unnamedHost !== -1) {
+      return this.#rejectSpawn(
+        input.templateId,
+        `egress.allow[${String(unnamedHost)}] of the request is no egress host in its one spelling, or is in the ` +
+          "shape of a credential, so it is in no template's allow list, and it is not repeated here",
+      )
+    }
+    const outsideEgress = egress.filter((host) => !t.egress.allow.some((allowed) => allowed === host))
     if (outsideEgress.length > 0) {
       return this.#rejectSpawn(
         input.templateId,
         `egress ${outsideEgress.join(', ')} is not in the template's allow list`,
+      )
+    }
+
+    const bind = input.egressBind ?? t.egress.bind
+    const unnamedBind = unnameable(bind, (id) => BINDING_ID.test(id))
+    if (unnamedBind !== -1) {
+      return this.#rejectSpawn(
+        input.templateId,
+        `egress.bind[${String(unnamedBind)}] of the request is no binding id, or is in the shape of a credential, ` +
+          "so it is in no template's bind list, and it is not repeated here",
+      )
+    }
+    const outsideBind = bind.filter((id) => !t.egress.bind.includes(id))
+    if (outsideBind.length > 0) {
+      return this.#rejectSpawn(
+        input.templateId,
+        `egress.bind ${outsideBind.join(', ')} is not in the template's bind list`,
       )
     }
 
@@ -248,14 +459,27 @@ export class AgentRegistry {
       id: input.childId,
       kind: 'ephemeral',
       tier,
-      egress: { allow: [...egress] },
+      // Every egress field by name, each the template's own entries that the
+      // request kept: a field this literal did not name would be dropped from
+      // the child (or, spread from the template, inherited unclamped), and an
+      // entry is the template's text, never the request's.
+      egress: {
+        allow: t.egress.allow.filter((host) => egress.includes(host)),
+        bind: t.egress.bind.filter((id) => bind.includes(id)),
+      },
       tools: { servers: [...t.tools.servers], allow: [...tools] },
       // An ephemeral agent may not spawn: maxDepth is 1 by construction.
       ...(t.spawn === undefined ? {} : { spawn: { templates: [], maxChildren: 0, maxDepth: 1 } }),
     }
 
+    // The template passed this at load; a child that lowered its tier below
+    // egress's while keeping the template's hosts would not.
+    const egressProblem = this.#egressProblem(manifest)
+    if (egressProblem !== undefined) return this.#rejectSpawn(input.templateId, egressProblem)
+
     const record: AgentRecord = { manifest, status: 'active', dir: template.dir }
-    this.#agents.set(input.childId, Object.freeze(record))
+    // Logged, then registered: an append that throws (a closed store, a row
+    // its schema refuses) leaves no agent holding reach the log never saw.
     this.#deps.store.append({
       type: 'agent.spawned',
       agentId: input.childId,
@@ -267,6 +491,7 @@ export class AgentRegistry {
         ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId }),
       },
     })
+    this.#agents.set(input.childId, freezeRecord(record))
     return record
   }
 
@@ -302,7 +527,7 @@ export class AgentRegistry {
       ...record,
       manifest: { ...record.manifest, kind: 'standard', version: record.manifest.version + 1 },
     }
-    this.#agents.set(agentId, Object.freeze(promoted))
+    this.#agents.set(agentId, freezeRecord(promoted))
     this.#deps.store.append({
       type: 'agent.promoted',
       agentId,
@@ -324,7 +549,7 @@ export class AgentRegistry {
     if (record === undefined) throw new ConfigError(`unknown agent ${agentId}`)
 
     const archived: AgentRecord = { ...record, status: 'archived' }
-    this.#agents.set(agentId, Object.freeze(archived))
+    this.#agents.set(agentId, freezeRecord(archived))
     this.#deps.store.append({
       type: 'agent.archived',
       agentId,

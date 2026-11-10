@@ -145,6 +145,7 @@ async function wire(t: TestContext, options: { maxPayloadBytes?: number } = {}):
       maxLlmCallsPerRun: 50,
       maxToolCallsPerRun: 100,
     },
+    egressBindings: {},
   })
   registry.load(dir)
 

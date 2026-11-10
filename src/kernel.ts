@@ -385,6 +385,10 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       // So a manifest asking for more than the operator allows is refused when the
       // file is read, not on the first run that reaches for it.
       budgets: config.budgets,
+      // So a manifest's egress.bind names only a binding kernel.yaml holds, and
+      // its egress.allow no host one binds. Read at load only: egress itself is
+      // the egress-proxy stub (STUBS), so no run reaches either.
+      egressBindings: config.egress.bindings,
     })
     agents.load(options.agentsDir ?? join(repoRoot, 'agents'))
 

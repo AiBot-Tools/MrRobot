@@ -33,7 +33,7 @@ import { bootKernel, configHash, defaultDriver, STUBS, SUBSYSTEM_ORDER } from '.
 import { isClean, projectRecovery } from '../src/events/projections.js'
 import { rebuildFromLog as rebuildApprovals } from '../src/policy/approvals.js'
 import { rebuildFromLog as rebuildQuarantine } from '../src/policy/quarantine.js'
-import { NotImplementedError } from '../src/errors.js'
+import { ConfigError, NotImplementedError } from '../src/errors.js'
 import { EventStore } from '../src/events/store.js'
 import { readAllRows } from '../src/events/chain.js'
 import { parseKernelConfig } from '../src/config.js'
@@ -1253,4 +1253,82 @@ test('a valid pmmcp bearer is masked before connecting, so a server that echoes 
   for (let i = 0; i + 8 <= bearer.length; i += 1) {
     assert.equal(logged.includes(bearer.slice(i, i + 8)), false, 'part of the bearer reached the event log')
   }
+})
+
+test("boot hands the registry kernel.yaml's egress bindings: a bound host in allow refuses the boot by file, a bind of its id boots", async (t) => {
+  // bootKernel builds the only production registry, so this is where a
+  // binding becomes something a manifest can name or must not list. A boot
+  // that handed the registry no bindings would load the first manifest and
+  // refuse the second, both silently wrong once the operator adds one.
+  const egress = `
+egress:
+  bindings:
+    github-git:
+      host: github.com
+      scheme: Basic
+      envVar: AOS_GITHUB_TOKEN
+      profiles: [git-fetch]
+      repos: [op/fixture]
+`
+  const worker = (id: string, lines: string): string => `
+id: ${id}
+version: 1
+kind: standard
+role: worker
+soul: worker.md
+tier: 2
+model:
+  primary: ${REAL_REF}
+sandbox:
+  domain: trusted
+egress:
+${lines}
+memory:
+  projectId: aos/agent/${id}
+`
+  // The shipped fleet, and one worker beside it.
+  const fleet = (id: string, lines: string): string => {
+    const dir = join(tmpdir(t), 'agents')
+    const files: Record<string, string> = { [id]: worker(id, lines) }
+    for (const shipped of ['ceo', 'worker-template']) {
+      files[shipped] = readFileSync(join(REPO_ROOT, 'agents', shipped, 'agent.yaml'), 'utf8')
+    }
+    for (const [name, yaml] of Object.entries(files)) {
+      mkdirSync(join(dir, name, 'history'), { recursive: true })
+      writeFileSync(join(dir, name, 'agent.yaml'), yaml)
+      writeFileSync(join(dir, name, 'AGENTS.md'), `# ${name}\n`)
+    }
+    return dir
+  }
+
+  const fx = fixture(t, { kernelYaml: (base) => `${base}${egress}` })
+  assert.deepEqual(Object.keys(fx.config.egress.bindings), ['github-git'])
+  let booted: Awaited<ReturnType<typeof bootKernel>> | undefined
+  let refusal: unknown
+  try {
+    booted = await bootKernel({
+      config: fx.config,
+      repoRoot: REPO_ROOT,
+      agentsDir: fleet('reacher', '  allow: [github.com]'),
+      providers: fx.providers,
+      toolViews: fx.toolViews,
+      env: { AOS_CONTROL_TOKEN: TEST_TOKEN },
+      sandboxDriver: fakeSandbox(),
+    })
+  } catch (e) {
+    refusal = e
+  }
+  // Shut down before asserting, so a boot that should have refused leaves no
+  // socket or open database behind to hang the file.
+  await booted?.shutdown()
+  assert.equal(booted, undefined, 'a manifest listing a bound host in egress.allow booted')
+  assert.ok(refusal instanceof ConfigError, `refused with ${String(refusal)}`)
+  assert.match(refusal.message, /reacher\/agent\.yaml: egress\.allow lists github\.com, the host of binding github-git in kernel\.yaml/)
+  verifyAt(fx.dbPath)
+
+  const { kernel } = await withKernel(t, {
+    kernelYaml: (base) => `${base}${egress}`,
+    agentsDir: fleet('fetcher', '  bind: [github-git]'),
+  })
+  assert.deepEqual(kernel.agents.get('fetcher')?.manifest.egress, { allow: [], bind: ['github-git'] })
 })

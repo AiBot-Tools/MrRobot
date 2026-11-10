@@ -76,6 +76,7 @@ async function harness(
     toolViews: views,
     store,
     budgets: config.budgets,
+    egressBindings: config.egress.bindings,
   })
   agents.load(`${REPO_ROOT}/agents`)
 
@@ -309,6 +310,7 @@ test('the registry refuses a kernel tool in a worker’s manifest', (t) => {
     toolViews: views,
     store,
     budgets: config.budgets,
+    egressBindings: config.egress.bindings,
   })
   // A temp fleet holding one worker that asks for a kernel tool.
   const root = tmpdir(t)

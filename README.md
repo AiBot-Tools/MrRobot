@@ -677,11 +677,18 @@ every namespace by accident.
 
 Tier is checked at load as well as at call time: a manifest naming a tool whose
 risk exceeds its tier is refused with the file named. Budgets are checked at load
-too — a manifest may only lower a kernel ceiling. Neither agent declares a
-`sandbox:` (the loop runs in process in this phase, so a domain would claim an
-isolation that does not happen), an `egress.allow` host (no proxy exists to enforce
-one), or a `schedule:` (the only routable model is a frontier one, and an
-unattended run that can reach it can empty an envelope).
+too — a manifest may only lower a kernel ceiling. So is egress, though nothing
+serves it yet (the `egress-proxy` stub): an `egress.allow` host must be a DNS
+name, kept in one spelling (never an IP literal, a port, a wildcard or a
+special-use name like `host.lima.internal`), an `egress.bind` id must name a
+binding in kernel.yaml's `egress.bindings`, no allow host may be a binding's
+host, and only a tier 2 or higher worker sandboxed in the trusted domain may
+hold either; a spawned child keeps a subset of its template's hosts and
+bindings, and only at tier 2 or more. No shipped manifest holds egress. Neither
+agent declares a `sandbox:` (the loop runs in process in this phase, so a domain
+would claim an isolation that does not happen), an `egress.allow` host (no proxy
+exists to enforce one), or a `schedule:` (the only routable model is a frontier
+one, and an unattended run that can reach it can empty an envelope).
 
 Both carry `tools.allow: []`, which is the honest state and not an oversight:
 `tool-views.yaml` exposes nothing to agents, and the registry refuses a manifest

@@ -390,6 +390,7 @@ const redaction: Suite = {
 const SCHEDULER = 'src/runtime/scheduler.ts'
 const CRON = 'src/runtime/cron.ts'
 const REGISTRY = 'src/agents/registry.ts'
+const MANIFEST = 'src/agents/manifest.ts'
 
 const schedule: Suite = {
   name: 'schedule',
@@ -423,12 +424,59 @@ const registry: Suite = {
     { id: 'Y5', file: REGISTRY, from: "      if (view.exposure !== 'agent') {", to: '      if (false) {', why: 'a manifest grants a tool the tool views withhold' },
     { id: 'Y6', file: REGISTRY, from: '      if (!allowed.includes(view.risk)) {', to: '      if (false) {', why: 'a tier holds a tool above its risk ceiling' },
     { id: 'Y7', file: REGISTRY, from: '    resolveCaps(this.#deps.budgets, manifest.budget ?? {})', to: '', why: 'a manifest may RAISE a budget cap' },
-    { id: 'Y8', file: REGISTRY, from: '    this.#agents.set(record.manifest.id, Object.freeze(record))', to: '    this.#agents.set(record.manifest.id, record)', why: 'a registered record can be edited by what holds it' },
+    { id: 'Y8', file: REGISTRY, from: '    this.#agents.set(record.manifest.id, freezeRecord(record))', to: '    this.#agents.set(record.manifest.id, record)', why: 'a registered record can be edited by what holds it' },
     { id: 'Y9', file: REGISTRY, from: "    if (template === undefined || template.manifest.kind !== 'template') {", to: '    if (template === undefined) {', why: 'an ephemeral agent can be spawned from a standing agent' },
     { id: 'Y10', file: REGISTRY, from: '    if (tier > t.tier) {', to: '    if (false) {', why: 'a spawned agent exceeds its template’s tier (invariant 6)' },
-    { id: 'Y11', file: REGISTRY, from: '    if (outsideEgress.length > 0) {', to: '    if (false) {', why: 'a spawned agent exceeds its template’s egress (invariant 6)' },
+    { id: 'Y11', file: REGISTRY, from: '    if (outsideEgress.length > 0) {', to: '    if (false) {', why: 'a spawn asking for a host outside its template is silently narrowed instead of refused and logged as agent.spawn.rejected (invariant 6)' },
     { id: 'Y12', file: REGISTRY, from: '    if (outsideTools.length > 0) {', to: '    if (false) {', why: 'a spawned agent holds tools its template does not' },
     { id: 'Y13', file: REGISTRY, from: '    if (this.#agents.has(input.childId)) {', to: '    if (false) {', why: 'a spawn overwrites an existing agent' },
+    // Egress at load and at spawn (egress plan E6): who may hold egress, which bindings exist, which hosts are bound.
+    { id: 'Y14', file: REGISTRY, from: "    if (manifest.role === 'orchestrator') {", to: '    if (false) {', why: 'an orchestrator holds egress, so content it fetched steers the agent that starts every run' },
+    { id: 'Y15', file: REGISTRY, from: "    if (manifest.sandbox?.domain !== 'trusted') {", to: '    if (false) {', why: 'a manifest with no sandbox, or a hostile one, holds egress' },
+    { id: 'Y16', file: REGISTRY, from: "    if (manifest.sandbox?.domain !== 'trusted') {", to: '    if (manifest.sandbox === undefined) {', why: 'the hostile domain is served egress' },
+    { id: 'Y17', file: REGISTRY, from: '    if (!(manifest.tier >= EGRESS_MIN_TIER)) {', to: '    if (false) {', why: 'a tier 0 or tier 1 manifest holds egress' },
+    { id: 'Y18', file: REGISTRY, from: 'const EGRESS_MIN_TIER = 2', to: 'const EGRESS_MIN_TIER = 1', why: 'a tier 1 manifest holds egress' },
+    { id: 'Y19', file: REGISTRY, from: '      if (!this.#bindingHosts.has(id)) {', to: '      if (!(id in this.#deps.egressBindings)) {', why: "a manifest bind: [constructor] passes as known: `in` finds Object.prototype's constructor on the parsed bindings record, a binding with no host" },
+    { id: 'Y20', file: REGISTRY, from: '      if (!this.#bindingHosts.has(id)) {', to: '      if (false) {', why: 'a manifest binds a credential kernel.yaml does not hold' },
+    { id: 'Y21', file: REGISTRY, from: '      if (redactString(host) !== host) {', to: '      if (false) {', why: "an allow host in a credential's shape loads, and every grant row naming it would be stored censored" },
+    { id: 'Y22', file: REGISTRY, from: '      if (owners !== undefined) {', to: '      if (false) {', why: 'a host a kernel.yaml binding names is also listed credential-free' },
+    { id: 'Y23', file: REGISTRY, from: '      bound.set(binding.host, [...(bound.get(binding.host) ?? []), id])', to: '', why: 'the bound hosts are never recorded, so a binding host listed in allow loads' },
+    { id: 'Y24', file: REGISTRY, from: '    if (outsideBind.length > 0) {', to: '    if (false) {', why: 'a spawn asking for a binding outside its template is silently narrowed instead of refused and logged as agent.spawn.rejected (invariant 6)' },
+    { id: 'Y25', file: REGISTRY, from: '        allow: t.egress.allow.filter((host) => egress.includes(host)),', to: '        allow: t.egress.allow,', why: "a child that asked for fewer hosts is given all of its template's" },
+    { id: 'Y26', file: REGISTRY, from: '        bind: t.egress.bind.filter((id) => bind.includes(id)),', to: '        bind: t.egress.bind,', why: "a child that asked for fewer bindings is given all of its template's" },
+    { id: 'Y27', file: REGISTRY, from: '        bind: t.egress.bind.filter((id) => bind.includes(id)),', to: '        bind: [],', why: "not fail-open: the child drops its template's bind, as the old record literal did" },
+    { id: 'Y28', file: REGISTRY, from: '    if (egressProblem !== undefined) return this.#rejectSpawn(input.templateId, egressProblem)', to: '', why: "a child that lowers its tier below 2 keeps its template's egress" },
+    { id: 'Y29', file: MANIFEST, from: '    allow: z.array(EgressHost).max(MAX_EGRESS_ALLOW).default([]),', to: '    allow: z.array(z.string().min(1)).max(MAX_EGRESS_ALLOW).default([]),', why: 'egress.allow takes any string, so 192.168.5.2 and host.lima.internal load as hosts' },
+    { id: 'Y30', file: MANIFEST, from: '    if (new Set(egress.allow).size !== egress.allow.length) {', to: '    if (false) {', why: 'not fail-open: a manifest lists a host twice, and every grant built from it is refused at issue' },
+    { id: 'Y31', file: MANIFEST, from: '    if (new Set(egress.bind).size !== egress.bind.length) {', to: '    if (false) {', why: 'not fail-open: a manifest names a binding twice, and every grant built from it is refused at issue' },
+    { id: 'Y32', file: MANIFEST, from: 'export const MAX_EGRESS_ALLOW = 64', to: 'export const MAX_EGRESS_ALLOW = 65', why: 'not fail-open: a manifest holds more hosts than one grant can, so its runs are never issued one' },
+    { id: 'Y33', file: MANIFEST, from: 'export const MAX_EGRESS_BIND = 16', to: 'export const MAX_EGRESS_BIND = 17', why: 'not fail-open: a manifest holds more bindings than one grant can route, so its runs are never issued one' },
+    // E6 review, round 2. `!(manifest.tier >= EGRESS_MIN_TIER)` has no mutant of its own: the spawn tier check
+    // (Y34) refuses every tier that could tell it from `<` before it is reached, and a loaded manifest's tier is parsed.
+    { id: 'Y34', file: REGISTRY, from: '    if (input.tier !== undefined && !Tier.safeParse(input.tier).success) {', to: '    if (false) {', why: 'a spawn with tier NaN, or a tier that is no number, passes the template clamp, and is refused, if at all, by a later check that names something else' },
+    { id: 'Y35', file: REGISTRY, from: "    const record: AgentRecord = { manifest, status: 'active', dir: template.dir }\n", to: "    const record: AgentRecord = { manifest, status: 'active', dir: template.dir }\n    this.#agents.set(input.childId, freezeRecord(record))\n", why: 'a child is registered before its agent.spawned row, so an append that throws leaves an agent the log never recorded' },
+    { id: 'Y36', file: REGISTRY, from: '      if (redactString(id) !== id) {', to: '      if (false) {', why: "a bind id in a credential's shape is repeated in the refusal" },
+    { id: 'Y37', file: MANIFEST, from: '  .strict()\n  .superRefine((egress, ctx) => {', to: '  .superRefine((egress, ctx) => {', why: 'an unknown egress key (binds:, envVar:, token:) is stripped, not refused with the file named' },
+    { id: 'Y38', file: MANIFEST, from: '    egress: Egress.default(() => ({ allow: [], bind: [] })),', to: '    egress: Egress.default({ allow: [], bind: [] }),', why: 'every manifest that omits egress shares one allow array and one bind array, so a push onto one reaches them all' },
+    { id: 'Y39', file: KERNEL, from: '      egressBindings: config.egress.bindings,', to: '      egressBindings: {},', why: "boot's registry never sees kernel.yaml's bindings: a bound host in allow loads, and every bind id is refused" },
+    // E6 review, round 3. Records frozen to the last list, in #register, spawnEphemeral and promote. archive's
+    // freezeRecord has no mutant of its own: it keeps the manifest it was handed, already frozen, so a shallow
+    // freeze there changes nothing a test could see.
+    { id: 'Y40', file: REGISTRY, from: '  freezeManifest(record.manifest)\n  return Object.freeze(record)', to: '  return Object.freeze(record)', why: 'a record is frozen and its manifest is not: tier, egress.bind and every other list stay writable by whatever holds the record, with no event row' },
+    { id: 'Y41', file: REGISTRY, from: '  for (const part of Object.values(value)) freezeManifest(part)\n', to: '', why: 'a manifest is frozen at its top only: its tier is fixed, and egress.bind still takes a push' },
+    { id: 'Y42', file: REGISTRY, from: '    this.#agents.set(input.childId, freezeRecord(record))', to: '    this.#agents.set(input.childId, Object.freeze(record))', why: "a spawned child's manifest is writable: a push onto its own egress.bind widens it with no event row" },
+    { id: 'Y43', file: REGISTRY, from: '    this.#agents.set(agentId, freezeRecord(promoted))', to: '    this.#agents.set(agentId, Object.freeze(promoted))', why: "a promoted agent's manifest is writable at its top: its tier can be raised with no event row" },
+    { id: 'Y44', file: MANIFEST, from: '    tools: Tools.default(() => ({ servers: [], allow: [] })),', to: '    tools: Tools.default({ servers: [], allow: [] }),', why: 'every manifest that omits tools shares one servers array and one allow array, so a push onto one reaches them all' },
+    { id: 'Y45', file: REGISTRY, from: '    if (unnamedHost !== -1) {', to: '    if (false) {', why: "a requested egress.allow host in a credential's shape is repeated in the spawn refusal, and stored censored" },
+    { id: 'Y46', file: REGISTRY, from: '    if (unnamedBind !== -1) {', to: '    if (false) {', why: "a requested egress.bind id in a credential's shape is repeated in the spawn refusal, and stored censored" },
+    { id: 'Y47', file: REGISTRY, from: "  return entries.findIndex((entry) => typeof entry !== 'string' || !shaped(entry) || redactString(entry) !== entry)", to: "  return entries.findIndex((entry) => typeof entry !== 'string' || !shaped(entry))", why: "a requested entry in its field's shape and a credential's (sk-abcdefghijklmnop is a valid binding id) is named in the spawn refusal" },
+    { id: 'Y48', file: REGISTRY, from: '    const unnamedBind = unnameable(bind, (id) => BINDING_ID.test(id))', to: '    const unnamedBind = unnameable(bind, () => true)', why: 'a requested egress.bind entry that is no binding id (a newline, any length) is repeated in the spawn refusal' },
+    { id: 'Y49', file: REGISTRY, from: '  return seen.ok && seen.host === host', to: '  return seen.ok', why: 'a requested egress.allow host not in its one spelling is repeated in the spawn refusal' },
+    // E6 review, round 3: refusals and clamps the suite did not yet pin.
+    { id: 'Y50', file: REGISTRY, from: '      bound.set(binding.host, [...(bound.get(binding.host) ?? []), id])', to: '      bound.set(binding.host, [id])', why: 'a refusal for a bound host in allow names only the last binding on it, not every one' },
+    { id: 'Y51', file: REGISTRY, from: '        allow: t.egress.allow.filter((host) => egress.includes(host)),', to: '        allow: [...egress],', why: "not fail-open: a child's allow is the request's text, so a host requested twice is held twice and every grant built from it is refused at issue" },
+    { id: 'Y52', file: REGISTRY, from: '        bind: t.egress.bind.filter((id) => bind.includes(id)),', to: '        bind: [...bind],', why: "not fail-open: a child's bind is the request's text, so a binding requested twice is held twice and every grant built from it is refused at issue" },
+    { id: 'Y53', file: REGISTRY, from: "    if (input.tier !== undefined && !Tier.safeParse(input.tier).success) {\n      const given = typeof input.tier === 'number' ? String(input.tier) : `of type ${typeof input.tier}`\n      return this.#rejectSpawn(input.templateId, `requested tier ${given} is not a tier: an integer from 0 to 3`)\n    }\n\n    const template = this.#agents.get(input.templateId)\n    if (template === undefined || template.manifest.kind !== 'template') {\n      return this.#rejectSpawn(input.templateId, `no template named ${input.templateId}`)\n    }\n", to: "    const template = this.#agents.get(input.templateId)\n    if (template === undefined || template.manifest.kind !== 'template') {\n      return this.#rejectSpawn(input.templateId, `no template named ${input.templateId}`)\n    }\n\n    if (input.tier !== undefined && !Tier.safeParse(input.tier).success) {\n      const given = typeof input.tier === 'number' ? String(input.tier) : `of type ${typeof input.tier}`\n      return this.#rejectSpawn(input.templateId, `requested tier ${given} is not a tier: an integer from 0 to 3`)\n    }\n", why: 'a spawn with tier NaN from no template is refused as no template: the tier is no longer checked before any other check' },
   ],
   control: {
     id: 'C',

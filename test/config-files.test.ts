@@ -350,6 +350,8 @@ test('agents/*/agent.yaml parse against the shipped providers and tool-views; th
     // The SHIPPED ceilings, so the shipped manifests are checked against the
     // numbers the operator actually runs with.
     budgets: parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO }).budgets,
+    // And the shipped bindings (none), as the kernel passes them.
+    egressBindings: parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO }).egress.bindings,
   })
   reg.load(join(REPO, 'agents'))
 
@@ -394,6 +396,10 @@ test('agents/*/agent.yaml parse against the shipped providers and tool-views; th
   // to a marker in the prompt rather than throwing, so nothing else would
   // notice a typo here.
   for (const record of reg.list()) {
+    // No shipped manifest holds egress: no host, no binding. One that does
+    // widens what an agent reaches, which waits on the Phase 2 exit (the
+    // egress plan's operator decision on shipping a coder manifest).
+    assert.deepEqual(record.manifest.egress, { allow: [], bind: [] }, `${record.manifest.id} ships with egress`)
     const soul = loadSoul(join(REPO, 'souls'), record.manifest.soul, { used: 0 })
     assert.equal(soul.missing, false, `${record.manifest.id} names a missing soul ${record.manifest.soul}`)
     assert.equal(soul.truncated, false, `${record.manifest.soul} exceeds the soul budget`)

@@ -8,14 +8,30 @@ import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import dgram, { createSocket as esmCreateSocket, Socket as EsmDgramSocket } from 'node:dgram'
+import dns, { resolve4 as esmResolve4 } from 'node:dns'
+import { lookup as esmLookup, Resolver as EsmResolver } from 'node:dns/promises'
+import http from 'node:http'
 import net from 'node:net'
+import tls from 'node:tls'
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 
-import { allowHost, clearAllowedHosts, NetworkBlocked } from './helpers/guard.js'
+import {
+  allowHost,
+  belowGuard,
+  clearAllowedHosts,
+  connectTargets,
+  isGuarded,
+  isLoopbackHost,
+  NetworkBlocked,
+  sendTarget,
+  serverRefused,
+  socketLookupRefused,
+} from './helpers/guard.js'
 import { VERSION } from '../src/version.js'
 import { tmpdir } from './helpers/tmpdir.js'
 
@@ -159,6 +175,379 @@ test('guard throws on net.Socket.connect to a non-loopback address', () => {
   socket.destroy()
 })
 
+/** A refusal by the guard, at `layer`, naming `target`. */
+const blockedAt =
+  (layer: string, target: string) =>
+  (e: unknown): boolean =>
+    e instanceof NetworkBlocked && e.message.startsWith(`test network guard: refused ${layer} to ${target}. `)
+
+test('guard refuses net.connect, net.createConnection and http.get to a non-loopback host before the real connect is reached', () => {
+  // net.connect and net.createConnection, and so an http Agent, tls and
+  // undici, hand Socket.connect node's normalized arguments, one array. A
+  // stub stands under the guard: a call it lets through reaches the stub,
+  // never the network, so a broken guard fails here and sends nothing.
+  assert.ok(isGuarded(net.Socket.prototype.connect), 'the guard is installed')
+  const reached: unknown[] = []
+  const agent = new http.Agent()
+  belowGuard(
+    {
+      'net.Socket.prototype.connect': function (this: unknown, ...args: unknown[]): unknown {
+        reached.push(args[0])
+        return this
+      },
+    },
+    () => {
+      const calls: readonly (readonly [string, () => unknown])[] = [
+        ['net.connect({host, port})', () => net.connect({ host: '192.0.2.1', port: 9 })],
+        ['net.connect(port, host)', () => net.connect(9, '192.0.2.1')],
+        ['net.createConnection(port, host)', () => net.createConnection(9, '192.0.2.1')],
+        ["net.createConnection('port', host)", () => Reflect.apply(net.createConnection, net, ['9', '192.0.2.1'])],
+        ["socket.connect('port', host)", () => Reflect.apply(net.Socket.prototype.connect, new net.Socket(), ['9', '192.0.2.1'])],
+        ['http.get(url)', () => http.get('http://192.0.2.1:9/', { agent })],
+        ['http.get({host})', () => http.get({ host: '192.0.2.1', port: 9, agent })],
+      ]
+      for (const [what, call] of calls) assert.throws(call, blockedAt('socket connect', '192.0.2.1'), what)
+      assert.throws(() => http.get({ host: 'b.example', port: 80, agent }), blockedAt('socket connect', 'b.example'), 'by name, before any lookup')
+      // Shapes that read as loopback or as a unix socket to a guard that
+      // reads them otherwise than node does.
+      assert.throws(() => net.connect({ path: '', host: 'b.example', port: 9 }), blockedAt('socket connect', 'b.example'), 'node takes an empty path for none')
+      assert.throws(
+        () => Reflect.apply(net.Socket.prototype.connect, new net.Socket(), [Object.assign([{ host: 'localhost', port: 9 }], { host: 'b.example', port: 9 })]),
+        blockedAt('socket connect', 'b.example'),
+        'node reads an array it did not mark as the options itself',
+      )
+      // A lookup of the caller's own decides where 'localhost' goes.
+      const asked: string[] = []
+      const lookup = (hostname: string, _options: unknown, callback: (error: null, address: string, family: number) => void): void => {
+        asked.push(hostname)
+        callback(null, '127.0.0.1', 4)
+      }
+      const byLookup: readonly (readonly [string, () => unknown])[] = [
+        ['net.connect({host, lookup})', () => net.connect({ host: 'localhost', port: 9, lookup })],
+        ['net.connect({lookup}) with no host', () => net.connect({ port: 9, lookup })],
+        ['tls.connect({host, lookup})', () => tls.connect({ host: 'localhost', port: 9, lookup })],
+        ['http.get({host, lookup})', () => http.get({ host: 'localhost', port: 9, lookup, agent })],
+      ]
+      for (const [what, call] of byLookup) assert.throws(call, blockedAt('socket connect', 'localhost through a lookup of its own'), what)
+      assert.deepEqual(asked, [], 'the lookup was never asked')
+      assert.deepEqual(reached, [], 'nothing reached the layer under the guard')
+      // What may pass still does, through that same layer: loopback by
+      // address and by name, a unix domain socket, and a lookup that is
+      // node's own or that an IP literal leaves unasked.
+      net.connect({ host: '127.0.0.1', port: 9 })
+      net.createConnection(9, 'localhost')
+      net.connect('/tmp/aos-guard-test.sock')
+      net.connect({ host: 'localhost', port: 9, lookup: dns.lookup })
+      net.connect({ host: '127.0.0.1', port: 9, lookup })
+      assert.equal(reached.length, 5)
+    },
+  )
+  agent.destroy()
+})
+
+test('guard refuses a name lookup, a reverse lookup, a resolver query and a datagram that would leave the machine, before the real one runs', async (t) => {
+  t.after(() => {
+    clearAllowedHosts()
+  })
+  // Installed on every way in, the ESM bindings included (the in-image mux
+  // imports lookup from node:dns/promises): checked first, so a guard that
+  // is not there fails here and nothing below makes a real query.
+  const owners: readonly (readonly [string, object])[] = [
+    ['dns', dns],
+    ['dns.promises', dns.promises],
+    ['dns.Resolver.prototype', dns.Resolver.prototype],
+    ['dns.promises.Resolver.prototype', dns.promises.Resolver.prototype],
+  ]
+  for (const [name, owner] of owners) {
+    const methods = Object.getOwnPropertyNames(owner).filter((key) => /^(?:resolve|reverse)/.test(key) && typeof Reflect.get(owner, key) === 'function')
+    assert.ok(methods.includes('resolve4') && methods.includes('reverse'), `${name}: ${methods.join(', ')}`)
+    for (const key of methods) assert.ok(isGuarded(Reflect.get(owner, key)), `${name}.${key}`)
+  }
+  for (const [name, fn] of [
+    ['dns.lookup', dns.lookup],
+    ['dns.promises.lookup', dns.promises.lookup],
+    ["node:dns/promises's named lookup", esmLookup],
+    ['dns.lookupService', dns.lookupService],
+    ['dns.promises.lookupService', dns.promises.lookupService],
+    ["node:dns/promises's named Resolver", EsmResolver.prototype.resolve4],
+    ['dgram send', dgram.Socket.prototype.send],
+    ['dgram connect', dgram.Socket.prototype.connect],
+    ['dgram.createSocket', dgram.createSocket],
+    ["node:dgram's named createSocket", esmCreateSocket],
+    ['dgram.Socket', dgram.Socket],
+    ["node:dgram's named Socket", EsmDgramSocket],
+  ] as const) {
+    assert.ok(isGuarded(fn), name)
+  }
+
+  const calls: string[] = []
+  const stub =
+    (name: string, promise = false) =>
+    (...args: unknown[]): unknown => {
+      calls.push(`${name} ${String(args[0])}`)
+      return promise ? Promise.resolve([]) : undefined
+    }
+  const none = (): void => {}
+  allowHost('a.example')
+  belowGuard(
+    {
+      'dns.lookup': stub('lookup'),
+      'dns.lookupService': stub('lookupService'),
+      'dns.Resolver.prototype.resolve4': stub('Resolver.resolve4'),
+      'dns.Resolver.prototype.reverse': stub('Resolver.reverse'),
+      'dns.resolve4': stub('dns.resolve4'),
+      'dgram.Socket.prototype.send': stub('send'),
+      'dgram.Socket.prototype.connect': stub('connect'),
+    },
+    () => {
+      assert.throws(() => dns.lookup('b.example', none), blockedAt('dns lookup', 'b.example'))
+      assert.throws(() => dns.lookup('192.0.2.1', {}, none), blockedAt('dns lookup', '192.0.2.1'))
+      dns.lookup('localhost', none)
+      dns.lookup('a.example', { all: true }, none)
+      assert.throws(() => dns.lookupService('192.0.2.1', 22, none), blockedAt('reverse lookup', '192.0.2.1'))
+      dns.lookupService('127.0.0.1', 22, none)
+
+      // A query goes to the resolver's servers, whatever the name.
+      const resolver = new dns.Resolver()
+      resolver.setServers(['192.0.2.1'])
+      assert.throws(() => resolver.resolve4('localhost', none), blockedAt('dns query', 'localhost via 192.0.2.1'))
+      assert.throws(() => resolver.reverse('127.0.0.1', none), blockedAt('dns query', '127.0.0.1 via 192.0.2.1'))
+      // The system's own servers, as a new Resolver and the module hold them.
+      const system = new dns.Resolver()
+      assert.throws(() => system.resolve4('github.com', none), (e: unknown) => e instanceof NetworkBlocked && /dns query to github\.com via /.test(e.message))
+      assert.throws(() => dns.resolve4('github.com', none), (e: unknown) => e instanceof NetworkBlocked && /dns query to github\.com via /.test(e.message))
+      // A test's own server on loopback, and a gated live test's allowed name, pass.
+      resolver.setServers(['127.0.0.1:5353'])
+      resolver.resolve4('github.com', none)
+      system.resolve4('a.example', none)
+      resolver.cancel()
+      system.cancel()
+
+      const udp = dgram.createSocket('udp4')
+      try {
+        assert.throws(() => udp.send('x', 53, '192.0.2.1'), blockedAt('udp send', '192.0.2.1'))
+        assert.throws(() => udp.send(Buffer.from('x'), 0, 1, 53, '192.0.2.1', none), blockedAt('udp send', '192.0.2.1'))
+        assert.throws(() => udp.connect(53, 'b.example'), blockedAt('udp connect', 'b.example'))
+        udp.send('x', 53)
+        udp.send('x', 53, '127.0.0.1', none)
+        udp.connect(53, '127.0.0.1')
+      } finally {
+        udp.close()
+      }
+      // dgram asks a socket's lookup for every address, an IP literal
+      // included, so a socket with a lookup of its own is refused when made.
+      const lookup = (_hostname: string, _family: unknown, callback: (error: null, address: string, family: number) => void): void => callback(null, '127.0.0.1', 4)
+      const refusedSocket = blockedAt('udp socket', '<every address> through a lookup of its own')
+      assert.throws(() => dgram.createSocket({ type: 'udp4', lookup }), refusedSocket, 'createSocket')
+      assert.throws(() => esmCreateSocket({ type: 'udp4', lookup }), refusedSocket, "node:dgram's named createSocket")
+      assert.throws(() => Reflect.construct(dgram.Socket, [{ type: 'udp4', lookup }]), refusedSocket, 'new dgram.Socket')
+      assert.throws(() => Reflect.construct(EsmDgramSocket, [{ type: 'udp4', lookup }]), refusedSocket, "new on node:dgram's named Socket")
+      const own = dgram.createSocket({ type: 'udp4', lookup: dns.lookup })
+      assert.ok(own instanceof dgram.Socket, 'a socket on the default lookup is made, and is a dgram.Socket')
+      own.close()
+    },
+  )
+  assert.deepEqual(calls, [
+    'lookup localhost',
+    'lookup a.example',
+    'lookupService 127.0.0.1',
+    'Resolver.resolve4 github.com',
+    'Resolver.resolve4 a.example',
+    'send x',
+    'send x',
+    'connect 53',
+  ])
+
+  // The promise APIs reject the same way.
+  calls.length = 0
+  const pending = belowGuard(
+    {
+      'dns.promises.lookup': stub('promises.lookup', true),
+      'dns.promises.lookupService': stub('promises.lookupService', true),
+      'dns.promises.Resolver.prototype.resolve4': stub('promises.Resolver.resolve4', true),
+      'dns.promises.resolve4': stub('promises.resolve4', true),
+    },
+    () => {
+      const queried = new EsmResolver()
+      queried.setServers(['192.0.2.1'])
+      return [
+        dns.promises.lookup('b.example'),
+        esmLookup('b.example', { all: true }),
+        dns.promises.lookupService('192.0.2.1', 22),
+        queried.resolve4('github.com'),
+        dns.promises.resolve4('github.com'),
+      ]
+    },
+  )
+  for (const refused of pending) await assert.rejects(refused, NetworkBlocked)
+  assert.deepEqual(calls, [])
+  assert.throws(() => belowGuard({ 'dns.nothing': stub('nothing') }, () => undefined), /the guard wraps no dns\.nothing/)
+})
+
+test('the guard reads the host from every shape node hands Socket.connect and dgram send, and lets a query reach only a loopback server of its own', () => {
+  // As net.connect, net.createConnection, an http Agent and tls call it: an
+  // array is read as node's normalized arguments, [options, callback], and as
+  // the options itself, which is how node reads an array it did not mark.
+  assert.deepEqual(connectTargets([[{ host: '192.0.2.1', port: 9 }, null]]), ['192.0.2.1', 'localhost'])
+  assert.deepEqual(connectTargets([[{ port: 9, host: 'b.example' }, null]]), ['b.example', 'localhost'])
+  assert.deepEqual(connectTargets([[{ port: 9 }, null]]), ['localhost', 'localhost'])
+  assert.deepEqual(connectTargets([[{ path: '/tmp/x.sock' }, null]]), ['localhost'])
+  assert.deepEqual(connectTargets([[9, '192.0.2.1']]), ['<unparseable>', 'localhost'])
+  assert.deepEqual(connectTargets([Object.assign([{ host: 'localhost', port: 9 }], { host: 'b.example', port: 9 })]), ['localhost', 'b.example'])
+  // As a caller of socket.connect does.
+  assert.deepEqual(connectTargets([{ host: '192.0.2.1', port: 9 }]), ['192.0.2.1'])
+  assert.deepEqual(connectTargets([{ host: '', port: 9 }]), ['localhost'])
+  assert.deepEqual(connectTargets([{ path: '/tmp/x.sock' }]), [])
+  assert.deepEqual(connectTargets([{ path: '', host: 'b.example', port: 9 }]), ['b.example'], 'node takes an empty path for no path at all (`!!path`)')
+  assert.deepEqual(connectTargets([443, 'b.example']), ['b.example'])
+  assert.deepEqual(connectTargets([443]), ['localhost'])
+  assert.deepEqual(connectTargets(['443', 'b.example']), ['b.example'], 'node reads a numeric string as a port')
+  assert.deepEqual(connectTargets(['/tmp/x.sock', () => undefined]), [])
+  // A lookup of the caller's own picks the address for any host but an IP literal.
+  const custom = (): void => undefined
+  assert.deepEqual(connectTargets([{ host: 'localhost', port: 9, lookup: custom }]), ['localhost through a lookup of its own'])
+  assert.deepEqual(connectTargets([{ port: 9, lookup: custom }]), ['localhost through a lookup of its own'])
+  assert.deepEqual(connectTargets([{ host: '127.0.0.1', port: 9, lookup: custom }]), ['127.0.0.1'])
+  assert.deepEqual(connectTargets([{ host: 'localhost', port: 9, lookup: dns.lookup }]), ['localhost'], "node's own lookup")
+  assert.deepEqual(connectTargets([{ host: 'localhost', port: 9, lookup: undefined }]), ['localhost'])
+  assert.deepEqual(connectTargets([{ path: '/tmp/x.sock', lookup: custom }]), [])
+  assert.equal(socketLookupRefused({ type: 'udp4', lookup: custom }), '<every address> through a lookup of its own')
+  assert.equal(socketLookupRefused({ type: 'udp4', lookup: dns.lookup }), undefined)
+  assert.equal(socketLookupRefused({ type: 'udp4' }), undefined)
+  assert.equal(socketLookupRefused('udp4'), undefined)
+
+  // send(msg, port, address), send(msg, offset, length, port, address), and with no address.
+  assert.equal(sendTarget(['x', 53, '192.0.2.1']), '192.0.2.1')
+  assert.equal(sendTarget(['x', 53, '192.0.2.1', () => undefined]), '192.0.2.1')
+  assert.equal(sendTarget(['x', 0, 1, 53, '192.0.2.1']), '192.0.2.1')
+  assert.equal(sendTarget(['x', 0, 1, 53, '192.0.2.1', () => undefined]), '192.0.2.1')
+  assert.equal(sendTarget(['x', 53]), undefined)
+  assert.equal(sendTarget(['x', 53, () => undefined]), undefined)
+  assert.equal(sendTarget(['x', 0, 1, 53]), undefined)
+
+  const system = new Set(['127.0.0.53', '8.8.8.8'])
+  assert.equal(serverRefused(['127.0.0.1:5353'], system), undefined)
+  assert.equal(serverRefused(['::1'], system), undefined)
+  assert.equal(serverRefused(['[::1]:5353'], system), undefined)
+  assert.equal(serverRefused(['127.0.0.53'], system), '127.0.0.53', "the system's own loopback resolver forwards off the machine")
+  assert.equal(serverRefused(['127.0.0.1:5353', '8.8.8.8'], new Set()), '8.8.8.8')
+  assert.equal(serverRefused(['[2001:db8::1]:53'], new Set()), '[2001:db8::1]:53')
+  assert.equal(serverRefused([], new Set()), '<no server>')
+})
+
+/**
+ * Spellings node reads as names, not loopback addresses (net.isIP gives 0),
+ * and hands to getaddrinfo, which looks a name up in /etc/hosts and then asks
+ * the system's resolver: a guard that trimmed, unbracketed or unzoned them
+ * first let a lookup leave the machine.
+ */
+const NAMES_NOT_LOOPBACK = ['[::1]', ' localhost', 'localhost\n', '127.0.0.1%lo', '[127.0.0.1]', '127.0.0.1 '] as const
+/** Spellings node dials on loopback as they are: localhost, and IP literals in 127/8, ::1 and ::ffff:127/104. */
+const LOOPBACK_AS_GIVEN = ['localhost', 'LocalHost', '127.0.0.1', '127.255.0.9', '::1', '::1%lo', '0:0:0:0:0:0:0:1', '::ffff:127.0.0.1', '::FFFF:7f00:2'] as const
+
+test('the guard reads a host as node does: a padded, bracketed or zoned loopback is a name, refused before node looks it up', async (t) => {
+  t.after(() => {
+    clearAllowedHosts()
+  })
+  for (const host of NAMES_NOT_LOOPBACK) {
+    assert.equal(net.isIP(host), 0, `node reads ${JSON.stringify(host)} as a name`)
+    assert.equal(isLoopbackHost(host), false, JSON.stringify(host))
+  }
+  for (const host of LOOPBACK_AS_GIVEN) assert.equal(isLoopbackHost(host), true, host)
+  for (const host of ['::ffff:128.0.0.1', '::2', '128.0.0.1', '127.1', 'localhost.', '']) assert.equal(isLoopbackHost(host), false, JSON.stringify(host))
+
+  // Through the entry points, with stubs under the guard: what it lets
+  // through reaches a stub, never getaddrinfo or a socket.
+  const reached: string[] = []
+  const none = (): void => {}
+  const udp = dgram.createSocket('udp6')
+  allowHost('a.example')
+  allowHost('k.example')
+  try {
+    belowGuard(
+      {
+        'net.Socket.prototype.connect': function (this: unknown, ...args: unknown[]): unknown {
+          const first = args[0]
+          const options: unknown = Array.isArray(first) ? first[0] : first
+          reached.push(`connect ${String(typeof options === 'object' && options !== null ? Reflect.get(options, 'host') : options)}`)
+          return this
+        },
+        'dns.lookup': (...args: unknown[]) => void reached.push(`lookup ${String(args[0])}`),
+        'dgram.Socket.prototype.send': (...args: unknown[]) => void reached.push(`send ${String(args[2])}`),
+        'dgram.Socket.prototype.connect': (...args: unknown[]) => void reached.push(`udp connect ${String(args[1])}`),
+      },
+      () => {
+        for (const host of NAMES_NOT_LOOPBACK) {
+          assert.throws(() => net.connect({ host, port: 9 }), blockedAt('socket connect', host), `net.connect ${JSON.stringify(host)}`)
+          assert.throws(() => dns.lookup(host, none), blockedAt('dns lookup', host), `dns.lookup ${JSON.stringify(host)}`)
+          assert.throws(() => udp.send('x', 53, host), blockedAt('udp send', host), `udp send ${JSON.stringify(host)}`)
+          assert.throws(() => udp.connect(53, host), blockedAt('udp connect', host), `udp connect ${JSON.stringify(host)}`)
+        }
+        // allowHost admits the name as spelt: a padded one is another name to getaddrinfo.
+        for (const host of [' a.example', 'a.example ', 'a.example\n', '\u212A.example']) {
+          assert.throws(() => net.connect({ host, port: 443 }), blockedAt('socket connect', host), `net.connect ${JSON.stringify(host)}`)
+          assert.throws(() => dns.lookup(host, none), blockedAt('dns lookup', host), `dns.lookup ${JSON.stringify(host)}`)
+        }
+        assert.deepEqual(reached, [], 'nothing reached the layer under the guard')
+        for (const host of [...LOOPBACK_AS_GIVEN, 'A.Example']) {
+          net.connect({ host, port: 9 })
+          dns.lookup(host, none)
+        }
+        udp.send('x', 53, '::1')
+        udp.connect(53, 'localhost')
+      },
+    )
+  } finally {
+    udp.close()
+  }
+  assert.deepEqual(
+    reached,
+    [...[...LOOPBACK_AS_GIVEN, 'A.Example'].flatMap((host) => [`connect ${host}`, `lookup ${host}`]), 'send ::1', 'udp connect localhost'],
+  )
+  // A URL's hostname spells an IPv6 address in brackets: fetch alone reads it unbracketed.
+  assert.equal(new URL('http://[::1]:9/').hostname, '[::1]')
+  await assert.rejects(fetch('http://[2001:db8::1]:9/'), blockedAt('fetch', '[2001:db8::1]'))
+  await assert.rejects(fetch('http://[::1]:9/'), (e: unknown) => !(e instanceof NetworkBlocked), "fetch to [::1] passes the guard and meets the closed port")
+})
+
+test('a module-level resolve function taken before dns.setServers, or named by an ESM import, is judged by the servers it still asks', async (t) => {
+  // dns.setServers makes a new default resolver and rebinds the module's
+  // exports to it; a function taken before, and the ESM binding synced at
+  // install, stay bound to the old one, whose servers are the system's.
+  const before = dns.getServers()
+  t.after(() => dns.setServers(before))
+  const taken = dns.resolve4
+  const takenPromise = dns.promises.resolve4
+  for (const [name, fn] of [
+    ['dns.resolve4', taken],
+    ['dns.promises.resolve4', takenPromise],
+    ["node:dns's named resolve4", esmResolve4],
+  ] as const) {
+    assert.ok(isGuarded(fn), name)
+  }
+  const calls: string[] = []
+  const none = (): void => {}
+  const refused = (e: unknown): boolean => e instanceof NetworkBlocked && /^test network guard: refused dns query to github\.com via /.test(e.message)
+  const pending = belowGuard(
+    {
+      'dns.resolve4': (...args: unknown[]) => void calls.push(`resolve4 ${String(args[0])}`),
+      'dns.promises.resolve4': (...args: unknown[]) => {
+        calls.push(`promises.resolve4 ${String(args[0])}`)
+        return Promise.resolve([])
+      },
+    },
+    () => {
+      dns.setServers(['127.0.0.1:5353'])
+      assert.deepEqual(dns.getServers(), ['127.0.0.1:5353'], "the module's default resolver asks a loopback server now")
+      assert.throws(() => taken('github.com', none), refused, 'taken before setServers')
+      assert.throws(() => esmResolve4('github.com', none), refused, 'named by an ESM import')
+      return takenPromise('github.com')
+    },
+  )
+  await assert.rejects(pending, refused)
+  assert.deepEqual(calls, [], 'nothing reached the function under the guard')
+})
+
 test('allowHost admits exactly the named host and nothing else', (t) => {
   t.after(() => {
     clearAllowedHosts()
@@ -166,16 +555,34 @@ test('allowHost admits exactly the named host and nothing else', (t) => {
   allowHost('a.example')
   // Allowed host: the guard steps aside, so connect() returns instead of
   // throwing. The point is that the tripwire did not fire, not that anything
-  // is reachable: the lookup answers with an error itself, so not even a DNS
-  // query leaves the machine (destroy() does not cancel a lookup in flight).
+  // is reachable: a stub stands under the guard, so the call it lets through
+  // reaches the stub, and nothing is looked up or dialled.
   const allowedSocket = new net.Socket()
   allowedSocket.on('error', () => undefined)
+  const reached: unknown[] = []
   const noLookup: net.LookupFunction = (_host, _options, callback) => {
     callback(new Error('no DNS in tests'), '', 4)
   }
-  assert.doesNotThrow(() => {
-    allowedSocket.connect({ port: 443, host: 'a.example', lookup: noLookup })
-  })
+  belowGuard(
+    {
+      'net.Socket.prototype.connect': function (this: unknown, ...args: unknown[]): unknown {
+        reached.push(args[0])
+        return this
+      },
+    },
+    () => {
+      assert.doesNotThrow(() => {
+        allowedSocket.connect({ port: 443, host: 'a.example' })
+      })
+      // An allowed name is no licence for a lookup of the caller's own,
+      // which may answer any address for it.
+      assert.throws(
+        () => allowedSocket.connect({ port: 443, host: 'a.example', lookup: noLookup }),
+        (e: unknown) => e instanceof NetworkBlocked && e.message.includes('a.example through a lookup of its own'),
+      )
+    },
+  )
+  assert.equal(reached.length, 1)
   allowedSocket.destroy()
   // Everything else is still refused, including a neighbouring name.
   const blockedSocket = new net.Socket()

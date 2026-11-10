@@ -298,6 +298,43 @@ test('node:child_process is imported only by src/sandbox/docker.ts and five test
   ])
   // The composer asks for a driver and does not wire processes itself.
   assert.equal(importersOf(SRC, 'node:child_process').includes('src/kernel.ts'), false)
+
+  // Inside the worker image, the one spawner is images/worker/mux.mjs, which
+  // runs the agent's command in the container as docker.ts runs the container
+  // on the Mac: in its own process group, with no stdin, through no shell. A
+  // second one would have none of that. Scanned by every way a module gets in
+  // (moduleUses below), so an import() or a bare 'child_process' counts too.
+  const spawners = imageFiles('images').filter((f) => moduleUses(f).specifiers.some((s) => /^(?:node:)?child_process$/.test(s)))
+  assert.deepEqual(spawners.map((f) => f.path), ['images/worker/mux.mjs'])
+  // One test runs the mux's spawner for real, without importing
+  // node:child_process itself: test/egress-mux.test.ts, through
+  // mux.spawnCommand, since only a real process group shows that killTree
+  // ends a grandchild, and only node's own spawn shows the command gets no
+  // stdin and no shell. It is the one test file that imports the mux: read
+  // from the syntax tree (an import however it is laid out, a re-export, an
+  // import() of a string), and no test loads a module by an import() of
+  // anything but a string, which no specifier shows, nor names the mux's
+  // file at all, as createRequire or a URL would be handed it.
+  assert.deepEqual(importersOfModule(TEST, 'images/worker/mux.mjs'), ['test/egress-mux.test.ts'])
+  assert.deepEqual(computedImports(TEST), [])
+  assert.deepEqual(TEST.filter((f) => f.text.includes('mux.mjs')).map((f) => f.path), ['test/egress-mux.test.ts'])
+  const reached = (text: string): SourceFile => ({ path: 'test/egress-frame.test.ts', text, lines: text.split('\n') })
+  for (const text of [
+    "import {\n  spawnCommand,\n} from '../images/worker/mux.mjs'",
+    "import { spawnCommand }\n  from\n  '../images/worker/mux.mjs'",
+    "export { spawnCommand } from '../images/worker/mux.mjs'",
+    "const mux = await import(\n  '../images/worker/mux.mjs'\n)",
+  ]) {
+    assert.deepEqual(importersOfModule([reached(text)], 'images/worker/mux.mjs'), ['test/egress-frame.test.ts'], text)
+  }
+  for (const text of ["const mux = await import(new URL('../images/worker/' + 'mux.mjs', import.meta.url).href)", 'const m = await import(name)']) {
+    assert.deepEqual(computedImports([reached(text)]), [`test/egress-frame.test.ts: ${text.slice(text.indexOf('import('))}`], text)
+  }
+  // The scan sees a second spawner in the image, however it is imported.
+  for (const text of ["import { spawn } from 'node:child_process'", "import cp from 'child_process'", "const cp = await import('node:child_process')"]) {
+    const probe = { path: 'images/worker/publish.mjs', text, lines: text.split('\n') }
+    assert.equal(moduleUses(probe).specifiers.some((s) => /^(?:node:)?child_process$/.test(s)), true, text)
+  }
 })
 
 test('src/ never imports test/', () => {
@@ -387,6 +424,121 @@ test('only decide() mints an egress allow: mintEgressAllow is named in src/egres
   // spelling it. So the module's importers are pinned too, resolved and
   // parsed (import, re-export, import()), type-only imports included.
   assert.deepEqual(importersOfModule(SRC, 'src/egress/decision.ts'), ['src/egress/policy.ts', 'src/egress/upstream.ts'])
+})
+
+/** The files of the worker image's own code: what its Dockerfile (I1) copies as it stands, with no node_modules and no build. */
+const IMAGE_CODE = /\.(?:[cm]?js|[cm]?ts)$/
+
+function imageFiles(dir: string, root = REPO): SourceFile[] {
+  const out: SourceFile[] = []
+  const visit = (rel: string): void => {
+    for (const entry of readdirSync(join(root, rel))) {
+      const path = `${rel}/${entry}`
+      if (statSync(join(root, path)).isDirectory()) visit(path)
+      else if (IMAGE_CODE.test(path)) {
+        const text = readFileSync(join(root, path), 'utf8')
+        out.push({ path, text, lines: text.split('\n') })
+      }
+    }
+  }
+  visit(dir)
+  return out
+}
+
+/**
+ * Every module a file names or loads, and every way it could load one a
+ * specifier does not show, as `what  text` lines: each import, re-export and
+ * import() specifier in code; each `from '...'` and `import('...')` anywhere
+ * in the text, comments included, which is how a JSDoc type import is
+ * spelt; an import() of anything but a string; and require, createRequire,
+ * getBuiltinModule, process.binding and process.dlopen by name. The caller
+ * keeps the specifiers that are not node: builtins.
+ */
+function moduleUses(file: SourceFile): { specifiers: string[]; loaders: string[] } {
+  const source = ts.createSourceFile(file.path, file.text, ts.ScriptTarget.Latest, true, /\.[cm]?ts$/.test(file.path) ? ts.ScriptKind.TS : ts.ScriptKind.JS)
+  const specifiers: string[] = []
+  const loaders: string[] = []
+  const visit = (node: ts.Node): void => {
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier !== undefined) {
+      if (ts.isStringLiteralLike(node.moduleSpecifier)) specifiers.push(node.moduleSpecifier.text)
+      else loaders.push(`a specifier that is no string: ${node.getText(source)}`)
+    } else if (ts.isImportEqualsDeclaration(node)) {
+      loaders.push(`import = require: ${node.getText(source)}`)
+    } else if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+      const spec = node.arguments[0]
+      if (spec !== undefined && ts.isStringLiteralLike(spec)) specifiers.push(spec.text)
+      else loaders.push(`import() of a name: ${node.getText(source)}`)
+    } else if (ts.isIdentifier(node) && /^(?:require|createRequire|getBuiltinModule|dlopen)$/.test(node.text)) {
+      loaders.push(`${node.text}: ${node.parent.getText(source)}`)
+    } else if (ts.isPropertyAccessExpression(node) && node.name.text === 'binding' && node.expression.getText(source) === 'process') {
+      loaders.push(`process.binding: ${node.getText(source)}`)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(source)
+  for (const m of file.text.matchAll(/\bfrom\s+['"]([^'"]*)['"]|\bimport\s*\(\s*['"]([^'"]*)['"]/g)) specifiers.push(m[1] ?? m[2] ?? '')
+  return { specifiers, loaders }
+}
+
+/**
+ * Every loader by name (moduleUses' loaders) in any image file under
+ * `root`'s images/, as `path: what` lines: a module such a loader reaches
+ * shows in no specifier, so neither the builtin scan below nor the spawner
+ * scan (which reads images/ whole) would see it.
+ */
+function imageLoaders(root = REPO): string[] {
+  return imageFiles('images', root).flatMap((f) => moduleUses(f).loaders.map((loader) => `${f.path}: ${loader}`))
+}
+
+test('images/worker imports only node: builtins', (t) => {
+  // The image copies its files as they stand: no node_modules, no build, so
+  // the image does not depend on npm run build (egress plan E9). A specifier
+  // that is not a node: builtin is a module the image does not have, a
+  // relative one is a file the Dockerfile must also copy and nothing here
+  // holds to these rules, and a loader by name (require, createRequire, an
+  // import() of a variable) is a module no specifier shows. The mux is no
+  // boundary, but what it runs is what the operator audited.
+  const IMAGE = imageFiles('images/worker')
+  assert.ok(IMAGE.some((f) => f.path === 'images/worker/mux.mjs'), `the scan finds no mux: ${IMAGE.map((f) => f.path).join(', ')}`)
+  for (const file of IMAGE) {
+    const { specifiers, loaders } = moduleUses(file)
+    if (file.path === 'images/worker/mux.mjs') assert.ok(specifiers.includes('node:net'), `${file.path}: the scan does not see its import of node:net`)
+    assert.deepEqual(specifiers.filter((s) => !/^node:[a-z_]+(?:\/[a-z_]+)?$/.test(s)), [], `${file.path} imports what is not a node: builtin`)
+    assert.deepEqual(loaders, [], `${file.path} loads a module no specifier shows`)
+  }
+  // No file anywhere under images/ loads a module by name: outside
+  // images/worker as well, where the spawner scan's specifiers are all that
+  // is read. Held on the repository, and on a tree with a file that does.
+  assert.deepEqual(imageLoaders(), [])
+  const tree = tmpdir(t)
+  mkdirSync(join(tree, 'images', 'worker'), { recursive: true })
+  mkdirSync(join(tree, 'images', 'publish'), { recursive: true })
+  writeFileSync(join(tree, 'images', 'worker', 'mux.mjs'), "import net from 'node:net'\n")
+  writeFileSync(join(tree, 'images', 'publish', 'run.mjs'), "const cp = process.getBuiltinModule('node:child_process')\n")
+  assert.deepEqual(imageLoaders(tree), ['images/publish/run.mjs: getBuiltinModule: process.getBuiltinModule'])
+
+  // The scan sees each way a module gets in, and passes a node: builtin.
+  const probe = (text: string): { specifiers: string[]; loaders: string[] } => moduleUses({ path: 'images/worker/probe.mjs', text, lines: text.split('\n') })
+  const outside = (text: string): string[] => {
+    const { specifiers, loaders } = probe(text)
+    return [...specifiers.filter((s) => !/^node:[a-z_]+(?:\/[a-z_]+)?$/.test(s)), ...loaders]
+  }
+  for (const text of [
+    "import { z } from 'zod'",
+    "import net from 'net'",
+    "export * from './frame.mjs'",
+    "const y = await import('yaml')",
+    'const name = "zod"\nconst m = await import(name)',
+    "import { createRequire } from 'node:module'\nconst z = createRequire(import.meta.url)('zod')",
+    "const z = require('zod')",
+    "const fs = process.getBuiltinModule('node:fs')",
+    "const b = process.binding('fs')",
+    "/** @import { ZodType } from 'zod' */\nconst x = 1",
+    "/** @type {import('../../src/egress/frame.js').Frame} */\nlet f",
+  ]) {
+    assert.notDeepEqual(outside(text), [], text)
+  }
+  assert.deepEqual(outside("import net from 'node:net'\nimport { lookup } from 'node:dns/promises'\n/** @import { Readable } from 'node:stream' */"), [])
 })
 
 /** A path with a `secrets` directory in it, in either separator. */
@@ -594,9 +746,26 @@ function relativeImports(file: SourceFile): string[] {
   return out
 }
 
-/** The files in `pool` that import `target` (a repo-relative .ts path) directly. */
+/** The files in `pool` that import `target` (a repo-relative .ts path, or a path as it is spelt for any other file: images/worker/mux.mjs) directly. */
 function importersOfModule(pool: readonly SourceFile[], target: string): string[] {
   return pool.filter((f) => relativeImports(f).includes(target)).map((f) => f.path).sort()
+}
+
+/** Each import() in `pool` of anything but a string, as `path: import(...)`: a module it loads shows in no specifier, so relativeImports cannot resolve it. */
+function computedImports(pool: readonly SourceFile[]): string[] {
+  const out: string[] = []
+  for (const file of pool) {
+    const source = parsed(file)
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        const spec = node.arguments[0]
+        if (spec === undefined || !ts.isStringLiteralLike(spec)) out.push(`${file.path}: ${node.getText(source)}`)
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+  }
+  return out
 }
 
 test('only the entry points, the .env writer, the live helper and three tests import secrets/dotenv.js; kernel.ts, config.ts and the broker never do', () => {

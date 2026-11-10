@@ -1,0 +1,1068 @@
+{
+  "about": [
+    "The egress channel frame codec, as test vectors (egress plan E7). src/egress/frame.ts and the in-image mux (E9, images/worker/mux.mjs) are both held to this file: test/egress-frame.test.ts and test/egress-mux.test.ts.",
+    "Hex is lower-case; spaces in it are for reading and carry nothing. A wire is LENGTH(4) TYPE(1) FLOW(4) PAYLOAD, integers unsigned big-endian; LENGTH counts the payload only.",
+    "frames: each one must encode to its wire, byte for byte.",
+    "scripts: run in order on one channel of the role named (a kernel channel holds the limits given; a mux channel learns them from go). send: the frame must be sent, as wire. refuse: the send must be refused with that refusal, and change nothing. receive: the pieces, fed in order, must decode to exactly those frames and then the refusal, if one is named; the pieces may be split or joined at any byte without changing that. finish: the other end's stream has ended; the refusal, if one is named, must be returned. openFlows and flowsOpened, on any step, must hold after it.",
+    "Each end's scripts meet every refusal that end can meet, receiving (and at finish) and sending, so a mux codec that replays only the mux scripts (E9) is held to every refusal a mux can meet. Between them the two ends' scripts meet every refusal in FRAME_REFUSALS, which lists them in the check order src/egress/frame.ts documents.",
+    "Each end's scripts also refuse a payload of every wrong length that end can meet, each way: each type under its least and past a fixed most (length), and a data, stdout or stderr past frameMaxBytes (oversize). test/egress-frame.test.ts lists them as LENGTH_CELLS.",
+    "A frame that breaks more than one rule is refused by the first it breaks in that check order; src/egress/frame.ts says, rule by rule, when a frame breaks each. A script named 'check order, X before Y' (or 'X before Y and Z') ends with one frame, received or sent, that breaks exactly the rules it names, and must be refused with X, the first of them. Wherever one frame can break two rules, the first it breaks and another, at an end and a way (receiving or sending) that can meet it, a check-order script of that end and way names both: test/egress-frame.test.ts finds every such place with a second evaluator of those rules over the states an end can reach, lists them as ORDER_PAIRS, and holds these names and frames to them."
+  ],
+  "wire": {"headerBytes":9,"readyMaxBytes":4096,"frameMaxBytesLimit":1048576,"maxFlowsLimit":256,"maxFlowId":4294967295},
+  "types": {"ready":1,"go":2,"open":16,"data":17,"end":18,"close":19,"stdout":32,"stderr":33,"exit":34},
+  "limits": {"oversize":"frameMaxBytes","max-flows":"maxFlows"},
+  "frames": [
+    {"name":"ready, with its report","type":"ready","flow":0,"payload":"6f6b","wire":"00000002 01 00000000 6f6b"},
+    {"name":"ready, empty","type":"ready","flow":0,"payload":"","wire":"00000000 01 00000000"},
+    {"name":"go: frameMaxBytes 65536, maxFlows 16","type":"go","flow":0,"payload":"00010000 00000010","wire":"00000008 02 00000000 00010000 00000010"},
+    {"name":"open of flow 1","type":"open","flow":1,"payload":"","wire":"00000000 10 00000001"},
+    {"name":"data on flow 1","type":"data","flow":1,"payload":"474554202f","wire":"00000005 11 00000001 474554202f"},
+    {"name":"data on flow 0x01020304: the flow id is big-endian","type":"data","flow":16909060,"payload":"abcd","wire":"00000002 11 01020304 abcd"},
+    {"name":"data on the last flow id","type":"data","flow":4294967295,"payload":"00","wire":"00000001 11 ffffffff 00"},
+    {"name":"end of flow 1","type":"end","flow":1,"payload":"","wire":"00000000 12 00000001"},
+    {"name":"close of flow 1","type":"close","flow":1,"payload":"","wire":"00000000 13 00000001"},
+    {"name":"stdout","type":"stdout","flow":0,"payload":"68690a","wire":"00000003 20 00000000 68690a"},
+    {"name":"stderr","type":"stderr","flow":0,"payload":"21","wire":"00000001 21 00000000 21"},
+    {"name":"exit 137, a death by SIGKILL","type":"exit","flow":0,"payload":"89","wire":"00000001 22 00000000 89"}
+  ],
+  "scripts": [
+    {"name":"kernel: a flow, the command's output and its exit, end to end; a frame split across pieces at any byte","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}],"openFlows":1,"flowsOpened":1},
+      {"receive":["00000004 11 0000","0001 4745","5420"],"frames":[{"type":"data","flow":1,"payload":"47455420","stale":false}]},
+      {"receive":["00000000 12 00000001"],"frames":[{"type":"end","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"data","flow":1,"payload":"4f4b"},"wire":"00000002 11 00000001 4f4b"},
+      {"send":{"type":"end","flow":1,"payload":""},"wire":"00000000 12 00000001"},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001","openFlows":1},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}],"openFlows":0,"flowsOpened":1},
+      {"receive":["00000002 20 00000000 6869","00000001 21 00000000 21","00000001 22 00000000 00"],"frames":[{"type":"stdout","flow":0,"payload":"6869","stale":false},{"type":"stderr","flow":0,"payload":"21","stale":false},{"type":"exit","flow":0,"payload":"00","stale":false}]},
+      {"finish":true}
+    ]},
+    {"name":"kernel: an open past maxFlows is refused, a limit, and the refusal is final","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001","00000000 10 00000002","00000000 10 00000003"],"frames":[{"type":"open","flow":1,"payload":"","stale":false},{"type":"open","flow":2,"payload":"","stale":false}],"refusal":"max-flows"},
+      {"receive":["00000001 11 00000001 61"],"frames":[],"refusal":"max-flows"},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"max-flows"},
+      {"finish":true,"refusal":"max-flows"}
+    ]},
+    {"name":"kernel: a flow the mux closed still counts until the kernel closes it","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 10 00000002"],"frames":[{"type":"open","flow":2,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}],"openFlows":2},
+      {"receive":["00000000 10 00000003"],"frames":[],"refusal":"max-flows"}
+    ]},
+    {"name":"kernel: a flow the kernel closed still counts until the mux closes it","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 10 00000002"],"frames":[{"type":"open","flow":2,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001","openFlows":2},
+      {"receive":["00000000 10 00000003"],"frames":[],"refusal":"max-flows"}
+    ]},
+    {"name":"kernel: a flow is retired once both closes have crossed, and is never named again","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 10 00000002"],"frames":[{"type":"open","flow":2,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001","openFlows":1},
+      {"receive":["00000000 10 00000003"],"frames":[{"type":"open","flow":3,"payload":"","stale":false}],"openFlows":2,"flowsOpened":3},
+      {"receive":["00000001 11 00000001 61"],"frames":[],"refusal":"closed-flow"}
+    ]},
+    {"name":"kernel: data and an end the mux sent before it read the kernel's close are stale, not refused","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000002 11 00000001 6162"],"frames":[{"type":"data","flow":1,"payload":"6162","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"receive":["00000002 11 00000001 6364","00000000 12 00000001"],"frames":[{"type":"data","flow":1,"payload":"6364","stale":true},{"type":"end","flow":1,"payload":"","stale":true}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}],"openFlows":0},
+      {"receive":["00000001 11 00000001 65"],"frames":[],"refusal":"closed-flow"}
+    ]},
+    {"name":"kernel: an unknown type","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"receive":["00000000 7f 00000000"],"frames":[],"refusal":"unknown-type"}
+    ]},
+    {"name":"kernel: check order, unknown-type before not-ready and before-go: an all-zero header, before anything else","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000000 00 00000000"],"frames":[],"refusal":"unknown-type"}
+    ]},
+    {"name":"kernel: the mux never sends go","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[],"refusal":"direction"}
+    ]},
+    {"name":"kernel: a data frame on flow 0","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000001 11 00000000 61"],"frames":[],"refusal":"flow-zero"}
+    ]},
+    {"name":"kernel: an open of flow 0","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000000"],"frames":[],"refusal":"flow-zero"}
+    ]},
+    {"name":"kernel: stdout naming a flow","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000001 20 00000001 61"],"frames":[],"refusal":"channel-flow"}
+    ]},
+    {"name":"kernel: a frame before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000000 10 00000001"],"frames":[],"refusal":"not-ready"}
+    ]},
+    {"name":"kernel: ready twice","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[],"refusal":"ready-twice"}
+    ]},
+    {"name":"kernel: a frame between ready and go","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"receive":["00000000 10 00000001"],"frames":[],"refusal":"before-go"}
+    ]},
+    {"name":"kernel: a ready past 4096 bytes, refused at its header","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00001001 01 00000000"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: an open with a payload","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000001 10 00000001 00"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: an empty data frame","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 11 00000001"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: an empty stdout frame","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 20 00000000"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: an exit of two bytes","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000002 22 00000000 0000"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: an empty exit frame","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 22 00000000"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: an empty stderr frame","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 21 00000000"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: an end with a payload","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000001 12 00000001 00"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: a close with a payload","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000001 13 00000001 00"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: data past frameMaxBytes, refused at its header","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000005 11 00000001"],"frames":[],"refusal":"oversize"}
+    ]},
+    {"name":"kernel: a header claiming 4 GiB, refused at its header","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["ffffffff 11 00000001"],"frames":[],"refusal":"oversize"}
+    ]},
+    {"name":"kernel: stdout past frameMaxBytes","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000005 20 00000000"],"frames":[],"refusal":"oversize"}
+    ]},
+    {"name":"kernel: stderr past frameMaxBytes","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000004 21 00000000 21212121","00000005 21 00000000"],"frames":[{"type":"stderr","flow":0,"payload":"21212121","stale":false}],"refusal":"oversize"}
+    ]},
+    {"name":"kernel: an open out of order","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000002"],"frames":[],"refusal":"flow-order"}
+    ]},
+    {"name":"kernel: a flow opened twice","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 10 00000001"],"frames":[],"refusal":"flow-order"}
+    ]},
+    {"name":"kernel: data on a flow never opened","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000001 11 00000002 61"],"frames":[],"refusal":"unopened-flow"}
+    ]},
+    {"name":"kernel: data after the mux's own end","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 12 00000001"],"frames":[{"type":"end","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000001 11 00000001 61"],"frames":[],"refusal":"after-end"}
+    ]},
+    {"name":"kernel: end twice","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 12 00000001"],"frames":[{"type":"end","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 12 00000001"],"frames":[],"refusal":"after-end"}
+    ]},
+    {"name":"kernel: data after the mux's own close","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000001 11 00000001 61"],"frames":[],"refusal":"after-close"}
+    ]},
+    {"name":"kernel: close twice","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[],"refusal":"after-close"}
+    ]},
+    {"name":"kernel: stdout after exit","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000001 22 00000000 00"],"frames":[{"type":"exit","flow":0,"payload":"00","stale":false}]},
+      {"receive":["00000001 20 00000000 61"],"frames":[],"refusal":"after-exit"}
+    ]},
+    {"name":"kernel: exit twice","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000001 22 00000000 00"],"frames":[{"type":"exit","flow":0,"payload":"00","stale":false}]},
+      {"receive":["00000001 22 00000000 00"],"frames":[],"refusal":"after-exit"}
+    ]},
+    {"name":"kernel: an open after exit","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000001 22 00000000 00"],"frames":[{"type":"exit","flow":0,"payload":"00","stale":false}]},
+      {"receive":["00000000 10 00000001"],"frames":[],"refusal":"after-exit"}
+    ]},
+    {"name":"kernel: a stream that ends inside a header","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"receive":["00000002 20 00"],"frames":[]},
+      {"finish":true,"refusal":"truncated-header"}
+    ]},
+    {"name":"kernel: a stream that ends inside a payload","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000002 20 00000000 68"],"frames":[]},
+      {"finish":true,"refusal":"truncated-payload"}
+    ]},
+    {"name":"kernel: what the kernel sends is held to the rules the mux applies, and a refused send changes nothing","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"refuse":{"type":"go","flow":0,"payload":"00000004 00000002"},"refusal":"not-ready"},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"not-ready"},
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"before-go"},
+      {"refuse":{"type":"go","flow":1,"payload":"00000004 00000002"},"refusal":"channel-flow"},
+      {"refuse":{"type":"go","flow":0,"payload":"00000008 00000002"},"refusal":"go-value"},
+      {"refuse":{"type":"go","flow":0,"payload":"00000004 000000"},"refusal":"length"},
+      {"refuse":{"type":"go","flow":0,"payload":"00000004 00000002 00"},"refusal":"length"},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"refuse":{"type":"go","flow":0,"payload":"00000004 00000002"},"refusal":"go-twice"},
+      {"refuse":{"type":"open","flow":1,"payload":""},"refusal":"direction"},
+      {"refuse":{"type":"stdout","flow":0,"payload":"61"},"refusal":"direction"},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"unopened-flow"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"refuse":{"type":"data","flow":0,"payload":"61"},"refusal":"flow-zero"},
+      {"refuse":{"type":"data","flow":1,"payload":""},"refusal":"length"},
+      {"refuse":{"type":"data","flow":1,"payload":"6162636465"},"refusal":"oversize"},
+      {"refuse":{"type":"end","flow":1,"payload":"00"},"refusal":"length"},
+      {"refuse":{"type":"close","flow":1,"payload":"00"},"refusal":"length"},
+      {"send":{"type":"data","flow":1,"payload":"61626364"},"wire":"00000004 11 00000001 61626364"},
+      {"send":{"type":"end","flow":1,"payload":""},"wire":"00000000 12 00000001"},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"after-end"},
+      {"refuse":{"type":"end","flow":1,"payload":""},"refusal":"after-end"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}],"openFlows":1},
+      {"receive":["00000000 10 00000002"],"frames":[{"type":"open","flow":2,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000002"],"frames":[{"type":"close","flow":2,"payload":"","stale":false}]},
+      {"refuse":{"type":"data","flow":2,"payload":"61"},"refusal":"peer-closed"},
+      {"refuse":{"type":"end","flow":2,"payload":""},"refusal":"peer-closed"},
+      {"send":{"type":"close","flow":2,"payload":""},"wire":"00000000 13 00000002","openFlows":1},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001","openFlows":0},
+      {"refuse":{"type":"close","flow":1,"payload":""},"refusal":"closed-flow"},
+      {"receive":["00000000 10 00000003"],"frames":[{"type":"open","flow":3,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":3,"payload":""},"wire":"00000000 13 00000003"},
+      {"refuse":{"type":"data","flow":3,"payload":"61"},"refusal":"after-close"},
+      {"refuse":{"type":"close","flow":3,"payload":""},"refusal":"after-close"},
+      {"finish":true}
+    ]},
+    {"name":"kernel: check order, direction before channel-flow and not-ready: a go from the mux, on flow 1, before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000008 02 00000001 00000004 00000002"],"frames":[],"refusal":"direction"}
+    ]},
+    {"name":"kernel: check order, direction before flow-zero and not-ready and before-go and flow-order: an open sent by the kernel, of flow 0, before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"refuse":{"type":"open","flow":0,"payload":""},"refusal":"direction"}
+    ]},
+    {"name":"kernel: check order, channel-flow before ready-twice: a second ready, on flow 1","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"receive":["00000000 01 00000001"],"frames":[],"refusal":"channel-flow"}
+    ]},
+    {"name":"kernel: check order, flow-zero before not-ready and before-go and closed-flow: data on flow 0 before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000001 11 00000000 61"],"frames":[],"refusal":"flow-zero"}
+    ]},
+    {"name":"kernel: check order, ready-twice before length: a second ready, of 4097 bytes","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"receive":["00001001 01 00000000"],"frames":[],"refusal":"ready-twice"}
+    ]},
+    {"name":"kernel: check order, oversize before unopened-flow: data past frameMaxBytes on a flow never opened, a limit","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000005 11 00000001"],"frames":[],"refusal":"oversize"}
+    ]},
+    {"name":"kernel: check order, length before after-exit: an exit of two bytes after exit","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000001 22 00000000 00"],"frames":[{"type":"exit","flow":0,"payload":"00","stale":false}]},
+      {"receive":["00000002 22 00000000 0000"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: check order, after-exit before flow-order and max-flows: an open of the wrong flow id at the cap, after exit","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 10 00000002"],"frames":[{"type":"open","flow":2,"payload":"","stale":false}]},
+      {"receive":["00000001 22 00000000 00"],"frames":[{"type":"exit","flow":0,"payload":"00","stale":false}]},
+      {"receive":["00000000 10 00000004"],"frames":[],"refusal":"after-exit"}
+    ]},
+    {"name":"kernel: check order, flow-order before max-flows: an open of the wrong flow id at the cap","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 10 00000002"],"frames":[{"type":"open","flow":2,"payload":"","stale":false}]},
+      {"receive":["00000000 10 00000004"],"frames":[],"refusal":"flow-order","openFlows":2}
+    ]},
+    {"name":"kernel: check order, after-close before after-end: data after the mux's own end and close","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 12 00000001"],"frames":[{"type":"end","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000001 11 00000001 61"],"frames":[],"refusal":"after-close"}
+    ]},
+    {"name":"kernel: check order, after-end before peer-closed: a data send after the kernel's own end and the mux's close","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"end","flow":1,"payload":""},"wire":"00000000 12 00000001"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"after-end"}
+    ]},
+    {"name":"kernel: check order, direction before not-ready and go-value: a go frame from the mux naming frameMaxBytes 5, not the channel's 4, before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000008 02 00000000 00000005 00000002"],"frames":[],"refusal":"direction"}
+    ]},
+    {"name":"kernel: check order, direction before go-twice and length: a second go frame from the mux of 0 bytes","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 02 00000000"],"frames":[],"refusal":"direction"}
+    ]},
+    {"name":"kernel: check order, channel-flow before not-ready and before-go and length: an empty stdout frame from the mux on flow 1, before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000000 20 00000001"],"frames":[],"refusal":"channel-flow"}
+    ]},
+    {"name":"kernel: check order, channel-flow before oversize and after-exit: a stdout frame from the mux on flow 1 of 5 bytes, after exit","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000001 22 00000000 00"],"frames":[{"type":"exit","flow":0,"payload":"00","stale":false}]},
+      {"receive":["00000005 20 00000001 6161616161"],"frames":[],"refusal":"channel-flow"}
+    ]},
+    {"name":"kernel: check order, flow-zero before not-ready and before-go and oversize and closed-flow: a data frame from the mux on flow 0 of 5 bytes, before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000005 11 00000000 6161616161"],"frames":[],"refusal":"flow-zero"}
+    ]},
+    {"name":"kernel: check order, flow-zero before length and after-exit and flow-order and max-flows: an open frame from the mux of flow 0 of 1 byte, after exit, at the cap of 2 flows","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 10 00000002"],"frames":[{"type":"open","flow":2,"payload":"","stale":false}]},
+      {"receive":["00000001 22 00000000 00"],"frames":[{"type":"exit","flow":0,"payload":"00","stale":false}]},
+      {"receive":["00000001 10 00000000 61"],"frames":[],"refusal":"flow-zero"}
+    ]},
+    {"name":"kernel: check order, not-ready before before-go and length and flow-order: an open frame from the mux of flow 2 of 1 byte, before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000001 10 00000002 61"],"frames":[],"refusal":"not-ready"}
+    ]},
+    {"name":"kernel: check order, not-ready before before-go and oversize and unopened-flow: a data frame from the mux on flow 1 of 5 bytes, before ready, flow 1 never opened","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000005 11 00000001 6161616161"],"frames":[],"refusal":"not-ready"}
+    ]},
+    {"name":"kernel: check order, before-go before length and flow-order: an open frame from the mux of flow 2 of 1 byte, between ready and go","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"receive":["00000001 10 00000002 61"],"frames":[],"refusal":"before-go"}
+    ]},
+    {"name":"kernel: check order, before-go before oversize and unopened-flow: a data frame from the mux on flow 1 of 5 bytes, between ready and go, flow 1 never opened","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"receive":["00000005 11 00000001 6161616161"],"frames":[],"refusal":"before-go"}
+    ]},
+    {"name":"kernel: check order, length before flow-order and max-flows: an open frame from the mux of flow 1 of 1 byte, at the cap of 2 flows","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 10 00000002"],"frames":[{"type":"open","flow":2,"payload":"","stale":false}]},
+      {"receive":["00000001 10 00000001 61"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: check order, length before unopened-flow: an empty data frame from the mux on flow 1, flow 1 never opened","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 11 00000001"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: check order, length before closed-flow: an empty data frame from the mux on flow 1, flow 1 retired","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"receive":["00000000 11 00000001"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: check order, length before after-close and after-end: an empty data frame from the mux on flow 1, after the mux's own end and close","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 12 00000001"],"frames":[{"type":"end","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 11 00000001"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"kernel: check order, oversize before after-exit: a stdout frame from the mux of 5 bytes, after exit","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000001 22 00000000 00"],"frames":[{"type":"exit","flow":0,"payload":"00","stale":false}]},
+      {"receive":["00000005 20 00000000 6161616161"],"frames":[],"refusal":"oversize"}
+    ]},
+    {"name":"kernel: check order, oversize before closed-flow: a data frame from the mux on flow 1 of 5 bytes, flow 1 retired","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"receive":["00000005 11 00000001 6161616161"],"frames":[],"refusal":"oversize"}
+    ]},
+    {"name":"kernel: check order, oversize before after-close and after-end: a data frame from the mux on flow 1 of 5 bytes, after the mux's own end and close","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 12 00000001"],"frames":[{"type":"end","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000005 11 00000001 6161616161"],"frames":[],"refusal":"oversize"}
+    ]},
+    {"name":"kernel: check order, direction before channel-flow and length and after-exit: an empty stdout frame sent on flow 1, after exit","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000001 22 00000000 00"],"frames":[{"type":"exit","flow":0,"payload":"00","stale":false}]},
+      {"refuse":{"type":"stdout","flow":1,"payload":""},"refusal":"direction"}
+    ]},
+    {"name":"kernel: check order, direction before ready-twice: a second ready frame sent, between ready and go","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"refuse":{"type":"ready","flow":0,"payload":""},"refusal":"direction"}
+    ]},
+    {"name":"kernel: check order, direction before not-ready and before-go and oversize: a stdout frame sent of 5 bytes, before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"refuse":{"type":"stdout","flow":0,"payload":"6161616161"},"refusal":"direction"}
+    ]},
+    {"name":"kernel: check order, direction before max-flows: an open frame sent of flow 3, at the cap of 2 flows","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 10 00000002"],"frames":[{"type":"open","flow":2,"payload":"","stale":false}]},
+      {"refuse":{"type":"open","flow":3,"payload":""},"refusal":"direction"}
+    ]},
+    {"name":"kernel: check order, channel-flow before not-ready and length: an empty go frame sent on flow 1, before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"refuse":{"type":"go","flow":1,"payload":""},"refusal":"channel-flow"}
+    ]},
+    {"name":"kernel: check order, channel-flow before go-twice and go-value: a second go frame sent on flow 1 naming frameMaxBytes 5, not the channel's 4","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"refuse":{"type":"go","flow":1,"payload":"00000005 00000002"},"refusal":"channel-flow"}
+    ]},
+    {"name":"kernel: check order, flow-zero before not-ready and before-go and length and closed-flow: an empty data frame sent on flow 0, before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"refuse":{"type":"data","flow":0,"payload":""},"refusal":"flow-zero"}
+    ]},
+    {"name":"kernel: check order, flow-zero before not-ready and before-go and oversize and closed-flow: a data frame sent on flow 0 of 5 bytes, before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"refuse":{"type":"data","flow":0,"payload":"6161616161"},"refusal":"flow-zero"}
+    ]},
+    {"name":"kernel: check order, not-ready before before-go and length and unopened-flow: an empty data frame sent on flow 1, before ready, flow 1 never opened","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"refuse":{"type":"data","flow":1,"payload":""},"refusal":"not-ready"}
+    ]},
+    {"name":"kernel: check order, not-ready before before-go and oversize and unopened-flow: a data frame sent on flow 1 of 5 bytes, before ready, flow 1 never opened","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"refuse":{"type":"data","flow":1,"payload":"6161616161"},"refusal":"not-ready"}
+    ]},
+    {"name":"kernel: check order, not-ready before go-value: a go frame sent naming frameMaxBytes 5, not the channel's 4, before ready","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"refuse":{"type":"go","flow":0,"payload":"00000005 00000002"},"refusal":"not-ready"}
+    ]},
+    {"name":"kernel: check order, go-twice before length: a second go frame sent of 0 bytes","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"refuse":{"type":"go","flow":0,"payload":""},"refusal":"go-twice"}
+    ]},
+    {"name":"kernel: check order, go-twice before go-value: a second go frame sent naming frameMaxBytes 5, not the channel's 4","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"refuse":{"type":"go","flow":0,"payload":"00000005 00000002"},"refusal":"go-twice"}
+    ]},
+    {"name":"kernel: check order, before-go before length and unopened-flow: an empty data frame sent on flow 1, between ready and go, flow 1 never opened","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"refuse":{"type":"data","flow":1,"payload":""},"refusal":"before-go"}
+    ]},
+    {"name":"kernel: check order, before-go before oversize and unopened-flow: a data frame sent on flow 1 of 5 bytes, between ready and go, flow 1 never opened","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"refuse":{"type":"data","flow":1,"payload":"6161616161"},"refusal":"before-go"}
+    ]},
+    {"name":"kernel: check order, length before unopened-flow: an empty data frame sent on flow 1, flow 1 never opened","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"refuse":{"type":"data","flow":1,"payload":""},"refusal":"length"}
+    ]},
+    {"name":"kernel: check order, length before closed-flow: an empty data frame sent on flow 1, flow 1 retired","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"refuse":{"type":"data","flow":1,"payload":""},"refusal":"length"}
+    ]},
+    {"name":"kernel: check order, length before after-close: an empty data frame sent on flow 1, after the kernel's own close","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"refuse":{"type":"data","flow":1,"payload":""},"refusal":"length"}
+    ]},
+    {"name":"kernel: check order, length before after-end and peer-closed: an empty data frame sent on flow 1, after the kernel's own end, after the mux's close","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"end","flow":1,"payload":""},"wire":"00000000 12 00000001"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"refuse":{"type":"data","flow":1,"payload":""},"refusal":"length"}
+    ]},
+    {"name":"kernel: check order, oversize before unopened-flow: a data frame sent on flow 1 of 5 bytes, flow 1 never opened","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"refuse":{"type":"data","flow":1,"payload":"6161616161"},"refusal":"oversize"}
+    ]},
+    {"name":"kernel: check order, oversize before closed-flow: a data frame sent on flow 1 of 5 bytes, flow 1 retired","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"refuse":{"type":"data","flow":1,"payload":"6161616161"},"refusal":"oversize"}
+    ]},
+    {"name":"kernel: check order, oversize before after-close: a data frame sent on flow 1 of 5 bytes, after the kernel's own close","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"refuse":{"type":"data","flow":1,"payload":"6161616161"},"refusal":"oversize"}
+    ]},
+    {"name":"kernel: check order, oversize before after-end and peer-closed: a data frame sent on flow 1 of 5 bytes, after the kernel's own end, after the mux's close","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"end","flow":1,"payload":""},"wire":"00000000 12 00000001"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"refuse":{"type":"data","flow":1,"payload":"6161616161"},"refusal":"oversize"}
+    ]},
+    {"name":"kernel: check order, after-close before after-end: a data frame sent on flow 1, after the kernel's own end and close","role":"kernel","limits":{"frameMaxBytes":4,"maxFlows":2}, "steps": [
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[{"type":"ready","flow":0,"payload":"6f6b","stale":false}]},
+      {"send":{"type":"go","flow":0,"payload":"00000004 00000002"},"wire":"00000008 02 00000000 00000004 00000002"},
+      {"receive":["00000000 10 00000001"],"frames":[{"type":"open","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"end","flow":1,"payload":""},"wire":"00000000 12 00000001"},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"after-close"}
+    ]},
+    {"name":"mux: the mirror of a flow end to end; go teaches the limits","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001","openFlows":1,"flowsOpened":1},
+      {"send":{"type":"data","flow":1,"payload":"47455420"},"wire":"00000004 11 00000001 47455420"},
+      {"send":{"type":"end","flow":1,"payload":""},"wire":"00000000 12 00000001"},
+      {"receive":["00000002 11 00000001 4f4b","00000000 12 00000001","00000000 13 00000001"],"frames":[{"type":"data","flow":1,"payload":"4f4b","stale":false},{"type":"end","flow":1,"payload":"","stale":false},{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001","openFlows":0},
+      {"send":{"type":"stdout","flow":0,"payload":"6869"},"wire":"00000002 20 00000000 6869"},
+      {"send":{"type":"stderr","flow":0,"payload":"21"},"wire":"00000001 21 00000000 21"},
+      {"send":{"type":"exit","flow":0,"payload":"00"},"wire":"00000001 22 00000000 00"},
+      {"finish":true}
+    ]},
+    {"name":"mux: data and an end the kernel sent before it read the mux's close are stale, not refused","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"receive":["00000002 11 00000001 6162","00000000 12 00000001"],"frames":[{"type":"data","flow":1,"payload":"6162","stale":true},{"type":"end","flow":1,"payload":"","stale":true}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}],"openFlows":0}
+    ]},
+    {"name":"mux: go naming the bounds is accepted","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00100000 00000100"],"frames":[{"type":"go","flow":0,"payload":"00100000 00000100","stale":false}]},
+      {"finish":true}
+    ]},
+    {"name":"mux: go before the mux sent ready","role":"mux", "steps": [
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[],"refusal":"not-ready"}
+    ]},
+    {"name":"mux: the kernel never sends ready","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000002 01 00000000 6f6b"],"frames":[],"refusal":"direction"}
+    ]},
+    {"name":"mux: the kernel never sends open","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000000 10 00000001"],"frames":[],"refusal":"direction"}
+    ]},
+    {"name":"mux: the kernel never sends exit","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000001 22 00000000 00"],"frames":[],"refusal":"direction"}
+    ]},
+    {"name":"mux: data before go","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000001 11 00000001 61"],"frames":[],"refusal":"before-go"}
+    ]},
+    {"name":"mux: go twice","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[],"refusal":"go-twice"}
+    ]},
+    {"name":"mux: a go of seven bytes","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000007 02 00000000 00000004 000000"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"mux: a go naming frameMaxBytes 0","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000000 00000002"],"frames":[],"refusal":"go-value"}
+    ]},
+    {"name":"mux: a go naming frameMaxBytes past 1 MiB","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00100001 00000002"],"frames":[],"refusal":"go-value"}
+    ]},
+    {"name":"mux: a go naming maxFlows 0","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000000"],"frames":[],"refusal":"go-value"}
+    ]},
+    {"name":"mux: a go naming maxFlows 257","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000101"],"frames":[],"refusal":"go-value"}
+    ]},
+    {"name":"mux: kernel data past the frameMaxBytes go named","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000005 11 00000001"],"frames":[],"refusal":"oversize"}
+    ]},
+    {"name":"mux: kernel data on a flow the mux never opened","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000001 11 00000001 61"],"frames":[],"refusal":"unopened-flow"}
+    ]},
+    {"name":"mux: a stream that ends inside a header","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["000000"],"frames":[]},
+      {"finish":true,"refusal":"truncated-header"}
+    ]},
+    {"name":"mux: an unknown type","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000000 7f 00000001"],"frames":[],"refusal":"unknown-type"}
+    ]},
+    {"name":"mux: a go on flow 1","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000001 00000004 00000002"],"frames":[],"refusal":"channel-flow"}
+    ]},
+    {"name":"mux: kernel data on flow 0","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000001 11 00000000 61"],"frames":[],"refusal":"flow-zero"}
+    ]},
+    {"name":"mux: a go of nine bytes","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000009 02 00000000 00000004 00000002 00"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"mux: an empty kernel data frame","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000000 11 00000001"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"mux: a kernel end with a payload","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000001 12 00000001 00"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"mux: a kernel close with a payload","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000001 13 00000001 00"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"mux: kernel data after the kernel's own end","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000000 12 00000001"],"frames":[{"type":"end","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000001 11 00000001 61"],"frames":[],"refusal":"after-end"}
+    ]},
+    {"name":"mux: kernel data after the kernel's own close","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000001 11 00000001 61"],"frames":[],"refusal":"after-close"}
+    ]},
+    {"name":"mux: kernel data on a retired flow","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}],"openFlows":0,"flowsOpened":1},
+      {"receive":["00000001 11 00000001 61"],"frames":[],"refusal":"closed-flow"}
+    ]},
+    {"name":"mux: a stream that ends inside a payload","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 0000"],"frames":[]},
+      {"finish":true,"refusal":"truncated-payload"}
+    ]},
+    {"name":"mux: what the mux sends is held to the rules the kernel applies","role":"mux", "steps": [
+      {"refuse":{"type":"open","flow":1,"payload":""},"refusal":"not-ready"},
+      {"refuse":{"type":"ready","flow":0,"payload":"0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"},"refusal":"length"},
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"refuse":{"type":"ready","flow":0,"payload":"6f6b"},"refusal":"ready-twice"},
+      {"refuse":{"type":"open","flow":1,"payload":""},"refusal":"before-go"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"refuse":{"type":"go","flow":0,"payload":"00000004 00000002"},"refusal":"direction"},
+      {"refuse":{"type":"open","flow":2,"payload":""},"refusal":"flow-order"},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"open","flow":2,"payload":""},"wire":"00000000 10 00000002","openFlows":2,"flowsOpened":2},
+      {"refuse":{"type":"open","flow":3,"payload":""},"refusal":"max-flows"},
+      {"refuse":{"type":"data","flow":1,"payload":"6162636465"},"refusal":"oversize"},
+      {"refuse":{"type":"stdout","flow":0,"payload":"6162636465"},"refusal":"oversize"},
+      {"refuse":{"type":"stderr","flow":0,"payload":"6162636465"},"refusal":"oversize"},
+      {"refuse":{"type":"stdout","flow":1,"payload":"61"},"refusal":"channel-flow"},
+      {"send":{"type":"exit","flow":0,"payload":"89"},"wire":"00000001 22 00000000 89"},
+      {"refuse":{"type":"stdout","flow":0,"payload":"61"},"refusal":"after-exit"},
+      {"refuse":{"type":"open","flow":3,"payload":""},"refusal":"after-exit"},
+      {"send":{"type":"data","flow":1,"payload":"61626364"},"wire":"00000004 11 00000001 61626364"},
+      {"finish":true}
+    ]},
+    {"name":"mux: what the mux sends on a flow is held to the rules the kernel applies","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"refuse":{"type":"open","flow":0,"payload":""},"refusal":"flow-zero"},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"unopened-flow"},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"refuse":{"type":"data","flow":0,"payload":"61"},"refusal":"flow-zero"},
+      {"refuse":{"type":"open","flow":2,"payload":"00"},"refusal":"length"},
+      {"refuse":{"type":"data","flow":1,"payload":""},"refusal":"length"},
+      {"refuse":{"type":"end","flow":1,"payload":"00"},"refusal":"length"},
+      {"refuse":{"type":"close","flow":1,"payload":"00"},"refusal":"length"},
+      {"refuse":{"type":"stderr","flow":0,"payload":""},"refusal":"length"},
+      {"refuse":{"type":"stdout","flow":0,"payload":""},"refusal":"length"},
+      {"refuse":{"type":"exit","flow":0,"payload":""},"refusal":"length"},
+      {"refuse":{"type":"exit","flow":0,"payload":"0000"},"refusal":"length"},
+      {"send":{"type":"data","flow":1,"payload":"61"},"wire":"00000001 11 00000001 61"},
+      {"send":{"type":"end","flow":1,"payload":""},"wire":"00000000 12 00000001"},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"after-end"},
+      {"refuse":{"type":"end","flow":1,"payload":""},"refusal":"after-end"},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001","openFlows":1},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"after-close"},
+      {"refuse":{"type":"end","flow":1,"payload":""},"refusal":"after-close"},
+      {"refuse":{"type":"close","flow":1,"payload":""},"refusal":"after-close"},
+      {"send":{"type":"open","flow":2,"payload":""},"wire":"00000000 10 00000002","openFlows":2},
+      {"receive":["00000000 13 00000002"],"frames":[{"type":"close","flow":2,"payload":"","stale":false}]},
+      {"refuse":{"type":"data","flow":2,"payload":"61"},"refusal":"peer-closed"},
+      {"refuse":{"type":"end","flow":2,"payload":""},"refusal":"peer-closed"},
+      {"send":{"type":"close","flow":2,"payload":""},"wire":"00000000 13 00000002","openFlows":1},
+      {"refuse":{"type":"close","flow":2,"payload":""},"refusal":"closed-flow"},
+      {"refuse":{"type":"data","flow":2,"payload":"61"},"refusal":"closed-flow"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}],"openFlows":0,"flowsOpened":2},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"closed-flow"},
+      {"finish":true}
+    ]},
+    {"name":"mux: check order, unknown-type before not-ready and before-go: an all-zero header, before anything else","role":"mux", "steps": [
+      {"receive":["00000000 00 00000000"],"frames":[],"refusal":"unknown-type"}
+    ]},
+    {"name":"mux: check order, direction before channel-flow and ready-twice: a ready from the kernel, on flow 1","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000000 01 00000001"],"frames":[],"refusal":"direction"}
+    ]},
+    {"name":"mux: check order, direction before flow-zero and flow-order: an open from the kernel, of flow 0","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000000 10 00000000"],"frames":[],"refusal":"direction"}
+    ]},
+    {"name":"mux: check order, channel-flow before go-twice: a second go, on flow 1","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000008 02 00000001 00000004 00000002"],"frames":[],"refusal":"channel-flow"}
+    ]},
+    {"name":"mux: check order, channel-flow before ready-twice: a second ready sent, on flow 1","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"refuse":{"type":"ready","flow":1,"payload":""},"refusal":"channel-flow"}
+    ]},
+    {"name":"mux: check order, flow-zero before not-ready and before-go and closed-flow: kernel data on flow 0 before ready","role":"mux", "steps": [
+      {"receive":["00000001 11 00000000 61"],"frames":[],"refusal":"flow-zero"}
+    ]},
+    {"name":"mux: check order, flow-zero before not-ready and before-go and flow-order: an open sent of flow 0, before ready","role":"mux", "steps": [
+      {"refuse":{"type":"open","flow":0,"payload":""},"refusal":"flow-zero"}
+    ]},
+    {"name":"mux: check order, go-twice before length: a second go, of nine bytes","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000009 02 00000000 00000004 00000002 00"],"frames":[],"refusal":"go-twice"}
+    ]},
+    {"name":"mux: check order, oversize before unopened-flow: kernel data past frameMaxBytes on a flow never opened, a limit","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000005 11 00000001"],"frames":[],"refusal":"oversize"}
+    ]},
+    {"name":"mux: check order, length before after-exit: an exit of two bytes sent after exit","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"exit","flow":0,"payload":"00"},"wire":"00000001 22 00000000 00"},
+      {"refuse":{"type":"exit","flow":0,"payload":"0000"},"refusal":"length"}
+    ]},
+    {"name":"mux: check order, after-exit before flow-order and max-flows: an open sent of the wrong flow id at the cap, after exit","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"open","flow":2,"payload":""},"wire":"00000000 10 00000002"},
+      {"send":{"type":"exit","flow":0,"payload":"00"},"wire":"00000001 22 00000000 00"},
+      {"refuse":{"type":"open","flow":4,"payload":""},"refusal":"after-exit"}
+    ]},
+    {"name":"mux: check order, flow-order before max-flows: an open sent of the wrong flow id at the cap","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"open","flow":2,"payload":""},"wire":"00000000 10 00000002"},
+      {"refuse":{"type":"open","flow":4,"payload":""},"refusal":"flow-order"}
+    ]},
+    {"name":"mux: check order, after-close before after-end: kernel data after the kernel's own end and close","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000000 12 00000001"],"frames":[{"type":"end","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000001 11 00000001 61"],"frames":[],"refusal":"after-close"}
+    ]},
+    {"name":"mux: check order, after-end before peer-closed: a data send after the mux's own end and the kernel's close","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"end","flow":1,"payload":""},"wire":"00000000 12 00000001"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"after-end"}
+    ]},
+    {"name":"mux: check order, direction before not-ready and before-go and length: an open frame from the kernel of flow 1 of 1 byte, before ready","role":"mux", "steps": [
+      {"receive":["00000001 10 00000001 61"],"frames":[],"refusal":"direction"}
+    ]},
+    {"name":"mux: check order, direction before oversize and after-exit: a stdout frame from the kernel of 5 bytes, after exit","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"exit","flow":0,"payload":"00"},"wire":"00000001 22 00000000 00"},
+      {"receive":["00000005 20 00000000 6161616161"],"frames":[],"refusal":"direction"}
+    ]},
+    {"name":"mux: check order, direction before max-flows: an open frame from the kernel of flow 3, at the cap of 2 flows","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"open","flow":2,"payload":""},"wire":"00000000 10 00000002"},
+      {"receive":["00000000 10 00000003"],"frames":[],"refusal":"direction"}
+    ]},
+    {"name":"mux: check order, channel-flow before not-ready and length: an empty go frame from the kernel on flow 1, before ready","role":"mux", "steps": [
+      {"receive":["00000000 02 00000001"],"frames":[],"refusal":"channel-flow"}
+    ]},
+    {"name":"mux: check order, channel-flow before not-ready and go-value: a go frame from the kernel on flow 1 naming frameMaxBytes 0, before ready","role":"mux", "steps": [
+      {"receive":["00000008 02 00000001 00000000 00000002"],"frames":[],"refusal":"channel-flow"}
+    ]},
+    {"name":"mux: check order, flow-zero before not-ready and before-go and length and closed-flow: an empty data frame from the kernel on flow 0, before ready","role":"mux", "steps": [
+      {"receive":["00000000 11 00000000"],"frames":[],"refusal":"flow-zero"}
+    ]},
+    {"name":"mux: check order, flow-zero before oversize and closed-flow: a data frame from the kernel on flow 0 of 5 bytes","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000005 11 00000000 6161616161"],"frames":[],"refusal":"flow-zero"}
+    ]},
+    {"name":"mux: check order, not-ready before before-go and length and unopened-flow: an empty data frame from the kernel on flow 1, before ready, flow 1 never opened","role":"mux", "steps": [
+      {"receive":["00000000 11 00000001"],"frames":[],"refusal":"not-ready"}
+    ]},
+    {"name":"mux: check order, not-ready before go-value: a go frame from the kernel naming frameMaxBytes 0, before ready","role":"mux", "steps": [
+      {"receive":["00000008 02 00000000 00000000 00000002"],"frames":[],"refusal":"not-ready"}
+    ]},
+    {"name":"mux: check order, go-twice before go-value: a second go frame from the kernel naming frameMaxBytes 5, not the channel's 4","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000008 02 00000000 00000005 00000002"],"frames":[],"refusal":"go-twice"}
+    ]},
+    {"name":"mux: check order, before-go before length and unopened-flow: an empty data frame from the kernel on flow 1, between ready and go, flow 1 never opened","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000000 11 00000001"],"frames":[],"refusal":"before-go"}
+    ]},
+    {"name":"mux: check order, length before unopened-flow: an empty data frame from the kernel on flow 1, flow 1 never opened","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"receive":["00000000 11 00000001"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"mux: check order, length before closed-flow: an empty data frame from the kernel on flow 1, flow 1 retired","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"receive":["00000000 11 00000001"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"mux: check order, length before after-close and after-end: an empty data frame from the kernel on flow 1, after the kernel's own end and close","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000000 12 00000001"],"frames":[{"type":"end","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 11 00000001"],"frames":[],"refusal":"length"}
+    ]},
+    {"name":"mux: check order, oversize before closed-flow: a data frame from the kernel on flow 1 of 5 bytes, flow 1 retired","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"receive":["00000005 11 00000001 6161616161"],"frames":[],"refusal":"oversize"}
+    ]},
+    {"name":"mux: check order, oversize before after-close and after-end: a data frame from the kernel on flow 1 of 5 bytes, after the kernel's own end and close","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000000 12 00000001"],"frames":[{"type":"end","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"receive":["00000005 11 00000001 6161616161"],"frames":[],"refusal":"oversize"}
+    ]},
+    {"name":"mux: check order, direction before channel-flow and not-ready and length: an empty go frame sent on flow 1, before ready","role":"mux", "steps": [
+      {"refuse":{"type":"go","flow":1,"payload":""},"refusal":"direction"}
+    ]},
+    {"name":"mux: check order, direction before go-twice and go-value: a second go frame sent naming frameMaxBytes 5, not the channel's 4","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"refuse":{"type":"go","flow":0,"payload":"00000005 00000002"},"refusal":"direction"}
+    ]},
+    {"name":"mux: check order, channel-flow before not-ready and before-go and length: an empty stdout frame sent on flow 1, before ready","role":"mux", "steps": [
+      {"refuse":{"type":"stdout","flow":1,"payload":""},"refusal":"channel-flow"}
+    ]},
+    {"name":"mux: check order, channel-flow before oversize and after-exit: a stdout frame sent on flow 1 of 5 bytes, after exit","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"exit","flow":0,"payload":"00"},"wire":"00000001 22 00000000 00"},
+      {"refuse":{"type":"stdout","flow":1,"payload":"6161616161"},"refusal":"channel-flow"}
+    ]},
+    {"name":"mux: check order, flow-zero before length and after-exit and flow-order and max-flows: an open frame sent of flow 0 of 1 byte, after exit, at the cap of 2 flows","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"open","flow":2,"payload":""},"wire":"00000000 10 00000002"},
+      {"send":{"type":"exit","flow":0,"payload":"00"},"wire":"00000001 22 00000000 00"},
+      {"refuse":{"type":"open","flow":0,"payload":"61"},"refusal":"flow-zero"}
+    ]},
+    {"name":"mux: check order, flow-zero before oversize and closed-flow: a data frame sent on flow 0 of 5 bytes","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"refuse":{"type":"data","flow":0,"payload":"6161616161"},"refusal":"flow-zero"}
+    ]},
+    {"name":"mux: check order, ready-twice before length: a second ready frame sent of 4097 bytes, between ready and go","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"refuse":{"type":"ready","flow":0,"payload":"6161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161"},"refusal":"ready-twice"}
+    ]},
+    {"name":"mux: check order, not-ready before before-go and length and flow-order: an open frame sent of flow 2 of 1 byte, before ready","role":"mux", "steps": [
+      {"refuse":{"type":"open","flow":2,"payload":"61"},"refusal":"not-ready"}
+    ]},
+    {"name":"mux: check order, not-ready before before-go and unopened-flow: a data frame sent on flow 1, before ready, flow 1 never opened","role":"mux", "steps": [
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"not-ready"}
+    ]},
+    {"name":"mux: check order, before-go before length and flow-order: an open frame sent of flow 2 of 1 byte, between ready and go","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"refuse":{"type":"open","flow":2,"payload":"61"},"refusal":"before-go"}
+    ]},
+    {"name":"mux: check order, before-go before unopened-flow: a data frame sent on flow 1, between ready and go, flow 1 never opened","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"before-go"}
+    ]},
+    {"name":"mux: check order, length before flow-order and max-flows: an open frame sent of flow 1 of 1 byte, at the cap of 2 flows","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"open","flow":2,"payload":""},"wire":"00000000 10 00000002"},
+      {"refuse":{"type":"open","flow":1,"payload":"61"},"refusal":"length"}
+    ]},
+    {"name":"mux: check order, length before unopened-flow: an empty data frame sent on flow 1, flow 1 never opened","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"refuse":{"type":"data","flow":1,"payload":""},"refusal":"length"}
+    ]},
+    {"name":"mux: check order, length before closed-flow: an empty data frame sent on flow 1, flow 1 retired","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"refuse":{"type":"data","flow":1,"payload":""},"refusal":"length"}
+    ]},
+    {"name":"mux: check order, length before after-close: an empty data frame sent on flow 1, after the mux's own close","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"refuse":{"type":"data","flow":1,"payload":""},"refusal":"length"}
+    ]},
+    {"name":"mux: check order, length before after-end and peer-closed: an empty data frame sent on flow 1, after the mux's own end, after the kernel's close","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"end","flow":1,"payload":""},"wire":"00000000 12 00000001"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"refuse":{"type":"data","flow":1,"payload":""},"refusal":"length"}
+    ]},
+    {"name":"mux: check order, oversize before after-exit: a stdout frame sent of 5 bytes, after exit","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"exit","flow":0,"payload":"00"},"wire":"00000001 22 00000000 00"},
+      {"refuse":{"type":"stdout","flow":0,"payload":"6161616161"},"refusal":"oversize"}
+    ]},
+    {"name":"mux: check order, oversize before unopened-flow: a data frame sent on flow 1 of 5 bytes, flow 1 never opened","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"refuse":{"type":"data","flow":1,"payload":"6161616161"},"refusal":"oversize"}
+    ]},
+    {"name":"mux: check order, oversize before closed-flow: a data frame sent on flow 1 of 5 bytes, flow 1 retired","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"refuse":{"type":"data","flow":1,"payload":"6161616161"},"refusal":"oversize"}
+    ]},
+    {"name":"mux: check order, oversize before after-close: a data frame sent on flow 1 of 5 bytes, after the mux's own close","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"refuse":{"type":"data","flow":1,"payload":"6161616161"},"refusal":"oversize"}
+    ]},
+    {"name":"mux: check order, oversize before after-end and peer-closed: a data frame sent on flow 1 of 5 bytes, after the mux's own end, after the kernel's close","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"end","flow":1,"payload":""},"wire":"00000000 12 00000001"},
+      {"receive":["00000000 13 00000001"],"frames":[{"type":"close","flow":1,"payload":"","stale":false}]},
+      {"refuse":{"type":"data","flow":1,"payload":"6161616161"},"refusal":"oversize"}
+    ]},
+    {"name":"mux: check order, after-close before after-end: a data frame sent on flow 1, after the mux's own end and close","role":"mux", "steps": [
+      {"send":{"type":"ready","flow":0,"payload":"6f6b"},"wire":"00000002 01 00000000 6f6b"},
+      {"receive":["00000008 02 00000000 00000004 00000002"],"frames":[{"type":"go","flow":0,"payload":"00000004 00000002","stale":false}]},
+      {"send":{"type":"open","flow":1,"payload":""},"wire":"00000000 10 00000001"},
+      {"send":{"type":"end","flow":1,"payload":""},"wire":"00000000 12 00000001"},
+      {"send":{"type":"close","flow":1,"payload":""},"wire":"00000000 13 00000001"},
+      {"refuse":{"type":"data","flow":1,"payload":"61"},"refusal":"after-close"}
+    ]}
+  ]
+}

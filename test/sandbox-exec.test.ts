@@ -38,7 +38,9 @@
 //   capped, and the credential its cut split reaches the log unredacted.
 //   Redact a stream whole rather than its window, and a MiB of BEGIN lines
 //   with no END holds the daemon's event loop for seconds; show a window's
-//   cut side, or a key block its cut splits, and a credential reaches the log.
+//   cut side, or a key block its cut splits, and a credential reaches the log;
+//   read an end window from inside a token's match, and its redaction breaks a
+//   BEGIN the stream's keeps, and that block's body reaches the log.
 //   Quote a key the model sent in a refusal, or bound a failure text by raw
 //   bytes, and tool.result's append throws with tool.call written.
 
@@ -90,6 +92,7 @@ import {
   jwtRunStarts,
   pemEndHolds,
   sandboxToolProblem,
+  tokenFreeStart,
   type SandboxCallContext,
   type SandboxToolsOptions,
 } from '../src/runtime/sandbox-tools.js'
@@ -1783,6 +1786,10 @@ const startHeading = (label: string, shown: number, printed = CAPTURE_MAX_BYTES)
 const startHeadingRe = (label: string, printed = CAPTURE_MAX_BYTES): string =>
   literal(startHeading(label, 0, printed)).replace('redacted: 0 bytes', 'redacted: \\d+ bytes')
 
+/** What an exec shows of its stdout, read by its end: the text after its heading. */
+const shownEnd = (text: string): string | undefined =>
+  /\n--- stdout \(its end, redacted: \d+ bytes, of the \d+ bytes it printed\) ---\n([\s\S]*)\n--- stderr \(0 bytes\) ---\n$/.exec(text)?.[1]
+
 /** The lines of a build, plain text no credential pattern matches. */
 const BUILD_LINES = Array.from({ length: 3_000 }, (_, i) => `line ${String(i)} of the build\n`).join('')
 
@@ -1879,8 +1886,10 @@ test('a private key block a window cut splits is never shown from its marker on,
 test('a stream longer than its window is read by its end, and never shown where the window starts, inside a token or a key block', async (t) => {
   const args = { command: ['make'] }
   // The window's start falls inside a token, which it keeps the last 20
-  // bytes of. Plain output follows, then key blocks redaction shrinks, so
-  // the window fits its share and only its edge keeps the token out.
+  // bytes of, then a run of dots, which a Bearer credential would take too:
+  // it is read from the newline after them, the first character no token
+  // holds. Plain output follows, then key blocks redaction shrinks, so the
+  // window fits its share and is shown from its edge on.
   const token = `ghp_${'Q7xK'.repeat(9)}`
   const tail = `\n${'.'.repeat(17_000)}\n${KEY_BLOCK.repeat(12)}${BUILD_LINES.slice(0, 5_000)}LAST LINE\n`
   const windowStart = STREAM_WINDOW_BYTES - (Buffer.byteLength(tail) + 20)
@@ -1888,7 +1897,8 @@ test('a stream longer than its window is read by its end, and never shown where 
   const stdout = `${BUILD_LINES}${'.'.repeat(100_000)} ${token}${padTo(windowStart, '', '')}${tail}`
   const window = stdout.slice(stdout.length - STREAM_WINDOW_BYTES)
   assert.ok(window.startsWith(token.slice(-20) + '.'), 'the window starts inside the token')
-  const read = redactString(window)
+  const read = redactString(window.slice(window.indexOf('\n')))
+  assert.equal(window.indexOf('\n'), 20 + windowStart, 'read from the newline after the dots')
   assert.ok(Buffer.byteLength(read) < PAYLOAD_TEXT_BUDGET - DESCRIBE_RESERVE - 400, 'the redacted window fits the share')
   const d = direct(t, { exits: [{ exitCode: 1, stdout }] })
   const out = await d.tools.call(ticketFor('run_e', args), args, context('run_e'))
@@ -2043,7 +2053,10 @@ test('a window of -ey runs is withheld and costs milliseconds', async (t) => {
     // -eyA, the second shape: an upper-case letter is a segment character,
     // and a word character to \b, so the run goes on and each -ey starts.
     ['a run of -eyA, read whole', { exitCode: 1, stdout: `FIRST\n${'-eyA'.repeat(18_000)}\nLAST\n` }, 'stdout', 0],
-    ['read by its end', { exitCode: 1, stderr: `${BUILD_LINES}${run(200_000)}\n` }, 'stderr', BUILD_LINES.length + 200_001],
+    // Its window's cut lands in the first run, which every token pattern's
+    // characters make up: it is read from the newline after it, the first
+    // character no token holds, and so holds all of the second.
+    ['read by its end', { exitCode: 1, stderr: `${BUILD_LINES}${run(200_000)}\n${run(60_000)}\n` }, 'stderr', BUILD_LINES.length + 260_002],
     ['read by its end, from the END closing a block its window starts in', { exitCode: 1, stdout: inBlock }, 'stdout', inBlock.length],
     // Its count is what the capture kept: the stream printed at least that.
     ['capped, read by its start', { exitCode: 1, stdout: run(CAPTURE_MAX_BYTES), truncated: true }, 'stdout', CAPTURE_MAX_BYTES, true],
@@ -2066,6 +2079,12 @@ test('a window of -ey runs is withheld and costs milliseconds', async (t) => {
     assert.equal(result?.sha256, sha256Hex(out.text), what)
     for (const row of d.store.query()) assert.ok(Buffer.byteLength(row.payload) <= MAX_LOGGED_OUTPUT, what)
   }
+  // A run past the cut that reaches the stream's end holds no character no
+  // token holds, so none of it is read: nothing is redacted, or shown.
+  const toEnd = `${BUILD_LINES}${run(200_000)}`
+  const e = direct(t, { exits: [{ exitCode: 1, stdout: toEnd }] })
+  const ended = await e.tools.call(ticketFor('run_y', { command: ['make'] }), { command: ['make'] }, context('run_y'))
+  assert.equal(shownEnd(ended.text), '', 'nothing of a run that reaches the end is shown')
   // As many starts as a window may hold is redacted and shown as printed.
   const most = `FIRST\n${'-ey'.repeat(JWT_RUN_STARTS_MAX)}\nLAST\n`
   const d = direct(t, { exits: [{ exitCode: 1, stdout: most }] })
@@ -2155,10 +2174,6 @@ test("a long stream's window that starts inside a key block is read from the fir
   assert.equal(out.text, `${head}\n${endPart('\nLAST\n', late.length)}\n--- stderr (0 bytes) ---\n`)
 })
 
-/** What an exec shows of its stdout, read by its end: the text after its heading. */
-const shownEnd = (text: string): string | undefined =>
-  /\n--- stdout \(its end, redacted: \d+ bytes, of the \d+ bytes it printed\) ---\n([\s\S]*)\n--- stderr \(0 bytes\) ---\n$/.exec(text)?.[1]
-
 test("a long stream's window that starts inside a key block, however the stream's redaction pairs the markers before it, shows none of the block", async (t) => {
   const args = { command: ['make'] }
   const body = `MIIEvQIBADANBgkq${'Z'.repeat(47)}\n`.repeat(1_500)
@@ -2204,7 +2219,181 @@ test("a long stream's window that starts inside a key block, however the stream'
   }
 })
 
-test("over random streams of key blocks and markers that token patterns break, an exec never shows what the stream's redaction hides", async (t) => {
+test("a long stream's window whose cut a token crosses, or follows a word character, is read from the first character at or past the cut that no token holds, and shows only an end of what the stream's redaction shows", async (t) => {
+  const args = { command: ['make'] }
+  const secret = `SECRETBODY${'Q'.repeat(53)}\n`.repeat(600)
+  // A BEGIN inside the block's body, and the block's END after it: redact.ts
+  // pairs the first BEGIN with that END and hides all between.
+  const rest = `${secret}${BEGIN_KEY}\nBODY2\n${END_KEY}\n`
+  // Each row: what stands just before the cut, and the opener the window
+  // starts with. In the stream no token breaks the opener's BEGIN; read from
+  // the cut, a token starts in the window that breaks it, so the window's
+  // redaction pairs the later BEGIN with the END and leaves no END for pemCut
+  // to cut to. A word character before the cut keeps a token from starting
+  // at the window's first character in the stream (every token pattern is
+  // \b-led). A token that crosses the cut, and runs a few bytes past it,
+  // keeps one from starting inside its run in the stream: the token holds
+  // those bytes, and its pattern's search goes on past it, where the
+  // window's starts at the cut and finds a token of a pattern whose turn
+  // comes no earlier, inside the run, that runs on past where the crossing
+  // one ends: a Bearer credential reaches through white space after its
+  // word, and a JWT through dots, which an sk- key, a Slack key or a JWT's
+  // last segment does not take. Reading past the word characters the window
+  // starts with closes only the first kind.
+  const rows: readonly [string, string, string][] = [
+    ['an sk- key after a word character', 'x', `sk-AAAAAAAA${BEGIN_KEY}\n`],
+    ['a Bearer after a word character', 'x', `Bearer ${BEGIN_KEY}\n`],
+    ['a JWT after a word character', 'x', 'eyAAAAAAAAAA.eyBBBBBBBBBB.-----BEGINX PRIVATE KEY-----\n'],
+    ['a Bearer inside a Bearer credential, after a -', `Bearer ${'a'.repeat(20)}`, `aa-Bearer ${BEGIN_KEY}\n`],
+    ['a Bearer inside a Bearer credential, after a .', `Bearer ${'a'.repeat(20)}`, `aa.Bearer ${BEGIN_KEY}\n`],
+    ['a Bearer inside a Bearer credential, after a ~', `Bearer ${'a'.repeat(20)}`, `aa~Bearer ${BEGIN_KEY}\n`],
+    ['a Bearer inside a Bearer credential, after a +', `Bearer ${'a'.repeat(20)}`, `aa+Bearer ${BEGIN_KEY}\n`],
+    ['a Bearer inside a Bearer credential, after a /', `Bearer ${'a'.repeat(20)}`, `aa/Bearer ${BEGIN_KEY}\n`],
+    ["a Bearer inside a Bearer's white space and credential", 'Bearer ', ` aa-Bearer ${BEGIN_KEY}\n`],
+    ['a JWT inside an sk- key', 'sk-AAAAAAAA', 'AA-eyAAAAAAAAAA.eyBBBBBBBBBB.-----BEGINX PRIVATE KEY-----\n'],
+    ['a JWT inside a Slack key', 'xoxb-AAAAAAAAAA', 'AA-eyAAAAAAAAAA.eyBBBBBBBBBB.-----BEGINX PRIVATE KEY-----\n'],
+    ['a JWT inside an app-level Slack key', 'xapp-AAAAAAAAAA', 'AA-eyAAAAAAAAAA.eyBBBBBBBBBB.-----BEGINX PRIVATE KEY-----\n'],
+    ["a JWT inside a JWT's last segment", 'eyAAAAAAAAAA.eyBBBBBBBBBB.CCCC', 'CCCCCC-eyDDDDDDDDDD.eyEEEEEEEEEE.-----BEGINX PRIVATE KEY-----\n'],
+  ]
+  for (const [what, before, opener] of rows) {
+    const window = padTo(STREAM_WINDOW_BYTES, `${opener}${rest}`, 'LAST\n')
+    const stdout = `${'.'.repeat(30_000)}\n${before}${window}`
+    assert.equal(stdout.slice(stdout.length - STREAM_WINDOW_BYTES), window, `${what}: the window starts at the opener`)
+    const whole = redactString(stdout)
+    assert.ok(!whole.includes('SECRETBODY'), `${what}: the stream's redaction hides every SECRETBODY line`)
+    // Read from the cut, the window shows key body past its edge, and holds
+    // no END to cut to; read past the word characters it starts with, so
+    // too, but for a word character before the cut.
+    const shows = (read: string): boolean => !PEM_END.test(read) && read.slice(CAPTURE_EDGE_BYTES).includes('SECRETBODY')
+    assert.ok(shows(redactString(window)), `${what}: read from the cut, the window shows key body`)
+    assert.equal(shows(redactString(window.replace(/^\w+/, ''))), before !== 'x', `${what}: read past the word characters it starts with`)
+    const d = direct(t, { exits: [{ exitCode: 1, stdout }] })
+    const out = await d.tools.call(ticketFor('run_w', args), args, context('run_w'))
+    const shown = shownEnd(out.text)
+    assert.ok(!out.text.includes('SECRETBODY'), `${what}: no SECRETBODY line is shown`)
+    assert.ok(!JSON.stringify(payloads(d.store, 'tool.result')).includes('SECRETBODY'), `${what}: none is logged`)
+    assert.ok(shown !== undefined && shown.endsWith('LAST\n'), `${what}: the end is shown`)
+    assert.ok(whole.endsWith(shown), `${what}: what is shown is an end of what the stream's redaction shows`)
+  }
+  // Where the window is read from: the cut when the character before it is
+  // one no token holds, or the character after it is, and else the first
+  // such character past it. A space or a newline is none a token holds, but
+  // for white space just after a Bearer, which its \s+ takes. Key blocks
+  // shrink the window to fit its share, so it is shown from its edge on.
+  const plain = (lead: string): string => padTo(STREAM_WINDOW_BYTES, `${lead}${'.'.repeat(CAPTURE_EDGE_BYTES - 1)}SHOWN\n`, `${KEY_BLOCK.repeat(3)}LAST\n`)
+  const reads: readonly [string, string, string, boolean][] = [
+    // What stands before the cut, the window's first character, and whether
+    // it is read from the cut.
+    ['a word character, then a space', 'x', ' ', true],
+    ['a word character, then a newline', 'x', '\n', true],
+    ['a space, then a word character', ' ', 'x', true],
+    ['a newline, then a -', '\n', '-', true],
+    ['a comma, then a word character', ',', 'x', true],
+    ['a word character, then a -', 'x', '-', false],
+    ['a word character, then a .', 'x', '.', false],
+    // Bearer's \s+ takes the space after the cut, and its credential the
+    // dots and SHOWN: the stream's redaction hides them.
+    ['a Bearer, then a space', 'Bearer', ' ', false],
+    ['a Bearer and a newline, then a space', 'Bearer\n', ' ', false],
+  ]
+  for (const [what, before, lead, fromCut] of reads) {
+    const window = plain(lead)
+    const stdout = `${BUILD_LINES}${before}${window}`
+    const d = direct(t, { exits: [{ exitCode: 1, stdout }] })
+    const out = await d.tools.call(ticketFor('run_w', args), args, context('run_w'))
+    const shown = shownEnd(out.text)
+    // Read from past the cut, it is read from the newline after SHOWN.
+    const from = fromCut ? window : window.slice(window.indexOf('\n', 1))
+    assert.equal(shown, redactString(from).slice(CAPTURE_EDGE_BYTES), what)
+    assert.equal(shown?.startsWith('SHOWN\n'), fromCut, what)
+    assert.ok(redactString(stdout).endsWith(shown), `${what}: what is shown is an end of what the stream's redaction shows`)
+  }
+})
+
+test("an end window is read from where no match of redact.ts's token patterns runs across, so they read the stream there as they read its two sides apart", () => {
+  // tokenFreeStart's characters are read off these patterns: one added to
+  // redact.ts, or changed, must be read again before this pin moves.
+  assert.deepEqual(
+    TOKEN_PATTERNS.filter((re) => !re.source.includes('PRIVATE KEY')).map((re) => `/${re.source}/${re.flags}`),
+    [
+      '/\\bBearer\\s+[A-Za-z0-9._~+/-]+=*/g',
+      '/\\bsk-(?:ant-)?[A-Za-z0-9_-]{8,}/g',
+      '/\\bgh[pousr]_[A-Za-z0-9]{20,}/g',
+      '/\\bgithub_pat_[A-Za-z0-9_]{20,}/g',
+      '/\\bxox[abeprs]-[A-Za-z0-9-]{10,}/g',
+      '/\\bxapp-[A-Za-z0-9-]{10,}/g',
+      '/\\b(?:AKIA|ASIA)[A-Z2-7]{16}\\b/g',
+      '/\\bey[A-Za-z0-9_-]{10,}\\.ey[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\b/g',
+    ],
+  )
+  // No PEM marker in any of these, so redactString is the token patterns'
+  // pass alone. Split at the place tokenFreeStart gives, each side redacted
+  // apart reads as the whole does; split at the cut itself, often not.
+  const splitHolds = (text: string, at: number): boolean => redactString(text) === redactString(text.slice(0, at)) + redactString(text.slice(at))
+  const rows: readonly [string, string, string, boolean][] = [
+    // Before the cut, after it, and whether it is read from past the cut,
+    // where a split at the cut does not hold.
+    ['a Bearer credential, a Bearer inside it', `Bearer ${'a'.repeat(20)}`, 'aa-Bearer -----BEGIN x', true],
+    ["a Bearer's white space", 'Bearer ', ' aa-Bearer xyz==', true],
+    ["a Bearer's white space across a newline", 'Bearer\n', '  tok.en/x+y~z= more', true],
+    ['a JWT inside an sk- key', 'sk-AAAAAAAA', 'AA-eyAAAAAAAAAA.eyBBBBBBBBBB.CCCCCCCCCCCC done', true],
+    ["a JWT inside a JWT's last segment", 'eyAAAAAAAAAA.eyBBBBBBBBBB.CCCC', 'CCCCCC-eyDDDDDDDDDD.eyEEEEEEEEEE.FFFFFFFFFFFF ok', true],
+    ['a word character, then an sk- key', 'x', 'sk-AAAAAAAAAAAA, then', true],
+    // A character no token holds starts the window: it is read from the cut.
+    ['an astral character first', 'abc', '😀sk-AAAAAAAAAAAA', false],
+  ]
+  for (const [what, before, after, past] of rows) {
+    const text = `start ${before}${after}`
+    const cut = text.length - after.length
+    const at = tokenFreeStart(text, cut)
+    assert.equal(at > cut, past, `${what}: read from past the cut`)
+    assert.equal(splitHolds(text, cut), !past, `${what}: split at the cut`)
+    assert.ok(splitHolds(text, at), `${what}: split where it is read from, at ${String(at - cut)}`)
+  }
+  // The cut itself, when the character before it, or the one at it, is one
+  // no token holds; the stream's end when no such character follows.
+  for (const [text, cut, at] of [
+    ['abc def', 4, 4],
+    ['abc def', 3, 3],
+    ['abc,def', 5, 7],
+    ['abc€def', 4, 4],
+    ['Bearer  def', 7, 11],
+    ['Bearer  def', 8, 11],
+    ['Bearer x def', 8, 8],
+    ['xBearer  def', 8, 12],
+    ['ab😀cd', 2, 2],
+    ['abcdef', 3, 6],
+    ['', 0, 0],
+  ] as const) {
+    assert.equal(tokenFreeStart(text, cut), at, `${JSON.stringify(text)} at ${String(cut)}`)
+  }
+  // Over every mix of the pieces tokens are made of, at every cut: the place
+  // it is read from lies at or past the cut, on a character's start, and the
+  // split there holds.
+  const pieces = ['Bearer', ' ', '\n', '\t', ' ', ' ', 'sk-', 'ant-', 'xoxb-', 'xapp-', 'ghp_', 'github_pat_', 'AKIA', 'ASIA', 'ey', 'eyAAAAAAAAAA.', 'ABCDEFGHIJKLMNOP', 'abcdefghij', '0123', '.', '-', '_', '=', '~', '+', '/', ',', ':', '"', 'é', '😀', '[', ']']
+  let seed = 19
+  let failsAtCut = 0
+  for (let n = 0; n < 1_500; n++) {
+    let text = ''
+    for (let i = 0; i < 14; i++) {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648
+      text += pieces[seed % pieces.length] ?? ''
+    }
+    for (let cut = 0; cut <= text.length; cut++) {
+      const low = text.charCodeAt(cut)
+      if (low >= 0xdc00 && low <= 0xdfff) continue
+      const at = tokenFreeStart(text, cut)
+      assert.ok(at >= cut && at <= text.length, JSON.stringify(text))
+      const split = text.charCodeAt(at)
+      assert.ok(!(split >= 0xdc00 && split <= 0xdfff), `split inside a character: ${JSON.stringify(text)} at ${String(at)}`)
+      assert.ok(splitHolds(text, at), `${JSON.stringify(text)}, cut at ${String(cut)}, read from ${String(at)}`)
+      if (!splitHolds(text, cut)) failsAtCut += 1
+    }
+  }
+  assert.ok(failsAtCut > 1_000, `${String(failsAtCut)} cuts at which the split does not hold`)
+})
+
+test("over random streams of key blocks and markers that token patterns break, cut anywhere, just before a token's prefix, or inside a token that crosses the cut, an exec shows only an end of what the stream's redaction shows, and no line it hides", async (t) => {
   const pieces = [
     `${BEGIN_KEY}\n`,
     `${END_KEY}\n`,
@@ -2221,39 +2410,132 @@ test("over random streams of key blocks and markers that token patterns break, a
     'sk-AAAAAAAA-----BEGIN PRIVATE KEY-----\n',
     `-----BEGIN AKIAABCDEFGHIJKLMNOP -----BEGIN PRIVATE KEY-----${'A'.repeat(50)} -----END Q PRIVATE KEY-----\n`,
   ]
+  // Pieces led by a token's prefix whose run breaks the BEGIN after it, and
+  // the characters a window's cut may follow just before one: a word
+  // character, after which no token starts in the stream, or another.
+  const openers = [
+    'sk-AAAAAAAA-----BEGIN PRIVATE KEY-----\n',
+    `Bearer ${BEGIN_KEY}\n`,
+    'eyAAAAAAAAAA.eyBBBBBBBBBB.-----BEGINX PRIVATE KEY-----\n',
+    'xoxb-AAAAAAAAAA-----BEGIN PRIVATE KEY-----\n',
+    'xapp-AAAAAAAAAA-----BEGIN RSA PRIVATE KEY-----\n',
+  ]
+  const leads = ['x', '7', '_', 'Q', '-', '.', ' ', '\n']
   let seed = 3
   const rnd = (n: number): number => {
     seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648
     return seed % n
   }
   const args = { command: ['make'] }
-  let cases = 0
-  let hidden = 0
-  for (let n = 0; n < 600; n++) {
-    // Numbered sentinel lines between the pieces, each a line the stream's
-    // redaction either hides or leaves whole.
-    let stdout = `${'f'.repeat(1_000)}\n`
-    let sentinels = 0
-    const count = 30 + rnd(40)
-    for (let i = 0; i < count; i++) {
-      stdout += pieces[rnd(pieces.length)] ?? ''
-      const lines = 1 + rnd(8)
-      for (let j = 0; j < lines; j++) stdout += `S${String(sentinels++).padStart(5, '0')}${'q'.repeat(1_500)}\n`
-    }
-    stdout += 'LAST\n'
-    if (Buffer.byteLength(stdout) <= STREAM_WINDOW_BYTES) continue
-    cases += 1
+  // Numbered sentinel lines between the pieces, each a line the stream's
+  // redaction either hides or leaves whole.
+  let sentinels = 0
+  const piece = (from: readonly string[], lines = 1 + rnd(8)): string => {
+    let text = from[rnd(from.length)] ?? ''
+    for (let j = 0; j < lines; j++) text += `S${String(sentinels++).padStart(5, '0')}${'q'.repeat(1_500)}\n`
+    return text
+  }
+  // How many sentinels the stream's redaction hides, each checked unshown,
+  // and what is shown checked to be an end of what it shows.
+  const hiddenIn = async (what: string, stdout: string): Promise<number> => {
     const whole = redactString(stdout)
     const d = direct(t, { exits: [{ exitCode: 1, stdout }] })
     const out = await d.tools.call(ticketFor('run_k', args), args, context('run_k'))
+    const shown = shownEnd(out.text)
+    assert.ok(shown !== undefined && whole.endsWith(shown), `${what}: what is shown is not an end of what the stream's redaction shows`)
+    let hidden = 0
     for (let k = 0; k < sentinels; k++) {
       const tag = `S${String(k).padStart(5, '0')}`
       if (whole.includes(tag)) continue
       hidden += 1
-      assert.ok(!out.text.includes(tag), `case ${String(n)}: ${tag}, which the stream's redaction hides, is shown`)
+      assert.ok(!out.text.includes(tag), `${what}: ${tag}, which the stream's redaction hides, is shown`)
     }
+    return hidden
+  }
+  let cases = 0
+  let hidden = 0
+  for (let n = 0; n < 600; n++) {
+    sentinels = 0
+    let stdout = `${'f'.repeat(1_000)}\n`
+    const count = 30 + rnd(40)
+    for (let i = 0; i < count; i++) stdout += piece(pieces)
+    stdout += 'LAST\n'
+    if (Buffer.byteLength(stdout) <= STREAM_WINDOW_BYTES) continue
+    cases += 1
+    hidden += await hiddenIn(`case ${String(n)}`, stdout)
   }
   assert.ok(cases > 400 && hidden > 5_000, `${String(cases)} cases, ${String(hidden)} hidden sentinels`)
+  // The window's cut placed: a lead, then the window, an opener first, as
+  // much as 45 KB of lines after it, and a few pieces after those or as many
+  // as fit, padded to exactly STREAM_WINDOW_BYTES. A token that starts at
+  // the window's first character where the stream's starts none breaks the
+  // opener's BEGIN, and the block it opens would be shown past the edge when
+  // a later BEGIN takes its END and no END is left after.
+  let placed = 0
+  for (let n = 0; n < 300; n++) {
+    sentinels = 0
+    let before = `${'f'.repeat(1_000)}\n`
+    const count = 5 + rnd(20)
+    for (let i = 0; i < count; i++) before += piece(pieces)
+    const lead = leads[rnd(leads.length)] ?? ''
+    let window = piece(openers, 1 + rnd(30))
+    for (let more = rnd(2) === 0 ? 1 + rnd(3) : Infinity; more > 0; more--) {
+      const numbered = sentinels
+      const next = piece(pieces)
+      if (Buffer.byteLength(window + next) > STREAM_WINDOW_BYTES - 5) {
+        sentinels = numbered
+        break
+      }
+      window += next
+    }
+    window = padTo(STREAM_WINDOW_BYTES, window, 'LAST\n')
+    const stdout = `${before}${lead}${window}`
+    assert.equal(stdout.slice(stdout.length - STREAM_WINDOW_BYTES), window)
+    placed += await hiddenIn(`placed case ${String(n)}, after ${JSON.stringify(lead)}`, stdout)
+  }
+  assert.ok(placed > 1, `${String(placed)} hidden sentinels in placed cases`)
+  // The window's cut placed inside a token that crosses it, a few of its
+  // bytes in the window: then a character the token may take, then an
+  // opener. The crossing token holds those bytes, so the stream's patterns
+  // start none inside them; a window read from its cut may start one there,
+  // which runs on past where the crossing token ends and breaks the opener's
+  // BEGIN.
+  const crossing: readonly [string, string][] = [
+    // The token's bytes before the cut, and after it.
+    [`Bearer ${'a'.repeat(20)}`, 'aa'],
+    ['Bearer ', ' aa'],
+    ['Bearer\n', ' '],
+    ['sk-AAAAAAAA', 'AA'],
+    ['xoxb-AAAAAAAAAA', 'AA'],
+    ['xapp-AAAAAAAAAA', 'AA'],
+    ['eyAAAAAAAAAA.eyBBBBBBBBBB.CCCC', 'CCCCCC'],
+    [`ghp_${'A'.repeat(20)}`, 'AA'],
+  ]
+  const joins = ['-', '.', '~', '+', '/', '_', '=', '', ' ', '\n']
+  let crossed = 0
+  for (let n = 0; n < 300; n++) {
+    sentinels = 0
+    let before = `${'f'.repeat(1_000)}\n`
+    const count = 5 + rnd(20)
+    for (let i = 0; i < count; i++) before += piece(pieces)
+    const [head, rest] = crossing[rnd(crossing.length)] ?? ['', '']
+    const join = joins[rnd(joins.length)] ?? ''
+    let window = `${rest}${join}${piece(openers, 1 + rnd(30))}`
+    for (let more = rnd(2) === 0 ? 1 + rnd(3) : Infinity; more > 0; more--) {
+      const numbered = sentinels
+      const next = piece(pieces)
+      if (Buffer.byteLength(window + next) > STREAM_WINDOW_BYTES - 5) {
+        sentinels = numbered
+        break
+      }
+      window += next
+    }
+    window = padTo(STREAM_WINDOW_BYTES, window, 'LAST\n')
+    const stdout = `${before}${head}${window}`
+    assert.equal(stdout.slice(stdout.length - STREAM_WINDOW_BYTES), window)
+    crossed += await hiddenIn(`crossed case ${String(n)}, ${JSON.stringify(head)} and ${JSON.stringify(rest + join)}`, stdout)
+  }
+  assert.ok(crossed > 1, `${String(crossed)} hidden sentinels in crossed cases`)
 })
 
 test("the walk of a long stream's markers is linear: a MiB of BEGINs, ENDs, or BEGINs holding ENDs costs milliseconds", async (t) => {
@@ -2279,7 +2561,11 @@ test("the walk of a long stream's markers is linear: a MiB of BEGINs, ENDs, or B
 
 test('a stream of exactly STREAM_WINDOW_BYTES is read whole, and one byte more by its window', async (t) => {
   for (const bytes of [STREAM_WINDOW_BYTES, STREAM_WINDOW_BYTES + 1]) {
-    const d = direct(t, { exits: [{ exitCode: 1, stdout: 'o'.repeat(bytes) }] })
+    // Lines, so a window cut inside one is read from its end, 62 bytes on:
+    // a window of letters alone, which every token pattern's characters
+    // make up, would be read from the stream's end, and show nothing.
+    const stdout = `${'o'.repeat(63)}\n`.repeat(Math.ceil(bytes / 64)).slice(0, bytes)
+    const d = direct(t, { exits: [{ exitCode: 1, stdout }] })
     const args = { command: ['make'] }
     const out = await d.tools.call(ticketFor('run_x', args), args, context('run_x'))
     const heading =
@@ -2292,7 +2578,7 @@ test('a stream of exactly STREAM_WINDOW_BYTES is read whole, and one byte more b
     const whole = payloads(d.store, 'tool.result')[0]?.bytes
     const head = Buffer.byteLength(out.text.slice(0, out.text.indexOf('\n--- stdout')))
     if (bytes === STREAM_WINDOW_BYTES) assert.ok(typeof whole === 'number' && whole > head + bytes, String(whole))
-    else assert.ok(typeof whole === 'number' && whole < head + bytes - CAPTURE_EDGE_BYTES + 200, String(whole))
+    else assert.ok(typeof whole === 'number' && Math.abs(whole - (head + bytes - CAPTURE_EDGE_BYTES)) < 200, String(whole))
   }
 })
 
@@ -2360,7 +2646,7 @@ test('a driver whose kill refuses with a long text of quotes still gets its tool
   }
 })
 
-test("a driver's text of exactly DRIVER_TEXT_BYTES payload bytes is shown whole, and one of a byte more is cut and said to be", async (t) => {
+test("a driver's text of exactly DRIVER_TEXT_BYTES payload bytes is shown whole, and one of a byte more is redacted, then cut and said to be", async (t) => {
   const refusing = (text: string) => (base: FakeSandbox): SandboxDriver => withKill(base, () => Promise.reject(new Error(text)))
   const signalling = (text: string) => (base: FakeSandbox): SandboxDriver => ({
     name: base.name,
@@ -2378,6 +2664,9 @@ test("a driver's text of exactly DRIVER_TEXT_BYTES payload bytes is shown whole,
     ['x one past it', 'x'.repeat(DRIVER_TEXT_BYTES + 1), `${'x'.repeat(DRIVER_TEXT_BYTES)} [cut: ${String(DRIVER_TEXT_BYTES + 1)} bytes in all]`],
     ['quotes at the bound', '"'.repeat(DRIVER_TEXT_BYTES / 2), '"'.repeat(DRIVER_TEXT_BYTES / 2)],
     ['quotes one past it', '"'.repeat(DRIVER_TEXT_BYTES / 2 + 1), `${'"'.repeat(DRIVER_TEXT_BYTES / 2)} [cut: ${String(DRIVER_TEXT_BYTES / 2 + 1)} bytes in all]`],
+    // Redacted, then cut: cut first, the bound would leave sk- and six
+    // characters, too few for the pattern when boundOutput redacts again.
+    ['a key across the bound', `${'x'.repeat(DRIVER_TEXT_BYTES - 10)} sk-${'A'.repeat(20)}`, `${'x'.repeat(DRIVER_TEXT_BYTES - 10)} [REDACTED [cut: ${String(DRIVER_TEXT_BYTES + 1)} bytes in all]`],
   ]
   for (const [what, text, shown] of rows) {
     for (const [how, make, said] of [
@@ -2389,6 +2678,7 @@ test("a driver's text of exactly DRIVER_TEXT_BYTES payload bytes is shown whole,
       const out = await toolsOver(d, make(d.driver)).call(ticketFor('run_q', args), args, context('run_q'))
       assert.ok(out.text.includes(said), `${what}, ${how}: ${out.text.slice(0, 900)}`)
       assert.equal(out.text.includes('[cut:'), shown.includes('[cut:'), `${what}, ${how}`)
+      assert.ok(!out.text.includes('sk-'), `${what}, ${how}: part of a key is shown`)
     }
   }
 })
@@ -2429,6 +2719,14 @@ test("an END is taken to close a block only when no token pattern can break it, 
   ]
   for (const [what, before, holds] of rows) {
     assert.equal(pemEndHolds(before + END_KEY, before.length, END_KEY), holds, what)
+  }
+  // Each character a Bearer credential takes that no other token's run
+  // does, and two that others take too: Bearer's run reaches through it into
+  // the END and breaks it, so it is never taken to hold.
+  for (const ch of ['+', '~', '/', '_', '-']) {
+    const text = `Bearer abc${ch}${END_KEY}`
+    assert.equal(survives(text), false, `${ch}: redact.ts breaks it`)
+    assert.equal(pemEndHolds(text, text.length - END_KEY.length, END_KEY), false, `${ch}: taken to hold`)
   }
   assert.equal(pemEndHolds(markers[4] ?? '', 0, markers[4] ?? ''), false, 'an AWS key id inside it')
   // Never taken to hold where redact.ts breaks it: over every mix of the

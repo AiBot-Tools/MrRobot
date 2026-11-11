@@ -738,27 +738,34 @@ other's: the JWT pattern's is quadratic in a run of `-ey`, some 2 s over one
 window, so a window holding a run of letters, digits, `-` and `_` in which it
 starts at more than 16 places is withheld before any redaction reads it, the
 stream's byte count (what its capture kept, for one the driver capped) said in
-its place. A window is never shown on the side its cut is on, as that cut,
-like the driver's, is made before redaction and may split a credential: not
-the 16 KiB there, nor anything past a private key block's marker whose other
-marker the cut left out. A window whose start a key block may hold, however
-the stream's redaction pairs its markers, is shown from where the blocks that
-may hold it end instead, and not at all when none ends: all before that may be
-a block's body. Those blocks are read as a union, not as one pairing: every
-BEGIN, one inside another marker included, held open to the first END after it
-that no token pattern, run first, can break (one holding an AWS key id, or one
-a token runs into), and the blocks that overlap taken as one. A window that
-redaction shrinks is shown less of, never more.
-A result that shows a stream by its window, or withholds one, is marked
+its place. A window is never shown on the side its cut is on, as that cut, like
+the driver's, is made before redaction and may split a credential: not the 16
+KiB there, nor anything past a private key block's marker whose other marker the
+cut left out. An end window is read from its cut, or, when a token's match may
+hold the character before it, from the first character past it that none may
+hold, none of what that skips shown: no token pattern's match runs across where
+it is read from, so its redaction matches each token the stream's matches there
+and no other, and breaks no marker the stream's keeps, nor keeps one it breaks.
+A window whose start a key block may hold, however the stream's redaction pairs
+its markers, is shown from where the blocks that may hold it end instead, and
+not at all when none ends: all before that may be a block's body. Those blocks
+are read as a union, not as one pairing: every BEGIN, one inside another marker
+included, held open to the first END after it that no token pattern, run first,
+can break (one holding an AWS key id, or one a token runs into), and the blocks
+that overlap taken as one. So an end window shows an end of what a redaction of
+the whole stream shows, and no more. None of this follows a value the kernel's
+own mask holds, which no worker holds, nor, at a start window's cut, a token of
+a shape with an unbounded part that crosses it and runs on more than 16 KiB
+before it. A window that redaction shrinks is shown less of, never more. A
+result that shows a stream by its window, or withholds one, is marked
 `truncated`, and `tool.result`'s `bytes` and `sha256` are of what it shows
 before a stream is cut to its share, redacted: the windows short of their cut
-sides, not the streams. Only a
-worker with a `sandbox:` block at tier 2 or more may list it; the registry
-refuses it in any other manifest, at load and in a spawned child, and no MCP
-server may be named `sandbox` or `kernel`. The runner
+sides, not the streams. Only a worker with a `sandbox:` block at tier 2 or more
+may list it; the registry refuses it in any other manifest, at load and in a
+spawned child, and no MCP server may be named `sandbox` or `kernel`. The runner
 (`src/runtime/sandbox-tools.ts`) is built and tested against the fake driver,
-and not yet wired into the daemon (egress plan
-W1); no shipped manifest lists it.
+and not yet wired into the daemon (egress plan W1); no shipped manifest lists
+it.
 
 ### Goals
 
@@ -910,7 +917,11 @@ It exits 0 only when every mutant is **killed**, every suite's comment-only
 not a kill (a hang is a test with no bound), and a mutant that leaves the file
 unparseable or stops the test files loading is **invalid**, never a kill.
 
-It edits the working tree (src/ and two test helpers), so:
+It edits the working tree, in the files its mutants name: those under `src/`,
+six helpers under `test/helpers/`, and `images/worker/mux.mjs`,
+`scripts/falsify.ts`, `scripts/falsify/runner.ts`, `scripts/worker-image.ts`,
+`test/egress-address.test.ts`, `test/egress-frame.test.ts` and
+`test/hygiene.test.ts`. So:
 
 - it refuses a file with uncommitted changes (`--allow-dirty` to override);
 - it holds `.falsify/lock.json` for the whole run, naming its pid and that

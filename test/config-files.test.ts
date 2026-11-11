@@ -55,6 +55,7 @@ import { DENY_KEYS, TOKEN_PATTERNS } from '../src/events/redact.js'
 import { APPROVAL_PREVIEW_BYTES } from '../src/policy/engine.js'
 import { CAPTURE_EDGE_BYTES, DOCKER_CLI_FAILED, JWT_RUN_STARTS_MAX, KILL_WAIT_MS, STREAM_WINDOW_BYTES } from '../src/runtime/sandbox-tools.js'
 import { CAPTURE_MAX_BYTES } from '../src/sandbox/driver.js'
+import { CATALOG } from '../scripts/falsify/catalog.js'
 import { WORKSPACE_TARGET } from '../src/sandbox/docker.js'
 import { FORCE_QUIT_LOG, PMMCP_OLLAMA_NAMES } from '../scripts/install/force-quit.js'
 import { DOCKER_NAMES } from '../scripts/install/preflight.js'
@@ -763,12 +764,16 @@ interface CommandWord {
  * transformation (@P expands a prompt string, a $(...) in it included),
  * indirection, an offset or a default, a subscript other than digits (a
  * length's, ${#name[...]}, and an array element's assignment's, name[...]=,
- * included), and an arithmetic comparison inside [[ ]] (-eq, -ne, -lt, -le,
- * -gt, -ge) of an operand other than digits or $#: bash evaluates an offset,
- * a subscript and those operands as arithmetic, and a value a[$(...)] runs
- * the substitution. A builtin that takes a name with a subscript (local,
- * read, unset, printf -v) is held by the pin on BINDS's lines, and test -v,
- * which also reads one, is no command the script may run.
+ * included), an arithmetic comparison inside [[ ]] (-eq, -ne, -lt, -le, -gt,
+ * -ge) of an operand other than digits or $#, and a -v inside [[ ]] of an
+ * operand other than a plain name: bash evaluates an offset, a subscript and
+ * those operands as arithmetic, and -v's operand as a name whose subscript
+ * it evaluates so, and a value a[$(...)] runs the substitution. No other
+ * operator of [[ ]] evaluates its operand so (bash 5.2.21, each tried on
+ * that value: -t reads a number, -R and -o a name, the rest a string or a
+ * path). A builtin that takes a name with a subscript (local, read, unset,
+ * printf -v) is held by the pin on BINDS's lines, and test and [, whose -v
+ * reads one too, are no commands the script may run.
  */
 function bashCommands(code: readonly string[]): { readonly words: readonly CommandWord[]; readonly unread: readonly string[] } {
   const words: CommandWord[] = []
@@ -988,6 +993,10 @@ function bashCommands(code: readonly string[]): { readonly words: readonly Comma
             // -eq and its kin evaluate both operands as arithmetic, which
             // runs a value a[$(...)] as code: only digits and $# are read.
             for (const [k, op] of operands.entries()) {
+              // -v reads its operand as a name, and a subscript in it, or in
+              // the value it expands to, as arithmetic: only a plain name is
+              // read, with no $ or subscript.
+              if (op === '-v' && !/^[A-Za-z_]\w*$/.test(operands[k + 1] ?? '')) note('-v of an operand that is not a plain name')
               if (!ARITHMETIC_TEST.has(op)) continue
               const plain = [operands[k - 1], operands[k + 1]].every((o) => o !== undefined && /^(?:\d+|\$#)$/.test(o))
               if (!plain) note(`an arithmetic comparison (${op}) of an operand that is not digits or $#`)
@@ -1366,6 +1375,9 @@ test("scripts/build-worker-image.sh is executable and NEEDS VALIDATION, asks doc
     // reading once skipped whole: both are arithmetic to bash.
     ['P14, a length of a subscript runs a value', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nout=\'a[$(cp /tmp/evil/Dockerfile images/worker/Dockerfile)]\'\nout="${#BASH_SOURCE[$out]}"\n', ['a construct the command reading does not follow']],
     ["P15, an array element's assignment runs a value", 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nout=\'a[$(cp /tmp/evil/Dockerfile images/worker/Dockerfile)]\'\nout[$out]=1\n', ['a construct the command reading does not follow']],
+    // -v inside [[ ]] reads its operand as a name, a subscript evaluated as
+    // arithmetic among it: a value a[$(...)] runs the substitution.
+    ['P16, -v in a condition runs a value', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nout=\'a[$(cp /tmp/evil/Dockerfile images/worker/Dockerfile)]\'\n[[ ! -v $out ]] || exit 1\n', ['a construct the command reading does not follow']],
     // mkdir -v prints to stdout, which carries the id alone.
     ['M1, mkdir -pv', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -pv "${AOS_DOCKER_CONFIG}"\n', ['mkdir, exactly as pinned']],
   ]
@@ -1804,6 +1816,13 @@ test("README's agents section: 'Both carry' follows the paragraph on the two shi
     `Of each stream the runner reads and redacts at most ${String(STREAM_WINDOW_BYTES / 1_024)} KiB (the largest share and ${String(CAPTURE_EDGE_BYTES / 1_024)} KiB more):`,
     `all of a shorter one, the end of a longer one, and the start of one the driver capped at ${String(CAPTURE_MAX_BYTES / 1_048_576)} MiB,`,
     `not the ${String(CAPTURE_EDGE_BYTES / 1_024)} KiB there, nor anything past a private key block's marker whose other marker the cut left out.`,
+    // Read from inside a token's match, a window's redaction can start a
+    // token the stream's does not, one that breaks a BEGIN the stream's
+    // keeps: past a word character, or inside a token that crosses the cut.
+    "An end window is read from its cut, or, when a token's match may hold the character before it, from the first character past it that none may hold, none of what that skips shown: no token pattern's match runs across where it is read from, so its redaction matches each token the stream's matches there and no other, and breaks no marker the stream's keeps, nor keeps one it breaks.",
+    'So an end window shows an end of what a redaction of the whole stream shows, and no more.',
+    // What the windows do not follow, said rather than claimed away.
+    `None of this follows a value the kernel's own mask holds, which no worker holds, nor, at a start window's cut, a token of a shape with an unbounded part that crosses it and runs on more than ${String(CAPTURE_EDGE_BYTES / 1_024)} KiB before it.`,
     "A window whose start a key block may hold, however the stream's redaction pairs its markers, is shown from where the blocks that may hold it end instead, and not at all when none ends: all before that may be a block's body.",
     // A union, not one chain: a chain that an END the walk refuses and
     // redact.ts keeps leaves open closes on an END inside the next BEGIN.
@@ -1821,6 +1840,40 @@ test("README's agents section: 'Both carry' follows the paragraph on the two shi
   assert.doesNotMatch(sandbox, /never approves a command/)
   // Nor that the kill's bound frees a run whose driver never answers.
   assert.doesNotMatch(sandbox, /a daemon that never answers cannot hold/)
+  // Nor that skipping the word characters a window starts with is enough: a
+  // token that crosses the cut can still start one inside its run.
+  assert.doesNotMatch(sandbox, /past the word characters/)
+})
+
+/**
+ * The sentence README's mutation catalog section says the run edits with:
+ * every file a mutant or a control in `catalog` names, those under src/ as one
+ * directory and those under test/helpers/ by their count.
+ */
+function falsifyEditsSentence(catalog: typeof CATALOG): string {
+  const files = [...new Set(catalog.flatMap((suite) => [...suite.mutants, suite.control].map((mutant) => mutant.file)))].sort()
+  const helpers = files.filter((file) => file.startsWith('test/helpers/')).length
+  const named = files.filter((file) => !file.startsWith('src/') && !file.startsWith('test/helpers/')).map((file) => `\`${file}\``)
+  const counts = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve']
+  const last = named.pop()
+  const rest = last === undefined ? '' : `, and ${named.length === 0 ? last : `${named.join(', ')} and ${last}`}`
+  return `It edits the working tree, in the files its mutants name: those under \`src/\`, ${counts[helpers] ?? String(helpers)} helpers under \`test/helpers/\`${rest}. So:`
+}
+
+test("README's mutation catalog section names every file the catalog's mutants edit", () => {
+  const text = read('README.md').replace(/\s+/g, ' ')
+  const sentence = falsifyEditsSentence(CATALOG)
+  assert.ok(text.includes(sentence), `README does not say: ${sentence}`)
+  // Two files outside src/ and test/ that the catalog mutates by the score.
+  // (The mux's own file name is held to one test file by hygiene.test.ts.)
+  assert.ok(sentence.includes('`scripts/worker-image.ts`') && sentence.includes('`images/worker/'), sentence)
+  // The check reads the catalog: a mutant of a file README does not name is
+  // caught, as is the sentence README held before, which named two helpers.
+  const [first, ...others] = CATALOG
+  assert.ok(first !== undefined)
+  const more = [{ ...first, mutants: [...first.mutants, { ...first.control, id: 'X', file: 'scripts/elsewhere.ts' }] }, ...others]
+  assert.ok(!text.includes(falsifyEditsSentence(more)), 'a file README does not name is caught')
+  assert.doesNotMatch(text, /src\/ and two test helpers/)
 })
 
 test('.npmrc keeps npm\'s cache in the program folder', () => {

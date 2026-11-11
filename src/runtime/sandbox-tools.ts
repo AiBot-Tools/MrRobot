@@ -60,15 +60,25 @@
 // bytes its stream printed, or its capture kept, said in its place. A window
 // is never shown on its cut side: not the CAPTURE_EDGE_BYTES there, where the
 // cut may split a credential, nor a private key block the cut splits, from
-// its marker on. A window whose start a key block may hold, however the
-// stream's redaction pairs the markers, is shown from where the blocks that
-// may hold it end instead, wherever that is, and not at all when none ends:
-// all before that may be a block's body, a credential the cut split among
-// it. Those blocks are read as a union, not as one pairing (pemOpenAt):
-// every BEGIN, one inside another marker included, held open to the first
-// END after it that no token pattern, run first, can break (an AWS key id
-// inside it, or a token's run into it, breaks one), and the blocks that
-// overlap taken as one. A result that shows a stream by its window, or
+// its marker on. An end window is read from its cut, or, when a token's
+// match may hold the character before it, from the first character past it
+// that none may hold (tokenFreeStart), and what that skips is not shown: no
+// match of the token patterns runs across where it is read from, so its
+// redaction matches each token the stream's matches there and no other, and
+// breaks no marker the stream's keeps, nor keeps one it breaks. A window
+// whose start a key block may hold, however the stream's redaction pairs the
+// markers, is shown from where the blocks that may hold it end instead,
+// wherever that is, and not at all when none ends: all before that may be a
+// block's body, a credential the cut split among it. Those blocks are read
+// as a union, not as one pairing (pemOpenAt): every BEGIN, one inside
+// another marker included, held open to the first END after it that no
+// token pattern, run first, can break (an AWS key id inside it, or a token's
+// run into it, breaks one), and the blocks that overlap taken as one. So an
+// end window shows an end of what a redaction of the whole stream shows,
+// and no more. None of this follows a value the kernel's own mask holds
+// (SecretMask), which no worker holds, nor, at a start window's cut, a token
+// of a shape with an unbounded part that crosses it and runs on more than
+// CAPTURE_EDGE_BYTES before it. A result that shows a stream by its window, or
 // withholds one, is marked cut, and tool.result's bytes and sha256 describe
 // what is shown of each stream before its share is cut, redacted: the
 // windows short of their cut sides, not the streams.
@@ -782,25 +792,29 @@ export const DESCRIBE_RESERVE = 4_096
 
 /**
  * Bytes on a window's cut side that are never shown or hashed: those just
- * before the end of a stream's start, and just after the start of its end.
- * Each cut is made before anything is redacted (the driver's at
+ * before the end of a stream's start, and just after where its end is read
+ * from. Each cut is made before anything is redacted (the driver's at
  * CAPTURE_MAX_BYTES, and describe()'s own at STREAM_WINDOW_BYTES), so a
  * credential a cut splits (a token short of the length its pattern needs, a
  * value the kernel holds as secret with its first or last part gone, a PEM
  * block whose other marker lies past the cut) stands there unredacted. A key
  * block a cut splits is also dropped from its marker on, however long it is
  * (pemCut); this covers the rest, which is a few KiB at most for every
- * credential a tool prints. A window whose start a key block may hold is
- * read from where the blocks that may hold it end, an END's end, instead
- * (pemOpenAt), with no edge: all before that may be a block's body, and the
- * window's cut, with whatever it split, lies before it. Every token pattern but AWS's has an unbounded part: the PEM
- * pattern's body, which pemCut and pemOpenAt hold, and for the rest
- * Bearer's \s+ and its token, a JWT's segments, and the tails of the
- * provider, GitHub and Slack keys. A token of one of those shapes that
- * crosses a cut and runs more than this far past it is shown in part (a
- * Bearer token after more than 16 KiB of white space, whole). Only output
- * written to defeat the patterns holds one, and no worker holds a credential
- * to put in it.
+ * credential a tool prints. An end window is read from past any token its
+ * cut splits, however long (tokenFreeStart), and this edge is dropped after
+ * that; one whose start a key block may hold is read from where the blocks
+ * that may hold it end, an END's end, instead (pemOpenAt), with no edge: all
+ * before that may be a block's body, and the window's cut, with whatever it
+ * split, lies before it. So at an end window this edge holds back only a
+ * value the kernel's mask holds, which no worker holds. Every token pattern
+ * but AWS's has an unbounded part: the PEM pattern's body, which pemCut and
+ * pemOpenAt hold, and for the rest Bearer's \s+ and its token, a JWT's
+ * segments, and the tails of the provider, GitHub and Slack keys. A token of
+ * one of those shapes that crosses a start window's cut, and runs on more
+ * than this far before it, may be shown in part (a JWT whose first segment
+ * does, which the window's redaction does not match). Only output written to
+ * defeat the patterns holds one, and no worker holds a credential to put in
+ * it.
  */
 export const CAPTURE_EDGE_BYTES = 16_384
 
@@ -871,6 +885,55 @@ export function jwtRunStarts(text: string): number {
     }
   }
   return most
+}
+
+/**
+ * A character a match of redact.ts's token patterns (TOKEN_PATTERNS, the PEM
+ * pattern aside) may hold, white space aside: Bearer's credential takes
+ * [A-Za-z0-9._~+/-] and the `=` that pads it, and every other pattern's
+ * prefix and run take only those. The one white space any of them takes is
+ * Bearer's \s+, just after the word. Held to redact.ts by
+ * test/sandbox-exec.test.ts, which pins the patterns this is read from.
+ */
+function tokenChar(c: number): boolean {
+  return segmentChar(c) || c === 0x2e || c === 0x7e || c === 0x2b || c === 0x2f || c === 0x3d
+}
+
+/** White space as the Bearer pattern's \s reads it, Unicode spaces among it. */
+const WHITE_SPACE = /\s/
+
+/**
+ * Where an end window whose cut is at `from` in `raw` is read from: the first
+ * place at or after it that no match of redact.ts's token patterns runs
+ * across. That is `from` when no match can hold the character before it,
+ * else the first character at or after `from` that none can: one tokenChar
+ * refuses, or white space with no `Bearer` just before its run (read back
+ * over white space, past the cut too). No match of any pattern, at its turn,
+ * holds that character, so each ends before it or starts after it, and \b
+ * reads the same beside it in the window as in the stream (it is no word
+ * character): a redaction of what follows it matches each token a redaction
+ * of all of `raw` matches there, and no other. What lies between `from` and
+ * that place, among it the rest of any token the cut split, is not read. A
+ * value the kernel's mask holds (SecretMask), which no worker holds, is not
+ * followed. Linear: past the cut it reads each character once, and back from
+ * it only over the white space before it.
+ */
+export function tokenFreeStart(raw: string, from: number): number {
+  if (from <= 0) return 0
+  let i = from - 1
+  while (i < raw.length) {
+    if (tokenChar(raw.charCodeAt(i))) {
+      i += 1
+      continue
+    }
+    if (!WHITE_SPACE.test(raw.charAt(i))) return Math.max(i, from)
+    let run = i
+    while (run > 0 && WHITE_SPACE.test(raw.charAt(run - 1))) run--
+    const word = run - 'Bearer'.length
+    if (!(word >= 0 && raw.startsWith('Bearer', word))) return Math.max(i, from)
+    while (i < raw.length && WHITE_SPACE.test(raw.charAt(i))) i++
+  }
+  return raw.length
 }
 
 /**
@@ -1022,10 +1085,11 @@ export function pemEndHolds(raw: string, at: number, marker: string): boolean {
  * in `raw`, end: undefined when none of them holds `at` (one that starts at
  * `at`, or ends there, does not), null when one does and no END ends it, else
  * where the blocks that overlap the one holding it end: the end of the END
- * that ends the last of them. Read as a union, not as one pairing of the markers: every BEGIN, each one inside
- * another marker included, is held open from where it starts to the first
- * END that pemEndHolds admits starting at or after where it ends, read
- * greedily, and blocks that overlap are one. Over-approximating so:
+ * that ends the last of them. Read as a union, not as one pairing of the
+ * markers: every BEGIN, each one inside another marker included, is held
+ * open from where it starts to the first END that pemEndHolds admits
+ * starting at or after where it ends, read greedily, and blocks that overlap
+ * are one. Over-approximating so:
  *
  *   each block redact.ts hides starts at a BEGIN of `raw` (a marker holds no
  *   `[` or `]`, so no [REDACTED] stands inside one), its marker there ending
@@ -1097,16 +1161,18 @@ function pemOpenAt(raw: string, at: number): number | null | undefined {
  * What may be shown of `read`, a window redacted, on the side its cut is on:
  * not its CAPTURE_EDGE_BYTES there, nor a private key block the cut splits.
  * redact.ts hid every block whose two markers the window holds, so a marker
- * left in `read` is one whose other lies past the cut. Of a start, nothing
- * from the first BEGIN left on: in the stream as printed, the pattern pairs
- * it with the first END past the cut and hides all between, any later BEGIN
- * among it. Of an end, nothing up to the first END left. streamOf reads an
- * end window here only when no block pemOpenAt holds open holds its start,
- * so no block the stream's redaction hides crosses the cut, and an END left
- * here closes none, but for what neither that walk nor the window's own
- * redaction reads as the stream's does: a value the kernel's mask holds, and
- * a token whose prefix lies before the window's cut. It is held to as one
- * that may, which costs only what stands before it.
+ * left in `read` is one whose other, if any, lies past the cut. Of a start,
+ * nothing from the first BEGIN left on: in the stream as printed, the
+ * pattern pairs it with the first END past the cut and hides all between,
+ * any later BEGIN among it. Of an end, nothing up to the first END left.
+ * streamOf reads an end window here only from where no token's match runs
+ * across (tokenFreeStart), so its token patterns match what the stream's
+ * match there, and only when no block pemOpenAt holds open holds that place,
+ * so no block the stream's redaction hides crosses it: the window's
+ * redaction is then the stream's there, and an END left here closes none of
+ * its blocks, but for a value the kernel's mask holds, which no worker holds
+ * and neither reads as the other does. It is held to as one that may, which
+ * costs only what stands before it.
  */
 function pemCut(read: string, side: 'start' | 'end'): string {
   const bytes = Buffer.byteLength(read)
@@ -1172,12 +1238,20 @@ function withheld(label: Stream['label'], read: string, printed: number, capped:
  * to a character's start (docker.ts Capture), so a stream within three bytes
  * of the cap is taken as one it capped. A stream that filled the cap exactly
  * while the other was cut is taken so too, and shows its start: less of it,
- * nothing it did not print. A window whose start a key block may hold,
+ * nothing it did not print. An end window is read from its cut, or from the
+ * first character past it that no token's match may hold when one may hold
+ * the character before it (tokenFreeStart), and what that skips is not
+ * shown, a token the cut splits among it, however long, and all of the
+ * stream past the cut when no such character follows: no match runs across
+ * where it is read from, so its redaction matches each token the stream's
+ * matches there, and no other. A window whose start a key block may hold,
  * however the stream's redaction pairs the markers (pemOpenAt), is read from
- * where the blocks that may hold it end, and shows nothing when none ends: all
- * before that may be key body the stream's redaction would hide, a credential
- * its cut splits among it. What
- * is to be read is first held to JWT_RUN_STARTS_MAX, and withheld past it.
+ * where the blocks that may hold it end, and shows nothing when none ends:
+ * all before that may be key body the stream's redaction would hide, a
+ * credential its cut splits among it. What an end window shows is then an
+ * end of what a redaction of the whole stream shows, but for a value the
+ * kernel's mask holds (SecretMask). What is to be read is first held to
+ * JWT_RUN_STARTS_MAX, and withheld past it.
  */
 function streamOf(label: Stream['label'], raw: string, truncated: boolean): Stream {
   const printed = Buffer.byteLength(raw)
@@ -1187,9 +1261,11 @@ function streamOf(label: Stream['label'], raw: string, truncated: boolean): Stre
     return withheld(label, read, printed, true) ?? { label, text: pemCut(redactString(read), 'start'), window }
   }
   if (printed <= STREAM_WINDOW_BYTES) return withheld(label, raw, printed, false) ?? { label, text: redactString(raw) }
-  const tail = utf8Tail(raw, STREAM_WINDOW_BYTES)
+  const cut = raw.length - utf8Tail(raw, STREAM_WINDOW_BYTES).length
+  const from = tokenFreeStart(raw, cut)
+  const tail = raw.slice(from)
   const window = { side: 'end', printed } as const
-  const closes = pemOpenAt(raw, raw.length - tail.length)
+  const closes = pemOpenAt(raw, from)
   if (closes === null) return { label, text: '', window }
   if (closes !== undefined) {
     const read = raw.slice(closes)

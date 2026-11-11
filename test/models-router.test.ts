@@ -40,7 +40,9 @@ import {
   type ModelBinding,
   type RouteRequest,
 } from '../src/models/router.js'
-import type { AdapterRequest, ModelAdapter, PreparedCall } from '../src/models/transport.js'
+import { loggedText, withCallEvents, type AdapterRequest, type ModelAdapter, type PreparedCall } from '../src/models/transport.js'
+import { MAX_LOGGED_OUTPUT, PAYLOAD_TEXT_BUDGET } from '../src/events/bound.js'
+import { canonicalize } from '../src/events/canonical.js'
 
 // An OPAQUE credential: long enough for SecretMask to register
 // (MIN_MASK_LENGTH = 8), distinctive enough that a substring search cannot
@@ -466,6 +468,118 @@ test('fallback to a pricier model is refused when the remaining budget cannot co
 })
 
 // ── binding and stubs ──────────────────────────────────────────────────────
+
+/** The bytes `text` takes as a string in canonical JSON, its quotes aside. */
+const payloadBytes = (text: string): number => Buffer.byteLength(JSON.stringify(text)) - 2
+
+test("llm.request's prompt is bounded by the bytes it takes in the payload's canonical JSON, so a prompt of escapes is cut to fit and its row is written", async (t) => {
+  // The prompt is the provider's request body, already JSON; the log's
+  // canonical JSON escapes each quote, backslash and newline in it again.
+  // Bounded by its raw bytes, a prompt of them took twice that in the
+  // payload and the append threw, with no llm.request and no llm.response.
+  const store = withStore(t)
+  const options = { store, scope: { runId: 'run_p', agentId: 'coder' }, ref: 'openai/fake', card: card() }
+  const answer = (): Promise<{ content: string; finish: string; inputTokens: number; outputTokens: number; costMicroUsd: number }> =>
+    Promise.resolve({ content: 'ok', finish: 'stop', inputTokens: 1, outputTokens: 1, costMicroUsd: 1 })
+  const tools = Array.from({ length: 400 }, (_, i) => `pmmcp.a_tool_of_some_length_${String(i)}`)
+  const cases: readonly (readonly [string, string, readonly string[]])[] = [
+    ['quotes and backslashes', JSON.stringify({ messages: ['\\"'.repeat(PAYLOAD_TEXT_BUDGET / 3)] }), ['pmmcp.recall']],
+    ['short lines of quotes', JSON.stringify({ content: 'print("abcdefg")\n'.repeat(4_300) }), []],
+    ['a long tool list beside a prompt within its share', 'x'.repeat(PAYLOAD_TEXT_BUDGET), tools],
+  ]
+  for (const [what, prompt, offered] of cases) {
+    await withCallEvents(options, { prompt, tools: offered }, answer)
+    const row = store.query({ type: 'llm.request' }).at(-1)
+    assert.ok(row !== undefined, what)
+    assert.ok(Buffer.byteLength(row.payload) <= MAX_LOGGED_OUTPUT, `${what}: ${String(Buffer.byteLength(row.payload))} bytes`)
+    const logged = (JSON.parse(row.payload) as { prompt: string }).prompt
+    assert.ok(prompt.startsWith(logged) && logged.length < prompt.length, `${what}: a start of the prompt, cut`)
+    assert.ok(payloadBytes(logged) <= PAYLOAD_TEXT_BUDGET, what)
+    // Cut no more than it must: to its share, or to what the tool list leaves.
+    assert.ok(Buffer.byteLength(row.payload) > MAX_LOGGED_OUTPUT - 2_048, `${what}: ${String(Buffer.byteLength(row.payload))} bytes`)
+  }
+  assert.equal(store.query({ type: 'llm.response' }).length, cases.length)
+
+  // Within its share, in the bytes it takes in the payload, a prompt is kept
+  // whole; one byte past, it is cut to its share; and a prompt of escapes is
+  // cut by those bytes, not by its raw length.
+  const pay = (text: string): Record<string, unknown> => ({ schemaVersion: 1, ref: 'r', attempt: 1, prompt: text, tools: [] })
+  const fits = 'y'.repeat(PAYLOAD_TEXT_BUDGET)
+  assert.equal(loggedText(fits, pay), fits)
+  assert.equal(loggedText(`${fits}y`, pay), fits)
+  assert.equal(loggedText('"'.repeat(PAYLOAD_TEXT_BUDGET), pay), '"'.repeat(PAYLOAD_TEXT_BUDGET / 2))
+  // Redacted first, then cut: a credential shape is never stored, whole or in part.
+  const token = `ghp_${'Q7xK'.repeat(9)}`
+  const across = loggedText(`${'z'.repeat(PAYLOAD_TEXT_BUDGET - 10)} ${token}`, pay)
+  assert.equal(across.includes('ghp_'), false)
+  assert.ok(across.endsWith(' [REDACTED'), across.slice(-20))
+  // A payload whose stored size grows past what its prompt's share leaves is
+  // cut on, by what it is over, until it fits.
+  const echoing = (text: string): Record<string, unknown> => ({ ...pay(text), tail: text.slice(-20_000) })
+  const cut = loggedText('w'.repeat(PAYLOAD_TEXT_BUDGET), echoing)
+  assert.ok(Buffer.byteLength(canonicalize(echoing(cut))) <= MAX_LOGGED_OUTPUT)
+  assert.ok(cut.length > 0 && cut.length < PAYLOAD_TEXT_BUDGET)
+})
+
+test('a prompt whose cut falls inside a surrogate pair keeps whole characters, and its llm.request row is written', async (t) => {
+  // JSON leaves an emoji unescaped (4 UTF-8 bytes) and escapes a lone
+  // surrogate (6), so the cut is made with 7 bytes of the share left before
+  // two emoji: the first fits whole and the second does not. Cut by UTF-16
+  // units, the first emoji's high surrogate (6) would fit and its low would
+  // not, leaving a lone surrogate that canonical JSON refuses: the append, or
+  // the measure before it, would throw.
+  const emoji = '\u{1F600}'
+  const prompt = `${'a'.repeat(PAYLOAD_TEXT_BUDGET - 7)}${emoji}${emoji}b`
+  const pay = (text: string): Record<string, unknown> => ({ schemaVersion: 1, ref: 'r', attempt: 1, prompt: text, tools: [] })
+  const logged = loggedText(prompt, pay)
+  assert.equal(logged, `${'a'.repeat(PAYLOAD_TEXT_BUDGET - 7)}${emoji}`)
+  assert.doesNotMatch(logged, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, 'a lone surrogate')
+  assert.doesNotThrow(() => canonicalize({ prompt: logged }))
+  assert.equal(payloadBytes(logged), PAYLOAD_TEXT_BUDGET - 3)
+
+  const store = withStore(t)
+  const options = { store, scope: { runId: 'run_u', agentId: 'coder' }, ref: 'openai/fake', card: card() }
+  await withCallEvents(options, { prompt, tools: [] }, () =>
+    Promise.resolve({ content: 'ok', finish: 'stop', inputTokens: 1, outputTokens: 1, costMicroUsd: 1 }),
+  )
+  const [row] = store.query({ type: 'llm.request' })
+  assert.ok(row !== undefined, 'no llm.request row')
+  assert.equal((JSON.parse(row.payload) as { prompt: string }).prompt, logged)
+  assert.equal(store.query({ type: 'llm.response' }).length, 1)
+})
+
+test("llm.response's content is bounded by the bytes it takes in the payload's canonical JSON, so an answer of escapes is cut to fit and its row is written", async (t) => {
+  // An answer dense in escapes (escaped JSON, code): each quote, backslash
+  // and newline takes two bytes in the log's canonical JSON. Bounded by its
+  // raw bytes, a 60 KB answer of these lines took some 80 KB there, the
+  // append threw, and the call, and the run, ended in error.
+  const store = withStore(t)
+  const options = { store, scope: { runId: 'run_c', agentId: 'coder' }, ref: 'openai/fake', card: card() }
+  const content = 'say "hi" \\\\ \n'.repeat(Math.ceil(60_000 / 13))
+  assert.ok(Buffer.byteLength(content) >= 60_000 && Buffer.byteLength(content) < PAYLOAD_TEXT_BUDGET, 'within the raw share')
+  const outcome = await withCallEvents(options, { prompt: 'p', tools: [] }, () =>
+    Promise.resolve({ content, finish: 'stop', inputTokens: 1, outputTokens: 16_000, costMicroUsd: 1 }),
+  )
+  assert.equal(outcome.content, content, 'what the model answered is not cut')
+  const [row] = store.query({ type: 'llm.response' })
+  assert.ok(row !== undefined, 'no llm.response row')
+  assert.ok(Buffer.byteLength(row.payload) <= MAX_LOGGED_OUTPUT, `${String(Buffer.byteLength(row.payload))} bytes`)
+  const logged = (JSON.parse(row.payload) as { content: string; finish: string; outputTokens: number }).content
+  assert.ok(content.startsWith(logged) && logged.length < content.length, 'a start of the answer, cut')
+  assert.ok(payloadBytes(logged) <= PAYLOAD_TEXT_BUDGET)
+  assert.ok(payloadBytes(logged) > PAYLOAD_TEXT_BUDGET - 32, 'cut no more than its share asks')
+  // The rest of the row as it was: the answer's finish and its tokens.
+  assert.equal((JSON.parse(row.payload) as { finish: string }).finish, 'stop')
+  assert.equal((JSON.parse(row.payload) as { outputTokens: number }).outputTokens, 16_000)
+  // Redacted first, then cut, as the prompt is.
+  const token = `ghp_${'Q7xK'.repeat(9)}`
+  await withCallEvents(options, { prompt: 'p', tools: [] }, () =>
+    Promise.resolve({ content: `${'"'.repeat(PAYLOAD_TEXT_BUDGET / 2 - 5)} ${token}`, finish: 'stop', inputTokens: 1, outputTokens: 1, costMicroUsd: 1 }),
+  )
+  const second = store.query({ type: 'llm.response' }).at(-1)
+  assert.ok(second !== undefined)
+  assert.equal(second.payload.includes('ghp_'), false)
+})
 
 test('router refuses a ref not bound to the agent → no request event', async (t) => {
   const cards = new Map([

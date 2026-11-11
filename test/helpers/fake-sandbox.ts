@@ -17,8 +17,10 @@
 //
 // Where the real driver refuses or reports something, so does this: a spec
 // whose command the audit's whole-argv scans refuse (a forbidden flag, the
-// docker socket, a --mount or a -v anywhere in it, so `go test -v` too) is
-// refused in its words (wholeArgvRefusal, src/sandbox/docker.ts); a spec
+// docker socket, a --mount or a -v anywhere in it, so `go test -v` too), or,
+// given the home a test hands it (`home`), its home check, is refused in its
+// words (commandAuditRefusal, src/sandbox/docker.ts), and commandRefusal()
+// says so of the command, as the real driver's does; a spec
 // whose image is not the pinned id, exactly, is refused, a tag among them, and
 // every spec while no valid id is pinned, with the real driver's own words
 // (imageRefusal, src/sandbox/limits.ts); a probe scripted ok reports the
@@ -41,7 +43,13 @@
 // after the container exited: the run then exits on its own, with its
 // scripted exit and no killedBy, and says it overran if the wallclock had
 // fired. test/sandbox-docker.test.ts drives both through the same steps for
-// these.
+// these. An abandon (SandboxDriver.abandon) ends a hung run as the real
+// driver's SIGKILL of its docker CLI does, on a later macrotask: no exit
+// status, SIGKILL and no killedBy, whatever its script says of kills; it
+// changes nothing for a run that has ended or whose end is already queued,
+// and every name it is passed is recorded (abandons). A hung run is never
+// ended by the fake on its own, wallclock or not: one that nothing kills,
+// overruns or abandons is a driver that never answers.
 //
 // What still differs: when a run whose kill ended nothing exits, which here is
 // just after that kill, and on the real driver whenever its container does.
@@ -53,7 +61,7 @@
 // that follows it (killedBy requested, SIGKILL): a run a kill ends is
 // scripted `hangs` here.
 // And a command that names the operator's home, which the real driver's audit
-// refuses and the fake, which does not know the home, runs.
+// refuses, and the fake, unless a test hands it one, knows no home to refuse.
 // And the reason a probe gives with no valid id pinned and a probe scripted
 // not ok (or none scripted): the scripted (or default) reason here, where the
 // real driver names sandbox.imageId before asking any daemon anything.
@@ -126,7 +134,7 @@ import {
   type SandboxResult,
   type SandboxSpec,
 } from '../../src/sandbox/driver.js'
-import { wholeArgvRefusal } from '../../src/sandbox/docker.js'
+import { commandAuditRefusal } from '../../src/sandbox/docker.js'
 import { imageIdProblem, imageRefusal } from '../../src/sandbox/limits.js'
 
 export interface ScriptedExit {
@@ -164,6 +172,12 @@ export interface FakeSandboxOptions {
    * ships it, every run is refused and no probe reports ok.
    */
   readonly imageId?: string | undefined
+  /**
+   * The home the audit's home check refuses, as the real driver is handed
+   * one (DockerDriverOptions.home) or reads the OS's. Unset, none: no command
+   * is refused for naming a home.
+   */
+  readonly home?: string
 }
 
 /** A channel run's container ends, for a test to play the container with. */
@@ -195,6 +209,8 @@ export interface FakeSandbox extends SandboxDriver {
   readonly channels: FakeChannel[]
   /** Names passed to kill(), including repeats. */
   readonly kills: string[]
+  /** Names passed to abandon(), including repeats. */
+  readonly abandons: string[]
   /** End a hanging run as a wallclock overrun would, on a later macrotask. */
   simulateOverrun(name: string): void
 }
@@ -322,6 +338,8 @@ interface Hung {
   overran: boolean
   /** Its end is queued (later): a second kill queues nothing. */
   ending: boolean
+  /** It was given up (abandon): its docker CLI ended by SIGKILL, whatever its container did. */
+  abandoned?: true
 }
 
 /**
@@ -463,17 +481,26 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
       pending.delete(hung.spec.name)
       const { spec, scripted, killedBy, overran } = hung
       const own = ownExit(spec, scripted, overran)
+      // As the real driver reports a run it gave up: its CLI killed by a
+      // signal, so no exit status and no killedBy, whatever kill came before.
+      if (hung.abandoned === true) {
+        hung.resolve({ ...own, exitCode: null, signal: 'SIGKILL' })
+        return
+      }
       // As the real driver reports a run its kill ended: the CLI's 137, with
       // SIGKILL, and what it captured before the kill.
       hung.resolve(killedBy === undefined ? own : { ...own, exitCode: 137, signal: 'SIGKILL', killedBy })
     })
   }
 
+  const abandons: string[] = []
+
   return {
     name: 'fake',
     specs,
     channels,
     kills,
+    abandons,
 
     async probe(): Promise<ProbeResult> {
       const probe = options.probe ?? UNAVAILABLE
@@ -500,12 +527,13 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
       // with no scripted exit spent on it.
       const refusedChannel = channelRefusal(spec)
       if (refusedChannel !== undefined) throw new ConfigError(refusedChannel)
-      // As the real driver's audit does first (wholeArgvRefusal), over the
-      // argv its builder writes: a command that carries a forbidden flag, the
-      // docker socket, a --mount or a -v is refused, `go test -v` among them,
-      // with no scripted exit spent on it. The one --mount stands for the
-      // builder's own, which with the rest of its options passes these scans.
-      const scanned = wholeArgvRefusal(['--mount', ...spec.command])
+      // As the real driver's audit does first (wholeArgvRefusal, then its
+      // home check), over the argv its builder writes: a command that carries
+      // a forbidden flag, the docker socket, a --mount or a -v is refused,
+      // `go test -v` among them, and one that names the home a test gave,
+      // with no scripted exit spent on it. The audit's one --mount stands for
+      // the builder's own, which with the rest of its options passes these.
+      const scanned = commandAuditRefusal(spec.command, options.home ?? '')
       if (scanned !== undefined) throw new ConfigError(scanned)
       // As the real driver's audit does (buildRunArgs): the image must be the
       // pinned id, exactly, and with none pinned no run is built at all.
@@ -568,6 +596,11 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
       return { name: spec.name, result, ...(pipes === undefined ? {} : { channel: pipes.channel }) }
     },
 
+    commandRefusal(command: readonly string[]): string | undefined {
+      // As run() refuses the command, and the real driver's says.
+      return commandAuditRefusal(command, options.home ?? '')
+    },
+
     async kill(name: string): Promise<void> {
       kills.push(name)
       // As the real driver does: a name without the prefix is sent nowhere.
@@ -577,6 +610,21 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
       const hung = pending.get(name)
       if (hung === undefined) return // already finished; kill is idempotent
       if (hung.scripted.ignoresKill !== true) hung.killedBy ??= 'requested'
+      end(hung)
+    },
+
+    async abandon(name: string): Promise<void> {
+      abandons.push(name)
+      // As the real driver does: a name without the prefix is sent nowhere.
+      if (!name.startsWith(CONTAINER_PREFIX)) return
+      const hung = pending.get(name)
+      if (hung === undefined) return // ended: its CLI is gone, and a kill by name of it ends nothing
+      // Its end already queued is its CLI's exit, after which the real
+      // driver signals nothing.
+      if (hung.ending) return
+      // Its CLI is SIGKILLed whatever the container does, so a script that
+      // ignores kills ends here too, as a CLI killed by a signal reports.
+      hung.abandoned = true
       end(hung)
     },
 

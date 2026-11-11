@@ -18,9 +18,10 @@
 // event redaction pass censors it by exact substring rather than hoping a
 // pattern matches.
 
-import { boundOutput, PAYLOAD_TEXT_BUDGET } from '../events/bound.js'
+import { boundOutput, MAX_LOGGED_OUTPUT, PAYLOAD_TEXT_BUDGET } from '../events/bound.js'
+import { canonicalize } from '../events/canonical.js'
 import type { EventStore } from '../events/store.js'
-import { SecretMask } from '../events/redact.js'
+import { redactString, redactValue, SecretMask } from '../events/redact.js'
 import type { ModelCard } from './registry.js'
 import { PROVIDER_TOOL_NAME } from '../mcp/names.js'
 
@@ -267,19 +268,19 @@ export async function withCallEvents(
   // censored by exact substring rather than by a hopeful pattern.
   if (key !== undefined) SecretMask.register(key)
 
-  const prompt = boundOutput(context.prompt, PAYLOAD_TEXT_BUDGET)
+  const requestPayload = (prompt: string): Record<string, unknown> => ({
+    schemaVersion: 1,
+    ref,
+    attempt,
+    prompt,
+    tools: [...context.tools],
+    ...(context.maxOutputTokens === undefined ? {} : { maxOutputTokens: context.maxOutputTokens }),
+  })
   store.append({
     type: 'llm.request',
     ...(scope.runId === undefined ? {} : { runId: scope.runId }),
     ...(scope.agentId === undefined ? {} : { agentId: scope.agentId }),
-    payload: {
-      schemaVersion: 1,
-      ref,
-      attempt,
-      prompt: prompt.text,
-      tools: [...context.tools],
-      ...(context.maxOutputTokens === undefined ? {} : { maxOutputTokens: context.maxOutputTokens }),
-    },
+    payload: requestPayload(loggedText(context.prompt, requestPayload)),
   })
 
   const startedAt = Date.now()
@@ -287,23 +288,29 @@ export async function withCallEvents(
 
   try {
     const outcome = await perform(wire, key)
+    const durationMs = Date.now() - startedAt
+    // The model's answer is bounded as the prompt is (loggedText): an answer
+    // dense in escapes (escaped JSON, code) takes up to six times its raw
+    // bytes in the log's canonical JSON, and bounded by those raw bytes its
+    // append would throw and end the run in error.
+    const responsePayload = (content: string): Record<string, unknown> => ({
+      schemaVersion: 1,
+      ref,
+      attempt,
+      content,
+      finish: outcome.finish,
+      inputTokens: outcome.inputTokens,
+      outputTokens: outcome.outputTokens,
+      ...(outcome.cacheReadTokens === undefined ? {} : { cacheReadTokens: outcome.cacheReadTokens }),
+      ...(outcome.cacheWriteTokens === undefined ? {} : { cacheWriteTokens: outcome.cacheWriteTokens }),
+      costMicroUsd: outcome.costMicroUsd,
+      durationMs,
+    })
     store.append({
       type: 'llm.response',
       ...(scope.runId === undefined ? {} : { runId: scope.runId }),
       ...(scope.agentId === undefined ? {} : { agentId: scope.agentId }),
-      payload: {
-        schemaVersion: 1,
-        ref,
-        attempt,
-        content: boundOutput(outcome.content, PAYLOAD_TEXT_BUDGET).text,
-        finish: outcome.finish,
-        inputTokens: outcome.inputTokens,
-        outputTokens: outcome.outputTokens,
-        ...(outcome.cacheReadTokens === undefined ? {} : { cacheReadTokens: outcome.cacheReadTokens }),
-        ...(outcome.cacheWriteTokens === undefined ? {} : { cacheWriteTokens: outcome.cacheWriteTokens }),
-        costMicroUsd: outcome.costMicroUsd,
-        durationMs: Date.now() - startedAt,
-      },
+      payload: responsePayload(loggedText(outcome.content, responsePayload)),
     })
     return outcome
   } catch (e) {
@@ -329,6 +336,68 @@ export async function withCallEvents(
       },
     })
     throw e
+  }
+}
+
+/**
+ * The bytes `text` takes as a string in canonical JSON, its quotes aside:
+ * JSON's escapes (canonical.ts), under which a quote, a backslash or a
+ * newline takes two bytes and another C0 control six.
+ */
+function payloadBytes(text: string): number {
+  return Buffer.byteLength(JSON.stringify(text)) - 2
+}
+
+/** The longest start of `text` whose payloadBytes is at most `keep`, whole code points only. */
+function firstFitting(text: string, keep: number): string {
+  let end = 0
+  let used = 0
+  for (const point of text) {
+    const cost = payloadBytes(point)
+    if (used + cost > keep) break
+    used += cost
+    end += point.length
+  }
+  return text.slice(0, end)
+}
+
+/**
+ * The bytes the store measures `payload` by against MAX_LOGGED_OUTPUT: its
+ * canonical JSON once redacted, redacted again as a text (store.ts append).
+ */
+function storedBytes(payload: Record<string, unknown>): number {
+  return Buffer.byteLength(redactString(canonicalize(redactValue(payload))))
+}
+
+/**
+ * The one long text of a payload as the log keeps it (llm.request's prompt,
+ * llm.response's content): redacted, and cut, at a code point, until the
+ * payload `payloadOf` builds around it fits the store's limit, as the store
+ * measures it. The log's canonical JSON escapes every quote, backslash and
+ * control character in the text: the prompt is the provider's request body,
+ * already JSON, so a tool result of many short quoted lines, which the body
+ * shows as \" and \n, takes up to twice its size there, and an answer of
+ * escaped JSON or code as much or more. Bounded by its raw bytes, such a text
+ * is over the limit, and the append throws, ending the run in error. So the
+ * text is held to its share, PAYLOAD_TEXT_BUDGET, counted in the bytes it
+ * takes in the payload, and to what is left of MAX_LOGGED_OUTPUT beside the
+ * rest of the payload (a long tool list); and should the store's redaction of
+ * the canonical text still leave it over, cut by what it is over until it
+ * fits. A cut text is a start of the redacted text, cut after redaction, as
+ * boundOutput cuts, and never splits a surrogate pair, which canonical JSON
+ * refuses. What the provider is sent, and what the model answered, are not
+ * cut: only what the log keeps of them.
+ */
+export function loggedText(text: string, payloadOf: (text: string) => Record<string, unknown>): string {
+  const redacted = redactString(text)
+  const room = MAX_LOGGED_OUTPUT - storedBytes(payloadOf(''))
+  let keep = Math.min(PAYLOAD_TEXT_BUDGET, room)
+  if (payloadBytes(redacted) <= keep && storedBytes(payloadOf(redacted)) <= MAX_LOGGED_OUTPUT) return redacted
+  for (;;) {
+    const cut = keep <= 0 ? '' : firstFitting(redacted, keep)
+    const over = storedBytes(payloadOf(cut)) - MAX_LOGGED_OUTPUT
+    if (over <= 0 || cut === '') return cut
+    keep = payloadBytes(cut) - over
   }
 }
 

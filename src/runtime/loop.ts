@@ -24,9 +24,21 @@
 // one, and a worker that names one anyway is refused by the gate and the kernel
 // runner. There is no branch here that creates a run: the delegate tool asks
 // the kernel to launch one, under a ceiling carved from this run's budget.
+//
+// Sandbox tools (`sandbox.exec`) go to the kernel's sandbox runner, never to
+// the hub, and are offered only to a run whose agent's manifest, read from the
+// registry by its id, may hold the tool and lists it (SandboxTools.
+// holderProblem), whatever the RunAgent's own tool list says: a run of any
+// other is never shown one. Before the gate, the runner is asked whether it
+// would refuse the call whoever approved it, for its caller (that manifest
+// again, or no runner wired at all) or for its arguments on their own, and
+// the gate denies such a call (its rule 3c) rather than ask a human to
+// approve a command that would then never run. A caller the registry stops
+// admitting while a human is asked (archived, or reloaded without the tool)
+// is denied after the gate, with a tool.result saying so.
 
 import { canonicalize, sha256Hex } from '../events/canonical.js'
-import { boundOutput, type BoundedOutput } from '../events/bound.js'
+import { boundOutput, PAYLOAD_TEXT_BUDGET, type BoundedOutput } from '../events/bound.js'
 import type { EventStore } from '../events/store.js'
 import { PolicyDenied } from '../errors.js'
 import { decide, type GateDecision } from '../policy/gate.js'
@@ -39,6 +51,7 @@ import type { ToolCall, ToolSchema, TurnMessage } from '../models/transport.js'
 import { Budget, type BudgetCaps, type StopReason } from './budget.js'
 import type { KernelTools } from './kernel-tools.js'
 import type { Lanes, LaneName } from './lanes.js'
+import { isSandboxRef, type SandboxTools } from './sandbox-tools.js'
 import { withRunScope } from './scope.js'
 
 /** What the loop tells the gate about one proposed call. Nothing else. */
@@ -108,6 +121,14 @@ export interface LoopOptions {
   readonly budgetFor: (agent: RunAgent, ceiling?: Partial<BudgetCaps>) => Budget
   /** Kernel-native tools (delegation). Absent: none are offered. */
   readonly kernelTools?: KernelTools
+  /**
+   * The sandbox runner (`sandbox.exec`). Every sandbox.* ref is routed to it
+   * and never to the hub. Absent: none is offered, and a call of one (a hub
+   * view that offers one, which config refuses by reserving the server id)
+   * is denied by the gate, before any human is asked, and never reaches the
+   * hub.
+   */
+  readonly sandboxTools?: SandboxTools
   /** Hard ceiling on turns, independent of the budget's call caps. */
   readonly maxTurns?: number
 }
@@ -331,7 +352,10 @@ export class RunLoop {
    * manifest — default deny. Kernel tools are offered to an orchestrator only:
    * the registry already refuses them in any other manifest, and this refuses
    * them again at the point of offer, so a worker cannot be shown a delegation
-   * tool even if a manifest somehow listed one.
+   * tool even if a manifest somehow listed one. Sandbox tools likewise, to a
+   * run whose agent's manifest, read from the registry by its id rather than
+   * from the RunAgent, may hold one and lists it (holderProblem): a RunAgent
+   * whose toolAllow names sandbox.exec is not shown it otherwise.
    */
   #toolsFor(agent: RunAgent): ToolSchema[] {
     const allowed = new Set(agent.toolAllow)
@@ -339,7 +363,12 @@ export class RunLoop {
       agent.role === 'orchestrator' && this.#o.kernelTools !== undefined
         ? this.#o.kernelTools.schemas()
         : []
-    return [...this.#o.agentView().tools, ...kernel].filter((t) => allowed.has(t.ref))
+    const sandbox = this.#o.sandboxTools
+    const boxed =
+      sandbox === undefined
+        ? []
+        : sandbox.schemas().filter((t) => sandbox.holderProblem(t.ref, agent.agentId) === undefined)
+    return [...this.#o.agentView().tools, ...kernel, ...boxed].filter((t) => allowed.has(t.ref))
   }
 
   async #handleToolCall(
@@ -359,6 +388,16 @@ export class RunLoop {
     const toolName = at <= 0 ? call.ref : call.ref.slice(at + 1)
     const view = resolveView(this.#o.views, serverId, toolName)
 
+    // Before the gate, so that the gate denies (its rule 3c) a sandbox call
+    // the runner would refuse whoever approved it, for its caller or its
+    // arguments, rather than ask a human to approve a command that then never
+    // runs. The caller first: who may hold the tool is the more fundamental.
+    const sandboxTools = this.#o.sandboxTools
+    const isSandbox = isSandboxRef(call.ref)
+    const runnerRefusal = isSandbox
+      ? (this.#sandboxHolderProblem(call.ref, agent.agentId) ?? sandboxTools?.argsRefusal(call.ref, context.args))
+      : undefined
+
     const gateInput = {
       view: {
         exposure: view.exposure,
@@ -376,6 +415,7 @@ export class RunLoop {
       manifestAllows: agent.toolAllow.includes(call.ref),
       toolRef: call.ref,
       args: context.args,
+      ...(runnerRefusal === undefined ? {} : { runnerRefusal }),
     }
 
     // The pure gate runs first so the loop knows whether to park BEFORE the
@@ -437,6 +477,16 @@ export class RunLoop {
     if (isKernel && agent.role !== 'orchestrator') {
       return { text: '[denied] kernel tools are for the orchestrator only', isError: true, taints: false }
     }
+    // A sandbox tool, from a run whose agent's manifest, read from the
+    // registry now, may no longer hold it (archived, or reloaded without it,
+    // while a human was asked): denied, whatever the RunAgent's own tool list
+    // said to the gate, and recorded as the call's tool.result, so the log
+    // holds what the model is told. The same check the gate was handed, so a
+    // kernel with no runner is refused here too, and never reaches the hub.
+    if (isSandbox) {
+      const problem = this.#sandboxHolderProblem(call.ref, agent.agentId)
+      if (problem !== undefined) return this.#deniedAfterGate(request, budget, ticket, `[denied] ${problem}`)
+    }
     const executed =
       isKernel && kernelTools !== undefined
         ? await kernelTools.call(ticket, context.args, {
@@ -445,7 +495,14 @@ export class RunLoop {
             budget,
             signal: request.signal,
           })
-        : await this.#o.agentView().call(ticket, context.args)
+        : isSandbox && sandboxTools !== undefined
+          ? await sandboxTools.call(ticket, context.args, {
+              runId,
+              agentId: agent.agentId,
+              budget,
+              signal: request.signal,
+            })
+          : await this.#o.agentView().call(ticket, context.args)
     const resultTaints = view.taints || ('taints' in executed && executed.taints === true)
     const charged = budget.charge('tool')
 
@@ -475,6 +532,55 @@ export class RunLoop {
       taints: resultTaints,
       ...(charged.ok ? {} : { stop: charged.stop }),
     }
+  }
+
+  /**
+   * Why the run's agent may not call the sandbox tool `ref`, read now, or
+   * undefined: no runner wired into this kernel, or the runner's reading of
+   * the agent's manifest in the registry (SandboxTools.holderProblem). Asked
+   * before the gate and again after it, as one check.
+   */
+  #sandboxHolderProblem(ref: string, agentId: string): string | undefined {
+    const sandboxTools = this.#o.sandboxTools
+    return sandboxTools === undefined
+      ? 'no sandbox runner is wired into this kernel'
+      : sandboxTools.holderProblem(ref, agentId)
+  }
+
+  /**
+   * A call the gate allowed and the loop refuses before it executes: told to
+   * the model, and recorded as the call's tool.result under its ticket, bounded
+   * as any result is. No tool.call precedes it: nothing was about to run. It
+   * is charged to the budget as a tool call, as every call the log holds a
+   * tool.result for is, so a run's live count is the one recovery reads back
+   * from those rows (projectRecovery), and a model that keeps calling it
+   * meets the run's tool-call cap.
+   */
+  #deniedAfterGate(
+    request: RunRequest,
+    budget: Budget,
+    ticket: { readonly ticketId: string; readonly toolRef: string },
+    text: string,
+  ): { text: string; isError: boolean; taints: boolean; stop?: StopReason } {
+    const bounded = boundOutput(text, PAYLOAD_TEXT_BUDGET)
+    this.#o.store.append({
+      type: 'tool.result',
+      runId: request.runId,
+      agentId: request.agent.agentId,
+      payload: {
+        schemaVersion: 1,
+        ticketId: ticket.ticketId,
+        toolRef: ticket.toolRef,
+        ok: false,
+        text: bounded.text,
+        bytes: bounded.bytes,
+        truncated: bounded.truncated,
+        ...(bounded.sha256 === undefined ? {} : { sha256: bounded.sha256 }),
+        durationMs: 0,
+      },
+    })
+    const charged = budget.charge('tool')
+    return { text: bounded.text, isError: true, taints: false, ...(charged.ok ? {} : { stop: charged.stop }) }
   }
 
   #resume(request: RunRequest, parkedAt: number): void {

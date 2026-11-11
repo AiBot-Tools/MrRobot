@@ -44,6 +44,7 @@ import { isClean, projectRecovery, type Recovery } from './events/projections.js
 import { GoalTracker } from './goals/tracker.js'
 import { Delegation } from './runtime/delegate.js'
 import { KernelTools } from './runtime/kernel-tools.js'
+import { SandboxTools } from './runtime/sandbox-tools.js'
 import { GoalWriter } from './goals/writer.js'
 import { goalToolsUnusable, watchGoalTools } from './goals/tools.js'
 
@@ -626,6 +627,16 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       },
     })
     const kernelTools = new KernelTools({ store, views: toolViews, handlers: delegation.handlers() })
+    // ── sandbox tools: sandbox.exec, a worker's commands in a container ───
+    //
+    // Built whatever the sandbox subsystem's mark: a driver that cannot run
+    // refuses each call itself, and the call's result says why. Every
+    // sandbox.* ref goes to this runner, never to the hub, and is offered only
+    // to a run whose agent's manifest, read from the registry, may hold it
+    // (sandboxToolProblem) and lists it. Each exec runs --network none with no
+    // channel: egress stays the stub (STUBS, egress-proxy), and no shipped
+    // manifest lists a sandbox tool.
+    const sandboxTools = new SandboxTools({ store, views: toolViews, driver, agents, sandbox: config.sandbox })
 
     const loop = new RunLoop({
       store,
@@ -650,6 +661,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
         )
       },
       kernelTools,
+      sandboxTools,
     })
 
     // ── scheduler ─────────────────────────────────────────────────────────

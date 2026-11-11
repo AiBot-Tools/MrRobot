@@ -1244,6 +1244,8 @@ test('resolved real path, not the request string, is passed to docker', (t) => {
 // ── the driver ─────────────────────────────────────────────────────────────
 
 interface FakeChild extends ChildLike {
+  /** Every signal the driver sent this child, in order (ChildLike.kill). */
+  readonly signals: string[]
   close(code: number | null, signal: string | null): void
   /** As Node's child emits 'exit', before 'close', once the process has ended. */
   exit(code: number | null, signal: string | null): void
@@ -1262,10 +1264,17 @@ function fakeChild(streams: ChildStreams = SILENT): FakeChild {
     ;(handlers[event] ??= []).push(cb)
     return child
   }
+  const signals: string[] = []
   const child: FakeChild = {
     stdin: streams.stdin ?? null,
     stdout: streams.stdout,
     stderr: streams.stderr,
+    signals,
+    // Recorded only: a test plays the process's end (exit, close) itself.
+    kill(signal) {
+      signals.push(signal)
+      return true
+    },
     on: on as ChildLike['on'],
     close(code, signal) {
       for (const cb of handlers['close'] ?? []) (cb as (c: number | null, s: string | null) => void)(code, signal)
@@ -2931,6 +2940,91 @@ test('sweepOrphans resolves only once every kill it sent has returned, and kill(
   release()
   assert.deepEqual(await sweep, [`${CONTAINER_PREFIX}h1`])
   await kill
+})
+
+test('abandon SIGKILLs the docker CLI the driver spawned, while it runs, and kills the container by name on its own domain; the fake agrees on the result', async (t) => {
+  // For a caller that waited past a run's wallclock for a result the driver
+  // never gave (a daemon that accepts and never answers): the CLI is the one
+  // process the driver signals, its own child, and the kill by name goes to
+  // the VM recorded with the name, as kill() sends one.
+  const f = fixture(t)
+  const name = `${CONTAINER_PREFIX}given-up`
+  const d = driverFor(f)
+  const running = d.driver.run(spec(f, { domain: 'hostile', name }))
+  // A requested kill first, as a stopped run sends: it does not stop the
+  // give-up from ending the CLI.
+  await d.driver.kill(name)
+  d.execs.length = 0
+  await d.driver.abandon(name)
+  assert.deepEqual(d.child.signals, ['SIGKILL'])
+  assert.deepEqual(killsSent(d), [`${HOSTILE_HOST} ${name}`])
+  // Node reports a child killed by a signal with no exit code: the run's
+  // result says so, with no killedBy, though a kill was requested before.
+  d.child.exit(null, 'SIGKILL')
+  d.child.close(null, 'SIGKILL')
+  const result = await running.result
+  assert.deepEqual([result.exitCode, result.signal, result.killedBy], [null, 'SIGKILL', undefined])
+
+  // The name no longer held, nothing is signalled, and the kill by name asks
+  // every VM, as kill() asks of a name it does not know.
+  d.execs.length = 0
+  await d.driver.abandon(name)
+  assert.deepEqual(d.child.signals, ['SIGKILL'])
+  assert.deepEqual(killsSent(d), [`${TRUSTED_HOST} ${name}`, `${HOSTILE_HOST} ${name}`])
+
+  // A CLI that has exited, with its pipes still open (a channel run whose
+  // input its caller holds), is not signalled: Node signals no process it has
+  // reaped, and the name it held is killed on its own domain.
+  const exited = driverFor(f)
+  exited.driver.run(spec(f, { name }))
+  exited.child.exit(0, null)
+  await exited.driver.abandon(name)
+  assert.deepEqual(exited.child.signals, [])
+  assert.deepEqual(killsSent(exited), [`${TRUSTED_HOST} ${name}`])
+
+  // A daemon that never answers the kill holds abandon, which a caller
+  // bounds; the CLI was ended before that kill was sent.
+  const hung = driverFor(f)
+  hung.setExec((args) => (args[0] === 'kill' ? new Promise<never>(() => undefined) : Promise.resolve({ stdout: '', stderr: '' })))
+  hung.driver.run(spec(f, { name }))
+  let answered = false
+  void hung.driver.abandon(name).then(() => {
+    answered = true
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(hung.child.signals, ['SIGKILL'])
+  assert.deepEqual(killsSent(hung), [`${TRUSTED_HOST} ${name}`])
+  assert.equal(answered, false)
+
+  // A name without the kernel's prefix is sent nowhere and signals nothing.
+  const bare = driverFor(f)
+  bare.driver.run(spec(f, { name }))
+  await bare.driver.abandon('someone-elses-container')
+  assert.deepEqual(bare.child.signals, [])
+  assert.deepEqual(bare.execs, [])
+
+  // The fake: a hung run given up ends as a CLI killed by a signal, whatever
+  // its script says of kills, on a later macrotask; a run that has ended, or
+  // a name without the prefix, changes nothing; every name is recorded.
+  for (const ignoresKill of [false, true]) {
+    const fake = fakeSandbox({ imageId: IMAGE_ID, script: [{ hangs: true, ...(ignoresKill ? { ignoresKill } : {}), stdout: 'partial\n' }, {}] })
+    const hungRun = fake.run(spec(f, { name }))
+    let settled = false
+    void hungRun.result.then(() => {
+      settled = true
+    })
+    await fake.abandon(name)
+    assert.equal(settled, false, 'the fake ended the run before abandon() returned')
+    const given = await hungRun.result
+    assert.deepEqual([given.exitCode, given.signal, given.killedBy, given.stdout], [null, 'SIGKILL', undefined, 'partial\n'], String(ignoresKill))
+    const quick = fake.run(spec(f, { name }))
+    const own = await quick.result
+    await fake.abandon(name)
+    await fake.abandon('someone-elses-container')
+    assert.equal(own.exitCode, 0)
+    assert.deepEqual(fake.abandons, [name, name, 'someone-elses-container'])
+    assert.deepEqual(fake.kills, [])
+  }
 })
 
 test('kill of a name without the kernel prefix sends nothing to either VM', async (t) => {

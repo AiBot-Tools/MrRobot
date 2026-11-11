@@ -235,6 +235,11 @@ export function projectRecovery(rows: readonly EventRow[]): Recovery {
         break
       }
       case 'tool.result': {
+        // Every tool.result is a call the live run charged as a tool call,
+        // one the loop denied after the gate among them (loop.ts
+        // #deniedAfterGate), so this count is the live one. A denial's text
+        // is the kernel's, not untrusted output; counting it as untrusted
+        // input below fails safe.
         const run = row.runId === null ? undefined : open.get(row.runId)
         if (run !== undefined) run.toolCalls += 1
         if (row.runId !== null) touchedUntrusted.add(row.runId)

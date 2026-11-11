@@ -10,7 +10,9 @@
 // tool arguments. The schema is strict so a caller cannot smuggle in an extra
 // field like `modelDecision` or `allow` and have some future branch read it.
 // Arguments are the one piece of model-influenced data here, and they are
-// used only to REFUSE (protected paths), never to permit.
+// used only to REFUSE (protected paths, and a runner's own refusal of them,
+// which the kernel works out from them before the gate), never to permit. So
+// is the runner's refusal itself, whatever it is of (runnerRefusal).
 //
 // Rule order, first match wins. It runs from structural facts to contextual
 // ones so the reported reason is the most fundamental true thing:
@@ -21,13 +23,17 @@
 //      an AGENTS.md                      deny      invariant 8, read-only personas
 //   3b. the tool's namespace argument
 //      is not the agent's own namespace  deny      memory is per agent
+//   3c. the tool's runner refuses the
+//      call whoever approves it (its     deny      no human is asked to
+//      caller or its arguments)                    approve what never runs
 //   4. risk is 'irreversible'            needs-human   always, no exceptions
 //   5. tainted run, risk is not 'read'   needs-human   invariant 3
 //   6. the tool-view says quarantine     quarantine
 //   7. otherwise                         allow
 //
 // Rules 4 and 5 are needs-human rather than deny: the operator can say yes.
-// Rules 1 to 3 are deny, because no human approval makes them safe.
+// Rules 1 to 3c are deny, because no human approval makes them safe, or, for
+// 3c, makes them run.
 
 import { z } from 'zod'
 
@@ -68,6 +74,18 @@ export const GateInput = z
     toolRef: z.string().min(1),
     /** Model-influenced. Used only to refuse, never to permit. */
     args: z.record(z.string(), z.unknown()),
+    /**
+     * Why the tool's own runner refuses this call whatever a human says,
+     * worked out by the kernel before the gate (sandbox tools', run loop
+     * #runnerRefusal): its caller, an agent whose manifest, read from the
+     * registry, may not hold the tool (SandboxTools.holderProblem), or a
+     * kernel with no runner for it; or its arguments, a command the approval
+     * preview would cut, redact or show unreadably, one past the runner's
+     * bounds, or one the driver's audit refuses (SandboxTools.argsRefusal).
+     * Absent: the runner refuses nothing it can tell before it runs, or the
+     * kernel does not ask. Used only to refuse, as the arguments are.
+     */
+    runnerRefusal: z.string().min(1).optional(),
   })
   .strict()
 
@@ -99,7 +117,7 @@ export function mentionsProtectedPath(value: unknown): boolean {
  */
 export function decide(input: GateInput): GateVerdict {
   const parsed = GateInput.parse(input)
-  const { view, scope, manifestAllows, toolRef, args } = parsed
+  const { view, scope, manifestAllows, toolRef, args, runnerRefusal } = parsed
 
   if (view.exposure !== 'agent') {
     return { decision: 'deny', reason: `${toolRef} is ${view.exposure}, not exposed to agents` }
@@ -141,6 +159,13 @@ export function decide(input: GateInput): GateVerdict {
           `not ${typeof asked === 'string' ? asked : 'an unnamed namespace'}`,
       }
     }
+  }
+
+  // Deny, before any rule that would ask a human: the runner refuses this
+  // call however it is decided, so asking would only have a human approve a
+  // command that never runs, or one they were never shown whole.
+  if (runnerRefusal !== undefined) {
+    return { decision: 'deny', reason: runnerRefusal }
   }
 
   if (view.risk === 'irreversible') {

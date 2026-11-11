@@ -681,18 +681,12 @@ export function auditRunArgs(
   // A command argument can use either spelling, so both are refused. Spellings
   // a string cannot see (an APFS case variant, a firmlink, a bind mount) are
   // refused by identity in confineWorkspace, on every run.
-  if (home !== '') {
-    const spellings = [...new Set([home, realpathNearest(home)])]
-    for (const h of spellings) {
-      if (workspace === h) {
-        throw new ConfigError('the workspace may never be the home directory')
-      }
-      for (const arg of args) {
-        if (arg.includes(`source=${h},`) || arg === h || arg.startsWith(`${h}/`)) {
-          throw new ConfigError(`docker args reference the home directory (${h})`)
-        }
-      }
+  for (const h of homeSpellings(home)) {
+    if (workspace === h) {
+      throw new ConfigError('the workspace may never be the home directory')
     }
+    const named = homeReference(args, h)
+    if (named !== undefined) throw new ConfigError(named)
   }
 
   // What docker itself obeys: the options between `run` and the image. A spec
@@ -780,6 +774,52 @@ export function auditRunArgs(
   for (const option of CAP_VALUES.keys()) assertCapValue(option, values.get(option) ?? '')
   assertTheMount(mount ?? '', workspace)
   assertTheNetwork(values.get('--network') ?? '')
+}
+
+/**
+ * The spellings of `home` a string can carry: as given and fully resolved.
+ * None for an empty HOME, which would make the check vacuous (every path
+ * starts with `/`), so it is skipped rather than compared against ''.
+ */
+function homeSpellings(home: string): readonly string[] {
+  if (home === '') return []
+  const spellings = [...new Set([home, realpathNearest(home)])]
+  return spellings
+}
+
+/**
+ * Why `args` reference the home directory spelled `h`, in the audit's words,
+ * or undefined: an element that is it, a path under it, or a mount whose
+ * source it is.
+ */
+function homeReference(args: readonly string[], h: string): string | undefined {
+  for (const arg of args) {
+    if (arg.includes(`source=${h},`) || arg === h || arg.startsWith(`${h}/`)) {
+      return `docker args reference the home directory (${h})`
+    }
+  }
+  return undefined
+}
+
+/**
+ * Why the audit would refuse a run for `command` alone, in the words
+ * auditRunArgs throws, or undefined: its whole-argv scans (wholeArgvRefusal),
+ * asked beside the builder's one --mount, then its home check over the
+ * command's elements under both spellings of `home`, in the audit's order.
+ * Nothing else the audit reads is the command's: after the image docker
+ * passes every element on unread, and the rest is what the builder wrote.
+ * DockerDriver.commandRefusal answers with this, so a caller that asks
+ * before a human approves a command (sandbox.exec's) refuses exactly the
+ * commands run() would refuse whatever the human said.
+ */
+export function commandAuditRefusal(command: readonly string[], home: string): string | undefined {
+  const scanned = wholeArgvRefusal(['--mount', ...command])
+  if (scanned !== undefined) return scanned
+  for (const h of homeSpellings(home)) {
+    const named = homeReference(command, h)
+    if (named !== undefined) return named
+  }
+  return undefined
 }
 
 /**
@@ -925,10 +965,14 @@ function assertTheMount(value: string, workspace: string): void {
  * The output streams' chunks are what Node's child pipes emit: a Buffer each,
  * or a string had an encoding been set on the stream (the driver sets none).
  * stdin is the CLI's: a channel run's output (with stdout, a Readable then,
- * its input), and closed at once on any other run.
+ * its input), and closed at once on any other run. kill is Node's own
+ * ChildProcess.kill, which signals this child and nothing else: the driver
+ * sends it SIGKILL only to give a run up (abandon), and only before the CLI
+ * has exited, after which Node sends nothing.
  */
 export interface ChildLike {
   readonly stdin: Writable | null
+  kill(signal: 'SIGKILL'): boolean
   readonly stdout: { on(event: 'data', cb: (chunk: Buffer | string) => void): void } | null
   readonly stderr: { on(event: 'data', cb: (chunk: Buffer | string) => void): void } | null
   on(event: 'close', cb: (code: number | null, signal: string | null) => void): unknown
@@ -1117,6 +1161,11 @@ interface Held {
    * a kill sent before the exit ended it is the CLI's exit to say (run()).
    */
   requested(): void
+  /**
+   * End the docker CLI this driver spawned for the run, by SIGKILL, unless it
+   * has already exited (abandon).
+   */
+  end(): void
 }
 
 export class DockerDriver implements SandboxDriver {
@@ -1344,6 +1393,14 @@ export class DockerDriver implements SandboxDriver {
         // a kill (a tear-down's, say) can come long after the exit.
         if (exitedAt === undefined) killSentBy ??= 'requested'
       },
+      end: () => {
+        // The CLI only, and only while it runs: once it has exited there is
+        // nothing of it to end, and Node signals no process it has reaped.
+        // Its close then settles the result as a CLI killed by a signal (no
+        // exit status, no killedBy), which a caller that gave the run up
+        // does not read.
+        if (exitedAt === undefined) child.kill('SIGKILL')
+      },
     })
     // A channel run's stdin and stdout are its caller's, and the driver
     // writes and reads neither: its stdout is not captured, and the result's
@@ -1391,8 +1448,12 @@ export class DockerDriver implements SandboxDriver {
       // this case as for a CLI killed from outside. Until then, a wallclock
       // kill that ends nothing (it reached no daemon, and the container later
       // exited on its own) leaves the result no killedBy (finish, below):
-      // `overran` is then the only trace of the breach, and W1 must log the
-      // run from it, not from killedBy.
+      // `overran` is then the only trace of the breach, and the runner logs
+      // the run from it (sandbox-tools.ts endReason), not from killedBy. The
+      // runner also bounds its wait on this result, at the wallclock and a
+      // grace, and then gives the run up (abandon): that ends this CLI and
+      // sends a second kill by name, which bounds the call, not the
+      // container, through a daemon that never answers.
       const timer = setTimeout(() => {
         killSentBy = 'wallclock'
         overran = true
@@ -1503,12 +1564,46 @@ export class DockerDriver implements SandboxDriver {
    * a daemon lists. A kill of it is sent nowhere, which keeps the contract
    * (not an error) without reaching someone else's container on either VM.
    */
+  /**
+   * Why run() would refuse a spec for its command alone (SandboxDriver.
+   * commandRefusal): the audit's whole-argv scans and its home check, under
+   * the home run() checks against (commandAuditRefusal).
+   */
+  commandRefusal(command: readonly string[]): string | undefined {
+    return commandAuditRefusal(command, this.#options.home ?? homeDirectory())
+  }
+
   async kill(name: string): Promise<void> {
     if (!name.startsWith(CONTAINER_PREFIX)) return
     const held = this.#running.get(name)
     held?.requested()
     const domains = held === undefined ? DOMAINS : [held.domain]
     await Promise.all(domains.map((domain) => this.#killOn(name, domain)))
+  }
+
+  /**
+   * Give up on the run under `name` (SandboxDriver.abandon): SIGKILL to the
+   * docker CLI this driver spawned for it, while it runs and the name is
+   * held, and a kill by name on the run's own domain, or on every domain for
+   * a name this driver no longer holds, as kill() sends one. The CLI is the
+   * only process this driver signals, and it is its own child: a daemon
+   * that accepts and never answers holds the CLI's `docker run` and its
+   * wallclock kill alike (#killOn has no timeout), and only the CLI's end
+   * frees the name and the CLI's pipes. Not a requested kill: a run given
+   * up reports no killedBy, and its caller records its end as an error. A
+   * name without CONTAINER_PREFIX is sent nowhere.
+   */
+  async abandon(name: string): Promise<void> {
+    if (!name.startsWith(CONTAINER_PREFIX)) return
+    const held = this.#running.get(name)
+    try {
+      held?.end()
+    } catch {
+      // Node's kill throws only for a signal it does not know, and SIGKILL is
+      // one it does; whatever failed, the kill by name below still goes out.
+    }
+    const where = held === undefined ? DOMAINS : [held.domain]
+    await Promise.all(where.map((domain) => this.#killOn(name, domain)))
   }
 
   /**

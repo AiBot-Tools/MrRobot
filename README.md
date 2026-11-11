@@ -685,8 +685,9 @@ binding in kernel.yaml's `egress.bindings`, no allow host may be a binding's
 host, and only a tier 2 or higher worker sandboxed in the trusted domain may
 hold either; a spawned child keeps a subset of its template's hosts and
 bindings, and only at tier 2 or more. No shipped manifest holds egress. Neither
-agent declares a `sandbox:` (the loop runs in process in this phase, so a domain
-would claim an isolation that does not happen), an `egress.allow` host (the
+agent declares a `sandbox:` (a worker with one at tier 2 or more that lists
+`sandbox.exec` has its commands run in containers since egress plan W1a, and a
+shipped manifest that does waits on the Phase 2 exit, as egress does), an `egress.allow` host (the
 kernel's egress engine is not wired to enforce one), or a `schedule:` (the only routable model is a frontier
 one, and an unattended run that can reach it can empty an envelope).
 
@@ -709,23 +710,33 @@ It logs `sandbox.started` and `sandbox.killed` between `tool.call` and
 client ended with no exit status or with 125 (its own failure, a lost daemon
 connection among them), since such a client may leave its container running;
 it waits 10 s at most for that kill, so that kill never holds the run. The
-driver's own result is still awaited with no such bound: the docker CLI holds
-it until it closes, and the container's wallclock is a kill by name through
-the same daemon, so a daemon that accepts and never answers (a paused Colima
-VM) holds the call, and the run, past that wallclock until the wiring task
-(egress plan W1) bounds the wait. Its output taints the run, so every exec
-after the first in a run, and every other write, waits for a human. An exec
+driver's own result is awaited for the container's wallclock and 30 s more at
+most, and once the run is stopped (`aos kill`, or a shutdown), whose kill by
+name goes out then, for 30 s from the stop at most: the docker CLI holds it
+until it closes, and the container's wallclock is a kill by name through the
+same daemon, so a daemon that accepts and never answers (a paused Colima VM)
+would hold the call, and the run, for good. Past that bound the runner gives
+the container up: the driver ends the docker
+client it spawned (SIGKILL, the one process it signals) and kills the
+container by name on its own domain, waited on for 10 s at most, and
+`sandbox.killed` records `error`, the result saying the driver never
+answered. Its output taints the run, so every exec after the first in a run,
+and every other write, waits for a human. An exec
 whose arguments the approval preview would cut (500 bytes of their canonical
 JSON), would redact (a span shaped like a credential is shown as
 `[REDACTED]`, and the PEM pattern hides everything between its markers), or
 would show with a character a screen hides or reorders text by (a bidi, format
 or C1 control, a line separator, or another default-ignorable code point: a
-Hangul filler, a variation selector, so an emoji written with VS16 too) never
-runs, even once approved: the gate is generic, so the human is still asked
-first, and the runner refuses the call after. `aos approvals` does not show
-what an approval would run (protocol v1's `ApprovalItem` carries no preview, and
-adding one is a protocol version bump for the operator), so before
-`aos approve` on an exec, read the command it was shown in its
+Hangul filler, a variation selector, so an emoji written with VS16 too), or
+whose command the driver's own audit refuses (a `-v`, `--volume`, `--mount` or
+`--device` anywhere in it, the docker socket, or an argument that is the
+operator's home or a path under it, in either spelling) never
+runs, and no human is asked to approve it: the run loop asks the runner's own
+check of the arguments before the gate, and the gate denies the call, its
+`tool.gate` row giving the runner's refusal as the reason. `aos approvals`
+does not show what an approval would run (protocol v1's `ApprovalItem` carries
+no preview, and adding one is a protocol version bump for the operator), so
+before `aos approve` on an exec, read the command it was shown in its
 `approval.requested` row: `npm run cli -- search --type approval.requested
 --run <runId> --limit 1`. Each output stream keeps its own share of the
 result, counted in the bytes it takes in the log's JSON. Of each stream the
@@ -763,9 +774,14 @@ before a stream is cut to its share, redacted: the windows short of their cut
 sides, not the streams. Only a worker with a `sandbox:` block at tier 2 or more
 may list it; the registry refuses it in any other manifest, at load and in a
 spawned child, and no MCP server may be named `sandbox` or `kernel`. The runner
-(`src/runtime/sandbox-tools.ts`) is built and tested against the fake driver,
-and not yet wired into the daemon (egress plan W1); no shipped manifest lists
-it.
+(`src/runtime/sandbox-tools.ts`) is wired into the daemon (egress plan W1a):
+every `sandbox.*` call goes to it, never to the hub, and the run loop offers
+`sandbox.exec` only to a run whose agent's manifest, read from the registry,
+may hold it and lists it. Any other run that names it is denied it before the
+gate asks anyone, its `tool.gate` row giving the reason, and one whose agent
+the registry stops admitting while a human is asked (archived, say) is denied
+it once approved, with a `tool.result` saying so. No shipped manifest lists it,
+so no shipped agent is offered it.
 
 ### Goals
 
@@ -920,8 +936,8 @@ unparseable or stops the test files loading is **invalid**, never a kill.
 It edits the working tree, in the files its mutants name: those under `src/`,
 six helpers under `test/helpers/`, and `images/worker/mux.mjs`,
 `scripts/falsify.ts`, `scripts/falsify/runner.ts`, `scripts/worker-image.ts`,
-`test/egress-address.test.ts`, `test/egress-frame.test.ts` and
-`test/hygiene.test.ts`. So:
+`test/config-files.test.ts`, `test/egress-address.test.ts`,
+`test/egress-frame.test.ts` and `test/hygiene.test.ts`. So:
 
 - it refuses a file with uncommitted changes (`--allow-dirty` to override);
 - it holds `.falsify/lock.json` for the whole run, naming its pid and that

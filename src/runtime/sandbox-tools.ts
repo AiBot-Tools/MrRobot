@@ -2,10 +2,11 @@
 //
 // `sandbox.exec` runs one command in one container of the run's own sandbox
 // domain, and nothing else: no network (every run is --network none), no
-// channel (so no egress, whatever the manifest's egress says, until the wiring
-// task W1 gives exec a grant), the pinned worker image by id, and the run's
-// own workspace, <mountRoot>/<runId>, at /workspace. A second exec of the same
-// run sees what the first left there; no other run's does.
+// channel (so no egress, whatever the manifest's egress says, until egress is
+// wired and gives exec a grant, egress plan W1), the pinned worker image by
+// id, and the run's own workspace, <mountRoot>/<runId>, at /workspace. A
+// second exec of the same run sees what the first left there; no other run's
+// does.
 //
 // It meets the contract every agent tool meets, as kernel-tools.ts reproduces
 // the hub's execute half for tools that have no server:
@@ -26,12 +27,17 @@
 //   says nothing of its container, which may run on with the driver's
 //   wallclock timer cleared (docker.ts), so the container is killed by name
 //   before that row is written. That kill is awaited for KILL_WAIT_MS at most,
-//   so it never holds the call. The driver's result itself has no bound of the
-//   runner's: DockerDriver settles it only once the docker CLI closes, and its
-//   wallclock is a kill by name through the same daemon, so a daemon that
-//   accepts and never answers (a paused VM) holds the call, and the run, past
-//   the container's wallclock, until the wiring task bounds that wait (egress
-//   plan W1).
+//   so it never holds the call. The driver's result is awaited for the
+//   container's wallclock and RESULT_GRACE_MS more at most, and once the run
+//   is stopped (its kill by name sent then) for RESULT_GRACE_MS from the
+//   stop at most: DockerDriver settles it only once the docker CLI closes,
+//   and its wallclock is a kill by name through the same daemon, so a daemon
+//   that accepts and never answers (a paused VM) would hold the call, and
+//   the run, for good. Past that bound the runner gives the container up (SandboxDriver.abandon: the
+//   driver ends the docker CLI it spawned, by SIGKILL, and kills the
+//   container by name on its domain, awaited for KILL_WAIT_MS at most), and
+//   records sandbox.killed with reason error, the result saying the driver
+//   never answered.
 //
 // Its arguments are held to what a human is shown of them: approval.requested
 // previews at most APPROVAL_PREVIEW_BYTES of their redacted canonical JSON
@@ -41,8 +47,13 @@
 // tail the human never saw), one it would redact (redact.ts shows a span
 // shaped like a credential as [REDACTED], and the PEM pattern hides all that
 // stands between its markers), and one holding a character a screen shows as
-// nothing or uses to reorder the text around it. The human is still asked
-// first, since the gate is generic; the runner refuses after. Its output
+// nothing or uses to reorder the text around it. So is one the driver's own
+// audit refuses for its command alone (SandboxDriver.commandRefusal: the
+// real driver's whole-argv scans, and its home check, an argument that is
+// the operator's home or a path under it). The run loop asks those checks
+// (argsRefusal) before the gate, which denies such a call before any human is
+// asked (GateInput.runnerRefusal), so no human approves a command the runner
+// then refuses; the runner refuses it again at execution. Its output
 // reaches the model and the log with each stream bounded to its own share,
 // counted in the bytes it takes in the logged JSON, so stderr, and the end of
 // each, where a failure is, is never lost to a long stdout, and a stream of
@@ -89,10 +100,15 @@
 // in the run, the next exec among them, waits for a human (invariant 3).
 //
 // Who may hold these tools is the registry's call, at load, through
-// sandboxToolProblem: a worker, with a sandbox: block, at tier 2 or more. The
-// loop offers a tool only to a manifest that lists it, so no other agent is
-// ever offered one. This runner is built and tested, and not yet wired into
-// bootKernel or the run loop (egress plan W1); no shipped manifest lists it.
+// sandboxToolProblem: a worker, with a sandbox: block, at tier 2 or more.
+// bootKernel builds this runner, and the run loop routes every sandbox.* ref
+// to it and never to the hub (egress plan W1a). The loop offers a sandbox
+// tool only to a run whose agent's manifest, read from the registry by its
+// id (holderProblem), may hold it and lists it, whatever the run's own tool
+// list says; it denies a call from any other before the gate, so no human is
+// asked to approve it, and again after it, with its tool.result, should the
+// registry change while a human is asked; the runner reads the registry
+// again at the call. No shipped manifest lists one.
 //
 // Its hard wallclock is what is left of the run's budget, at most
 // sandbox.defaults.wallclockMs: a container never outlives the run that
@@ -105,7 +121,7 @@ import { z } from 'zod'
 
 import type { AgentManifest } from '../agents/manifest.js'
 import type { AgentRecord } from '../agents/registry.js'
-import type { KernelConfig } from '../config.js'
+import { MAX_TIMER_MS, type KernelConfig } from '../config.js'
 import { PolicyDenied } from '../errors.js'
 import { boundOutput, PAYLOAD_TEXT_BUDGET } from '../events/bound.js'
 import { canonicalize, sha256Hex } from '../events/canonical.js'
@@ -125,11 +141,15 @@ import {
   type SandboxResult,
   type SandboxSpec,
 } from '../sandbox/driver.js'
-import { wholeArgvRefusal } from '../sandbox/docker.js'
 import { imageIdProblem, memoryBytes } from '../sandbox/limits.js'
 
 /** The server id sandbox tools are addressed under: `sandbox.exec`. */
 export const SANDBOX_SERVER = 'sandbox'
+
+/** Whether `ref` is a sandbox tool's, which the run loop routes to SandboxTools and never to the hub. */
+export function isSandboxRef(ref: string): boolean {
+  return ref.startsWith(`${SANDBOX_SERVER}.`)
+}
 
 /** The tier a sandbox tool starts at: tier 2 is the first that runs sandboxed (plan D15). */
 export const SANDBOX_MIN_TIER = 2
@@ -160,6 +180,19 @@ export const MAX_EXEC_BYTES = 65_536
  * sandbox.killed row written.
  */
 export const KILL_WAIT_MS = 10_000
+
+/**
+ * How long past a container's wallclock the runner waits on the driver's
+ * result before it gives the container up (SandboxDriver.abandon), and how
+ * long past the run being stopped, when that comes sooner. The driver's
+ * wallclock is a kill by name sent when it elapses, as the stop's is, and
+ * the result settles once the docker CLI then closes: within a second or two
+ * through a daemon that answers, and never through one that accepts and never
+ * answers (a paused Colima VM), whose kill holds as long as its run does.
+ * Thirty seconds is ample for the first and bounds the second. The wait is at
+ * most a timer's limit (MAX_TIMER_MS) in all.
+ */
+export const RESULT_GRACE_MS = 30_000
 
 /**
  * The docker CLI's own failure status: `docker run` exits 125 when the error
@@ -240,6 +273,8 @@ export interface SandboxToolsOptions {
   readonly sandbox: Pick<KernelConfig['sandbox'], 'imageId' | 'domains' | 'defaults'>
   /** Unset, KILL_WAIT_MS. A test's shorter bound, so a kill that never answers is met in milliseconds. */
   readonly killWaitMs?: number
+  /** Unset, RESULT_GRACE_MS. A test's shorter grace, so a driver that never answers is given up in milliseconds. */
+  readonly resultGraceMs?: number
 }
 
 const NUL = '\u0000'
@@ -282,6 +317,43 @@ function issueText(issue: z.core.$ZodIssue): string {
   }
   return `${issue.path.map(String).join('.') || '(arguments)'}: ${issue.message}`
 }
+
+/**
+ * sandbox.exec's command, or why the runner refuses `args` on them alone, in
+ * the order #exec reads them: ExecArgs' bounds, then what a human approving
+ * the call would not be shown as it runs (previewRefusal), then what
+ * `driver`'s audit refuses of a command (commandRefusal: the real driver's
+ * whole-argv scans and its home check). Each refusal names what the model
+ * sent by its place only, but for a short argument the audit refuses.
+ */
+function execCommand(
+  args: Record<string, unknown>,
+  driver: Pick<SandboxDriver, 'commandRefusal'>,
+): { readonly command: readonly string[] } | { readonly refusal: string } {
+  const parsed = ExecArgs.safeParse(args)
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map(issueText).join('; ')
+    return { refusal: `sandbox.exec takes {command: [program, ...args]}: ${issues}` }
+  }
+  const { command } = parsed.data
+  const unshown = previewRefusal(args, command)
+  if (unshown !== undefined) return { refusal: unshown }
+  // Before the workspace is made: the driver's audit would refuse it too,
+  // after, in docker's terms rather than the command's.
+  const flagged = commandRefusal(command, driver)
+  if (flagged !== undefined) return { refusal: flagged }
+  return { command }
+}
+
+/**
+ * What a wait on a driver's result came to: its result, its rejection, or
+ * nothing within the bound, from the container's start (`bound`) or from the
+ * run being stopped (`stopped`).
+ */
+type Waited =
+  | { readonly result: SandboxResult }
+  | { readonly rejected: unknown }
+  | { readonly late: 'bound' | 'stopped' }
 
 const EXEC_DESCRIPTION =
   'Run one command in a fresh container of your sandbox, with no network. The command is an argv (no shell ' +
@@ -341,7 +413,38 @@ export class SandboxTools {
   }
 
   isSandboxRef(ref: string): boolean {
-    return ref.startsWith(`${SANDBOX_SERVER}.`)
+    return isSandboxRef(ref)
+  }
+
+  /**
+   * Why the agent `agentId` may not be offered or run `ref`, read from the
+   * registry now, or undefined when it may: one the registry does not hold,
+   * an archived one, one sandboxToolProblem refuses, or one whose manifest
+   * does not list the tool. The run loop asks it of every sandbox schema it
+   * would offer a run, and of every sandbox call before the gate and again
+   * before it executes, so a run whose own tool list names a sandbox tool its
+   * manifest may not hold is never offered it and is denied it, without a
+   * human asked; call() asks it once more.
+   */
+  holderProblem(ref: string, agentId: string): string | undefined {
+    const held = this.#holderOf(ref, agentId)
+    return 'problem' in held ? held.problem : undefined
+  }
+
+  /**
+   * Why the runner would refuse `args` for `ref` on the arguments alone, or
+   * undefined: what #exec refuses before it reads anything but them
+   * (execCommand), the driver's audit of the command among it. The run loop
+   * asks it before the gate, and hands the answer to it
+   * (GateInput.runnerRefusal), so a call the runner refuses
+   * whoever approved it is denied before any human is asked to approve it.
+   * Undefined for a ref with no arguments the runner reads: call() refuses
+   * a tool the kernel does not implement at execution.
+   */
+  argsRefusal(ref: string, args: Record<string, unknown>): string | undefined {
+    if (ref !== `${SANDBOX_SERVER}.exec`) return undefined
+    const checked = execCommand(args, this.#o.driver)
+    return 'refusal' in checked ? checked.refusal : undefined
   }
 
   /**
@@ -443,31 +546,31 @@ export class SandboxTools {
    * claims an agent it is not, or a record that changed since.
    */
   #holder(ref: string, agentId: string): AgentManifest {
+    const held = this.#holderOf(ref, agentId)
+    if ('problem' in held) throw new PolicyDenied(ref, held.problem)
+    return held.manifest
+  }
+
+  /** The manifest #holder admits, or why it refuses: holderProblem's reading. */
+  #holderOf(ref: string, agentId: string): { readonly manifest: AgentManifest } | { readonly problem: string } {
     const record = this.#o.agents.get(agentId)
-    if (record === undefined) throw new PolicyDenied(ref, `no agent ${agentId} is registered`)
-    if (record.status !== 'active') throw new PolicyDenied(ref, `agent ${agentId} is ${record.status}`)
+    if (record === undefined) return { problem: `no agent ${agentId} is registered` }
+    if (record.status !== 'active') return { problem: `agent ${agentId} is ${record.status}` }
     const problem = sandboxToolProblem(record.manifest)
-    if (problem !== undefined) throw new PolicyDenied(ref, problem)
+    if (problem !== undefined) return { problem }
     if (!record.manifest.tools.allow.includes(ref)) {
-      throw new PolicyDenied(ref, `${ref} is not in agent ${agentId}'s manifest (default deny)`)
+      return { problem: `${ref} is not in agent ${agentId}'s manifest (default deny)` }
     }
-    return record.manifest
+    return { manifest: record.manifest }
   }
 
   /** One command in one container, start to end. */
   async #exec(args: Record<string, unknown>, ctx: SandboxCallContext, manifest: AgentManifest): Promise<Done> {
-    const parsed = ExecArgs.safeParse(args)
-    if (!parsed.success) {
-      const issues = parsed.error.issues.map(issueText).join('; ')
-      throw new Error(`[refused] sandbox.exec takes {command: [program, ...args]}: ${issues}`)
-    }
-    const { command } = parsed.data
-    const unshown = previewRefusal(args, command)
-    if (unshown !== undefined) throw new Error(`[refused] ${unshown}`)
-    // Before the workspace is made: the driver's audit would refuse it too,
-    // after, in docker's terms rather than the command's.
-    const flagged = commandRefusal(command)
-    if (flagged !== undefined) throw new Error(`[refused] ${flagged}`)
+    // Asked of the loop before the gate too (argsRefusal), and again here,
+    // for a caller that did not ask, or a ticket minted without it.
+    const checked = execCommand(args, this.#o.driver)
+    if ('refusal' in checked) throw new Error(`[refused] ${checked.refusal}`)
+    const { command } = checked
     if (ctx.signal?.aborted === true) throw new Error('[refused] the run was stopped before the container started')
 
     const { imageId, domains, defaults } = this.#o.sandbox
@@ -502,9 +605,9 @@ export class SandboxTools {
       command,
       workspace,
       limits: { memoryMb, cpus: defaults.cpus, pids: defaults.pidsLimit, wallclockMs },
-      // No channel: no egress until W1 issues exec a grant, and the hostile
-      // domain never gets one. A run without one has no -i, and its stdin is
-      // closed at once.
+      // No channel: no egress until egress is wired to issue exec a grant
+      // (W1), and the hostile domain never gets one. A run without one has no
+      // -i, and its stdin is closed at once.
     }
 
     let running: RunningSandbox
@@ -536,26 +639,54 @@ export class SandboxTools {
       })
     } catch (e) {
       // A container the log cannot record is not left running, and the call
-      // fails only once it has ended (its wallclock bounds the wait), with the
-      // log's refusal, whatever the driver's result says.
+      // fails only once it has ended, or been given up past its wallclock and
+      // a grace, with the log's refusal, whatever the driver's result says.
       kill()
-      await running.result.then(
-        () => undefined,
-        () => undefined,
-      )
+      const waited = await this.#within(running.result, this.#resultBound(spec), ctx.signal)
+      if ('late' in waited) await this.#giveUp(spec.name)
       throw e
     }
 
     const signal = ctx.signal
     signal?.addEventListener('abort', kill, { once: true })
     if (signal?.aborted === true) kill()
-    let result: SandboxResult
+    const boundMs = this.#resultBound(spec)
+    let waited: Waited
     try {
-      result = await running.result
-    } catch (e) {
+      waited = await this.#within(running.result, boundMs, signal)
+    } finally {
+      signal?.removeEventListener('abort', kill)
+    }
+    if ('late' in waited) {
+      // The driver never answered: no result past the container's wallclock
+      // and a grace, or past the grace from the run being stopped, whose kill
+      // by name went out then. Its CLI is ended and its container killed by
+      // name (abandon), and its end recorded as an error, so the started row
+      // is closed and the run goes on; what the result would have said, if it
+      // ever settles, is not read.
+      log.warn(
+        { sandboxId: spec.name, driver: this.#o.driver.name, boundMs, late: waited.late },
+        'sandbox result never came; the run gave the container up',
+      )
+      const sent = await this.#giveUp(spec.name)
+      this.#o.store.append({
+        type: 'sandbox.killed',
+        runId: ctx.runId,
+        agentId: ctx.agentId,
+        payload: { schemaVersion: 1, sandboxId: spec.name, reason: 'error' },
+      })
+      const within =
+        waited.late === 'stopped'
+          ? `within ${String(this.#graceMs())} ms of the run being stopped, which sent a kill by name to it,`
+          : `within ${String(boundMs)} ms of its start (its wallclock of ${String(wallclockMs)} ms and a grace of ` +
+            `${String(this.#graceMs())} ms),`
+      throw new Error(`[error] the driver never answered: ${spec.name} had no result ${within} so the run gave it up; ${sent}`)
+    }
+    if ('rejected' in waited) {
       // A driver's result settles and never rejects (SandboxDriver.run). One
       // that did says nothing of its container: it is killed by name, and its
       // end recorded, so no started row is left open on a container that runs.
+      const e = waited.rejected
       const sent = await this.#killByName(spec.name)
       this.#o.store.append({
         type: 'sandbox.killed',
@@ -564,9 +695,8 @@ export class SandboxTools {
         payload: { schemaVersion: 1, sandboxId: spec.name, reason: 'error' },
       })
       throw new Error(`[error] the driver lost ${spec.name}: ${e instanceof Error ? e.message : String(e)}; ${sent}`)
-    } finally {
-      signal?.removeEventListener('abort', kill)
     }
+    const result = waited.result
 
     // An end that says nothing of the container (mayRunOn): such a client is
     // expected to leave its --rm container running, its wallclock timer
@@ -590,19 +720,99 @@ export class SandboxTools {
     return describe(spec, result, sent)
   }
 
+  /** The grace past a container's wallclock its result is awaited for: RESULT_GRACE_MS, or a test's. */
+  #graceMs(): number {
+    return this.#o.resultGraceMs ?? RESULT_GRACE_MS
+  }
+
   /**
-   * Kill `name` by name, and say so for the result text. Never rejects, and
-   * waits KILL_WAIT_MS at most (killWaitMs in a test), so the caller always
-   * records the container's end: the real driver's kill never rejects, but
-   * may never settle (docker.ts #killOn has no timeout), and another's that
-   * rejects or throws is logged and said, never thrown.
+   * How long the runner waits on `spec`'s result from its start: its
+   * wallclock and the grace, at most a timer's limit (a longer delay fires at
+   * once).
    */
+  #resultBound(spec: SandboxSpec): number {
+    return Math.min(spec.limits.wallclockMs + this.#graceMs(), MAX_TIMER_MS)
+  }
+
+  /**
+   * What `result` comes to within `boundMs`: the result, the reason it
+   * rejected, or `late`. Once `signal` aborts (the run was stopped, and the
+   * caller's kill by name sent), the wait ends at the grace from then
+   * (#graceMs) if that comes sooner: what is left of a container's wallclock
+   * buys a stopped run nothing, and a daemon that never answers would
+   * otherwise hold its run.finished row and its lane until the bound. Its
+   * rejection is handled here, so a result that rejects after the wait has
+   * ended raises nothing unhandled. The timers are not unref'd, for the
+   * reason #send's is not, and the abort listener is removed when the wait
+   * ends.
+   */
+  async #within(result: Promise<SandboxResult>, boundMs: number, signal?: AbortSignal): Promise<Waited> {
+    let timer: NodeJS.Timeout | undefined
+    let stopped: (() => void) | undefined
+    const late = new Promise<Waited>((resolve) => {
+      const startedAt = Date.now()
+      timer = setTimeout(() => {
+        resolve({ late: 'bound' })
+      }, boundMs)
+      if (signal === undefined) return
+      stopped = (): void => {
+        const graceMs = this.#graceMs()
+        // The bound still holds when it ends first.
+        if (graceMs >= boundMs - (Date.now() - startedAt)) return
+        clearTimeout(timer)
+        timer = setTimeout(() => {
+          resolve({ late: 'stopped' })
+        }, graceMs)
+      }
+      if (signal.aborted) stopped()
+      else signal.addEventListener('abort', stopped, { once: true })
+    })
+    try {
+      return await Promise.race([
+        result.then(
+          (settled): Waited => ({ result: settled }),
+          (e: unknown): Waited => ({ rejected: e }),
+        ),
+        late,
+      ])
+    } finally {
+      clearTimeout(timer)
+      if (stopped !== undefined) signal?.removeEventListener('abort', stopped)
+    }
+  }
+
+  /** Kill `name` by name, and say so for the result text (#send). */
   async #killByName(name: string): Promise<string> {
+    return this.#send(name, 'kill by name', `a kill by name was sent to ${name}`, () => this.#o.driver.kill(name))
+  }
+
+  /**
+   * Give `name` up (SandboxDriver.abandon: its docker CLI ended, and a kill
+   * by name sent), and say so for the result text (#send).
+   */
+  async #giveUp(name: string): Promise<string> {
+    return this.#send(
+      name,
+      'abandon',
+      `the driver was asked to end its docker client and kill ${name} by name`,
+      () => this.#o.driver.abandon(name),
+    )
+  }
+
+  /**
+   * Ask the driver to `ask` about `name` (a kill by name, or a give-up),
+   * and say what came of it after `said`. Never rejects, and waits
+   * KILL_WAIT_MS at most (killWaitMs in a test), so the caller always
+   * records the container's end: the real driver's kill and abandon never
+   * reject, but may never settle (docker.ts #killOn has no timeout), and
+   * another's that rejects or throws is logged and said, never thrown.
+   */
+  async #send(name: string, what: string, said: string, ask: () => Promise<void>): Promise<string> {
     const waitMs = this.#o.killWaitMs ?? KILL_WAIT_MS
     // An async function, so a driver's kill that throws as it is called
     // rejects instead, and the kill is sent now, before any await.
     const killing = (async (): Promise<void> => {
-      await this.#o.driver.kill(name)
+      await ask()
     })()
     // Not unref'd: a process with nothing else left to do waits out the
     // bound and records the container's end, rather than exit with the call
@@ -624,14 +834,14 @@ export class SandboxTools {
         late,
       ])
       if (ended.late) {
-        log.warn({ sandboxId: name, driver: this.#o.driver.name, waitMs }, 'sandbox kill by name went unanswered')
-        return `a kill by name was sent to ${name}, and no daemon answered within ${String(waitMs)} ms`
+        log.warn({ sandboxId: name, driver: this.#o.driver.name, waitMs }, `sandbox ${what} went unanswered`)
+        return `${said}, and no daemon answered within ${String(waitMs)} ms`
       }
       if ('refused' in ended) {
-        log.warn({ sandboxId: name, driver: this.#o.driver.name }, 'sandbox kill by name failed')
-        return `a kill by name was sent to ${name}, and the driver refused it: ${driverText(ended.refused)}`
+        log.warn({ sandboxId: name, driver: this.#o.driver.name }, `sandbox ${what} failed`)
+        return `${said}, and the driver refused it: ${driverText(ended.refused)}`
       }
-      return `a kill by name was sent to ${name}`
+      return said
     } finally {
       clearTimeout(timer)
     }
@@ -751,26 +961,37 @@ function previewRefusal(args: Record<string, unknown>, command: readonly string[
 }
 
 /**
- * Why the driver's whole-argv audit would refuse `command`, said in the
- * command's terms, or undefined. The audit reads every element of the docker
- * argv, the command's included (docker.ts wholeArgvRefusal), so `-v` or
- * `--device` anywhere in a command is refused as a second mount or a device,
- * an over-refusal kept until the operator decides whether those scans stop at
- * the image. Asked beside the builder's one --mount, as the fake driver asks,
- * so this refuses exactly the commands the audit refuses, and names the first
- * argument that it refuses on its own: the audit refuses a command only for
- * one of those.
+ * Why `driver`'s audit would refuse `command`, said in the command's terms,
+ * or undefined. The real driver's audit reads every element of the docker
+ * argv, the command's included (docker.ts commandAuditRefusal): its
+ * whole-argv scans refuse `-v` or `--device` anywhere in a command as a
+ * second mount or a device, an over-refusal kept until the operator decides
+ * whether those scans stop at the image, and the docker socket; its home
+ * check refuses an argument that is the operator's home or a path under it,
+ * in either spelling. The driver is asked of the whole command, so this
+ * refuses exactly the commands its run() refuses, and then of each argument
+ * alone, to name the first it refuses on its own: the audit refuses a
+ * command only for one of those.
  */
-function commandRefusal(command: readonly string[]): string | undefined {
-  const audit = wholeArgvRefusal(['--mount', ...command])
+function commandRefusal(command: readonly string[], driver: Pick<SandboxDriver, 'commandRefusal'>): string | undefined {
+  const audit = driver.commandRefusal(command)
   if (audit === undefined) return undefined
-  const at = command.findIndex((arg) => wholeArgvRefusal(['--mount', arg]) !== undefined)
+  const at = command.findIndex((arg) => driver.commandRefusal([arg]) !== undefined)
   const arg = command[at]
-  const own = arg === undefined ? undefined : wholeArgvRefusal(['--mount', arg])
+  const own = arg === undefined ? undefined : driver.commandRefusal([arg])
   if (arg === undefined || own === undefined) return audit
   // Quoted when short, as a flag is; a long argument that mentions the
   // docker socket is named by its place.
   const named = Buffer.byteLength(arg) <= 64 ? `command[${String(at)}], ${JSON.stringify(arg)},` : `command[${String(at)}]`
+  if (own.startsWith('docker args reference the home directory')) {
+    // The audit's text names the home in its resolved spelling, which the
+    // model need not be told: the argument is named instead.
+    return (
+      `${named} names the operator's home directory, or a path under it, which no container sees: the sandbox's ` +
+      "audit refuses such an argument wherever it stands in the docker run's arguments, in either spelling of the " +
+      "home. Name a path under /workspace, the run's own workspace, instead."
+    )
+  }
   const advice = own.startsWith('docker args mention ')
     ? 'Leave it out: no container reaches the docker daemon, so no command needs its socket.'
     : 'Spell it another way if the program has one (--verbose for -v), or leave it out.'

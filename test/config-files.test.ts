@@ -53,7 +53,7 @@ import { AgentRegistry } from '../src/agents/registry.js'
 import { loadSoul } from '../src/agents/souls.js'
 import { DENY_KEYS, TOKEN_PATTERNS } from '../src/events/redact.js'
 import { APPROVAL_PREVIEW_BYTES } from '../src/policy/engine.js'
-import { CAPTURE_EDGE_BYTES, DOCKER_CLI_FAILED, JWT_RUN_STARTS_MAX, KILL_WAIT_MS, STREAM_WINDOW_BYTES } from '../src/runtime/sandbox-tools.js'
+import { CAPTURE_EDGE_BYTES, DOCKER_CLI_FAILED, JWT_RUN_STARTS_MAX, KILL_WAIT_MS, RESULT_GRACE_MS, STREAM_WINDOW_BYTES } from '../src/runtime/sandbox-tools.js'
 import { CAPTURE_MAX_BYTES } from '../src/sandbox/driver.js'
 import { CATALOG } from '../scripts/falsify/catalog.js'
 import { WORKSPACE_TARGET } from '../src/sandbox/docker.js'
@@ -1806,11 +1806,27 @@ test("README's agents section: 'Both carry' follows the paragraph on the two shi
   for (const fact of [
     `kills the container by name before that end when the docker client ended with no exit status or with ${String(DOCKER_CLI_FAILED)} (its own failure`,
     `it waits ${String(KILL_WAIT_MS / 1_000)} s at most for that kill, so that kill never holds the run.`,
-    // The bound is the kill's only: the driver's result is not bounded yet.
-    "The driver's own result is still awaited with no such bound",
-    'holds the call, and the run, past that wallclock until the wiring task (egress plan W1) bounds the wait.',
+    // The driver's result is bounded too (egress plan W1a), past the
+    // container's wallclock, and past a stop, and a run given up is ended as
+    // an error.
+    `The driver's own result is awaited for the container's wallclock and ${String(RESULT_GRACE_MS / 1_000)} s more at most,`,
+    `and once the run is stopped (\`aos kill\`, or a shutdown), whose kill by name goes out then, for ${String(RESULT_GRACE_MS / 1_000)} s from the stop at most:`,
+    'so a daemon that accepts and never answers (a paused Colima VM) would hold the call, and the run, for good.',
+    'Past that bound the runner gives the container up: the driver ends the docker client it spawned (SIGKILL, the one process it signals) and kills the container by name on its own domain,',
+    `waited on for ${String(KILL_WAIT_MS / 1_000)} s at most, and \`sandbox.killed\` records \`error\`, the result saying the driver never answered.`,
     `An exec whose arguments the approval preview would cut (${String(APPROVAL_PREVIEW_BYTES)} bytes of their canonical JSON), would redact`,
-    'never runs, even once approved: the gate is generic, so the human is still asked first, and the runner refuses the call after.',
+    // Refused before the gate files an approval (W1a): no human approves a
+    // command the runner then refuses, the driver's audit's refusals among
+    // them.
+    "or whose command the driver's own audit refuses (a `-v`, `--volume`, `--mount` or `--device` anywhere in it, the docker socket, or an argument that is the operator's home or a path under it, in either spelling)",
+    "never runs, and no human is asked to approve it: the run loop asks the runner's own check of the arguments before the gate, and the gate denies the call, its `tool.gate` row giving the runner's refusal as the reason.",
+    // Wired, and offered only to what the registry admits.
+    'The runner (`src/runtime/sandbox-tools.ts`) is wired into the daemon (egress plan W1a): every `sandbox.*` call goes to it, never to the hub,',
+    // Denied before the gate to a caller the registry does not admit, and
+    // after it only when the registry changes while a human is asked.
+    'Any other run that names it is denied it before the gate asks anyone, its `tool.gate` row giving the reason,',
+    'is denied it once approved, with a `tool.result` saying so.',
+    'No shipped manifest lists it, so no shipped agent is offered it.',
     '`npm run cli -- search --type approval.requested --run <runId> --limit 1`',
     "Each output stream keeps its own share of the result, counted in the bytes it takes in the log's JSON.",
     `Of each stream the runner reads and redacts at most ${String(STREAM_WINDOW_BYTES / 1_024)} KiB (the largest share and ${String(CAPTURE_EDGE_BYTES / 1_024)} KiB more):`,
@@ -1835,11 +1851,21 @@ test("README's agents section: 'Both carry' follows the paragraph on the two shi
   ]) {
     assert.ok(sandbox.includes(fact), `README's sandbox.exec paragraph does not say: ${fact}`)
   }
-  // The runner refuses after the human is asked, so a human does approve a
-  // command the runner then refuses: the paragraph must not say otherwise.
-  assert.doesNotMatch(sandbox, /never approves a command/)
-  // Nor that the kill's bound frees a run whose driver never answers.
-  assert.doesNotMatch(sandbox, /a daemon that never answers cannot hold/)
+  // Not what it said before W1a: that the human is asked first and the
+  // runner refuses after, that the driver's result has no bound, or that the
+  // runner is not wired.
+  assert.doesNotMatch(sandbox, /the human is still asked first|the runner refuses the call after/)
+  assert.doesNotMatch(sandbox, /with no such bound|until the wiring task/)
+  assert.doesNotMatch(sandbox, /not yet wired/)
+  // Nor that every denial of an unadmitted caller comes after the gate.
+  assert.doesNotMatch(sandbox, /and denies it, with a `tool\.result` saying so, to any other run/)
+  // And the agents paragraph gives the reason that holds since W1a, not that
+  // the loop runs in process.
+  assert.doesNotMatch(paragraphs[neither] ?? '', /the loop runs in process in this phase/)
+  assert.ok(
+    (paragraphs[neither] ?? '').includes('has its commands run in containers since egress plan W1a, and a shipped manifest that does waits on the Phase 2 exit, as egress does'),
+    paragraphs[neither] ?? '',
+  )
   // Nor that skipping the word characters a window starts with is enough: a
   // token that crosses the cut can still start one inside its run.
   assert.doesNotMatch(sandbox, /past the word characters/)
@@ -2089,8 +2115,8 @@ test('agents/*/agent.yaml parse against the shipped providers and tool-views; th
     // egress plan's operator decision on shipping a coder manifest).
     assert.deepEqual(record.manifest.egress, { allow: [], bind: [] }, `${record.manifest.id} ships with egress`)
     // Nor a sandbox: block or a sandbox tool (egress plan S3): sandbox.exec
-    // is built but not wired into the daemon (W1), and a manifest that lists
-    // it waits on the Phase 2 exit, as egress does.
+    // is wired into the daemon (W1a) with no egress, and a manifest that
+    // lists it waits on the Phase 2 exit, as egress does.
     assert.equal(record.manifest.sandbox, undefined, `${record.manifest.id} ships with a sandbox: block`)
     assert.deepEqual(
       record.manifest.tools.allow.filter((ref) => ref.startsWith('sandbox.')),
@@ -2121,8 +2147,9 @@ test('agents/*/agent.yaml parse against the shipped providers and tool-views; th
     assert.deepEqual(record.manifest.tools.allow, [])
     assert.deepEqual(record.manifest.egress.allow, [])
     assert.equal(record.manifest.spawn, undefined, 'a worker must not spawn')
-    // No sandbox: the loop runs in process in this phase, so a domain here would
-    // claim an isolation that does not happen.
+    // No sandbox: a worker with one that lists sandbox.exec has its commands
+    // run in containers (egress plan W1a), and a shipped manifest that does
+    // waits on the Phase 2 exit, as egress does.
     assert.equal(record.manifest.sandbox, undefined)
     // No schedule: the only routable model is a frontier one, and an unattended
     // run that can reach it is an unattended run that can empty an envelope.

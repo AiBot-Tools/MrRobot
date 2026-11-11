@@ -405,6 +405,17 @@ export interface SandboxDriver {
    */
   run(spec: SandboxSpec): RunningSandbox
   /**
+   * Why run() would refuse a spec for its command alone, in the words run()
+   * throws, or undefined: what the driver's own audit reads of a command
+   * (DockerDriver: its whole-argv scans and its home check, docker.ts
+   * commandAuditRefusal). Asked before a human is asked to approve a command
+   * (sandbox.exec's argsRefusal), so a command run() would refuse whoever
+   * approved it is refused first, without one. Starts nothing, reads no spec
+   * and never throws. Undefined says nothing of the rest of a spec, which
+   * run() still judges.
+   */
+  commandRefusal(command: readonly string[]): string | undefined
+  /**
    * Idempotent: killing an unknown or already-dead container is not an error.
    * A name without CONTAINER_PREFIX is someone else's container: a kill of it
    * is sent nowhere and ends nothing, and is not an error either.
@@ -418,4 +429,21 @@ export interface SandboxDriver {
    * exit.
    */
   kill(name: string): Promise<void>
+  /**
+   * Give up on the run under `name`, for a caller that waited past its
+   * wallclock for a result the driver never gave (a daemon that accepts and
+   * never answers, a paused VM): end the process the driver spawned for it,
+   * if one is still running (the docker CLI, by SIGKILL: the one process a
+   * driver may signal, and its own child), and kill the container by name,
+   * on the run's own domain when the driver still holds the name, else on
+   * every domain, as kill() does. A name without CONTAINER_PREFIX is sent
+   * nowhere.
+   *
+   * Never rejects. Resolves once the kill by name has been answered, which a
+   * daemon that never answers never does, so a caller bounds the wait. The
+   * run's result may settle after this (the CLI ended by a signal reports no
+   * exit status and no killedBy) or never; a caller that gave up on it reads
+   * nothing more from it, and records the container's end itself.
+   */
+  abandon(name: string): Promise<void>
 }

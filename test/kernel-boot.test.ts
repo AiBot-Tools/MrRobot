@@ -55,7 +55,8 @@ import { tmpdir } from './helpers/tmpdir.js'
 import { join } from 'node:path'
 import { fakeSandbox } from './helpers/fake-sandbox.js'
 import type { SandboxDriver } from '../src/sandbox/driver.js'
-import { anthropicEndTurn, fakeProvider } from './helpers/fake-provider.js'
+import { anthropicEndTurn, anthropicToolUse, fakeProvider } from './helpers/fake-provider.js'
+import { mintHumanActor } from '../src/control/actor.js'
 import { freshProbe } from './helpers/probe.js'
 import { writeProbeRecord } from '../src/models/probe.js'
 import { mockMcp } from './helpers/mock-mcp.js'
@@ -1331,4 +1332,157 @@ memory:
     agentsDir: fleet('fetcher', '  bind: [github-git]'),
   })
   assert.deepEqual(kernel.agents.get('fetcher')?.manifest.egress, { allow: [], bind: ['github-git'] })
+})
+
+// ── sandbox.exec, wired (egress plan W1a) ───────────────────────────────────
+
+/** The tool names a provider request offered, as the Anthropic dialect spells them. */
+function offeredNames(body: unknown): string[] {
+  const tools = (body as { tools?: { name: string }[] } | undefined)?.tools ?? []
+  return tools.map((tool) => tool.name)
+}
+
+test('the shipped fleet declares no sandbox: block, and no shipped agent is offered any sandbox tool', async (t) => {
+  // bootKernel hands the run loop the sandbox runner (W1a), which offers a
+  // sandbox tool only to a manifest that may hold one and lists it. No
+  // shipped manifest does, so what each shipped agent is offered is what it
+  // was before: the CEO its two kernel tools, the pair nothing.
+  const provider = fakeProvider([0, 1, 2].map(() => anthropicEndTurn({ text: 'done' })))
+  const { kernel } = await withKernel(t, {
+    env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-9c1f0b' },
+    fetch: provider.fetch,
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+  for (const record of kernel.agents.list()) {
+    assert.equal(record.manifest.sandbox, undefined, `${record.manifest.id} ships with a sandbox: block`)
+  }
+  const ran = ['ceo', 'researcher', 'writer']
+  for (const agentId of ran) {
+    const finished = await runThroughControl(kernel, 'anything', agentId)
+    assert.equal(finished['status'], 'ok', `${agentId}: ${String(finished['reason'])}`)
+  }
+  const offers = provider.requests.map((r) => offeredNames(r.body))
+  assert.deepEqual(offers, [['kernel__adopt_plan', 'kernel__delegate'], [], []])
+  assert.equal(offers.flat().some((name) => name.startsWith('sandbox__')), false)
+})
+
+test('a test fleet worker with a sandbox: block is offered sandbox.exec, runs it through the fake driver, and its second exec waits for a human', async (t) => {
+  // BootOptions.agentsDir: the shipped fleet and one tier 2 worker on the
+  // trusted domain whose manifest lists sandbox.exec. The daemon's own
+  // wiring, end to end: the loop offers the tool, the gate allows the first
+  // exec of a clean run, the runner runs one container through the driver
+  // boot was handed, logs it, taints the run, and the second exec waits for
+  // a human, who denies it.
+  const image = `sha256:${'cd'.repeat(32)}`
+  const dir = join(tmpdir(t), 'agents')
+  const files: Record<string, string> = {
+    coder: [
+      'id: coder',
+      'version: 1',
+      'kind: standard',
+      'role: worker',
+      'soul: worker.md',
+      'tier: 2',
+      'model:',
+      `  primary: ${REAL_REF}`,
+      'tools:',
+      '  allow: [sandbox.exec]',
+      'sandbox:',
+      '  domain: trusted',
+      'memory:',
+      '  projectId: aos/agent/coder',
+      '',
+    ].join('\n'),
+  }
+  for (const shipped of ['ceo', 'worker-template', 'researcher', 'writer']) {
+    files[shipped] = readFileSync(join(REPO_ROOT, 'agents', shipped, 'agent.yaml'), 'utf8')
+  }
+  for (const [name, yaml] of Object.entries(files)) {
+    mkdirSync(join(dir, name, 'history'), { recursive: true })
+    writeFileSync(join(dir, name, 'agent.yaml'), yaml)
+    writeFileSync(join(dir, name, 'AGENTS.md'), `# ${name}\n`)
+  }
+  const driver = fakeSandbox({ imageId: image, probe: { ok: true, version: 'fake 1' }, script: [{ stdout: 'v24.15.0\n', durationMs: 4 }] })
+  const provider = fakeProvider([
+    anthropicToolUse({ name: 'sandbox__exec', input: { command: ['node', '--version'] } }),
+    anthropicToolUse({ name: 'sandbox__exec', input: { command: ['make', 'install'] } }),
+    anthropicEndTurn({ text: 'done' }),
+  ])
+  const { kernel, fx } = await withKernel(t, {
+    kernelYaml: (base) => base.replace('  image: aos-worker:test\n', `  image: aos-worker:test\n  imageId: "${image}"\n`),
+    agentsDir: dir,
+    sandboxDriver: driver,
+    env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-9c1f0b' },
+    fetch: provider.fetch,
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+  assert.equal(fx.config.sandbox.imageId, image)
+  assert.equal(kernel.status().subsystems.sandbox.state, 'ok')
+  // Egress stays the stub: no channel, no grant, whatever runs.
+  assert.equal(kernel.status().subsystems.egress.state, 'absent')
+
+  let asked: Record<string, unknown> | undefined
+  const stop = kernel.store.subscribe((row) => {
+    if (row.type !== 'approval.requested') return
+    asked = JSON.parse(row.payload) as Record<string, unknown>
+    const id = String(asked['approvalId'])
+    queueMicrotask(() => {
+      kernel.approvals.resolve(id, mintHumanActor('conn-test'), 'denied')
+    })
+  })
+  t.after(stop)
+  const finished = await runThroughControl(kernel, 'which node, then install', 'coder')
+  assert.equal(finished['status'], 'ok', String(finished['reason']))
+  const runId = String(finished['runId'])
+
+  // Offered to the worker whose manifest lists it, under its provider name.
+  assert.deepEqual(offeredNames(provider.requests[0]?.body), ['sandbox__exec'])
+
+  // One container, on the manifest's domain, of the pinned image by id, in
+  // the run's own workspace under the trusted mountRoot, with no channel.
+  assert.equal(driver.specs.length, 1)
+  const spec = driver.specs[0]
+  assert.ok(spec !== undefined)
+  assert.equal(spec.domain, 'trusted')
+  assert.equal(spec.image, image)
+  assert.deepEqual(spec.command, ['node', '--version'])
+  assert.equal(spec.workspace, join(fx.config.sandbox.domains.trusted.mountRoot, runId))
+  assert.equal('channel' in spec, false, 'an exec asks for no channel')
+  assert.equal(driver.channels.length, 0)
+
+  // The one run's calls, in order: the boot wrote none of these.
+  const logged = rows(fx.dbPath)
+  const flow = logged.map((r) => r.type).filter((type) => /^(tool\.|sandbox\.|approval\.)/.test(type))
+  assert.deepEqual(flow, [
+    'tool.gate',
+    'tool.call',
+    'sandbox.started',
+    'sandbox.killed',
+    'tool.result',
+    'tool.gate',
+    'approval.requested',
+    'approval.resolved',
+  ])
+  const gates = logged.filter((r) => r.type === 'tool.gate').map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+  assert.deepEqual(gates.map((g) => [g['toolRef'], g['decision'], g['risk'], g['taint']]), [
+    ['sandbox.exec', 'allow', 'write', 'clean'],
+    ['sandbox.exec', 'needs-human', 'write', 'tainted'],
+  ])
+  // The run is tainted by what the container printed: its second exec waited
+  // for a human, who was shown what it would run.
+  assert.equal(asked?.['toolRef'], 'sandbox.exec')
+  assert.equal(asked?.['argsPreview'], '{"command":["make","install"]}')
+  const killed = logged.filter((r) => r.type === 'sandbox.killed').map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+  assert.deepEqual(killed, [{ schemaVersion: 1, sandboxId: `aos-run-${runId}-1`, reason: 'exited', exitCode: 0 }])
+  const [result] = logged.filter((r) => r.type === 'tool.result').map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+  assert.equal(result?.['ok'], true)
+  assert.match(String(result?.['text']), /^aos-run-\S+ on the trusted domain, no network, exited 0 after 4 ms\n--- stdout \(9 bytes\) ---\nv24\.15\.0\n/)
+  // Denied: the model is told, and nothing else ran.
+  const third = JSON.stringify(provider.requests[2]?.body)
+  assert.ok(third.includes('[denied] a human denied this call'), third.slice(-400))
+  assert.equal(kernel.store.verifyChain(kernel.store.readAnchor()).ok, true)
 })

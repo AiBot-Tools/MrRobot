@@ -117,6 +117,40 @@ test('args pointing at souls or AGENTS.md are denied protected-path', () => {
   assert.equal(mentionsProtectedPath({ a: 1, b: null, c: [2, 'ok'] }), false)
 })
 
+test("a runner's own refusal of the call is a deny, before any rule that asks a human, after the structural ones", () => {
+  // Rule 3c (sandbox.exec's, egress plan W1a): the kernel asks the tool's
+  // runner whether it refuses this call, for its caller or its arguments,
+  // whoever approves it, and the gate denies such a call rather than put a
+  // command that never runs to a human. It wins over irreversible, a tainted write and quarantine, and
+  // loses to exposure, the manifest, a protected path and the namespace pin,
+  // which are the more fundamental reasons.
+  const refusal = "sandbox.exec's arguments come to 501 bytes as a human approving the call is shown them"
+  const write = { exposure: 'agent', risk: 'write', taints: true, quarantine: false } as const
+  for (const view of [
+    write,
+    { ...write, risk: 'irreversible' },
+    { ...write, quarantine: true },
+  ] as const) {
+    for (const taint of ['clean', 'tainted'] as const) {
+      const verdict = decide(
+        input({ view, scope: { runId: 'run-1', agentId: 'coder', taint }, toolRef: 'sandbox.exec', args: { command: ['x'] }, runnerRefusal: refusal }),
+      )
+      assert.deepEqual(verdict, { decision: 'deny', reason: refusal }, `${view.risk} ${String(view.quarantine)} ${taint}`)
+    }
+  }
+  const refused = { toolRef: 'sandbox.exec', runnerRefusal: refusal } as const
+  assert.match(decide(input({ ...refused, view: { ...write, exposure: 'kernel-only' } })).reason, /not exposed to agents/)
+  assert.match(decide(input({ ...refused, view: write, manifestAllows: false })).reason, /default deny/)
+  assert.match(decide(input({ ...refused, view: write, args: { path: 'souls/ceo.md' } })).reason, /protected-path/)
+  assert.match(
+    decide(input({ ...refused, view: { ...write, namespaceArg: 'project_id' }, args: { project_id: 'aos/ceo' } })).reason,
+    /reads a memory namespace|may only address/,
+  )
+  // Absent, the rules read as they did; empty, the input is refused outright.
+  assert.equal(decide(input({ view: write, toolRef: 'sandbox.exec' })).decision, 'allow')
+  assert.throws(() => decide(input({ runnerRefusal: '' })))
+})
+
 test('gate input is strict and rejects a modelDecision field', () => {
   // The headline: a model that persuades kernel code to pass an extra field
   // gains nothing, because the input schema refuses it outright rather than

@@ -28,17 +28,17 @@
 // whatever a peer might read another way is not sent at all. Only absolute
 // form (http:// or https://, lower-case) is a target; userinfo is a second
 // host, refused with the host a URL parser reads past its last `@` (or why it
-// is none, namedHost), so a log row says where such a request was headed;
-// the host is read before the rest of the target (its length, its
-// characters, a fragment, the port and the path), so a target naming an
-// address or a special-use name (192.168.5.2:8766, host.lima.internal:8766)
-// is refused for its host whatever port it names and whatever follows it,
-// and only an egress host on a port other than 443 is refused for the port,
-// which names another service than the one dialled; and the path may hold no backslash, no empty segment (a double
-// slash), no dot segment, no percent-encoded slash, dot, backslash, percent or
-// control character, and nothing that does not decode to UTF-8 (an overlong
-// encoding is one more spelling of a dot or a slash). The query is carried as
-// it came, and a route admits only the one it names.
+// is none, namedHost), so a log row says where such a request was headed; the
+// host is read before the rest of the target (its length, its characters, a
+// fragment, the port and the path), so a target naming an address or a
+// special-use name (192.168.5.2:8766, host.lima.internal:8766) is refused for
+// its host whatever port it names and whatever follows it, and only an egress
+// host on a port other than 443 is refused for the port, which names another
+// service than the one dialled; and the path may hold no backslash, no empty
+// segment (a double slash), no dot segment, no percent-encoded slash, dot,
+// backslash, percent or control character, and nothing that does not decode
+// to UTF-8 (an overlong encoding is one more spelling of a dot or a slash).
+// The query is carried as it came, and a route admits only the one it names.
 //
 // A refusal carries a reason from ROUTE_REFUSALS and a clause that never
 // holds the input: a worker's request is attacker-chosen text.

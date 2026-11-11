@@ -53,7 +53,7 @@ import { AgentRegistry } from '../src/agents/registry.js'
 import { loadSoul } from '../src/agents/souls.js'
 import { DENY_KEYS, TOKEN_PATTERNS } from '../src/events/redact.js'
 import { APPROVAL_PREVIEW_BYTES } from '../src/policy/engine.js'
-import { CAPTURE_EDGE_BYTES, DOCKER_CLI_FAILED, KILL_WAIT_MS, STREAM_WINDOW_BYTES } from '../src/runtime/sandbox-tools.js'
+import { CAPTURE_EDGE_BYTES, DOCKER_CLI_FAILED, JWT_RUN_STARTS_MAX, KILL_WAIT_MS, STREAM_WINDOW_BYTES } from '../src/runtime/sandbox-tools.js'
 import { CAPTURE_MAX_BYTES } from '../src/sandbox/driver.js'
 import { WORKSPACE_TARGET } from '../src/sandbox/docker.js'
 import { FORCE_QUIT_LOG, PMMCP_OLLAMA_NAMES } from '../scripts/install/force-quit.js'
@@ -361,17 +361,23 @@ test('the worker Dockerfile FROM is pinned by digest, USER is 65534:65534, the p
   // honest worker relies on to send its requests where the kernel's egress
   // engine judges them, and something a later edit could quietly undo.
   const text = read('images/worker/Dockerfile')
-  // Every file the image is made from is printable ASCII, tabs and newlines,
-  // so this test's readers and BuildKit's (Go's unicode.IsSpace, its
-  // trimNewline) cannot differ on a character: U+FEFF between two ENV pairs
-  // is white space to JavaScript's \s and part of a word to BuildKit, and a
-  // CRLF ending is one \r to drop here and every \r to it.
+  // Every file BuildKit or git reads as configuration (the Dockerfile,
+  // gitconfig and .dockerignore) is printable ASCII, tabs and newlines (the
+  // mux the image copies is code Node reads, and holds box-drawing rules in
+  // its comments), so this test's readers and BuildKit's (Go's
+  // unicode.IsSpace, its trimNewline) cannot differ on a character: U+FEFF
+  // between two ENV pairs is white space to JavaScript's \s and part of a
+  // word to BuildKit, and a CRLF ending is one \r to drop here and every \r
+  // to it.
   for (const rel of ['images/worker/Dockerfile', 'images/worker/gitconfig', 'images/worker/.dockerignore']) {
     assert.deepEqual(notPlainAscii(read(rel)), [], `${rel} holds a character that is not printable ASCII, a tab or a newline`)
   }
   assert.deepEqual(notPlainAscii(text.replace('    NO_PROXY="" \\\n    no_proxy="" \\\n', '    NO_PROXY=""\uFEFFno_proxy="" \\\n')), ['U+FEFF'])
   assert.deepEqual(notPlainAscii(text.replaceAll('\n', '\r\n')), ['U+000D'])
   assert.deepEqual(notPlainAscii('\u00a0\u0085\u00a0\u{1F600}\t \n~'), ['U+00A0', 'U+0085', 'U+1F600'])
+  // The controls beside the printable range, DEL and VT among them: bash's
+  // blanks are space and tab alone, so \v starts a word to it.
+  assert.deepEqual(notPlainAscii('\x7f\v\f\x1f'), ['U+007F', 'U+000B', 'U+000C', 'U+001F'])
   const steps = dockerInstructions(text)
   const of = (keyword: string): string[] => steps.filter((s) => s.keyword === keyword).map((s) => s.args)
   const config = parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO })
@@ -711,7 +717,11 @@ function scanned(line: string): string {
 /** A name assigned, in any of bash's forms but a builtin's (BINDS): `name=`, `name+=`, `name[i]=`, and `${name=}` or `${name:=}`. */
 const assigns = (names: string): RegExp => new RegExp(`(?:^|[\\s;&|(!])(?:${names})(?:\\[[^\\]]*\\])?\\+?=|\\$\\{(?:${names}):?=`)
 
-/** Words that run another command, a string or a file as code: an interpreter, eval, a trap, the `.` builtin. */
+/**
+ * Words that run another command, a string or a file as code: an interpreter,
+ * eval, a trap, the `.` builtin. A variable's value run as code by
+ * arithmetic or by prompt expansion is no word, and is bashCommands' to name.
+ */
 const INDIRECT =
   /\b(?:eval|exec|source|xargs|bash|sh|zsh|dash|ksh|node|npx|npm|tsx|python3?|perl|ruby|osascript|nohup|sudo|command|builtin|env|trap|alias|enable|coproc)\b|(?:^|[;&|({!]\s*|\b(?:then|do|else|elif|if|while|until|time)\s+)\.\s/
 
@@ -720,6 +730,9 @@ const BINDS = /\b(?:export|typeset|declare|readonly|local|read|mapfile|readarray
 
 /** Reserved words after which bash reads the next word as a command name as well. */
 const LEADING_WORDS = new Set(['if', 'then', 'else', 'elif', 'while', 'until', 'do', '!', '{'])
+
+/** The comparisons inside [[ ]] that read both operands as arithmetic. */
+const ARITHMETIC_TEST = new Set(['-eq', '-ne', '-lt', '-le', '-gt', '-ge'])
 
 /** A case arm's patterns, its `)` included, at the start of a line inside a case: plain or single-quoted words, a `|` between each two. */
 const CASE_PATTERN = /^(?:'[^']*'|[^ \t()'"|$`\\;&<>]+)(?:[ \t]*\|[ \t]*(?:'[^']*'|[^ \t()'"|$`\\;&<>]+))*\)/
@@ -743,9 +756,19 @@ interface CommandWord {
  * read on its own: none of this script's continues onto the next, and one
  * that tried would leave a quote, a `(` or a `\` open, which is named. So is
  * anything this reading does not follow (a backtick, arithmetic, a
- * here-document, process substitution, ANSI-C quoting, an option of env but
- * -i or of command but -v), in unread, so that it is refused rather than read
- * past.
+ * here-document, process substitution, inside [[ ]] too, ANSI-C quoting, an
+ * option of env but -i or of command but -v or -V), in unread, so that it is
+ * refused rather than read past; and so is anything that runs a variable's
+ * value as code, which no reading of the text can see: a ${...@...}
+ * transformation (@P expands a prompt string, a $(...) in it included),
+ * indirection, an offset or a default, a subscript other than digits (a
+ * length's, ${#name[...]}, and an array element's assignment's, name[...]=,
+ * included), and an arithmetic comparison inside [[ ]] (-eq, -ne, -lt, -le,
+ * -gt, -ge) of an operand other than digits or $#: bash evaluates an offset,
+ * a subscript and those operands as arithmetic, and a value a[$(...)] runs
+ * the substitution. A builtin that takes a name with a subscript (local,
+ * read, unset, printf -v) is held by the pin on BINDS's lines, and test -v,
+ * which also reads one, is no command the script may run.
  */
 function bashCommands(code: readonly string[]): { readonly words: readonly CommandWord[]; readonly unread: readonly string[] } {
   const words: CommandWord[] = []
@@ -780,6 +803,22 @@ function bashCommands(code: readonly string[]): { readonly words: readonly Comma
       if (next === '{') {
         const start = i
         i += 2
+        // What follows the name may run a value as code: a transformation
+        // (${name@P} expands a prompt string, $(...) in it included), an
+        // offset (${name:offset} evaluates offset as arithmetic, and a value
+        // a[$(...)] runs the substitution), indirection (${!name}), and a
+        // subscript other than digits (arithmetic too), a length's
+        // (${#name[...]}) as well: a `#` before a name is a length, not the
+        // special parameter. The script uses none of them but
+        // ${BASH_SOURCE[0]}, and trims (%%, #) and plain names, which run
+        // nothing.
+        const param = /^(!?)(?:#(?=[A-Za-z_\d]))?([A-Za-z_]\w*|\d+|[#?$*@-])(\[[^\]]*\])?(.?)/.exec(line.slice(i))
+        const [, bang = '', , subscript, after = ''] = param ?? []
+        if (param === null) note('a ${...} this reading does not follow')
+        else if (bang !== '') note('indirect expansion')
+        else if (subscript !== undefined && !/^\[\d+\]$/.test(subscript)) note('a subscript, which bash reads as arithmetic')
+        else if (after === '@') note('a ${...@...} transformation')
+        else if (after === ':') note('an offset or a default (${...:...})')
         for (let depth = 1; depth > 0; ) {
           const c = at()
           if (c === '') {
@@ -870,6 +909,7 @@ function bashCommands(code: readonly string[]): { readonly words: readonly Comma
       let skip = 0
       let envOptions = false
       let lookup = false
+      let operands: string[] = []
       let named: number | undefined
       for (;;) {
         while (isBlank(at())) i++
@@ -877,6 +917,12 @@ function bashCommands(code: readonly string[]): { readonly words: readonly Comma
         if (c === '') {
           if (nested) note('a ( left open')
           return
+        }
+        if (cond && (c === '<' || c === '>') && at(1) === '(') {
+          // bash runs process substitution inside [[ ]] too.
+          note('process substitution')
+          i = line.length
+          continue
         }
         if (cond && (META.includes(c) || c === '!')) {
           i++
@@ -939,8 +985,18 @@ function bashCommands(code: readonly string[]): { readonly words: readonly Comma
         }
         if (cond) {
           if (raw === ']]') {
+            // -eq and its kin evaluate both operands as arithmetic, which
+            // runs a value a[$(...)] as code: only digits and $# are read.
+            for (const [k, op] of operands.entries()) {
+              if (!ARITHMETIC_TEST.has(op)) continue
+              const plain = [operands[k - 1], operands[k + 1]].every((o) => o !== undefined && /^(?:\d+|\$#)$/.test(o))
+              if (!plain) note(`an arithmetic comparison (${op}) of an operand that is not digits or $#`)
+            }
+            operands = []
             cond = false
             position = false
+          } else {
+            operands.push(raw)
           }
           continue
         }
@@ -950,7 +1006,13 @@ function bashCommands(code: readonly string[]): { readonly words: readonly Comma
         }
         if (!position) continue
         if (/^\d+$/.test(raw) && (at() === '<' || at() === '>')) continue
-        if (/^[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=/.test(raw)) continue
+        const assignment = /^[A-Za-z_]\w*(\[[^\]]*\])?\+?=/.exec(raw)
+        if (assignment !== null) {
+          // name[subscript]=: bash reads an array element's subscript as
+          // arithmetic, which runs a value a[$(...)] as code.
+          if (assignment[1] !== undefined && !/^\[\d+\]$/.test(assignment[1])) note("an array element's assignment, whose subscript bash reads as arithmetic")
+          continue
+        }
         if (envOptions && w === '-i') continue
         if ((envOptions || lookup) && w.startsWith('-')) {
           if (lookup && (w === '-v' || w === '-V')) {
@@ -1094,6 +1156,9 @@ function buildScriptProblems(text: string, driverEnv: readonly string[], planKey
   expect('the calls reaching docker the scan sees', calls.length >= 10, true)
   expect('docker asked something before the plan', calls.filter(({ i }) => i < plan).map(({ i }) => code[i]), [])
   expect('a directory made before the plan', code.findIndex((l) => l.startsWith('mkdir')) > plan, true)
+  // And made as pinned: an option such as -v would print to stdout, which
+  // carries the id alone.
+  expect('mkdir, exactly as pinned', where(/\bmkdir\b/), ['mkdir -p "${AOS_DOCKER_CONFIG}"'])
 
   // Every socket and the DOCKER_CONFIG come from the plan, which reads
   // kernel.yaml: the script names no socket, no Colima path, no home or
@@ -1261,6 +1326,8 @@ test("scripts/build-worker-image.sh is executable and NEEDS VALIDATION, asks doc
     // trim(), a command named \f# or U+00A0# to bash, which fails (127,
     // which set -e lets pass left of ||) and runs what follows the ||.
     ['U1, a \\f-led # line pushes', holdsHostile, `${holdsHostile}\f# || dk "\${TRUSTED_HOST}" push "\${IMAGE}" >&2\n`, ['a character bash does not read as this test does', 'a command the script may not run', 'what each VM is asked']],
+    // bash's blanks are space and tab: \v starts a word, as \f does.
+    ['U1, a \\v-led # line pushes', holdsHostile, `${holdsHostile}\v# || dk "\${TRUSTED_HOST}" push "\${IMAGE}" >&2\n`, ['a character bash does not read as this test does', 'a command the script may not run', 'what each VM is asked']],
     [
       'U1, a U+00A0-led # line loads into the default profile',
       holdsHostile,
@@ -1282,6 +1349,25 @@ test("scripts/build-worker-image.sh is executable and NEEDS VALIDATION, asks doc
     // Arithmetic, which the command reading does not follow, ends its reading
     // of the line, and the cp after it is seen only as what was not read.
     ['P7, arithmetic before a cp', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}" "$((1))"; cp /tmp/evil/Dockerfile "$(dirname "$0")/../images/worker/Dockerfile"\n', ['a construct the command reading does not follow']],
+    // bash runs process substitution inside [[ ]], where the reading skips
+    // the operators a condition holds.
+    ['P8, process substitution inside a condition copies a Dockerfile in', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n[[ -n <(cp "$(dirname "$0")/../../evil/Dockerfile" "$(dirname "$0")/../images/worker/Dockerfile") ]]\n', ['a construct the command reading does not follow']],
+    // A value run as code, by prompt expansion or as arithmetic: no command
+    // word is in the text to see, and out is a name the script assigns
+    // already. A single-quoted value is no command substitution until bash
+    // expands it so.
+    ['P9, a prompt expansion runs a value', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nout=\'$(cp /tmp/evil/Dockerfile images/worker/Dockerfile)\'\nmkdir -p "${out@P}"\n', ['a construct the command reading does not follow']],
+    ['P10, an offset runs a value as arithmetic', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nout=\'a[$(cp /tmp/evil/Dockerfile images/worker/Dockerfile)]\'\nmkdir -p "${id:out}"\n', ['a construct the command reading does not follow']],
+    ['P11, a comparison runs a value as arithmetic', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nout=\'a[$(cp /tmp/evil/Dockerfile images/worker/Dockerfile)]\'\n[[ $out -eq 0 ]] || exit 1\n', ['a construct the command reading does not follow']],
+    ['P12, a subscript runs a value as arithmetic', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nout=\'a[$(cp /tmp/evil/Dockerfile images/worker/Dockerfile)]\'\nmkdir -p "${BASH_SOURCE[$out]}"\n', ['a construct the command reading does not follow']],
+    ['P13, an indirection runs a value as arithmetic', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nout=\'a[$(cp /tmp/evil/Dockerfile images/worker/Dockerfile)]\'\nmkdir -p "${!out}"\n', ['a construct the command reading does not follow']],
+    // A length's subscript, after the `#` the reading once took for the
+    // special parameter, and an array element's, in an assignment the
+    // reading once skipped whole: both are arithmetic to bash.
+    ['P14, a length of a subscript runs a value', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nout=\'a[$(cp /tmp/evil/Dockerfile images/worker/Dockerfile)]\'\nout="${#BASH_SOURCE[$out]}"\n', ['a construct the command reading does not follow']],
+    ["P15, an array element's assignment runs a value", 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nout=\'a[$(cp /tmp/evil/Dockerfile images/worker/Dockerfile)]\'\nout[$out]=1\n', ['a construct the command reading does not follow']],
+    // mkdir -v prints to stdout, which carries the id alone.
+    ['M1, mkdir -pv', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -pv "${AOS_DOCKER_CONFIG}"\n', ['mkdir, exactly as pinned']],
   ]
   for (const [name, from, to, labels] of mutants) {
     assert.equal(text.split(from).length, 2, `${name}: its anchor is not in the script exactly once`)
@@ -1344,6 +1430,26 @@ test("the build's plan refuses a placeholder digest and any base but node:24-boo
     // nothing.
     [`${from}\nFROM\tdebian:latest`, /has 2 FROM lines/],
     [`${from}\n# a comment \\\nFROM debian:latest`, /has 2 FROM lines/],
+    // A line BuildKit strips of its leading white space, a VT among it,
+    // before it reads the keyword.
+    [`${from}\n\vFROM alpine:3.20`, /has 2 FROM lines/],
+    // Files from an image other than the base, by whatever name BuildKit is
+    // given (a tag among them), or from anywhere but the context: refused,
+    // naming the instruction, whatever else the file holds.
+    [`${from}\nCOPY --from=debian:latest /bin/sh /opt/aos/sh`, /'s COPY takes files from another image \(--from, or a mount's from=\), which BuildKit pulls/],
+    [`${from}\ncopy --FROM=debian:latest /bin/sh /opt/aos/sh`, /'s COPY takes files from another image/],
+    [`${from}\nRUN --mount=type=bind,from=alpine:latest,target=/x cp /x/bin/busybox /opt/aos/`, /'s RUN takes files from another image/],
+    [`${from}\nRUN --mount=from=alpine:latest,target=/x true`, /'s RUN takes files from another image/],
+    [`${from}\nRUN --mount=type=bind,FROM=alpine:latest,target=/x true`, /'s RUN takes files from another image/],
+    // Spelled with quotes or a backslash, which BuildKit's flag reader takes
+    // off a `--` word before BFlags or the mount's CSV reads it.
+    [`${from}\nCOPY --"from"=debian:latest /bin/sh /opt/aos/sh`, /'s COPY takes files from another image/],
+    [`${from}\nCOPY --fr\\om=debian:latest /bin/sh /opt/aos/sh`, /'s COPY takes files from another image/],
+    [`${from}\nRUN --mount=type=bind,"from=alpine:latest",target=/x cp /x/bin/busybox /opt/aos/`, /'s RUN takes files from another image/],
+    [`${from}\nRUN --mount=type=bind,fr''om=alpine:latest,target=/x cp /x/bin/busybox /opt/aos/`, /'s RUN takes files from another image/],
+    [`${from}\nADD https://example.invalid/busybox /opt/aos/busybox`, /has ADD: ADD fetches what a URL or a git ref names, and ONBUILD runs an instruction in another build/],
+    [`${from}\nADD gitconfig /etc/gitconfig`, /has ADD: /],
+    [`${from}\nONBUILD RUN true`, /has ONBUILD: /],
   ]
   for (const [line, why] of refused) {
     assert.match(baseProblem(swap(line)) ?? '', why, line)
@@ -1359,6 +1465,30 @@ test("the build's plan refuses a placeholder digest and any base but node:24-boo
   // continues an instruction the file never ends.
   assert.match(baseProblem(shipped.replace('ENTRYPOINT []\n', 'ENTRYPOINT [] \\\n')) ?? '', /has an empty line inside a continued instruction, on line \d+: BuildKit joins the line after it on/)
   assert.match(baseProblem(shipped.replace(/\nUSER 65534:65534\n?$/, '\nUSER 65534:65534 \\\n')) ?? '', /ends inside a continued line/)
+  // A heredoc, whose body BuildKit reads as text and readDockerfile as
+  // instructions: after the shipped USER line, a RUN heredoc whose quoted
+  // terminator keeps its backslash. BuildKit reads `true` as its body and
+  // the line `EOF\` as its end, then FROM debian:latest as a second stage,
+  // the last, which `docker build` builds; readDockerfile joins `EOF\` to
+  // the FROM after it, and sees one FROM, the pinned one. Refused, as a plain
+  // COPY heredoc is, and one whose `<<` its lines join.
+  const terminator = `${shipped}RUN <<'EOF\\'\ntrue\nEOF\\\nFROM debian:latest\nUSER 65534:65534\nENTRYPOINT []\n`
+  assert.deepEqual(
+    readDockerfile(terminator).steps.filter((step) => step.keyword === 'FROM').map((step) => step.text),
+    [from],
+    'readDockerfile reads the heredoc as instructions, and one FROM',
+  )
+  const heredocs: [string, RegExp][] = [
+    [terminator, /has a heredoc \(`<<`\) on line \d+: BuildKit reads a heredoc's body as text, not instructions/],
+    [`${shipped}COPY <<EOF /x\nhello\nEOF\n`, /has a heredoc \(`<<`\) on line \d+: BuildKit reads a heredoc's body as text, not instructions/],
+    [`${shipped}COPY <\\\n<EOF /x\nhello\nEOF\n`, /has a heredoc \(`<<`\) in its COPY, as its lines join: BuildKit reads a heredoc's body as text, not instructions/],
+  ]
+  for (const [text, why] of heredocs) {
+    assert.match(baseProblem(text) ?? '', why, text.slice(shipped.length))
+    assert.throws(() => planFrom(text, config), (e: unknown) => e instanceof ConfigError && why.test(e.message), text.slice(shipped.length))
+  }
+  // `<<` in a comment is no heredoc: BuildKit drops the line.
+  assert.equal(baseProblem(shipped.replace('# The aos worker image', '# The aos worker image, no <<EOF heredoc,')), undefined)
   // A parser directive on line 1, before the header: escape would make a
   // backtick the continuation, so FR` then OM debian:latest, which the
   // reading here takes as two instructions, is BuildKit's second stage.
@@ -1370,7 +1500,7 @@ test("the build's plan refuses a placeholder digest and any base but node:24-boo
   // And, once all else is read, any character that is not printable ASCII, a
   // tab or a newline, a comment's included: how BuildKit's Go reads it never
   // decides what is built.
-  for (const [stray, named] of [['\u00a0', 'U+00A0'], ['\uFEFF', 'U+FEFF'], ['\r', 'U+000D'], ['\u3000', 'U+3000']] as const) {
+  for (const [stray, named] of [['\u00a0', 'U+00A0'], ['\uFEFF', 'U+FEFF'], ['\r', 'U+000D'], ['\u3000', 'U+3000'], ['\v', 'U+000B'], ['\x7f', 'U+007F']] as const) {
     const text = shipped.replace('# The aos worker image', `#${stray}The aos worker image`)
     assert.notEqual(text, shipped)
     assert.equal(baseProblem(text), `images/worker/Dockerfile holds ${named}: it may hold only printable ASCII, tabs and newlines, so that no other character's reading decides what is built`)
@@ -1674,7 +1804,15 @@ test("README's agents section: 'Both carry' follows the paragraph on the two shi
     `Of each stream the runner reads and redacts at most ${String(STREAM_WINDOW_BYTES / 1_024)} KiB (the largest share and ${String(CAPTURE_EDGE_BYTES / 1_024)} KiB more):`,
     `all of a shorter one, the end of a longer one, and the start of one the driver capped at ${String(CAPTURE_MAX_BYTES / 1_048_576)} MiB,`,
     `not the ${String(CAPTURE_EDGE_BYTES / 1_024)} KiB there, nor anything past a private key block's marker whose other marker the cut left out.`,
-    "`tool.result`'s `bytes` and `sha256` are of what was read, redacted.",
+    "A window whose start a key block may hold, however the stream's redaction pairs its markers, is shown from where the blocks that may hold it end instead, and not at all when none ends: all before that may be a block's body.",
+    // A union, not one chain: a chain that an END the walk refuses and
+    // redact.ts keeps leaves open closes on an END inside the next BEGIN.
+    'Those blocks are read as a union, not as one pairing: every BEGIN, one inside another marker included, held open to the first END after it that no token pattern, run first, can break (one holding an AWS key id, or one a token runs into), and the blocks that overlap taken as one.',
+    // The window bounds the PEM pattern's cost alone; the JWT pattern's is
+    // held by withholding.
+    'The window bounds that pattern\'s cost and no other\'s:',
+    `in which it starts at more than ${String(JWT_RUN_STARTS_MAX)} places is withheld before any redaction reads it, the stream's byte count (what its capture kept, for one the driver capped) said in its place.`,
+    "A result that shows a stream by its window, or withholds one, is marked `truncated`, and `tool.result`'s `bytes` and `sha256` are of what it shows before a stream is cut to its share, redacted: the windows short of their cut sides, not the streams.",
   ]) {
     assert.ok(sandbox.includes(fact), `README's sandbox.exec paragraph does not say: ${fact}`)
   }

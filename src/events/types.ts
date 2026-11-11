@@ -625,10 +625,11 @@ export const PROXY_DENY_REASONS = Object.freeze([
  * is none. A row of one names no host, and so no binding. (A CONNECT names
  * the host its authority names, routes.ts namedHost, and is not among them.)
  * parseTarget reads an absolute-form target's host before its length, its
- * characters and a fragment, so a 'target' deny of one in absolute form is
- * of an egress host whose target no request line holds (a fragment, a
- * character outside printable ASCII, more than MAX_TARGET), and names no host
- * all the same; a probe of a host that is none is not-a-host first.
+ * characters and a fragment, so a 'target' deny of one in absolute form is of
+ * an egress host whose target no request line holds (a fragment, a character
+ * no request line has: a space, a control character, anything outside ASCII;
+ * more than MAX_TARGET), and names no host all the same; a probe of a host
+ * that is none is not-a-host (or second-host, with userinfo) first.
  */
 export const PROXY_DENIES_BEFORE_HOST = Object.freeze(['target', 'not-a-host'] as const)
 
@@ -1060,19 +1061,19 @@ function isRouteOf(reason: string, method: string, path: string, repo: string): 
  * denies are counted on overflow rows (`overflow: true`), one per reason and,
  * for a reason PROXY_DENIES_BY_HOST_REFUSAL names, one per host refusal. An
  * overflow row names its reason, its count and that host refusal, nothing
- * else, and says so in PROXY_OVERFLOW_WHY. parseTarget reads an
- * absolute-form target's host before the rest of it (its length, its
- * characters, a fragment, the port and the path), so a loopback probe in the
- * absolute form it reads (http:// or https://, lower-case) is not-a-host
- * whatever port it names and whatever follows its host (192.168.5.2:8766, 192.168.5.2:7777 and host.lima.internal:8766 as
- * well as 192.168.5.2, with a path or none, a fragment, or past MAX_TARGET:
- * http://192.168.5.2:8766/mcp#x is ip-literal), and only an egress host on a
- * wrong port is a port deny, which names that host. A CONNECT (the spelling an
- * HTTPS client under HTTPS_PROXY uses) is use-route, and a target with
- * userinfo second-host; each names the host its authority names past any
- * userinfo or, when that is none, host.ts's reason
- * (PROXY_DENIES_BY_HOST_REFUSAL): CONNECT 192.168.5.2:8766 is a use-route deny
- * with hostRefusal ip-literal, CONNECT github.com:443 one with host
+ * else, and says so in PROXY_OVERFLOW_WHY. parseTarget reads an absolute-form
+ * target's host before the rest of it (its length, its characters, a
+ * fragment, the port and the path), so a loopback probe in the absolute form
+ * it reads (http:// or https://, lower-case) is not-a-host whatever port it
+ * names and whatever follows its host (192.168.5.2:8766, 192.168.5.2:7777 and
+ * host.lima.internal:8766 as well as 192.168.5.2, with a path or none, a
+ * fragment, or past MAX_TARGET: http://192.168.5.2:8766/mcp#x is ip-literal),
+ * and only an egress host on a wrong port is a port deny, which names that
+ * host. A CONNECT (the spelling an HTTPS client under HTTPS_PROXY uses) is
+ * use-route, and a target with userinfo second-host; each names the host its
+ * authority names past any userinfo or, when that is none, host.ts's reason
+ * (PROXY_DENIES_BY_HOST_REFUSAL): CONNECT 192.168.5.2:8766 is a use-route
+ * deny with hostRefusal ip-literal, CONNECT github.com:443 one with host
  * github.com. Among a flood of other denies a probe is therefore its own row,
  * or a count under its reason and its own host refusal (ip-literal for
  * 192.168.5.2, special-use for host.lima.internal), never a count under
@@ -1081,16 +1082,17 @@ function isRouteOf(reason: string, method: string, path: string, repo: string): 
  * refused. A target deny: a target that is not absolute form as parseTarget
  * reads it (origin-form, whose Host header alone names a host; an upper-case
  * scheme), in which nothing is read as a host, or one in absolute form whose
- * host is an egress host and whose text no request line holds (a fragment, a
- * character outside printable ASCII, more than MAX_TARGET:
- * http://registry.npmjs.org/react#readme), a typo of a real host, never a
- * probe. And a CONNECT whose target is no authority (CONNECT
+ * host is an egress host and whose text no request line holds: a fragment
+ * (http://registry.npmjs.org/react#readme), a character no request line has
+ * (a space, a control character, anything outside ASCII), more than
+ * MAX_TARGET. Such a deny is never a probe of a host that is none (an address
+ * or a special-use name). And a CONNECT whose target is no authority (CONNECT
  * http://192.168.5.2:8766/, or 192.168.5.2:8766/ with its slash), a use-route
- * deny with neither host nor host refusal (routes.ts namedHost). A target with
- * no path after its host is no such request: parseTarget reads it with path /
- * (http://github.com, http://github.com?x), and its authority ends at a
- * `#`, so http://github.com#x is a target deny (its host an egress host) and
- * http://192.168.5.2:8766#x not-a-host.
+ * deny with neither host nor host refusal (routes.ts namedHost). A target
+ * with no path after its host is no such request: parseTarget reads it with
+ * path / (http://github.com, http://github.com?x), and its authority ends at
+ * a `#`, so http://github.com#x is a target deny (its host an egress host)
+ * and http://192.168.5.2:8766#x not-a-host.
  *
  * `stage: 'upstream'` is the upstream's refusal of a request decide() allowed:
  * it follows that request's allow row, keeps its allow reason and fields,

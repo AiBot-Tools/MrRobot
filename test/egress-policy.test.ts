@@ -512,8 +512,20 @@ test('the host is judged before the port: a probe of the Mac\'s loopback is not-
       )
     }
   }
+  // MAX_TARGET is the longest target read: one of exactly that length on an
+  // egress host is read, and refused for its path (longer than MAX_PATH),
+  // naming the host; one character more is a target deny.
+  const atMost = `http://registry.npmjs.org/${'a'.repeat(MAX_TARGET - 'http://registry.npmjs.org/'.length)}`
+  assert.equal(atMost.length, MAX_TARGET)
+  const read = decide(EXEC, request('GET', atMost))
+  denies(read, 'path', 'exactly MAX_TARGET')
+  assert.equal(read.host, 'registry.npmjs.org')
+  const over = decide(EXEC, request('GET', `${atMost}a`))
+  denies(over, 'target', 'MAX_TARGET and one more')
+  assert.equal(over.host, undefined)
   // An egress host's target that no request line holds is a target deny,
-  // and names no host: a typo of a real host, never a probe.
+  // and names no host: never a probe of a host that is none (an address or
+  // a special-use name).
   for (const target of ['http://registry.npmjs.org/react#readme', 'http://github.com#x', 'http://github.com:8766#x', `http://registry.npmjs.org/${long}`, 'http://registry.npmjs.org/re\tact']) {
     const decision = decide(EXEC, request('GET', target))
     denies(decision, 'target', JSON.stringify(target.slice(0, 64)))
@@ -707,8 +719,31 @@ test('path normalisation refuses %2f, %2e, .., a double slash and a second host,
   denies(decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { host: ['registry.npmjs.org', 'example.com'] })), 'second-host', 'two Host headers')
   allows(decide(EXEC, request('GET', 'http://registry.npmjs.org/react', { Host: 'REGISTRY.npmjs.org.' })), 'allow-host', 'Host in another spelling and case of name')
   // Only absolute form: origin form, authority form, another scheme, a fragment, a space.
-  for (const target of ['/react', 'registry.npmjs.org/react', 'registry.npmjs.org:443', 'ftp://registry.npmjs.org/', 'HTTP://registry.npmjs.org/', 'ws://registry.npmjs.org/', 'http:/registry.npmjs.org/', 'http://registry.npmjs.org/react#x', 'http://registry.npmjs.org/re act', '*', '', 'http://registry.npmjs.org/\u00e9']) {
-    denies(decide(EXEC, request('GET', target)), 'target', JSON.stringify(target))
+  // And absolute form only from the target's first character: a URL later in
+  // a target that is not absolute form (in a query, after an upper-case or
+  // another scheme) is never read, and the target deny names no host.
+  for (const [target, host] of [
+    ['/react', undefined],
+    ['registry.npmjs.org/react', undefined],
+    ['registry.npmjs.org:443', undefined],
+    ['ftp://registry.npmjs.org/', undefined],
+    ['HTTP://registry.npmjs.org/', undefined],
+    ['ws://registry.npmjs.org/', undefined],
+    ['http:/registry.npmjs.org/', undefined],
+    ['http://registry.npmjs.org/react#x', undefined],
+    ['http://registry.npmjs.org/re act', undefined],
+    ['*', undefined],
+    ['', undefined],
+    ['http://registry.npmjs.org/\u00e9', undefined],
+    ['/x?u=http://registry.npmjs.org/', undefined],
+    ['HTTP://192.168.5.2:8766/http://github.com/op/fixture.git/info/refs?service=git-upload-pack', 'github.com'],
+    ['ftp://x/http://github.com/', undefined],
+  ] as const) {
+    const decision = decide(EXEC, request('GET', target, host === undefined ? {} : { host }))
+    denies(decision, 'target', JSON.stringify(target))
+    assert.deepEqual({ host: decision.host, hostRefusal: decision.verdict === 'deny' ? decision.hostRefusal : 'allowed' }, { host: undefined, hostRefusal: undefined }, target)
+    const parsed = parseTarget(target)
+    assert.equal(parsed.ok ? parsed.host : parsed.reason, 'target', target)
   }
   // Admitted paths are sent as written, percent-encodings and all; an empty path is '/'.
   for (const [target, originForm] of [

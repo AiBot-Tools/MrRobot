@@ -71,9 +71,12 @@ import { Budget } from '../src/runtime/budget.js'
 import { Lanes } from '../src/runtime/lanes.js'
 import { RunLoop, type RunAgent } from '../src/runtime/loop.js'
 import {
+  AWS_KEY_ID,
   CAPTURE_EDGE_BYTES,
   DESCRIBE_RESERVE,
   DOCKER_CLI_FAILED,
+  DRIVER_TEXT_BYTES,
+  JWT_RUN_STARTS_MAX,
   KILL_WAIT_MS,
   MAX_EXEC_ARGS,
   MAX_EXEC_ARG_BYTES,
@@ -84,6 +87,8 @@ import {
   STREAM_WINDOW_BYTES,
   SandboxTools,
   endReason,
+  jwtRunStarts,
+  pemEndHolds,
   sandboxToolProblem,
   type SandboxCallContext,
   type SandboxToolsOptions,
@@ -1772,7 +1777,7 @@ const cappedHead = (runId: string): string =>
 
 /** The heading of a stream read by its start, `shown` bytes of a capture of `printed`. */
 const startHeading = (label: string, shown: number, printed = CAPTURE_MAX_BYTES): string =>
-  `--- ${label} (its start, redacted: ${String(shown)} bytes, of the ${String(printed)} bytes its capture kept; the stream carried more) ---`
+  `--- ${label} (its start, redacted: ${String(shown)} bytes, of the ${String(printed)} bytes its capture kept; the stream may have carried more) ---`
 
 /** startHeading as a regular expression, for any count shown. */
 const startHeadingRe = (label: string, printed = CAPTURE_MAX_BYTES): string =>
@@ -1838,8 +1843,13 @@ test("a capped stream's window is never shown at its own cut, where it may split
   assert.equal(out.text, `${cappedHead('run_w')}${startHeading('stdout', shown.length)}\n${shown}\n--- stderr (0 bytes) ---\n`)
   assert.ok(shown.includes(`${BUILD_LINES.slice(0, 1_000)}[REDACTED]\n[REDACTED]\n`), 'the redacted blocks are shown')
   assert.ok(!out.text.includes('ghp_'))
-  // Nothing describe() read was cut from what it shows: the text is whole.
-  assert.equal(payloads(d.store, 'tool.result')[0]?.truncated, false)
+  // Nothing was cut to fit, and the stream is still shown by its window, not
+  // whole: tool.result is marked cut, with the bytes and digest of the text,
+  // which is the window short of its cut side.
+  const [result] = payloads(d.store, 'tool.result')
+  assert.equal(result?.truncated, true)
+  assert.equal(result?.bytes, Buffer.byteLength(out.text))
+  assert.equal(result?.sha256, sha256Hex(out.text))
 })
 
 test('a private key block a window cut splits is never shown from its marker on, however far before the cut it begins', async (t) => {
@@ -1914,7 +1924,7 @@ test('a stream longer than its window is read by its end, and never shown where 
   assert.ok(err.text.endsWith('[REDACTED]\nLAST LINE\n'))
 })
 
-test('no redaction reads more than a window of a stream, so a MiB of BEGIN lines with no END costs milliseconds, not seconds', async (t) => {
+test("no redaction reads more than a window of a stream, so a MiB of BEGIN lines with no END, the PEM pattern's slow shape, costs milliseconds, not seconds", async (t) => {
   // redact.ts's PEM pattern takes time quadratic in a text of BEGIN lines no
   // END follows: some 11 s for each 1 MiB stream, with the daemon's event
   // loop blocked throughout, on an exec that needs no human.
@@ -1942,12 +1952,504 @@ test('no redaction reads more than a window of a stream, so a MiB of BEGIN lines
   assert.ok(typeof bytes === 'number' && bytes <= 2 * STREAM_WINDOW_BYTES, `tool.result's bytes: ${String(bytes)}`)
 })
 
+/**
+ * The heading and line of a stream withheld for a run JWT_RUN_STARTS_MAX
+ * refuses, `printed` bytes: of a stream the driver `capped`, what its capture
+ * kept, which the stream may have printed more than.
+ */
+const withheldPart = (label: string, printed: number, capped = false): string =>
+  (capped
+    ? `--- ${label} (withheld: the ${String(printed)} bytes its capture kept; the stream may have carried more) ---\n`
+    : `--- ${label} (withheld: ${String(printed)} bytes printed) ---\n`) +
+  `[withheld: what would be read of this stream holds a run of letters, digits, - and _ in which redact.ts's JWT ` +
+  `pattern starts at more than ${String(JWT_RUN_STARTS_MAX)} places, which redaction reads in time quadratic in ` +
+  `the run's length, so none of it is redacted or shown; ` +
+  (capped ? `its capture kept ${String(printed)} bytes]` : `the stream printed ${String(printed)} bytes]`)
+
+test("the JWT starts counted in a run are the places redact.ts's JWT pattern starts, a run ended by anything it does not take", () => {
+  // Each `ey` that \b admits, as the pattern's own regular expression reads
+  // it, counted within each stretch of [A-Za-z0-9_-]: the reference this
+  // one-pass count must agree with.
+  const reference = (text: string): number => {
+    let most = 0
+    for (const run of text.split(/[^A-Za-z0-9_-]+/)) {
+      let starts = 0
+      for (let i = 0; i < run.length; i++) {
+        const at = /\bey/y
+        // The character before the run is none it takes, so \b reads the run
+        // alone as it reads it in the text.
+        at.lastIndex = i
+        if (at.test(run)) starts += 1
+      }
+      most = Math.max(most, starts)
+    }
+    return most
+  }
+  const rows: readonly [string, number][] = [
+    ['', 0],
+    ['ey', 1],
+    ['eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlLWhlcmU', 1],
+    ['-ey'.repeat(17), 17],
+    // Upper case and digits are segment characters, and word characters to
+    // \b: they neither end a run nor admit a start after them.
+    ['-eyA'.repeat(17), 17],
+    ['-ey7'.repeat(17), 17],
+    ['Aey', 0],
+    ['7ey', 0],
+    ['aey-ey', 1],
+    ['_ey-ey', 1],
+    ['0ey', 0],
+    ['-ey-ey.-ey-ey-ey', 3],
+    ['-ey-ey -ey', 2],
+    ['é-ey€ey', 1],
+    ['\u0000ey ey', 1],
+    ['-eY-Ey-ey', 1],
+    ['-e-y', 0],
+  ]
+  for (const [text, starts] of rows) {
+    assert.equal(jwtRunStarts(text), starts, JSON.stringify(text))
+    assert.equal(reference(text), starts, `the reference agrees: ${JSON.stringify(text)}`)
+  }
+  // And over text no row was written for: every mix of the characters that
+  // decide a start.
+  const alphabet = ['e', 'y', '-', '.', 'a', 'A', '7', '_', ' ', 'é']
+  let seed = 7
+  for (let n = 0; n < 2_000; n++) {
+    let text = ''
+    for (let i = 0; i < 40; i++) {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648
+      text += alphabet[seed % alphabet.length] ?? ''
+    }
+    assert.equal(jwtRunStarts(text), reference(text), JSON.stringify(text))
+  }
+})
+
+test('a window of -ey runs is withheld and costs milliseconds', async (t) => {
+  // redact.ts's JWT pattern starts at every -ey and scans the rest of the run
+  // from each: some 2 s for one redaction of 74 KiB of them, the daemon's
+  // event loop blocked throughout, and as much again on every later
+  // redaction of the result while it stays in the model's context.
+  const run = (bytes: number): string => '-ey'.repeat(Math.ceil(bytes / 3)).slice(0, bytes)
+  // A long stream whose window starts inside a key block a later END
+  // closes, and is read from that END (pemOpenAt): what follows it is held
+  // to the bound as well.
+  const body = `MIIEvQIBADANBgkq${'Z'.repeat(47)}\n`.repeat(1_500)
+  assert.ok(body.length > 90_000)
+  const inBlock = `${BUILD_LINES}${BEGIN_KEY}\n${body}${END_KEY}\n${run(60_000)}\nLAST\n`
+  const windowAt = inBlock.length - STREAM_WINDOW_BYTES
+  assert.ok(windowAt > inBlock.indexOf(BEGIN_KEY) && windowAt < inBlock.indexOf(END_KEY), 'the window starts inside the block')
+  const cases: readonly [string, ScriptedExit, 'stdout' | 'stderr', number, boolean?][] = [
+    ['read whole', { exitCode: 1, stdout: run(STREAM_WINDOW_BYTES - 2) }, 'stdout', STREAM_WINDOW_BYTES - 2],
+    // -eyA, the second shape: an upper-case letter is a segment character,
+    // and a word character to \b, so the run goes on and each -ey starts.
+    ['a run of -eyA, read whole', { exitCode: 1, stdout: `FIRST\n${'-eyA'.repeat(18_000)}\nLAST\n` }, 'stdout', 0],
+    ['read by its end', { exitCode: 1, stderr: `${BUILD_LINES}${run(200_000)}\n` }, 'stderr', BUILD_LINES.length + 200_001],
+    ['read by its end, from the END closing a block its window starts in', { exitCode: 1, stdout: inBlock }, 'stdout', inBlock.length],
+    // Its count is what the capture kept: the stream printed at least that.
+    ['capped, read by its start', { exitCode: 1, stdout: run(CAPTURE_MAX_BYTES), truncated: true }, 'stdout', CAPTURE_MAX_BYTES, true],
+    // One run of exactly as many starts as a window may hold, and one more,
+    // amid plain lines.
+    ['one start too many', { exitCode: 1, stdout: `FIRST\n${'-ey'.repeat(JWT_RUN_STARTS_MAX + 1)}\nLAST\n` }, 'stdout', 0],
+  ]
+  for (const [what, exit, label, printed, capped = false] of cases) {
+    const d = direct(t, { exits: [exit] })
+    const args = { command: ['make'] }
+    const began = performance.now()
+    const out = await d.tools.call(ticketFor('run_y', args), args, context('run_y'))
+    const took = performance.now() - began
+    assert.ok(took < 1_000, `${what}: the exec took ${String(Math.round(took))} ms`)
+    const bytes = printed === 0 ? Buffer.byteLength(exit.stdout ?? '') : printed
+    assert.ok(out.text.includes(`\n${withheldPart(label, bytes, capped)}`), `${what}: ${out.text.slice(0, 600)}`)
+    assert.ok(!out.text.includes('-ey'), `${what}: no part of the run is shown`)
+    const [result] = payloads(d.store, 'tool.result')
+    assert.equal(result?.truncated, true, what)
+    assert.equal(result?.sha256, sha256Hex(out.text), what)
+    for (const row of d.store.query()) assert.ok(Buffer.byteLength(row.payload) <= MAX_LOGGED_OUTPUT, what)
+  }
+  // As many starts as a window may hold is redacted and shown as printed.
+  const most = `FIRST\n${'-ey'.repeat(JWT_RUN_STARTS_MAX)}\nLAST\n`
+  const d = direct(t, { exits: [{ exitCode: 1, stdout: most }] })
+  const args = { command: ['make'] }
+  const out = await d.tools.call(ticketFor('run_y', args), args, context('run_y'))
+  assert.ok(out.text.includes(`\n--- stdout (${String(most.length)} bytes) ---\n${most}`), out.text)
+})
+
+test("a long stream's window that starts inside an unterminated key block shows nothing up to the first END printed after it, even one the window's redaction paired with a later BEGIN", async (t) => {
+  const args = { command: ['make'] }
+  const head = 'aos-run-run_k-1 on the trusted domain, no network, exited 1 after 1 ms'
+  const endPart = (shown: string, printed: number): string =>
+    `--- stdout (its end, redacted: ${String(Buffer.byteLength(shown))} bytes, of the ${String(printed)} bytes it printed) ---\n${shown}`
+  const body = `MIIEvQIBADANBgkq${'Z'.repeat(47)}\n`.repeat(1_500)
+  assert.ok(body.length > 90_000)
+  // A BEGIN with no END of its own, then a whole key block: a redaction of
+  // the whole stream pairs the first BEGIN with the block's END and hides all
+  // between; the window's pairs the block's own two markers, and holds no END
+  // left over.
+  const paired = `${BUILD_LINES}${BEGIN_KEY}\n${body}${KEY_BLOCK}LAST LINE\n`
+  assert.equal(redactString(paired), `${BUILD_LINES}[REDACTED]\nLAST LINE\n`)
+  const window = paired.slice(paired.length - STREAM_WINDOW_BYTES)
+  assert.ok(!PEM_END.test(redactString(window)), "the window's redaction leaves no END")
+  // Two ENDs after the BEGIN: the first closes it, the second closes nothing,
+  // and what stands between them is shown.
+  const twice = `${BUILD_LINES}${BEGIN_KEY}\n${body}${END_KEY}\nBETWEEN\n${END_KEY}\nAFTER\n`
+  // No END at all: nothing of the window is shown.
+  const open = `${BUILD_LINES}${BEGIN_KEY}\n${body}LAST LINE\n`
+  const cases: readonly [string, string, string][] = [
+    ['an END the window paired', paired, '\nLAST LINE\n'],
+    ['two ENDs', twice, `\nBETWEEN\n${END_KEY}\nAFTER\n`],
+    ['no END', open, ''],
+  ]
+  for (const [what, stdout, shown] of cases) {
+    const d = direct(t, { exits: [{ exitCode: 1, stdout }] })
+    const out = await d.tools.call(ticketFor('run_k', args), args, context('run_k'))
+    assert.equal(out.text, `${head}\n${endPart(shown, stdout.length)}\n--- stderr (0 bytes) ---\n`, what)
+    for (const piece of ['MIIEvQ', 'ZZZZ']) assert.ok(!out.text.includes(piece), `${what}: ${piece}`)
+  }
+  // A window that starts outside any block, holding two ENDs with no BEGIN
+  // before them past its edge: nothing up to the first is shown, and what
+  // stands between the two is.
+  const stray = `${BUILD_LINES}${'.'.repeat(100_000)}\n${'.'.repeat(STREAM_WINDOW_BYTES - 10_000)}\n${END_KEY}\nBETWEEN\n${END_KEY}\nAFTER\n`
+  const d = direct(t, { exits: [{ exitCode: 1, stdout: stray }] })
+  const out = await d.tools.call(ticketFor('run_k', args), args, context('run_k'))
+  assert.equal(out.text, `${head}\n${endPart(`\nBETWEEN\n${END_KEY}\nAFTER\n`, stray.length)}\n--- stderr (0 bytes) ---\n`)
+})
+
+test("a long stream's window that starts inside a key block is read from the first END the token patterns leave whole, not one an AWS id, a Bearer or a token's run breaks", async (t) => {
+  const args = { command: ['make'] }
+  const head = 'aos-run-run_k-1 on the trusted domain, no network, exited 1 after 1 ms'
+  const endPart = (shown: string, printed: number): string =>
+    `--- stdout (its end, redacted: ${String(Buffer.byteLength(shown))} bytes, of the ${String(printed)} bytes it printed) ---\n${shown}`
+  const body = `MIIEvQIBADANBgkq${'Z'.repeat(47)}\n`.repeat(1_500)
+  const second = `SECONDBODY${'Q'.repeat(53)}\n`.repeat(10)
+  // redact.ts runs its token patterns before its PEM pattern, so a token
+  // that overlaps the first END leaves no END there: a redaction of the whole
+  // stream pairs the BEGIN with the next END, and hides the SECONDBODY lines.
+  const broken: readonly [string, string][] = [
+    ['an AWS key id inside the END', '-----END AKIAABCDEFGHIJKLMNOP PRIVATE KEY-----'],
+    ['a Bearer before the END', `Bearer\n${END_KEY}`],
+    ["a JWT's last segment run into the END", `eyAAAAAAAAAA.eyBBBBBBBBBB.cc${END_KEY}`],
+    ["an sk- key's run into the END", `sk-AAAAAAAA${END_KEY}`],
+  ]
+  for (const [what, end] of broken) {
+    const stdout = `${BUILD_LINES}${BEGIN_KEY}\n${body}${end}\n${second}${END_KEY}\nLAST\n`
+    const windowAt = stdout.length - STREAM_WINDOW_BYTES
+    assert.ok(windowAt > stdout.indexOf(BEGIN_KEY) && windowAt < stdout.indexOf(end), `${what}: the window starts inside the block`)
+    assert.ok(PEM_END.test(end), `${what}: the raw text holds an END there`)
+    assert.equal(redactString(stdout), `${BUILD_LINES}[REDACTED]\nLAST\n`, `${what}: the stream's redaction hides up to the second END`)
+    const d = direct(t, { exits: [{ exitCode: 1, stdout }] })
+    const out = await d.tools.call(ticketFor('run_k', args), args, context('run_k'))
+    assert.equal(out.text, `${head}\n${endPart('\nLAST\n', stdout.length)}\n--- stderr (0 bytes) ---\n`, what)
+    for (const piece of ['SECONDBODY', 'MIIEvQ', 'ZZZZ']) assert.ok(!out.text.includes(piece), `${what}: ${piece}`)
+  }
+  // A window that starts past such an END, inside the block it leaves open,
+  // whose own redaction pairs the END that closes that block with a later
+  // BEGIN, and holds no END left over: the stream's redaction hides all of
+  // it up to that END, the later BEGIN among it.
+  const late = `${BUILD_LINES}${BEGIN_KEY}\n${body.slice(0, 6_400)}${broken[0]?.[1] ?? ''}\n${'SECONDBODY\n'.repeat(9_000)}${KEY_BLOCK}LAST\n`
+  const windowAt = late.length - STREAM_WINDOW_BYTES
+  assert.ok(windowAt > late.indexOf('SECONDBODY') && windowAt < late.lastIndexOf(BEGIN_KEY), 'the window starts in the SECONDBODY lines')
+  assert.equal(redactString(late), `${BUILD_LINES}[REDACTED]\nLAST\n`)
+  assert.ok(!PEM_END.test(redactString(late.slice(windowAt))), "the window's redaction leaves no END")
+  const d = direct(t, { exits: [{ exitCode: 1, stdout: late }] })
+  const out = await d.tools.call(ticketFor('run_k', args), args, context('run_k'))
+  assert.equal(out.text, `${head}\n${endPart('\nLAST\n', late.length)}\n--- stderr (0 bytes) ---\n`)
+})
+
+/** What an exec shows of its stdout, read by its end: the text after its heading. */
+const shownEnd = (text: string): string | undefined =>
+  /\n--- stdout \(its end, redacted: \d+ bytes, of the \d+ bytes it printed\) ---\n([\s\S]*)\n--- stderr \(0 bytes\) ---\n$/.exec(text)?.[1]
+
+test("a long stream's window that starts inside a key block, however the stream's redaction pairs the markers before it, shows none of the block", async (t) => {
+  const args = { command: ['make'] }
+  const body = `MIIEvQIBADANBgkq${'Z'.repeat(47)}\n`.repeat(1_500)
+  const secret = `SECONDBODY${'Q'.repeat(53)}\n`.repeat(1_200)
+  // A BEGIN whose greedy marker holds an END: redact.ts reads the line as one
+  // BEGIN when an END follows it, and pairs it with that END.
+  const holdsEnd = '-----BEGIN Q PRIVATE KEY----- -----END Q PRIVATE KEY-----'
+  // A BEGIN an AWS key id breaks, holding a BEGIN that reaches a PRIVATE
+  // KEY----- past the outer one's 100 characters: redact.ts opens a block at
+  // the inner BEGIN, whose marker runs on past the END inside it.
+  const nested = `-----BEGIN AKIAABCDEFGHIJKLMNOP -----BEGIN PRIVATE KEY-----${'A'.repeat(50)} -----END Q PRIVATE KEY-----`
+  // Each stream, and what is shown of it: from the END that ends the last
+  // block that may hold the window's start, or nothing when no END the token
+  // patterns surely leave whole does.
+  const rows: readonly [string, string, string][] = [
+    // An END that pemEndHolds refuses and redact.ts keeps closes the first
+    // block; a single chain then closes on the END inside the next BEGIN.
+    ['v1, a refused END, then a BEGIN holding an END', `${BUILD_LINES}${BEGIN_KEY}\nAAAA\nabc${END_KEY}\n${holdsEnd}\n${secret}${KEY_BLOCK}LAST\n`, '\nLAST\n'],
+    // A key block after the END that ends them is shown as its own: hidden.
+    ['v1, a key block after', `${BUILD_LINES}${BEGIN_KEY}\nAAAA\nabc${END_KEY}\n${holdsEnd}\n${secret}${KEY_BLOCK}MIDDLE\n${KEY_BLOCK}LAST\n`, '\nMIDDLE\n[REDACTED]\nLAST\n'],
+    // The last END follows a Q, a token character, so none is surely whole.
+    ['v2, the window starts in the first block, its END refused', `${BUILD_LINES}${BEGIN_KEY}\n${body}abc${END_KEY}\n${holdsEnd}\n${secret.slice(0, 38_000)}${END_KEY}\nLAST\n`, ''],
+    ['v2, its last END on a line of its own', `${BUILD_LINES}${BEGIN_KEY}\n${body}abc${END_KEY}\n${holdsEnd}\n${secret.slice(0, 38_016)}${END_KEY}\nLAST\n`, '\nLAST\n'],
+    ['v3, a BEGIN inside an END marker', `${BUILD_LINES}${BEGIN_KEY}\nAAAA\nabc${END_KEY}\n-----END -----BEGIN Q PRIVATE KEY-----\n${secret}${KEY_BLOCK}LAST\n`, '\nLAST\n'],
+    ['v4, a BEGIN an AWS id breaks', `${BUILD_LINES}-----BEGIN AKIAABCDEFGHIJKLMNOP PRIVATE KEY-----\nAAAA\n${holdsEnd}\n${secret}${KEY_BLOCK}LAST\n`, '\nLAST\n'],
+    ['v5, an END Bearer breaks, holding one it does not', `${BUILD_LINES}${BEGIN_KEY}\nAAAA\nBearer -----END -----END RSA PRIVATE KEY-----\n${holdsEnd}\n${secret}${KEY_BLOCK}LAST\n`, '\nLAST\n'],
+    ['v6, a BEGIN inside a BEGIN an AWS id breaks', `${BUILD_LINES}${nested}\n${secret}${KEY_BLOCK}LAST\n`, '\nLAST\n'],
+    // An END inside an END that Bearer breaks is one redact.ts keeps, and
+    // closes the block: what follows it is shown.
+    ['v7, an END inside an END Bearer breaks', `${BUILD_LINES}${BEGIN_KEY}\n${body}Bearer -----END -----END RSA PRIVATE KEY-----\nAFTER\nLAST\n`, '\nAFTER\nLAST\n'],
+  ]
+  for (const [what, stdout, expected] of rows) {
+    const whole = redactString(stdout)
+    assert.ok(!whole.includes('SECONDBODY'), `${what}: the stream's redaction hides every SECONDBODY line`)
+    const windowAt = stdout.length - STREAM_WINDOW_BYTES
+    assert.ok(windowAt > stdout.indexOf('SECONDBODY') || windowAt < stdout.indexOf(holdsEnd), `${what}: the window starts inside what is hidden`)
+    const d = direct(t, { exits: [{ exitCode: 1, stdout }] })
+    const out = await d.tools.call(ticketFor('run_k', args), args, context('run_k'))
+    const shown = shownEnd(out.text)
+    assert.equal(shown, expected, what)
+    assert.ok(whole.endsWith(expected), `${what}: what is shown is what the stream's redaction leaves`)
+    for (const piece of ['SECONDBODY', 'MIIEvQ', 'ZZZZ']) assert.ok(!out.text.includes(piece), `${what}: ${piece}`)
+  }
+})
+
+test("over random streams of key blocks and markers that token patterns break, an exec never shows what the stream's redaction hides", async (t) => {
+  const pieces = [
+    `${BEGIN_KEY}\n`,
+    `${END_KEY}\n`,
+    KEY_BLOCK,
+    KEY_BLOCK,
+    `abc${END_KEY}\n`,
+    `Bearer ${END_KEY}\n`,
+    `x.${END_KEY}\n`,
+    '-----BEGIN Q PRIVATE KEY----- -----END Q PRIVATE KEY-----\n',
+    '-----END -----BEGIN Q PRIVATE KEY-----\n',
+    '-----BEGIN AKIAABCDEFGHIJKLMNOP PRIVATE KEY-----\n',
+    '-----END AKIAABCDEFGHIJKLMNOP PRIVATE KEY-----\n',
+    'Bearer -----END -----END RSA PRIVATE KEY-----\n',
+    'sk-AAAAAAAA-----BEGIN PRIVATE KEY-----\n',
+    `-----BEGIN AKIAABCDEFGHIJKLMNOP -----BEGIN PRIVATE KEY-----${'A'.repeat(50)} -----END Q PRIVATE KEY-----\n`,
+  ]
+  let seed = 3
+  const rnd = (n: number): number => {
+    seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648
+    return seed % n
+  }
+  const args = { command: ['make'] }
+  let cases = 0
+  let hidden = 0
+  for (let n = 0; n < 600; n++) {
+    // Numbered sentinel lines between the pieces, each a line the stream's
+    // redaction either hides or leaves whole.
+    let stdout = `${'f'.repeat(1_000)}\n`
+    let sentinels = 0
+    const count = 30 + rnd(40)
+    for (let i = 0; i < count; i++) {
+      stdout += pieces[rnd(pieces.length)] ?? ''
+      const lines = 1 + rnd(8)
+      for (let j = 0; j < lines; j++) stdout += `S${String(sentinels++).padStart(5, '0')}${'q'.repeat(1_500)}\n`
+    }
+    stdout += 'LAST\n'
+    if (Buffer.byteLength(stdout) <= STREAM_WINDOW_BYTES) continue
+    cases += 1
+    const whole = redactString(stdout)
+    const d = direct(t, { exits: [{ exitCode: 1, stdout }] })
+    const out = await d.tools.call(ticketFor('run_k', args), args, context('run_k'))
+    for (let k = 0; k < sentinels; k++) {
+      const tag = `S${String(k).padStart(5, '0')}`
+      if (whole.includes(tag)) continue
+      hidden += 1
+      assert.ok(!out.text.includes(tag), `case ${String(n)}: ${tag}, which the stream's redaction hides, is shown`)
+    }
+  }
+  assert.ok(cases > 400 && hidden > 5_000, `${String(cases)} cases, ${String(hidden)} hidden sentinels`)
+})
+
+test("the walk of a long stream's markers is linear: a MiB of BEGINs, ENDs, or BEGINs holding ENDs costs milliseconds", async (t) => {
+  const args = { command: ['make'] }
+  const shapes: readonly [string, string][] = [
+    ['BEGIN words', '-----BEGIN '.repeat(95_000)],
+    ['END words', '-----END '.repeat(116_000)],
+    ['BEGIN lines, no END', `${BEGIN_KEY}\n`.repeat(37_000)],
+    ['BEGIN lines and refused ENDs', `${BEGIN_KEY}\nabc${END_KEY}\n`.repeat(18_000)],
+    ['BEGIN holding END lines', '-----BEGIN Q PRIVATE KEY----- -----END Q PRIVATE KEY-----\n'.repeat(17_000)],
+    ['long markers', `-----BEGIN ${'A '.repeat(45)}PRIVATE KEY-----\n`.repeat(8_800)],
+    ['white space before ENDs', `${' '.repeat(60)}${END_KEY}`.repeat(12_000)],
+  ]
+  for (const [what, stdout] of shapes) {
+    assert.ok(stdout.length > 900_000, what)
+    const d = direct(t, { exits: [{ exitCode: 1, stdout }] })
+    const began = performance.now()
+    await d.tools.call(ticketFor('run_k', args), args, context('run_k'))
+    const took = performance.now() - began
+    assert.ok(took < 2_000, `${what}: the exec took ${String(Math.round(took))} ms`)
+  }
+})
+
+test('a stream of exactly STREAM_WINDOW_BYTES is read whole, and one byte more by its window', async (t) => {
+  for (const bytes of [STREAM_WINDOW_BYTES, STREAM_WINDOW_BYTES + 1]) {
+    const d = direct(t, { exits: [{ exitCode: 1, stdout: 'o'.repeat(bytes) }] })
+    const args = { command: ['make'] }
+    const out = await d.tools.call(ticketFor('run_x', args), args, context('run_x'))
+    const heading =
+      bytes === STREAM_WINDOW_BYTES
+        ? new RegExp(`\n--- stdout \\(${String(bytes)} bytes, cut to its last \\d+\\) ---\n`)
+        : new RegExp(`\n--- stdout \\(its end, redacted: \\d+ bytes, of the ${String(bytes)} bytes it printed\\) ---\n`)
+    assert.match(out.text, heading, String(bytes))
+    // Read whole, the whole it stands for is the stream; by its window, the
+    // window short of its edge.
+    const whole = payloads(d.store, 'tool.result')[0]?.bytes
+    const head = Buffer.byteLength(out.text.slice(0, out.text.indexOf('\n--- stdout')))
+    if (bytes === STREAM_WINDOW_BYTES) assert.ok(typeof whole === 'number' && whole > head + bytes, String(whole))
+    else assert.ok(typeof whole === 'number' && whole < head + bytes - CAPTURE_EDGE_BYTES + 200, String(whole))
+  }
+})
+
+test("a window's edge cut, shown when redaction shrinks the window to fit, lands on a whole character", async (t) => {
+  for (const ch of ['€', '😀']) {
+    for (let pad = 0; pad < 4; pad++) {
+      // Read by its end: the window starts amid the characters, and the key
+      // blocks after them shrink it, so its edge, 16 KiB in, is what is shown
+      // first.
+      const tail = `${ch.repeat(Math.ceil(30_000 / Buffer.byteLength(ch)))}${KEY_BLOCK.repeat(12)}LAST LINE\n`
+      const stdout = `${'x'.repeat(100_000 + pad)}${tail}`
+      const end = direct(t, { exits: [{ exitCode: 1, stdout }] })
+      const args = { command: ['make'] }
+      const out = await end.tools.call(ticketFor('run_u', args), args, context('run_u'))
+      const shown = /--- stdout \(its end, redacted: \d+ bytes, of the \d+ bytes it printed\) ---\n([\s\S]*)\n--- stderr/.exec(out.text)?.[1]
+      assert.ok(shown?.startsWith(ch) === true && shown.endsWith('[REDACTED]\nLAST LINE\n'), `${ch} ${String(pad)}: ${String(shown?.slice(0, 20))}`)
+      assert.doesNotMatch(out.text, /�|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u, `${ch} ${String(pad)}`)
+      assert.ok(Buffer.byteLength(shown) < STREAM_WINDOW_BYTES - CAPTURE_EDGE_BYTES - 40_000, 'the window was shrunk, and shown to its edge')
+
+      // Capped, read by its start: key blocks first, then the characters past
+      // the window's cut, so its edge, 16 KiB short of that cut, is what is
+      // shown last.
+      const start = `${'x'.repeat(pad)}${KEY_BLOCK.repeat(12)}FIRST LINE\n`
+      const capped = padTo(CAPTURE_MAX_BYTES, `${start}${ch.repeat(Math.ceil(60_000 / Buffer.byteLength(ch)))}`, '')
+      const head = direct(t, { exits: [{ exitCode: 1, stdout: capped, truncated: true }] })
+      const cut = await head.tools.call(ticketFor('run_u', args), args, context('run_u'))
+      const first = new RegExp(`${startHeadingRe('stdout')}\n([\\s\\S]*)\n--- stderr`).exec(cut.text)?.[1]
+      assert.ok(first?.endsWith(ch) === true && first.includes('[REDACTED]\nFIRST LINE\n'), `${ch} ${String(pad)}: ${String(first?.slice(-20))}`)
+      assert.doesNotMatch(cut.text, /�|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u, `${ch} ${String(pad)}`)
+    }
+  }
+})
+
+test('a driver whose kill refuses with a long text of quotes still gets its tool.result, the refusal cut to fit', async (t) => {
+  const quotes = '"'.repeat(40_000)
+  const cut = ` [cut: ${String(quotes.length)} bytes in all]`
+  // A kill refused at length, and a signal no docker client reports, each
+  // the driver's own text, in a head no share bounds.
+  const cases: readonly [string, (base: FakeSandbox) => SandboxDriver][] = [
+    ['a refusal', (base) => withKill(base, () => Promise.reject(new Error(quotes)))],
+    [
+      'a signal',
+      (base) => ({
+        name: base.name,
+        probe: () => base.probe(),
+        run: (spec) => {
+          const running = base.run(spec)
+          const result = running.result.then((r) => ({ ...r, signal: quotes as unknown as SandboxResult['signal'] }))
+          return { ...running, result }
+        },
+        kill: (name) => base.kill(name),
+      }),
+    ],
+  ]
+  for (const [what, make] of cases) {
+    const d = direct(t, { exits: [{ exitCode: null }] })
+    const args = { command: ['true'] }
+    const out = await toolsOver(d, make(d.driver)).call(ticketFor('run_q', args), args, context('run_q'))
+    assert.deepEqual(callRows(d.store), ['tool.call', 'sandbox.started', 'sandbox.killed', 'tool.result'], what)
+    for (const row of d.store.query()) assert.ok(Buffer.byteLength(row.payload) <= MAX_LOGGED_OUTPUT, what)
+    const kept = '"'.repeat(DRIVER_TEXT_BYTES / 2)
+    const said = what === 'a refusal' ? `and the driver refused it: ${kept}${cut}, as a docker client` : `ended with no exit status (${kept}${cut}) after`
+    assert.ok(out.text.includes(said), `${what}: ${out.text.slice(0, 400)}`)
+    assert.ok(!out.text.includes(`${kept}"`), `${what}: no more of it`)
+  }
+})
+
+test("a driver's text of exactly DRIVER_TEXT_BYTES payload bytes is shown whole, and one of a byte more is cut and said to be", async (t) => {
+  const refusing = (text: string) => (base: FakeSandbox): SandboxDriver => withKill(base, () => Promise.reject(new Error(text)))
+  const signalling = (text: string) => (base: FakeSandbox): SandboxDriver => ({
+    name: base.name,
+    probe: () => base.probe(),
+    run: (spec) => {
+      const running = base.run(spec)
+      const result = running.result.then((r) => ({ ...r, signal: text as unknown as SandboxResult['signal'] }))
+      return { ...running, result }
+    },
+    kill: (name) => base.kill(name),
+  })
+  // Counted in the bytes it takes in the log's JSON: 256 quotes are 512.
+  const rows: readonly [string, string, string][] = [
+    ['x at the bound', 'x'.repeat(DRIVER_TEXT_BYTES), 'x'.repeat(DRIVER_TEXT_BYTES)],
+    ['x one past it', 'x'.repeat(DRIVER_TEXT_BYTES + 1), `${'x'.repeat(DRIVER_TEXT_BYTES)} [cut: ${String(DRIVER_TEXT_BYTES + 1)} bytes in all]`],
+    ['quotes at the bound', '"'.repeat(DRIVER_TEXT_BYTES / 2), '"'.repeat(DRIVER_TEXT_BYTES / 2)],
+    ['quotes one past it', '"'.repeat(DRIVER_TEXT_BYTES / 2 + 1), `${'"'.repeat(DRIVER_TEXT_BYTES / 2)} [cut: ${String(DRIVER_TEXT_BYTES / 2 + 1)} bytes in all]`],
+  ]
+  for (const [what, text, shown] of rows) {
+    for (const [how, make, said] of [
+      ['a refusal', refusing(text), `and the driver refused it: ${shown}, as a docker client`],
+      ['a signal', signalling(text), `ended with no exit status (${shown}) after`],
+    ] as const) {
+      const d = direct(t, { exits: [{ exitCode: null }] })
+      const args = { command: ['true'] }
+      const out = await toolsOver(d, make(d.driver)).call(ticketFor('run_q', args), args, context('run_q'))
+      assert.ok(out.text.includes(said), `${what}, ${how}: ${out.text.slice(0, 900)}`)
+      assert.equal(out.text.includes('[cut:'), shown.includes('[cut:'), `${what}, ${how}`)
+    }
+  }
+})
+
 test("the window cuts read redact.ts's PEM pattern's own markers", () => {
   const pem = TOKEN_PATTERNS.filter((re) => re.source.includes('PRIVATE KEY'))
   assert.equal(pem.length, 1)
   assert.equal(pem[0]?.source, `${PEM_BEGIN.source}[\\s\\S]*?${PEM_END.source}`)
   assert.equal(PEM_BEGIN.flags, '')
   assert.equal(PEM_END.flags, '')
+})
+
+test("an END is taken to close a block only when no token pattern can break it, as redact.ts's patterns read it in context", () => {
+  // The one token pattern that can match inside a marker is redact.ts's own.
+  assert.ok(TOKEN_PATTERNS.some((re) => re.source === AWS_KEY_ID.source), 'AWS_KEY_ID is a token pattern of redact.ts')
+  assert.equal(AWS_KEY_ID.flags, '')
+  const markers = [
+    END_KEY,
+    '-----END RSA PRIVATE KEY-----',
+    '-----ENDXY PRIVATE KEY-----',
+    '-----END PRIVATE KEY BLOCK-----',
+    '-----END AKIAABCDEFGHIJKLMNOP PRIVATE KEY-----',
+    '-----END-ASIA2345234523452345- PRIVATE KEY BLOCK-----',
+  ]
+  // Whether the END ending the text is one the PEM pattern still finds once
+  // the token patterns have run over all of it.
+  const survives = (text: string): boolean => new RegExp(`(?:${PEM_END.source})$`).test(redactString(text))
+  const rows: readonly [string, string, boolean][] = [
+    ['a line end before it', `abc==\n`, true],
+    ['the stream starts with it', '', true],
+    ['a Bearer with a value before the line end', 'Bearer x\n', true],
+    ["a word ending in Bearer", 'xBearer\n', true],
+    ['an = after a Bearer value', 'Bearer abc=', true],
+    ['Bearer and a line end', 'Bearer\n', false],
+    ['Bearer and white space', 'Bearer \t\u00a0', false],
+    ['a token character', 'abc', false],
+    ['a dot', 'x.', false],
+  ]
+  for (const [what, before, holds] of rows) {
+    assert.equal(pemEndHolds(before + END_KEY, before.length, END_KEY), holds, what)
+  }
+  assert.equal(pemEndHolds(markers[4] ?? '', 0, markers[4] ?? ''), false, 'an AWS key id inside it')
+  // Never taken to hold where redact.ts breaks it: over every mix of the
+  // pieces a breaking token is made of, before every marker shape.
+  const pieces = ['Bearer', ' ', '\n', '\t', '\u00a0', 'sk-', 'xoxb-', 'xapp-', 'ey', 'eyAAAAAAAAAA.eyBBBBBBBBBB.', 'ABCDEFGHIJ', 'abcdefghij', '.', '-', '_', '=', '~', '+', '/', ',', '7', 'AKIA', 'ghp_', 'github_pat_', ':', '"']
+  let seed = 11
+  const counted = { holds: 0, breaks: 0 }
+  for (let n = 0; n < 4_000; n++) {
+    let before = ''
+    for (let i = 0; i < 6; i++) {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648
+      before += pieces[seed % pieces.length] ?? ''
+    }
+    const marker = markers[n % markers.length] ?? END_KEY
+    const text = before + marker
+    if (pemEndHolds(text, before.length, marker)) {
+      counted.holds += 1
+      assert.ok(survives(text), `taken to hold, yet redact.ts breaks it: ${JSON.stringify(text)}`)
+    } else if (!survives(text)) counted.breaks += 1
+  }
+  assert.ok(counted.holds > 200 && counted.breaks > 200, JSON.stringify(counted))
 })
 
 test('a capped stream of quotes or backslashes is shown from its start by the bytes it takes in the log, so its tool.result fits', async (t) => {

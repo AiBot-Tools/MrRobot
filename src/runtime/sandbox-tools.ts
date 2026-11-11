@@ -52,10 +52,26 @@
 // capped (it keeps the first CAPTURE_MAX_BYTES, cut before any redaction),
 // because redact.ts's PEM pattern takes time quadratic in a text of BEGIN
 // lines with no END after them, and a MiB of those would block the daemon's
-// event loop for seconds. A window is never shown on its cut side: not the
-// CAPTURE_EDGE_BYTES there, where the cut may split a credential, nor a
-// private key block the cut splits, from its marker on. tool.result's bytes
-// and sha256 describe what was read, redacted: the windows, not the streams.
+// event loop for seconds. The window bounds that pattern's cost, and no
+// other's: the JWT pattern takes time quadratic in a run of the characters
+// its segments take in which it starts at many places (`-ey` repeated), some
+// 2 s over one window, so a window holding such a run is withheld before any
+// redaction reads it (JWT_RUN_STARTS_MAX): never redacted, never shown, the
+// bytes its stream printed, or its capture kept, said in its place. A window
+// is never shown on its cut side: not the CAPTURE_EDGE_BYTES there, where the
+// cut may split a credential, nor a private key block the cut splits, from
+// its marker on. A window whose start a key block may hold, however the
+// stream's redaction pairs the markers, is shown from where the blocks that
+// may hold it end instead, wherever that is, and not at all when none ends:
+// all before that may be a block's body, a credential the cut split among
+// it. Those blocks are read as a union, not as one pairing (pemOpenAt):
+// every BEGIN, one inside another marker included, held open to the first
+// END after it that no token pattern, run first, can break (an AWS key id
+// inside it, or a token's run into it, breaks one), and the blocks that
+// overlap taken as one. A result that shows a stream by its window, or
+// withholds one, is marked cut, and tool.result's bytes and sha256 describe
+// what is shown of each stream before its share is cut, redacted: the
+// windows short of their cut sides, not the streams.
 //
 // Its result TAINTS the run, always, whatever tool-views.yaml says of it: a
 // container runs whatever the model asked for, on a workspace a container
@@ -284,11 +300,13 @@ interface Done {
   readonly ok: boolean
   readonly text: string
   /**
-   * When the text was cut to fit: all that was read before the cut, redacted
-   * already (each stream whole or as its window, before describe() cut one to
-   * its share, or a refusal before it was cut to the budget). What
-   * tool.result's bytes and sha256 then describe, as they describe the whole
-   * of any text boundOutput cuts.
+   * Set when the text is not all the call came to: what it shows before any
+   * cut to fit, redacted already (each stream whole, or its window short of
+   * its cut side, or the line that withholds it, before describe() cut one to
+   * its share; or a refusal before it was cut to the budget). Set whenever a
+   * stream is shown by its window or withheld, even when nothing is then cut
+   * to fit, so tool.result is marked cut. What tool.result's bytes and sha256
+   * then describe, as they describe the whole of any text boundOutput cuts.
    */
   readonly whole?: string
 }
@@ -601,7 +619,7 @@ export class SandboxTools {
       }
       if ('refused' in ended) {
         log.warn({ sandboxId: name, driver: this.#o.driver.name }, 'sandbox kill by name failed')
-        return `a kill by name was sent to ${name}, and the driver refused it: ${ended.refused}`
+        return `a kill by name was sent to ${name}, and the driver refused it: ${driverText(ended.refused)}`
       }
       return `a kill by name was sent to ${name}`
     } finally {
@@ -771,7 +789,18 @@ export const DESCRIBE_RESERVE = 4_096
  * value the kernel holds as secret with its first or last part gone, a PEM
  * block whose other marker lies past the cut) stands there unredacted. A key
  * block a cut splits is also dropped from its marker on, however long it is
- * (pemCut); this covers the rest, which is a few KiB at most.
+ * (pemCut); this covers the rest, which is a few KiB at most for every
+ * credential a tool prints. A window whose start a key block may hold is
+ * read from where the blocks that may hold it end, an END's end, instead
+ * (pemOpenAt), with no edge: all before that may be a block's body, and the
+ * window's cut, with whatever it split, lies before it. Every token pattern but AWS's has an unbounded part: the PEM
+ * pattern's body, which pemCut and pemOpenAt hold, and for the rest
+ * Bearer's \s+ and its token, a JWT's segments, and the tails of the
+ * provider, GitHub and Slack keys. A token of one of those shapes that
+ * crosses a cut and runs more than this far past it is shown in part (a
+ * Bearer token after more than 16 KiB of white space, whole). Only output
+ * written to defeat the patterns holds one, and no worker holds a credential
+ * to put in it.
  */
 export const CAPTURE_EDGE_BYTES = 16_384
 
@@ -783,11 +812,82 @@ export const CAPTURE_EDGE_BYTES = 16_384
  * start. redact.ts's PEM pattern takes time quadratic in a text of BEGIN lines
  * with no END after them (a 1 MiB capture of them takes some 11 s on one
  * core, the daemon's event loop blocked throughout, on an exec that needs no
- * human), and over a window of this size some 60 ms. Redaction may shrink a
- * window (a key block is [REDACTED]), and a stream is then shown less of than
- * its share: never more than its window.
+ * human), and over a window of this size some 60 ms. That bounds the PEM
+ * pattern's cost alone: the JWT pattern's, quadratic in a run of `-ey`, is
+ * some 2 s over one window, and is held by JWT_RUN_STARTS_MAX. Redaction may
+ * shrink a window (a key block is [REDACTED]), and a stream is then shown
+ * less of than its share: never more than its window.
  */
 export const STREAM_WINDOW_BYTES = PAYLOAD_TEXT_BUDGET - DESCRIBE_RESERVE + CAPTURE_EDGE_BYTES
+
+/**
+ * The most places redact.ts's JWT pattern may start in one run of `text`, a
+ * stretch of the characters its segments take ([A-Za-z0-9_-]) that anything
+ * else ends, a `.` among them, for a window holding it to be redacted. The
+ * pattern (TOKEN_PATTERNS) starts at every `ey` with no word character before
+ * it, so inside a run at every `-ey`, and from each start scans the rest of
+ * its run, and of the two after it when a `.` and `ey` join them, before it
+ * fails: a run of `-ey` repeated takes time quadratic in its length, some 2 s
+ * over one window, the event loop blocked throughout, and again on every
+ * later redaction of the result while the model holds it (each llm.request).
+ * Each start's scan ends within three runs, so with no run holding more
+ * than this many starts a pass scans a window at most three times over for
+ * each start a run may hold, some 3 ms (measured over a window: 2.5 ms for
+ * runs of 16 starts each, 6.5 ms at 32, 11 ms at 64). Output no one
+ * wrote to defeat the pattern holds no run like it: a token is one start or
+ * two, and random base64url holds `-ey` once in some 260 000 characters. A
+ * window holding one is withheld whole, not cut around it: a cut inside the
+ * run could split whatever credential it holds.
+ */
+export const JWT_RUN_STARTS_MAX = 16
+
+/** A character a JWT segment takes: [A-Za-z0-9_-]. */
+function segmentChar(c: number): boolean {
+  return (c >= 0x61 && c <= 0x7a) || (c >= 0x41 && c <= 0x5a) || (c >= 0x30 && c <= 0x39) || c === 0x5f || c === 0x2d
+}
+
+/** A character a regular expression's \b reads as a word character: [A-Za-z0-9_]. */
+function wordChar(c: number): boolean {
+  return segmentChar(c) && c !== 0x2d
+}
+
+/**
+ * The most places redact.ts's JWT pattern starts in any one run of `text`
+ * (JWT_RUN_STARTS_MAX), in one pass and no regular expression: an `ey` with
+ * no word character before it.
+ */
+export function jwtRunStarts(text: string): number {
+  let most = 0
+  let starts = 0
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i)
+    if (!segmentChar(c)) {
+      starts = 0
+      continue
+    }
+    if (c === 0x65 && text.charCodeAt(i + 1) === 0x79 && (i === 0 || !wordChar(text.charCodeAt(i - 1)))) {
+      starts += 1
+      if (starts > most) most = starts
+    }
+  }
+  return most
+}
+
+/**
+ * The most a driver's own text takes in describe()'s head, in payload bytes:
+ * a kill's refusal, or a signal no docker client reports. The head is not cut
+ * to a share, and a driver's text is not the runner's: one of 40 000 quotes
+ * would escape past what tool.result holds, and the call would fail at its
+ * last append with the container already gone and its end recorded.
+ */
+export const DRIVER_TEXT_BYTES = 512
+
+/** A driver's text for the head: redacted, then cut to DRIVER_TEXT_BYTES in payload bytes, and said to be. */
+function driverText(text: string): string {
+  const redacted = redactString(text)
+  if (payloadBytes(redacted) <= DRIVER_TEXT_BYTES) return redacted
+  return `${firstFitting(redacted, DRIVER_TEXT_BYTES)} [cut: ${String(Buffer.byteLength(redacted))} bytes in all]`
+}
 
 /**
  * The two markers of redact.ts's PEM pattern (TOKEN_PATTERNS), which hides
@@ -877,6 +977,122 @@ function utf8Tail(text: string, max: number): string {
   return buf.subarray(start).toString('utf8')
 }
 
+/** Where the first PEM_END in `text` ends, or -1 when it holds none. */
+function firstEndAfter(text: string): number {
+  const end = PEM_END.exec(text)
+  return end === null ? -1 : end.index + end[0].length
+}
+
+/**
+ * redact.ts's AWS access key id pattern (TOKEN_PATTERNS), the one token
+ * pattern that can match inside a PEM marker. Held to it by
+ * test/sandbox-exec.test.ts, so the two cannot drift apart.
+ */
+export const AWS_KEY_ID = /\b(?:AKIA|ASIA)[A-Z2-7]{16}\b/
+
+/**
+ * Whether the END `marker`, at `at` in `raw`, still closes a block once
+ * redact.ts's token patterns have run over the stream, as they do before its
+ * PEM pattern (TOKEN_PATTERNS): a token they match that overlaps the marker
+ * becomes [REDACTED], no END is left there, and the block it would have
+ * closed runs on to the next END that is. A marker holds only upper case,
+ * digits, space, `-` and `_`, and every token's prefix but AWS's holds lower
+ * case, so only these overlap one: an AWS id inside it, and a token whose run
+ * reaches into its leading `-----END` (Bearer's credential, sk-'s, Slack's, a
+ * JWT's last segment), which needs a character such a run takes, or a `.`,
+ * just before the marker, or white space with Bearer before it
+ * (`Bearer\n-----END`). Judged generously, so an END a token may break is
+ * taken as one it does: pemOpenAt holds a block open from every BEGIN,
+ * whichever ENDs this refuses, so refusing one only holds a block open
+ * longer, and hides more. A value the kernel's own mask holds (SecretMask,
+ * which runs before the patterns) is not followed: no worker holds one.
+ */
+export function pemEndHolds(raw: string, at: number, marker: string): boolean {
+  if (AWS_KEY_ID.test(marker)) return false
+  if (at > 0 && /[A-Za-z0-9._~+/-]/.test(raw.charAt(at - 1))) return false
+  let space = at
+  while (space > 0 && /\s/.test(raw.charAt(space - 1))) space--
+  if (space === at) return true
+  const word = space - 'Bearer'.length
+  return !(word >= 0 && raw.startsWith('Bearer', word) && (word === 0 || !/\w/.test(raw.charAt(word - 1))))
+}
+
+/**
+ * Where the private key blocks redact.ts's PEM pattern may hide, around `at`
+ * in `raw`, end: undefined when none of them holds `at` (one that starts at
+ * `at`, or ends there, does not), null when one does and no END ends it, else
+ * where the blocks that overlap the one holding it end: the end of the END
+ * that ends the last of them. Read as a union, not as one pairing of the markers: every BEGIN, each one inside
+ * another marker included, is held open from where it starts to the first
+ * END that pemEndHolds admits starting at or after where it ends, read
+ * greedily, and blocks that overlap are one. Over-approximating so:
+ *
+ *   each block redact.ts hides starts at a BEGIN of `raw` (a marker holds no
+ *   `[` or `]`, so no [REDACTED] stands inside one), its marker there ending
+ *   no later than the greedy one (a token pattern, run first, may cut it short,
+ *   and the pattern backtracks into it when nothing follows it);
+ *   the block ends at the first END that survives those patterns after its
+ *   marker, and an END pemEndHolds admits is one that survives, so that END
+ *   starts no later than the one taken here, and the one taken here ends no
+ *   earlier (one that starts inside it reaches its PRIVATE KEY-----, or one
+ *   past it);
+ *
+ * so each such block lies inside one held open here, whichever ENDs
+ * pemEndHolds refuses and however the patterns pair the markers: refusing an
+ * END only holds a block open longer. A pairing of one chain (a BEGIN opens a
+ * block when none is open, the END that closes it ends it, and the next
+ * BEGIN is sought past it) is not this: a refused END the stream's redaction
+ * keeps leaves the chain open past the block it closed, and the chain then
+ * closes on an END inside the next BEGIN's marker, and never opens the block
+ * that BEGIN opens. A value the kernel's mask holds (SecretMask) is not
+ * followed (pemEndHolds). Two passes, linear but for a binary search for
+ * each BEGIN's END: every END, then every BEGIN, each sought one character
+ * past the last one's start, each marker some 130 characters at most, and
+ * pemEndHolds reading back over the white space before an END, which no
+ * other END shares.
+ */
+function pemOpenAt(raw: string, at: number): number | null | undefined {
+  // Every END pemEndHolds admits, each inside another marker included, in
+  // order of where it starts.
+  const end = new RegExp(PEM_END.source, 'g')
+  const heldStarts: number[] = []
+  const heldEnds: number[] = []
+  for (let m = end.exec(raw); m !== null; m = end.exec(raw)) {
+    if (pemEndHolds(raw, m.index, m[0])) {
+      heldStarts.push(m.index)
+      heldEnds.push(m.index + m[0].length)
+    }
+    end.lastIndex = m.index + 1
+  }
+  // The end of the first of them that starts at or after `from`, or Infinity.
+  const closeAt = (from: number): number => {
+    let lo = 0
+    let hi = heldStarts.length
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1
+      if ((heldStarts[mid] ?? Infinity) < from) lo = mid + 1
+      else hi = mid
+    }
+    return heldEnds[lo] ?? Infinity
+  }
+  // Every BEGIN, in order: [where it starts, closeAt(where it ends)], those
+  // that overlap merged, until the one holding `at` is known.
+  const begin = new RegExp(PEM_BEGIN.source, 'g')
+  let start = -1
+  let reach = -1
+  for (let m = begin.exec(raw); m !== null; m = begin.exec(raw)) {
+    if (m.index >= reach) {
+      if (start < at && at < reach) break
+      if (m.index >= at) return undefined
+      start = m.index
+    }
+    reach = Math.max(reach, closeAt(m.index + m[0].length))
+    begin.lastIndex = m.index + 1
+  }
+  if (!(start < at && at < reach)) return undefined
+  return reach === Infinity ? null : reach
+}
+
 /**
  * What may be shown of `read`, a window redacted, on the side its cut is on:
  * not its CAPTURE_EDGE_BYTES there, nor a private key block the cut splits.
@@ -884,8 +1100,13 @@ function utf8Tail(text: string, max: number): string {
  * left in `read` is one whose other lies past the cut. Of a start, nothing
  * from the first BEGIN left on: in the stream as printed, the pattern pairs
  * it with the first END past the cut and hides all between, any later BEGIN
- * among it. Of an end, nothing up to the first END left, which closes a block
- * whose BEGIN lies before the window.
+ * among it. Of an end, nothing up to the first END left. streamOf reads an
+ * end window here only when no block pemOpenAt holds open holds its start,
+ * so no block the stream's redaction hides crosses the cut, and an END left
+ * here closes none, but for what neither that walk nor the window's own
+ * redaction reads as the stream's does: a value the kernel's mask holds, and
+ * a token whose prefix lies before the window's cut. It is held to as one
+ * that may, which costs only what stands before it.
  */
 function pemCut(read: string, side: 'start' | 'end'): string {
   const bytes = Buffer.byteLength(read)
@@ -895,15 +1116,17 @@ function pemCut(read: string, side: 'start' | 'end'): string {
     return begin === -1 || begin >= edge.length ? edge : read.slice(0, begin)
   }
   const edge = utf8Tail(read, bytes - CAPTURE_EDGE_BYTES)
-  const end = PEM_END.exec(read)
-  const after = end === null ? -1 : end.index + end[0].length
+  const after = firstEndAfter(read)
   return after <= read.length - edge.length ? edge : read.slice(after)
 }
 
 /** One stream as describe() read it. */
 interface Stream {
   readonly label: 'stdout' | 'stderr'
-  /** What was read of the stream, redacted: all of it, or a window of it short of its cut side. */
+  /**
+   * What is shown of the stream, redacted: all of it, or a window of it short
+   * of its cut side; or, when `withheld`, the line said in its place.
+   */
   readonly text: string
   /**
    * Set when `text` is a window: of its start, for a stream the driver
@@ -911,6 +1134,33 @@ interface Stream {
    * bytes the driver returned of the stream, as printed.
    */
   readonly window?: { readonly side: 'start' | 'end'; readonly printed: number }
+  /**
+   * Set when what was to be read of the stream held a run JWT_RUN_STARTS_MAX
+   * refuses: `text` says so. `capped` when the driver capped the stream, so
+   * that `printed` is what its capture kept, not all it printed.
+   */
+  readonly withheld?: { readonly printed: number; readonly capped: boolean }
+}
+
+/**
+ * A stream withheld in place of being read (JWT_RUN_STARTS_MAX), or
+ * undefined when `read`, the part of it to be redacted, may be. Said by its
+ * byte count alone, with no digest: a digest of text no redaction has read
+ * would commit the log to whatever it holds (bound.ts). Of a stream the
+ * driver `capped`, that count is what its capture kept: the stream printed
+ * at least that, and may have printed more.
+ */
+function withheld(label: Stream['label'], read: string, printed: number, capped: boolean): Stream | undefined {
+  if (jwtRunStarts(read) <= JWT_RUN_STARTS_MAX) return undefined
+  const count = capped ? `its capture kept ${String(printed)} bytes` : `the stream printed ${String(printed)} bytes`
+  return {
+    label,
+    text:
+      `[withheld: what would be read of this stream holds a run of letters, digits, - and _ in which redact.ts's ` +
+      `JWT pattern starts at more than ${String(JWT_RUN_STARTS_MAX)} places, which redaction reads in time ` +
+      `quadratic in the run's length, so none of it is redacted or shown; ${count}]`,
+    withheld: { printed, capped },
+  }
 }
 
 /**
@@ -922,34 +1172,52 @@ interface Stream {
  * to a character's start (docker.ts Capture), so a stream within three bytes
  * of the cap is taken as one it capped. A stream that filled the cap exactly
  * while the other was cut is taken so too, and shows its start: less of it,
- * nothing it did not print.
+ * nothing it did not print. A window whose start a key block may hold,
+ * however the stream's redaction pairs the markers (pemOpenAt), is read from
+ * where the blocks that may hold it end, and shows nothing when none ends: all
+ * before that may be key body the stream's redaction would hide, a credential
+ * its cut splits among it. What
+ * is to be read is first held to JWT_RUN_STARTS_MAX, and withheld past it.
  */
 function streamOf(label: Stream['label'], raw: string, truncated: boolean): Stream {
   const printed = Buffer.byteLength(raw)
   if (truncated && printed >= CAPTURE_MAX_BYTES - 3) {
-    const read = redactString(utf8Head(raw, STREAM_WINDOW_BYTES))
-    return { label, text: pemCut(read, 'start'), window: { side: 'start', printed } }
+    const read = utf8Head(raw, STREAM_WINDOW_BYTES)
+    const window = { side: 'start', printed } as const
+    return withheld(label, read, printed, true) ?? { label, text: pemCut(redactString(read), 'start'), window }
   }
-  if (printed <= STREAM_WINDOW_BYTES) return { label, text: redactString(raw) }
-  const read = redactString(utf8Tail(raw, STREAM_WINDOW_BYTES))
-  return { label, text: pemCut(read, 'end'), window: { side: 'end', printed } }
+  if (printed <= STREAM_WINDOW_BYTES) return withheld(label, raw, printed, false) ?? { label, text: redactString(raw) }
+  const tail = utf8Tail(raw, STREAM_WINDOW_BYTES)
+  const window = { side: 'end', printed } as const
+  const closes = pemOpenAt(raw, raw.length - tail.length)
+  if (closes === null) return { label, text: '', window }
+  if (closes !== undefined) {
+    const read = raw.slice(closes)
+    return withheld(label, read, printed, false) ?? { label, text: redactString(read), window }
+  }
+  return withheld(label, tail, printed, false) ?? { label, text: pemCut(redactString(tail), 'end'), window }
 }
 
 /**
  * One stream as the model and the log read it, within `keep` payload bytes,
- * and the whole it stands for: what was read of it. A stream read whole, or
- * by its end, keeps its end, where a failure is; one the driver capped keeps
- * its start. A heading's byte counts are of the redacted text, but for the
- * bytes a windowed stream printed.
+ * and the whole it stands for: what is shown of it before its share is cut.
+ * A stream read whole, or by its end, keeps its end, where a failure is; one
+ * the driver capped keeps its start. A heading's byte counts are of the
+ * redacted text, but for the bytes a windowed or withheld stream printed.
  */
 function streamPart(stream: Stream, keep: number): { readonly cut: string; readonly whole: string } {
   const { label, text, window } = stream
   const bytes = Buffer.byteLength(text)
   const heading = (shown: number): string => {
+    const kept = stream.withheld
+    if (kept?.capped === true) {
+      return `--- ${label} (withheld: the ${String(kept.printed)} bytes its capture kept; the stream may have carried more) ---`
+    }
+    if (kept !== undefined) return `--- ${label} (withheld: ${String(kept.printed)} bytes printed) ---`
     if (window?.side === 'start') {
       return (
         `--- ${label} (its start, redacted: ${String(shown)} bytes, of the ${String(window.printed)} bytes its ` +
-        'capture kept; the stream carried more) ---'
+        'capture kept; the stream may have carried more) ---'
       )
     }
     if (window?.side === 'end') {
@@ -984,8 +1252,12 @@ function describe(spec: SandboxSpec, result: SandboxResult, sent: string | undef
   else if (result.killedBy === 'requested') how = `was killed: the run was stopped${code}`
   else if (result.overran === true) {
     how = `outlived its wallclock of ${wallclock}: the kill it was sent ended nothing, and it then exited on its own${code}`
-  } else if (result.exitCode === null) how = `ended with no exit status (${result.signal ?? 'the docker client did not start'})`
-  else how = `exited ${String(result.exitCode)}`
+  } else if (result.exitCode === null) {
+    // The driver's own text, bounded: a SandboxDriver other than docker.ts's
+    // may report anything here, and the head is not cut to a share.
+    const signal = result.signal ?? undefined
+    how = `ended with no exit status (${signal === undefined ? 'the docker client did not start' : driverText(String(signal))})`
+  } else how = `exited ${String(result.exitCode)}`
   const head = [
     `${spec.name} on the ${spec.domain} domain, no network, ${how} after ${String(result.durationMs)} ms` +
       (sent === undefined ? '' : `; ${sent}`),
@@ -1004,7 +1276,10 @@ function describe(spec: SandboxSpec, result: SandboxResult, sent: string | undef
   const err = streamPart(stderr, errKeep)
   const text = [...head, out.cut, err.cut].join('\n')
   const ok = result.killedBy === undefined && result.overran !== true && result.exitCode === 0
-  if (out.cut === out.whole && err.cut === err.whole) return { ok, text }
+  // A stream shown by its window, or withheld, is not all the container
+  // printed: the result is marked cut even when its text then fits whole.
+  const partial = [stdout, stderr].some((stream) => stream.window !== undefined || stream.withheld !== undefined)
+  if (!partial && out.cut === out.whole && err.cut === err.whole) return { ok, text }
   return { ok, text, whole: [...head, out.whole, err.whole].join('\n') }
 }
 

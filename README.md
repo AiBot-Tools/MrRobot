@@ -732,12 +732,27 @@ result, counted in the bytes it takes in the log's JSON. Of each stream the
 runner reads and redacts at most 74 KiB (the largest share and 16 KiB more):
 all of a shorter one, the end of a longer one, and the start of one the driver
 capped at 1 MiB, since `redact.ts`'s PEM pattern takes time quadratic in BEGIN
-lines with no END (a MiB of them would hold the daemon's event loop some 11 s).
-A window is never shown on the side its cut is on, as that cut, like the
-driver's, is made before redaction and may split a credential: not the 16 KiB
-there, nor anything past a private key block's marker whose other marker the
-cut left out. A window that redaction shrinks is shown less of, never more;
-`tool.result`'s `bytes` and `sha256` are of what was read, redacted. Only a
+lines with no END (a MiB of them would hold the daemon's event loop some 11 s;
+a window of them, some 60 ms). The window bounds that pattern's cost and no
+other's: the JWT pattern's is quadratic in a run of `-ey`, some 2 s over one
+window, so a window holding a run of letters, digits, `-` and `_` in which it
+starts at more than 16 places is withheld before any redaction reads it, the
+stream's byte count (what its capture kept, for one the driver capped) said in
+its place. A window is never shown on the side its cut is on, as that cut,
+like the driver's, is made before redaction and may split a credential: not
+the 16 KiB there, nor anything past a private key block's marker whose other
+marker the cut left out. A window whose start a key block may hold, however
+the stream's redaction pairs its markers, is shown from where the blocks that
+may hold it end instead, and not at all when none ends: all before that may be
+a block's body. Those blocks are read as a union, not as one pairing: every
+BEGIN, one inside another marker included, held open to the first END after it
+that no token pattern, run first, can break (one holding an AWS key id, or one
+a token runs into), and the blocks that overlap taken as one. A window that
+redaction shrinks is shown less of, never more.
+A result that shows a stream by its window, or withholds one, is marked
+`truncated`, and `tool.result`'s `bytes` and `sha256` are of what it shows
+before a stream is cut to its share, redacted: the windows short of their cut
+sides, not the streams. Only a
 worker with a `sandbox:` block at tier 2 or more may list it; the registry
 refuses it in any other manifest, at load and in a spawned child, and no MCP
 server may be named `sandbox` or `kernel`. The runner

@@ -11,9 +11,13 @@
 // known yet) would fail the pull only after the operator had started. The
 // file is read as BuildKit reads it, continued lines joined (readDockerfile,
 // which test/config-files.test.ts reads it with as well), so the FROM checked
-// is the one the build uses; a parser directive, a reading that is not
-// certain, and any character but printable ASCII, tab and newline are
-// refused (readBase). And
+// is the one the build uses; what that reading does not follow is refused
+// rather than read: a parser directive, a heredoc (BuildKit reads the lines
+// after one, up to its terminator, as its body, not as instructions), a
+// reading that is not certain, and any character but printable ASCII, tab
+// and newline. So is any way a step takes files from an image other than
+// the base (COPY --from, a RUN mount's from=) or from anywhere but the
+// context (ADD), and ONBUILD (readBase). And
 // config/kernel.yaml, through the kernel's own parser and AOS_DATA_DIR as the
 // daemon reads it (src/main.ts), for what the kernel's docker calls use:
 // each domain's dockerHost and the DOCKER_CONFIG beside them (defaultDriver
@@ -55,6 +59,29 @@ export const WORKER_CONTEXT = 'images/worker'
 
 /** The one FROM a worker Dockerfile may have: WORKER_BASE by a sha256 digest, and nothing beside it. */
 const PINNED_FROM = /^FROM node:24-bookworm-slim@(sha256:[0-9a-f]{64})$/
+
+/**
+ * A step's arguments that take files from an image other than the stage's
+ * own base: COPY's --from, and a RUN --mount's from= (BuildKit lower-cases a
+ * mount option's key). Read case-insensitively and wherever it stands, a
+ * RUN's shell text included: refusing a command that only mentions one costs
+ * nothing. Tested against flagText(args), not the args as written.
+ */
+const OTHER_IMAGE = /--from\b|(?:^|[\s,=])from=/i
+
+/**
+ * A step's arguments with every quote and backslash removed: what OTHER_IMAGE
+ * reads. BuildKit's flag reader (extractBuilderFlags, as its source reads; not
+ * run here) takes a `--` word's quotes off and reads a `\` as escaping the
+ * character after it before BFlags or a mount's CSV reads the word, so
+ * `--"from"=`, `--fr\om=` and a mount's `"from=..."` or `fr''om=` are all
+ * --from or from= to it. Removing every one leaves each name BuildKit reads
+ * as one of those still spelled so, and only refuses more: a quote or
+ * backslash it keeps, escaped, is none of `--from` or `from=`.
+ */
+function flagText(args: string): string {
+  return args.replace(/["'\\]/g, '')
+}
 
 /** A digest that is one hex digit 64 times: a placeholder, not one any registry serves. */
 const PLACEHOLDER = /^sha256:([0-9a-f])\1{63}$/
@@ -116,7 +143,11 @@ export interface DockerfileReading {
  * empty line inside a continued instruction BuildKit skips, warning that it
  * will become an error, and joins the line after it on: so does this, saying
  * on which lines it did. An instruction the file ends inside is read as it
- * stands, as BuildKit reads it.
+ * stands, as BuildKit reads it. A heredoc is not read: BuildKit reads the
+ * lines after a RUN, COPY or ADD holding `<<`, up to the heredoc's
+ * terminator, as its body, and this reads them as instructions, a
+ * continuation among them, so readBase refuses a file holding one rather
+ * than build on this reading of it.
  */
 export function readDockerfile(text: string): DockerfileReading {
   const steps: DockerInstruction[] = []
@@ -212,9 +243,16 @@ export interface WorkerImagePlan {
  * frontend image by its tag), a syntax directive on any line, not only where
  * BuildKit reads one, and a file whose reading is not certain: an empty line
  * inside a continued instruction, a `\` with a space or tab after it, or a
- * last instruction left open. And after it, any character that is not
- * printable ASCII, a tab or a newline, so that how BuildKit's Go reads any
- * other never decides what is built.
+ * last instruction left open. A heredoc, on any line BuildKit does not read
+ * as a comment or in any instruction as joined: its body is text to
+ * BuildKit, and instructions to readDockerfile, so a FROM in it, or after a
+ * terminator readDockerfile joins to the next line, would be a stage the
+ * check never saw. An ADD (it fetches what a URL or a git ref names) or an
+ * ONBUILD, and a COPY or RUN that takes files from another image (--from, a
+ * mount's from=, however quotes and backslashes spell it: flagText), which
+ * BuildKit pulls by whatever name it is given, a tag among them. And after
+ * it, any character that is not printable ASCII, a tab or a newline, so that
+ * how BuildKit's Go reads any other never decides what is built.
  */
 function readBase(dockerfile: string): { readonly base: string } | { readonly why: string } {
   const file = `${WORKER_CONTEXT}/Dockerfile`
@@ -227,6 +265,8 @@ function readBase(dockerfile: string): { readonly base: string } | { readonly wh
   if (lines.some((line) => SYNTAX_DIRECTIVE.test(line))) {
     return { why: `${file} has a syntax directive, which has BuildKit pull a frontend image by its tag: remove it` }
   }
+  const heredoc = lines.findIndex((line) => !line.startsWith('#') && line.includes('<<'))
+  if (heredoc !== -1) return { why: heredocWhy(file, `on line ${String(heredoc + 1)}`) }
   const { steps, emptyContinued, spacedContinued, unterminated } = readDockerfile(dockerfile)
   if (emptyContinued.length > 0) {
     return { why: `${file} has an empty line inside a continued instruction, on line ${emptyContinued.join(', ')}: BuildKit joins the line after it on, with a warning that this will become an error; end the instruction or remove the line` }
@@ -236,6 +276,26 @@ function readBase(dockerfile: string): { readonly base: string } | { readonly wh
   }
   if (unterminated) {
     return { why: `${file} ends inside a continued line: its last line ends in \`\\\`` }
+  }
+  // A `<` that ends a line and one that starts the next join to `<<`, as
+  // BuildKit joins them before it looks for a heredoc.
+  const joinedHeredoc = steps.find((step) => step.text.includes('<<'))
+  if (joinedHeredoc !== undefined) return { why: heredocWhy(file, `in its ${joinedHeredoc.keyword}, as its lines join`) }
+  const elsewhere = steps.find((step) => step.keyword === 'ADD' || step.keyword === 'ONBUILD')
+  if (elsewhere !== undefined) {
+    return {
+      why:
+        `${file} has ${elsewhere.keyword}: ADD fetches what a URL or a git ref names, and ONBUILD runs an instruction in ` +
+        'another build; the worker image is built from its base and its context alone, with COPY and RUN: remove it',
+    }
+  }
+  const otherImage = steps.find((step) => (step.keyword === 'COPY' || step.keyword === 'RUN') && OTHER_IMAGE.test(flagText(step.args)))
+  if (otherImage !== undefined) {
+    return {
+      why:
+        `${file}'s ${otherImage.keyword} takes files from another image (--from, or a mount's from=), which BuildKit ` +
+        'pulls by whatever name it is given, a tag among them: the worker image is built from its one pinned base; remove it',
+    }
   }
   const froms = steps.filter((step) => step.keyword === 'FROM')
   if (froms.length !== 1) {
@@ -265,6 +325,14 @@ function readBase(dockerfile: string): { readonly base: string } | { readonly wh
     return { why: `${file} holds ${stray.join(', ')}: it may hold only printable ASCII, tabs and newlines, so that no other character's reading decides what is built` }
   }
   return { base: `${WORKER_BASE}@${digest}` }
+}
+
+/** Why a heredoc `where` in `file` is refused. */
+function heredocWhy(file: string, where: string): string {
+  return (
+    `${file} has a heredoc (\`<<\`) ${where}: BuildKit reads a heredoc's body as text, not instructions, and this ` +
+    'reading does not follow one, so the FROM it checks might not be the stage the build uses; write the step without one'
+  )
 }
 
 /** Why a worker Dockerfile's base cannot be built from (readBase), or undefined when it can. */

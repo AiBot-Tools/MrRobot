@@ -2503,7 +2503,7 @@ test('with sandbox.imageId unset the driver is degraded, naming the key and the 
   assert.equal(probe.ok, false)
   assert.ok(why.startsWith('sandbox.imageId is not set in config/kernel.yaml'), why)
   assert.ok(why.includes('runs the worker image only by that pinned id, with --pull=never, and never pulls one'), why)
-  assert.ok(why.includes('Build the image with scripts/build-worker-image.sh, which is still to be written, on the trusted VM'), why)
+  assert.ok(why.includes('Build the image with scripts/build-worker-image.sh, which builds it on the trusted VM and loads it into the hostile one'), why)
   assert.ok(why.endsWith('then set sandbox.imageId to the sha256:<64 hex> id it prints'), why)
   // Written into the hash-chained log for good (sandbox.degraded.reason) and
   // shown in status: it names the key and the script, in the repository, and

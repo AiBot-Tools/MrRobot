@@ -22,17 +22,25 @@
 //   on its own. The lockfile tests read every copy, nested ones included.
 //   Lose sandbox.imageId between kernel.yaml and the driver boot builds and a
 //   pinned kernel.yaml boots with its sandbox degraded for an unset id.
+//   Let the worker Dockerfile's FROM fall back to a tag or a placeholder
+//   digest, its proxy ENV drift off the mux's port, a RUN do more than its
+//   pinned text, or its gitconfig take a credential helper, and every image
+//   built from it says so nowhere; let the build script's code change by a
+//   line, call docker before its plan is checked, or under any environment
+//   but the kernel's own, or its plan take another spelling of the default
+//   Colima profile's socket, and it builds on a socket nobody chose.
 
 import './helpers/guard.js'
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { parse as parseYaml } from 'yaml'
 
-import { parseKernelConfig } from '../src/config.js'
+import { EGRESS_MUX_PORT, parseKernelConfig, type KernelConfig } from '../src/config.js'
 import { defaultDriver } from '../src/kernel.js'
 import { parseProviders } from '../src/models/registry.js'
 import {
@@ -47,8 +55,22 @@ import { DENY_KEYS, TOKEN_PATTERNS } from '../src/events/redact.js'
 import { APPROVAL_PREVIEW_BYTES } from '../src/policy/engine.js'
 import { CAPTURE_EDGE_BYTES, DOCKER_CLI_FAILED, KILL_WAIT_MS, STREAM_WINDOW_BYTES } from '../src/runtime/sandbox-tools.js'
 import { CAPTURE_MAX_BYTES } from '../src/sandbox/driver.js'
+import { WORKSPACE_TARGET } from '../src/sandbox/docker.js'
 import { FORCE_QUIT_LOG, PMMCP_OLLAMA_NAMES } from '../scripts/install/force-quit.js'
 import { DOCKER_NAMES } from '../scripts/install/preflight.js'
+import {
+  baseProblem,
+  macSockets,
+  namesDefaultColima,
+  notPlainAscii,
+  parserDirectives,
+  planFrom,
+  planText,
+  readDockerfile,
+  WORKER_BASE,
+  workerImagePlan,
+  type DockerInstruction,
+} from '../scripts/worker-image.js'
 import { credentialNames, gitignoresDotenv, parseDotenv, PLACEHOLDER_PREFIX } from '../src/secrets/dotenv.js'
 import { ConfigError } from '../src/errors.js'
 import { CREDENTIAL_NAME } from './helpers/guard.js'
@@ -260,6 +282,1301 @@ test('scripts/colima-up.sh exists, is executable, and its header says NEEDS VALI
   assert.ok(body.includes('export COLIMA_CACHE_HOME="${HOME}/.colima/'))
   assert.equal(body.includes('${HOME}/.aos'), false, 'a mount still points at ~/.aos')
   assert.equal(body.includes('docker --context'), false, 'a docker context lives in ~/.docker unless DOCKER_CONFIG moved it')
+})
+
+/**
+ * readDockerfile's instructions (scripts/worker-image.ts, the reading the
+ * build's plan checks the base with), for a Dockerfile whose reading is
+ * certain: no empty line inside a continued instruction, no `\\` with a space
+ * or tab after it, and none left open at the end.
+ */
+function dockerInstructions(text: string): readonly DockerInstruction[] {
+  const { steps, emptyContinued, spacedContinued, unterminated } = readDockerfile(text)
+  assert.equal(unterminated, false, 'the Dockerfile ends inside a continued line')
+  assert.deepEqual(emptyContinued, [], `an empty line inside a continued instruction, on line ${emptyContinued.join(', ')}: BuildKit joins the line after it on, with a warning`)
+  assert.deepEqual(spacedContinued, [], `a \\ with a space or tab after it, on line ${spacedContinued.join(', ')}`)
+  return steps
+}
+
+/** An ENV instruction's pairs, in the KEY=value and KEY="value" forms only: the legacy `ENV KEY value` form, or anything else, fails. */
+function envPairs(args: string): [string, string][] {
+  const out: [string, string][] = []
+  const pair = /([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"\\]*)"|([^\s"\\]*))(?:\s+|$)/y
+  for (let at = 0; at < args.length; at = pair.lastIndex) {
+    pair.lastIndex = at
+    const m = pair.exec(args)
+    assert.ok(m !== null, `ENV ${args.slice(at)} is not KEY=value or KEY="value"`)
+    out.push([m[1] ?? '', m[2] ?? m[3] ?? ''])
+  }
+  return out
+}
+
+/** A git config file's entries, `section[.subsection].key` (section and key lower-cased, as git reads them) to every value given. A line git would read any other way fails. */
+function gitConfigEntries(text: string): Map<string, string[]> {
+  const out = new Map<string, string[]>()
+  let section: string | undefined
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    if (line === '' || line.startsWith('#') || line.startsWith(';')) continue
+    const header = /^\[([A-Za-z0-9.-]+)(?:\s+"([^"\\]*)")?\]$/.exec(line)
+    if (header !== null) {
+      const name = (header[1] ?? '').toLowerCase()
+      section = header[2] === undefined ? name : `${name}.${header[2]}`
+      continue
+    }
+    const entry = /^([A-Za-z][A-Za-z0-9-]*)\s*=\s*([^#;"\\]*)$/.exec(line)
+    assert.ok(entry !== null && section !== undefined, `a gitconfig line this test does not read as git would: ${line}`)
+    const key = `${section}.${(entry[1] ?? '').toLowerCase()}`
+    out.set(key, [...(out.get(key) ?? []), (entry[2] ?? '').trim()])
+  }
+  return out
+}
+
+/** The environment of every docker call boot's driver makes for kernel.yaml as shipped, pinned to an id so that it asks the daemons. */
+async function driverDockerEnvs(): Promise<Record<string, string>[]> {
+  const envs: Record<string, string>[] = []
+  const id = `sha256:${'0123456789abcdef'.repeat(4)}`
+  const pinned = parseKernelConfig(parseYaml(read('config/kernel.yaml').replace('  image: aos-worker:0.0.1\n', `  image: aos-worker:0.0.1\n  imageId: ${id}\n`)), { repoRoot: REPO })
+  const probe = await defaultDriver(pinned, REPO, {
+    spawn: () => {
+      throw new Error('a probe starts no run')
+    },
+    execFile: (_command: string, args: readonly string[], options: { env: Record<string, string> }) => {
+      envs.push(options.env)
+      return Promise.resolve({
+        stdout: args[0] === 'network' ? 'true\n' : args[0] === 'image' ? `${args[args.length - 1] ?? ''}\n` : '29.5.2\n',
+        stderr: '',
+      })
+    },
+  }).probe()
+  assert.deepEqual(probe, { ok: true, version: '29.5.2' })
+  assert.ok(envs.length > 0, 'the driver asked docker nothing')
+  return envs
+}
+
+test('the worker Dockerfile FROM is pinned by digest, USER is 65534:65534, the proxy ENV is 127.0.0.1:3128 with NO_PROXY empty, and it sets no credential or credential helper', () => {
+  // Egress plan I1. The image is what every sandboxed run executes, by the id
+  // scripts/build-worker-image.sh prints. Nothing in it is a boundary (the
+  // agent's uid can override all of it), but each line here is something an
+  // honest worker relies on to send its requests where the kernel's egress
+  // engine judges them, and something a later edit could quietly undo.
+  const text = read('images/worker/Dockerfile')
+  // Every file the image is made from is printable ASCII, tabs and newlines,
+  // so this test's readers and BuildKit's (Go's unicode.IsSpace, its
+  // trimNewline) cannot differ on a character: U+FEFF between two ENV pairs
+  // is white space to JavaScript's \s and part of a word to BuildKit, and a
+  // CRLF ending is one \r to drop here and every \r to it.
+  for (const rel of ['images/worker/Dockerfile', 'images/worker/gitconfig', 'images/worker/.dockerignore']) {
+    assert.deepEqual(notPlainAscii(read(rel)), [], `${rel} holds a character that is not printable ASCII, a tab or a newline`)
+  }
+  assert.deepEqual(notPlainAscii(text.replace('    NO_PROXY="" \\\n    no_proxy="" \\\n', '    NO_PROXY=""\uFEFFno_proxy="" \\\n')), ['U+FEFF'])
+  assert.deepEqual(notPlainAscii(text.replaceAll('\n', '\r\n')), ['U+000D'])
+  assert.deepEqual(notPlainAscii('\u00a0\u0085\u00a0\u{1F600}\t \n~'), ['U+00A0', 'U+0085', 'U+1F600'])
+  const steps = dockerInstructions(text)
+  const of = (keyword: string): string[] => steps.filter((s) => s.keyword === keyword).map((s) => s.args)
+  const config = parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO })
+
+  // The operator's base, by the digest of its index, and only it: a second
+  // FROM would be a stage built from a base nobody pinned. The build script
+  // reads the same line, through baseProblem (the next test but one).
+  // No parser directive: escape would change how this test's reading joins
+  // lines (and a RUN's text with it), and syntax has BuildKit pull a frontend
+  // by its tag. A directive is read only before any other line, a comment
+  // included, so line 1 is the only place one can start; BuildKit reads it
+  // there past a byte-order mark or leading white space, and past a shebang
+  // for syntax (parserDirectives). The rows below are each such a line 1.
+  assert.deepEqual(parserDirectives(text), [], 'the Dockerfile starts with a parser directive')
+  const rest = text.slice(text.indexOf('\n'))
+  for (const first of [' # escape=`', '\uFEFF# escape=`', '\t# syntax=docker/dockerfile:1', '\u0085#escape=`', '\u3000# check=skip=all', '// syntax=docker/dockerfile:1', '#!/usr/bin/env docker\n# syntax=docker/dockerfile:1']) {
+    assert.notDeepEqual(parserDirectives(`${first}${rest}`), [], `${JSON.stringify(first)} is not read as a directive`)
+  }
+  // An empty line inside a continued instruction is skipped, and the line
+  // after it joined on: a `\` left after ENTRYPOINT [] would make the image's
+  // entrypoint the shell form `[] USER 65534:65534`, with no USER. Refused.
+  const r5 = text.replace('ENTRYPOINT []\n', 'ENTRYPOINT [] \\\n')
+  assert.notEqual(r5, text)
+  const read5 = readDockerfile(r5)
+  assert.deepEqual(read5.steps.slice(-1), [{ keyword: 'ENTRYPOINT', args: '[] USER 65534:65534', text: 'ENTRYPOINT [] USER 65534:65534' }])
+  assert.equal(read5.emptyContinued.length, 1)
+  assert.throws(() => dockerInstructions(r5), /an empty line inside a continued instruction, on line \d+: BuildKit joins the line after it on/)
+  assert.throws(() => dockerInstructions(text.replace(/\nUSER 65534:65534\n?$/, '\nUSER 65534:65534 \\\n')), /ends inside a continued line/)
+  // An instruction the file ends inside BuildKit reads as it stands, and so
+  // does readDockerfile: a FROM left open at the end is a second stage.
+  assert.deepEqual(readDockerfile('FROM a\nFROM b \\').steps.map((s) => s.text), ['FROM a', 'FROM b'])
+  // A last \n ends the last line and starts none (BuildKit's scanner), so a
+  // file that ends inside a continued line has no empty line inside it.
+  assert.deepEqual(readDockerfile('FROM a \\\n'), { steps: [{ keyword: 'FROM', args: 'a', text: 'FROM a' }], emptyContinued: [], spacedContinued: [], unterminated: true })
+  assert.deepEqual(readDockerfile('FROM a \\\n\n').emptyContinued, [2])
+  // Every \r at a line's end is dropped, as BuildKit's trimNewline drops
+  // them, so `FR\` before two of them still continues; and a `\` with a space
+  // or tab after it is reported: whether BuildKit's join keeps that space is
+  // not checked here, and FROM\ then debian:latest is FROM debian:latest
+  // if it does and FROMdebian:latest if not.
+  assert.deepEqual(readDockerfile('FR\\\r\r\nOM a\n').steps.map((s) => s.text), ['FROM a'])
+  assert.deepEqual(readDockerfile('FROM a\nRUN b \\ \nc\nRUN d\\\t\ne\n'), {
+    steps: [
+      { keyword: 'FROM', args: 'a', text: 'FROM a' },
+      { keyword: 'RUN', args: 'b c', text: 'RUN b c' },
+      { keyword: 'RUN', args: 'de', text: 'RUN de' },
+    ],
+    emptyContinued: [],
+    spacedContinued: [2, 4],
+    unterminated: false,
+  })
+  const spaced = text.replace('RUN apt-get update \\\n', 'RUN apt-get update \\ \n')
+  assert.notEqual(spaced, text)
+  assert.throws(() => dockerInstructions(spaced), /a \\ with a space or tab after it, on line \d+/)
+  assert.equal(steps[0]?.keyword, 'FROM', 'the first instruction is not FROM')
+  assert.equal(of('FROM').length, 1, 'a second FROM is a second stage, from a base nobody pinned')
+  const base = of('FROM')[0] ?? ''
+  assert.match(base, /^node:24-bookworm-slim@sha256:[0-9a-f]{64}$/)
+  assert.doesNotMatch(base, /@sha256:([0-9a-f])\1{63}$/, 'the base digest is a placeholder')
+  assert.ok(base.startsWith(`${WORKER_BASE}@`), base)
+  assert.equal(baseProblem(text), undefined)
+
+  // Only these instructions. No ARG: a build argument is how a credential
+  // reaches a build, and it stays in the image's history. No ADD: it fetches
+  // URLs and unpacks archives. No CMD, SHELL, VOLUME or ONBUILD either.
+  assert.deepEqual([...new Set(steps.map((s) => s.keyword))].sort(), ['COPY', 'ENTRYPOINT', 'ENV', 'FROM', 'RUN', 'USER'])
+
+  // One USER, the driver's own --user (kernel.yaml's sandbox.defaults.user),
+  // and last: every build step runs as root, nothing after it changes whose
+  // image it is.
+  assert.deepEqual(of('USER'), ['65534:65534'])
+  assert.equal(config.sandbox.defaults.user, '65534:65534')
+  assert.equal(steps.at(-1)?.keyword, 'USER', 'an instruction follows USER')
+
+  // The proxy is the mux, on the port kernel.yaml's egress.muxPort names
+  // (config.ts holds it to EGRESS_MUX_PORT); both spellings, because libcurl,
+  // which git uses, reads only the lower-case http_proxy. NO_PROXY empty in
+  // both: no host is meant to be reached any other way. And nothing else: no
+  // GIT_ASKPASS, no token, no credential of any name, set once each.
+  const pairs = of('ENV').flatMap(envPairs)
+  const env = new Map(pairs)
+  assert.equal(env.size, pairs.length, 'an ENV name is set twice')
+  assert.equal(config.egress.muxPort, EGRESS_MUX_PORT)
+  const proxy = `http://127.0.0.1:${String(EGRESS_MUX_PORT)}`
+  assert.deepEqual(Object.fromEntries(env), {
+    HTTP_PROXY: proxy,
+    HTTPS_PROXY: proxy,
+    http_proxy: proxy,
+    https_proxy: proxy,
+    NO_PROXY: '',
+    no_proxy: '',
+    NODE_USE_ENV_PROXY: '1',
+    GIT_TERMINAL_PROMPT: '0',
+    HOME: '/tmp',
+  })
+  for (const name of env.keys()) assert.doesNotMatch(name, DENY_KEYS, `ENV ${name} is a name the log censors as a credential`)
+  // What reads them: git's libcurl and Node. The image has no curl, so the
+  // Dockerfile names it once, to say so.
+  assert.deepEqual(
+    [...text.matchAll(/^.*\bcurl\b.*$/gm)].map((m) => m[0]),
+    ['# no curl (the slim base purges it, and apt adds only git and a CA store). The'],
+  )
+  // NODE_USE_ENV_PROXY=1 has two effects on Node 22.22 that its README row
+  // has the operator check on the image's Node: a warning on every node
+  // process's stderr, and loopback HTTP sent to the mux (NO_PROXY is empty),
+  // which the Phase 2 exit's fixture repository keeps its tests off.
+  const row = read('README.md').split('\n').find((l) => l.startsWith('| `scripts/build-worker-image.sh` and `images/worker/Dockerfile`, each marked NEEDS VALIDATION')) ?? ''
+  // And, since the build's plan refuses a socket that is the same file as
+  // ~/.colima/docker.sock, what that name is on the Mac before the first build.
+  for (const words of [
+    "what the image's `NODE_USE_ENV_PROXY=1` does on its Node (24.22.2)",
+    '`[UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental`',
+    'so check whether 24.22.2 still does',
+    'keeps its tests off loopback HTTP',
+    'before the first build, what `ls -l ~/.colima/docker.sock` shows: nothing there, or a link to `~/.colima/default/docker.sock`, is expected',
+    'not checked against Colima 0.10.3',
+  ]) {
+    assert.ok(row.includes(words), `README's NEEDS VALIDATION row for the image does not say ${words}`)
+  }
+  // No RUN after the proxy is set: apt, or anything else at build time, would
+  // be sent to a port nothing listens on during a build.
+  const firstEnv = steps.findIndex((s) => s.keyword === 'ENV')
+  assert.deepEqual(steps.slice(firstEnv).filter((s) => s.keyword === 'RUN'), [], 'a RUN follows the proxy ENV')
+
+  // No entrypoint: a run's argv is exactly what the kernel passed, which a
+  // human approving a sandbox.exec is shown, not `node <argv>` by way of the
+  // base's docker-entrypoint.sh, which runs a shell first.
+  assert.deepEqual(of('ENTRYPOINT'), ['[]'])
+
+  // The image's own files are every file in its build context but the
+  // Dockerfile and the context's .dockerignore, each copied once: git's
+  // config to /etc/gitconfig, the rest (the mux) to /opt/aos, where the mux's
+  // header says it runs from. The .dockerignore admits exactly those, so
+  // nothing else that lands in images/worker reaches a build. Read from the
+  // directory rather than named here: only test/egress-mux.test.ts spells the
+  // mux's file name (test/hygiene.test.ts).
+  const context = readdirSync(join(REPO, 'images/worker')).filter((f) => f !== 'Dockerfile' && f !== '.dockerignore').sort()
+  assert.ok(context.length >= 2 && context.includes('gitconfig'), context.join(', '))
+  assert.deepEqual([...of('COPY')].sort(), context.map((f) => `${f} ${f === 'gitconfig' ? '/etc/gitconfig' : `/opt/aos/${f}`}`))
+  const ignore = read('images/worker/.dockerignore').split('\n').map((l) => l.trim()).filter((l) => l !== '' && !l.startsWith('#'))
+  assert.deepEqual(ignore, ['*', ...context.map((f) => `!${f}`)])
+
+  // Two RUNs, each whole. apt installs git and a CA store, nothing they
+  // recommend (git recommends an ssh client) and nothing else, and keeps no
+  // package lists; then the copied files are made root's and read-only to
+  // everyone else (moot under --read-only, but what the comment says). Pinned
+  // exactly, so no RUN appends to /etc/gitconfig (held whole below), installs
+  // another package, loosens a mode, or mounts a build secret. As the shell
+  // is handed each: the space before each `\` and the next line's one-space
+  // indent are both kept.
+  const copied = context.filter((f) => f !== 'gitconfig').map((f) => `/opt/aos/${f}`)
+  assert.deepEqual(of('RUN'), [
+    'apt-get update  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates  && rm -rf /var/lib/apt/lists/*',
+    `chmod 0755 /opt/aos  && chmod 0444 /etc/gitconfig ${copied.join(' ')}`,
+  ])
+
+  // /etc/gitconfig: https remotes fetched as http (an absolute-form request to
+  // the mux, which the kernel judges and dials over TLS), no credential helper
+  // and no other credential key, neither file:// nor ext:: as a transport, and
+  // the workspace as the one safe directory. The whole file, so an
+  // http.extraHeader, an [include] or a second insteadOf fails too.
+  const git = gitConfigEntries(read('images/worker/gitconfig'))
+  assert.deepEqual(Object.fromEntries(git), {
+    'url.http://.insteadof': ['https://'],
+    'credential.helper': [''],
+    'protocol.file.allow': ['never'],
+    'protocol.ext.allow': ['never'],
+    'safe.directory': [WORKSPACE_TARGET],
+  })
+
+  // No credential shape, key block or certificate in anything the image or its
+  // build is made from (the repository is public: no TLS key or certificate is
+  // ever committed).
+  const sources = [
+    ...readdirSync(join(REPO, 'images/worker')).map((f) => `images/worker/${f}`),
+    'scripts/build-worker-image.sh',
+    'scripts/worker-image.ts',
+  ]
+  assert.ok(sources.length >= 6 && sources.includes('images/worker/Dockerfile'), sources.join(', '))
+  for (const rel of sources) {
+    const body = read(rel)
+    for (const pattern of [...TOKEN_PATTERNS, /-----BEGIN [A-Z0-9 ]*(?:CERTIFICATE|PRIVATE KEY)[A-Z ]*-----/]) {
+      const match = new RegExp(pattern.source, pattern.flags.replace('g', '')).exec(body)
+      assert.equal(match, null, `${rel} holds a credential shape: ${String(match?.[0])}`)
+    }
+  }
+})
+
+test('the Dockerfile reader is plain ASCII, and this file writes every invisible character it tests as an escape', () => {
+  // A byte-order mark, U+3000 or U+00A0 written as itself in a pattern or a
+  // row is invisible in most editors and diffs, and an editor that drops it
+  // turns the reader's /^\uFEFF/ into /^/, or a row into another row, with
+  // nothing failing. scripts/worker-image.ts is plain ASCII; this file holds
+  // visible characters beyond ASCII (dashes, rules), but nothing that is
+  // white space other than space, tab and newline, a format character, or
+  // one Unicode says may be ignored.
+  assert.deepEqual(notPlainAscii(read('scripts/worker-image.ts')), [])
+  const invisible = (text: string): string[] =>
+    notPlainAscii([...text.matchAll(/[\p{White_Space}\p{Cf}\p{Default_Ignorable_Code_Point}]/gu)].map((m) => m[0]).filter((c) => c !== ' ' && c !== '\t' && c !== '\n').join(''))
+  assert.deepEqual(invisible(read('test/config-files.test.ts')), [])
+  assert.deepEqual(invisible('a\uFEFFb\u3000c\u00a0d\u200be\u0085f\u00adg \u2014 \u2500 h\ti\nj'), ['U+FEFF', 'U+3000', 'U+00A0', 'U+200B', 'U+0085', 'U+00AD'])
+})
+
+/**
+ * A line with bash's blanks trimmed from its ends: spaces and tabs, and
+ * nothing else. JavaScript's trim() also strips \f, \v, \r, U+00A0, U+3000
+ * and more, which bash reads as part of a word: a line led by \f and then #
+ * would be a comment to trim() and a command named \f# to bash.
+ */
+function bashTrim(line: string): string {
+  return line.replace(/^[ \t]+|[ \t]+$/g, '')
+}
+
+/** The build script's code: each line with bash's blanks trimmed, blank lines and whole-line comments dropped. */
+function scriptCode(text: string): string[] {
+  return text.split('\n').map(bashTrim).filter((l) => l !== '' && !l.startsWith('#'))
+}
+
+/**
+ * scripts/build-worker-image.sh's code, whole (scriptCode). Its every
+ * command line is held here exactly, so any edit to what it runs edits this
+ * test too (the script is printable ASCII, tabs and newlines, which
+ * buildScriptProblems holds it to, so a line bash runs is a line here), and
+ * buildScriptProblems below says what such an edit must still keep: no
+ * lexical check can refuse a command name assembled from pieces at run
+ * time, and this list can.
+ */
+const BUILD_SCRIPT_CODE: readonly string[] = [
+  'set -euo pipefail',
+  'if [[ $# -ne 0 ]]; then',
+  'echo "error: scripts/build-worker-image.sh takes no arguments" >&2',
+  'exit 2',
+  'fi',
+  'REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"',
+  'CONTEXT="${REPO_ROOT}/images/worker"',
+  'need() {',
+  'command -v "$1" >/dev/null 2>&1 || {',
+  'echo "error: $1 is not installed" >&2',
+  'exit 1',
+  '}',
+  '}',
+  'need node',
+  'need docker',
+  'if ! plan="$(cd "${REPO_ROOT}" && node --import tsx scripts/worker-image.ts)"; then',
+  'echo "error: nothing was built (scripts/worker-image.ts refused, above)" >&2',
+  'exit 1',
+  'fi',
+  "BASE=''",
+  "IMAGE=''",
+  "TRUSTED_HOST=''",
+  "HOSTILE_HOST=''",
+  "AOS_DOCKER_CONFIG=''",
+  'while IFS= read -r line; do',
+  'case "${line%%=*}" in',
+  'BASE) BASE="${line#*=}" ;;',
+  'IMAGE) IMAGE="${line#*=}" ;;',
+  'TRUSTED_DOCKER_HOST) TRUSTED_HOST="${line#*=}" ;;',
+  'HOSTILE_DOCKER_HOST) HOSTILE_HOST="${line#*=}" ;;',
+  'DOCKER_CONFIG) AOS_DOCKER_CONFIG="${line#*=}" ;;',
+  '*)',
+  'echo "error: scripts/worker-image.ts printed a line this script does not read: ${line}" >&2',
+  'exit 1',
+  ';;',
+  'esac',
+  'done <<<"${plan}"',
+  'if [[ -z "${BASE}" || -z "${IMAGE}" || -z "${TRUSTED_HOST}" || -z "${HOSTILE_HOST}" || -z "${AOS_DOCKER_CONFIG}" ]]; then',
+  'echo "error: scripts/worker-image.ts left a value out; nothing was built" >&2',
+  'exit 1',
+  'fi',
+  'mkdir -p "${AOS_DOCKER_CONFIG}"',
+  'dk() {',
+  'local host="$1"',
+  'shift',
+  'env -i DOCKER_CONFIG="${AOS_DOCKER_CONFIG}" DOCKER_HOST="${host}" PATH="${PATH}" docker "$@"',
+  '}',
+  'answers() {',
+  'local domain="$1" host="$2" out',
+  'if ! out="$(dk "${host}" version --format \'{{.Server.Version}}\' 2>&1)"; then',
+  'echo "error: the ${domain} VM\'s docker daemon (${host}) does not answer: ${out}" >&2',
+  'echo "fix: start both VMs with scripts/colima-up.sh, then run this again" >&2',
+  'exit 1',
+  'fi',
+  '}',
+  'answers trusted "${TRUSTED_HOST}"',
+  'answers hostile "${HOSTILE_HOST}"',
+  'echo "building ${IMAGE} from ${BASE} on the trusted VM (${TRUSTED_HOST})" >&2',
+  'dk "${TRUSTED_HOST}" build --tag "${IMAGE}" --file "${CONTEXT}/Dockerfile" "${CONTEXT}" >&2',
+  'id="$(dk "${TRUSTED_HOST}" image inspect --format \'{{.Id}}\' "${IMAGE}")"',
+  'if [[ ! "${id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then',
+  'echo "error: the trusted VM gives ${IMAGE} the id \'${id}\', not sha256:<64 hex>" >&2',
+  'exit 1',
+  'fi',
+  'runs="$(dk "${TRUSTED_HOST}" image inspect --format \'{{.Config.User}} {{json .Config.Entrypoint}}\' "${id}")"',
+  'case "${runs}" in',
+  "'65534:65534 null' | '65534:65534 []') ;;",
+  '*)',
+  'echo "error: ${IMAGE} (${id}) has user and entrypoint \'${runs}\', not 65534:65534 and none; do not pin it" >&2',
+  'exit 1',
+  ';;',
+  'esac',
+  'echo "loading ${IMAGE} (${id}) into the hostile VM (${HOSTILE_HOST})" >&2',
+  'dk "${TRUSTED_HOST}" save "${IMAGE}" | dk "${HOSTILE_HOST}" load >&2',
+  'holds() {',
+  'local domain="$1" host="$2" got',
+  'if ! got="$(dk "${host}" image inspect --format \'{{.Id}}\' "${id}" 2>&1)" || [[ "${got}" != "${id}" ]]; then',
+  'echo "error: the ${domain} VM does not hold ${id} under that id (it answered: ${got})." >&2',
+  'echo "docker save and docker load did not keep the id, so no one sandbox.imageId names the image on both VMs; do not pin it" >&2',
+  'exit 1',
+  'fi',
+  '}',
+  'holds trusted "${TRUSTED_HOST}"',
+  'holds hostile "${HOSTILE_HOST}"',
+  'echo "" >&2',
+  'echo "Both VMs hold ${IMAGE} as ${id}. Pin it in config/kernel.yaml, under sandbox:" >&2',
+  'echo "  imageId: ${id}" >&2',
+  'printf \'%s\\n\' "${id}"',
+]
+
+/**
+ * An echo of one double-quoted string to stderr that expands only plain
+ * variables (`${name}` or `$name`): no command substitution, backtick,
+ * arithmetic or other expansion, so it runs nothing but echo.
+ */
+const PLAIN_ECHO = /^echo "(?:[^"\\$`]|\$(?:\{\w+\}|\w+))*" >&2$/
+
+/**
+ * A code line as buildScriptProblems scans it for command words, names and
+ * paths. A PLAIN_ECHO's text is data, and is dropped. Every other line loses
+ * its quote characters and backslashes, rather than having its quoted text
+ * replaced: bash runs "docker", 'docker', d""ocker and d\ocker all as
+ * docker, and a path in quotes is that path.
+ */
+function scanned(line: string): string {
+  return PLAIN_ECHO.test(line) ? 'echo "" >&2' : line.replace(/["'\\]/g, '')
+}
+
+/** A name assigned, in any of bash's forms but a builtin's (BINDS): `name=`, `name+=`, `name[i]=`, and `${name=}` or `${name:=}`. */
+const assigns = (names: string): RegExp => new RegExp(`(?:^|[\\s;&|(!])(?:${names})(?:\\[[^\\]]*\\])?\\+?=|\\$\\{(?:${names}):?=`)
+
+/** Words that run another command, a string or a file as code: an interpreter, eval, a trap, the `.` builtin. */
+const INDIRECT =
+  /\b(?:eval|exec|source|xargs|bash|sh|zsh|dash|ksh|node|npx|npm|tsx|python3?|perl|ruby|osascript|nohup|sudo|command|builtin|env|trap|alias|enable|coproc)\b|(?:^|[;&|({!]\s*|\b(?:then|do|else|elif|if|while|until|time)\s+)\.\s/
+
+/** Builtins and syntax that set, export or unset a variable otherwise than by `name=`. */
+const BINDS = /\b(?:export|typeset|declare|readonly|local|read|mapfile|readarray|getopts|let|unset|select|for|set|shopt)\b|\bprintf\s+-v\b|\(\(/
+
+/** Reserved words after which bash reads the next word as a command name as well. */
+const LEADING_WORDS = new Set(['if', 'then', 'else', 'elif', 'while', 'until', 'do', '!', '{'])
+
+/** A case arm's patterns, its `)` included, at the start of a line inside a case: plain or single-quoted words, a `|` between each two. */
+const CASE_PATTERN = /^(?:'[^']*'|[^ \t()'"|$`\\;&<>]+)(?:[ \t]*\|[ \t]*(?:'[^']*'|[^ \t()'"|$`\\;&<>]+))*\)/
+
+/** A word bash runs as a command name, the code line it is on (0-based, in scriptCode), and whether any of it was quoted. */
+interface CommandWord {
+  readonly word: string
+  readonly line: number
+  readonly quoted: boolean
+}
+
+/**
+ * Every word bash runs as a command name in the build script's code
+ * (scriptCode), with the reserved words that stand where one does. Read with
+ * bash's quoting (single and double quotes, a backslash, `${...}`), every
+ * `$(...)` and `( ... )` read as a command list of its own, `[[ ... ]]` as a
+ * condition, a case arm's pattern and a redirection's target as no command,
+ * an assignment before a command as no command, a function's definition as
+ * no call, and the command env -i, or command without -v, runs as a command
+ * name too. Only space and tab are blanks, as they are to bash. Each line is
+ * read on its own: none of this script's continues onto the next, and one
+ * that tried would leave a quote, a `(` or a `\` open, which is named. So is
+ * anything this reading does not follow (a backtick, arithmetic, a
+ * here-document, process substitution, ANSI-C quoting, an option of env but
+ * -i or of command but -v), in unread, so that it is refused rather than read
+ * past.
+ */
+function bashCommands(code: readonly string[]): { readonly words: readonly CommandWord[]; readonly unread: readonly string[] } {
+  const words: CommandWord[] = []
+  const unread: string[] = []
+  const META = ';&|()<>'
+  const isBlank = (c: string): boolean => c === ' ' || c === '\t'
+  let caseDepth = 0
+  for (const [n, whole] of code.entries()) {
+    const line = caseDepth > 0 ? whole.replace(CASE_PATTERN, '') : whole
+    let i = 0
+    const at = (k = 0): string => line[i + k] ?? ''
+    const note = (what: string): void => {
+      unread.push(`${what}: ${whole}`)
+    }
+    const dollar = (): string => {
+      const next = at(1)
+      if ((next === '(' && at(2) === '(') || next === '[') {
+        note('arithmetic')
+        i = line.length
+        return ''
+      }
+      if (next === "'" || next === '"') {
+        note('ANSI-C or locale quoting')
+        i++
+        return '$'
+      }
+      if (next === '(') {
+        i += 2
+        list(true)
+        return '$(...)'
+      }
+      if (next === '{') {
+        const start = i
+        i += 2
+        for (let depth = 1; depth > 0; ) {
+          const c = at()
+          if (c === '') {
+            note('a ${ left open')
+            return line.slice(start)
+          }
+          if (c === '$' && at(1) === '(') {
+            dollar()
+            continue
+          }
+          if (c === "'" || c === '"' || c === '`' || c === '\\') note('a quote or a backslash inside ${...}')
+          if (c === '{') depth++
+          if (c === '}') depth--
+          i++
+        }
+        return line.slice(start, i)
+      }
+      i++
+      return '$'
+    }
+    const dquoted = (): string => {
+      let text = ''
+      for (;;) {
+        const c = at()
+        if (c === '') {
+          note('a double quote left open')
+          return text
+        }
+        if (c === '"') {
+          i++
+          return text
+        }
+        if (c === '\\') {
+          text += at(1)
+          i += 2
+          continue
+        }
+        if (c === '$') {
+          text += dollar()
+          continue
+        }
+        if (c === '`') note('a backtick')
+        text += c
+        i++
+      }
+    }
+    // One word from i, its quotes removed: what bash runs, if it is a command name.
+    const word = (): string => {
+      let text = ''
+      for (;;) {
+        const c = at()
+        if (c === '' || isBlank(c) || META.includes(c)) return text
+        if (c === '\\') {
+          if (at(1) === '') note('a \\ that continues the line')
+          text += at(1)
+          i += 2
+          continue
+        }
+        if (c === "'") {
+          const end = line.indexOf("'", i + 1)
+          if (end === -1) {
+            note('a quote left open')
+            i = line.length
+            return text
+          }
+          text += line.slice(i + 1, end)
+          i = end + 1
+          continue
+        }
+        if (c === '"') {
+          i++
+          text += dquoted()
+          continue
+        }
+        if (c === '$') {
+          text += dollar()
+          continue
+        }
+        if (c === '`') note('a backtick')
+        text += c
+        i++
+      }
+    }
+    // A command list from i to the end of the line, or, nested, to the `)` that closes it.
+    const list = (nested: boolean): void => {
+      let position = true
+      let cond = false
+      let skip = 0
+      let envOptions = false
+      let lookup = false
+      let named: number | undefined
+      for (;;) {
+        while (isBlank(at())) i++
+        const c = at()
+        if (c === '') {
+          if (nested) note('a ( left open')
+          return
+        }
+        if (cond && (META.includes(c) || c === '!')) {
+          i++
+          continue
+        }
+        if (c === '#') {
+          i = line.length
+          continue
+        }
+        if (META.includes(c)) {
+          const defined = named
+          named = undefined
+          if (c === ')') {
+            i++
+            if (nested) return
+            note('a ) that closes nothing')
+            position = false
+          } else if (c === '(') {
+            const definition = /^\([ \t]*\)/.exec(line.slice(i))
+            if (at(1) === '(') {
+              note('arithmetic')
+              i = line.length
+            } else if (definition !== null && defined !== undefined) {
+              // name() { ... }: a definition, which runs nothing; its body does, when called.
+              words.splice(defined, 1)
+              i += definition[0].length
+              position = true
+            } else {
+              i++
+              list(true)
+              position = false
+            }
+          } else if (c === '<' || c === '>' || (c === '&' && at(1) === '>')) {
+            const op = /^(?:&>>?|<<<|<<-?|<>|<&|>&|>>|>\||<|>)/.exec(line.slice(i))?.[0] ?? c
+            i += op.length
+            if (op === '<<' || op === '<<-') {
+              note('a here-document')
+              i = line.length
+            } else if (at() === '(') {
+              note('process substitution')
+              i = line.length
+            } else {
+              while (isBlank(at())) i++
+              word()
+            }
+          } else {
+            i += (c === ';' && at(1) === ';') || (c === '&' && at(1) === '&') || (c === '|' && (at(1) === '|' || at(1) === '&')) ? 2 : 1
+            position = true
+          }
+          continue
+        }
+        const start = i
+        const w = word()
+        const raw = line.slice(start, i)
+        named = undefined
+        if (raw === '') {
+          note(`a character this reading does not follow (${c})`)
+          i++
+          continue
+        }
+        if (cond) {
+          if (raw === ']]') {
+            cond = false
+            position = false
+          }
+          continue
+        }
+        if (skip > 0) {
+          skip--
+          continue
+        }
+        if (!position) continue
+        if (/^\d+$/.test(raw) && (at() === '<' || at() === '>')) continue
+        if (/^[A-Za-z_]\w*(?:\[[^\]]*\])?\+?=/.test(raw)) continue
+        if (envOptions && w === '-i') continue
+        if ((envOptions || lookup) && w.startsWith('-')) {
+          if (lookup && (w === '-v' || w === '-V')) {
+            lookup = false
+            position = false
+          } else {
+            note(`an option this reading does not follow (${w})`)
+          }
+          continue
+        }
+        envOptions = false
+        lookup = false
+        const quoted = raw !== w
+        words.push({ word: w, line: n, quoted })
+        named = words.length - 1
+        if (quoted) {
+          position = false
+        } else if (LEADING_WORDS.has(w)) {
+          position = true
+        } else if (w === '[[') {
+          cond = true
+          position = false
+        } else if (w === 'case') {
+          skip = 2
+          position = false
+        } else if (w === 'env') {
+          envOptions = true
+        } else if (w === 'command') {
+          lookup = true
+        } else {
+          position = false
+        }
+      }
+    }
+    list(false)
+    for (const { word: w } of words.filter((cw) => cw.line === n && !cw.quoted)) {
+      if (w === 'case') caseDepth++
+      if (w === 'esac') caseDepth--
+    }
+  }
+  return { words, unread }
+}
+
+/** What the build script may run, by name: docker only as dk's, env -i's command. */
+const BUILD_SCRIPT_COMMANDS = new Set(['set', 'echo', 'exit', 'command', 'need', 'node', 'cd', 'dirname', 'pwd', 'mkdir', 'local', 'shift', 'env', 'docker', 'dk', 'answers', 'holds', 'printf', 'read'])
+
+/** The reserved words it may use where a command name stands, each unquoted (quoted, bash runs it as a command of that name). */
+const BUILD_SCRIPT_RESERVED = new Set(['if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'do', 'done', 'case', 'esac', '{', '}', '!', '[['])
+
+const PLAN_LINE = 'if ! plan="$(cd "${REPO_ROOT}" && node --import tsx scripts/worker-image.ts)"; then'
+const DK_LINE = 'env -i DOCKER_CONFIG="${AOS_DOCKER_CONFIG}" DOCKER_HOST="${host}" PATH="${PATH}" docker "$@"'
+const BUILD_LINE = 'dk "${TRUSTED_HOST}" build --tag "${IMAGE}" --file "${CONTEXT}/Dockerfile" "${CONTEXT}" >&2'
+const ID_LINE = 'printf \'%s\\n\' "${id}"'
+
+/**
+ * What the build script must do, read from its text: every problem found,
+ * each led by its label and a colon, or none. These say why each line of
+ * BUILD_SCRIPT_CODE is as it is, and what an edit to it must still keep.
+ * driverEnv is the names boot's own driver gives its docker calls, planKeys
+ * the keys scripts/worker-image.ts prints, in order.
+ */
+function buildScriptProblems(text: string, driverEnv: readonly string[], planKeys: readonly string[]): string[] {
+  const problems: string[] = []
+  const expect = (label: string, actual: unknown, expected: unknown): void => {
+    if (!isDeepStrictEqual(actual, expected)) problems.push(`${label}: ${JSON.stringify(actual)}`)
+  }
+  const code = scriptCode(text)
+  const scan = code.map(scanned)
+  const where = (pattern: RegExp): string[] => code.filter((_, i) => pattern.test(scan[i] ?? ''))
+  // Printable ASCII, tabs and newlines only, comments included: bash's blanks
+  // are space and tab alone, so a line this test reads as indented, blank or
+  // a comment is one to bash too, and no character reads one way here and
+  // another there (\f# is a command name to bash, \f* a pattern no word
+  // matches).
+  expect('a character bash does not read as this test does', notPlainAscii(text), [])
+  expect('set -euo pipefail', code.includes('set -euo pipefail'), true)
+  expect('arguments refused', code.includes('if [[ $# -ne 0 ]]; then'), true)
+
+  // Every command it runs is one of these, by name, wherever on a line it
+  // stands (bashCommands): no cp, git, rm, sed, curl or tee can change the
+  // Dockerfile or the build context between the plan's check and the build,
+  // whatever path it is given, and docker runs from dk alone. A construct
+  // the reading does not follow is refused, not read past.
+  const commands = bashCommands(code)
+  expect('a construct the command reading does not follow', commands.unread, [])
+  expect(
+    'a command the script may not run',
+    commands.words
+      .filter((w) => !(BUILD_SCRIPT_COMMANDS.has(w.word) || (BUILD_SCRIPT_RESERVED.has(w.word) && !w.quoted)) || (w.word === 'docker' && code[w.line] !== DK_LINE))
+      .map((w) => `${w.word} in ${code[w.line] ?? ''}`),
+    [],
+  )
+  const seen = new Set(commands.words.map((w) => w.word))
+  expect('a command the reading does not see', ['cd', 'dirname', 'pwd', 'node', 'read', 'docker', 'dk', 'answers', 'holds', 'printf'].filter((w) => !seen.has(w)), [])
+
+  // Every echo is one plain string, to stderr, wherever on a line it is: its
+  // text is then data, and stdout carries the id alone.
+  expect('an echo that runs more than echo or writes to stdout', where(/\becho\b/).filter((l) => !PLAIN_ECHO.test(l)), [])
+
+  // docker is run in one place, dk, whose environment is exactly the names
+  // DockerDriver gives its own calls: no docker context, ~/.docker or
+  // exported DOCKER_* variable can point it at another daemon. Nothing runs a
+  // command or a string another way (eval, an interpreter, `.`), no quoting
+  // hides a name from the scans, and no name the docker CLI or env -i reads
+  // is set anywhere else.
+  expect('docker outside dk', where(/\bdocker\b/), ['need docker', DK_LINE])
+  expect("dk's environment", [...DK_LINE.matchAll(/\b([A-Z_]+)="/g)].map((m) => m[1]).sort(), [...driverEnv])
+  expect('a command run indirectly', where(INDIRECT), ['command -v "$1" >/dev/null 2>&1 || {', 'need node', PLAN_LINE, DK_LINE])
+  expect('ANSI-C or locale quoting', code.filter((l) => /\$['"]/.test(l)), [])
+  expect('a backslash', code.filter((l) => l.includes('\\')), [ID_LINE])
+  expect('PATH or a DOCKER_ name set outside dk', where(assigns('PATH|DOCKER_\\w*')), [DK_LINE])
+  expect('a function', where(/^(?:function\b|[\w-]+\s*\(\s*\))/), ['need() {', 'dk() {', 'answers() {', 'holds() {'])
+
+  // Nothing reaches dk, and nothing is made on the Mac, before the plan:
+  // scripts/worker-image.ts refuses a placeholder digest, any other base, the
+  // default Colima profile and one socket for both domains first. dk is
+  // defined once, after the plan line: bash cannot run a function before its
+  // definition has run, so no call above the plan, however it is written,
+  // reaches docker through it. The scan below says the same of the calls
+  // themselves, a call of any function that reaches dk (answers, holds)
+  // counting as a call of dk, after a command separator or a shell keyword.
+  const reaching = new Set(['dk'])
+  const bodies = [...text.matchAll(/^(\w+)\(\) \{\n([\s\S]*?)^\}$/gm)].map((m) => [m[1] ?? '', (m[2] ?? '').split('\n').map((l) => scanned(bashTrim(l))).join('\n')] as const)
+  for (let grew = true; grew; ) {
+    grew = false
+    for (const [name, body] of bodies) {
+      if (!reaching.has(name) && [...reaching].some((r) => new RegExp(`(?:^|[\\s$(|;&!])${r}\\s`, 'm').test(body))) {
+        reaching.add(name)
+        grew = true
+      }
+    }
+  }
+  expect('the functions that reach docker', [...reaching].sort(), ['answers', 'dk', 'holds'])
+  const invokes = new RegExp(`(?:^|\\$\\(|[|;&!({]\\s*|\\b(?:if|then|else|elif|do|while|until|time)\\s+)(?:${[...reaching].join('|')})\\s`)
+  const calls = scan.map((l, i) => ({ l, i })).filter(({ l }) => invokes.test(l))
+  const plan = code.indexOf(PLAN_LINE)
+  expect('the plan line', plan > 0, true)
+  const defines = code.map((l, i) => ({ l, i })).filter(({ i }) => /^(?:function\s+)?dk\b\s*(?:\(\s*\)|\{|$)|^function\s+dk\b/.test(scan[i] ?? ''))
+  expect('dk is defined once, as dk() {', defines.map(({ l }) => l), ['dk() {'])
+  expect('dk is defined after the plan', (defines[0]?.i ?? -1) > plan, true)
+  expect('the calls reaching docker the scan sees', calls.length >= 10, true)
+  expect('docker asked something before the plan', calls.filter(({ i }) => i < plan).map(({ i }) => code[i]), [])
+  expect('a directory made before the plan', code.findIndex((l) => l.startsWith('mkdir')) > plan, true)
+
+  // Every socket and the DOCKER_CONFIG come from the plan, which reads
+  // kernel.yaml: the script names no socket, no Colima path, no home or
+  // docker config of its own, and runs no colima command (never the default
+  // profile, which shares $HOME).
+  expect('a Colima path, socket, home or docker config of its own', where(/\.colima|docker\.sock|unix:\/\/|\bcolima\b|\bHOME\b|~\/|\.docker\b|\/Users\//), [])
+  // What each VM is asked, in order: both answer version and are asked for
+  // the image by its id, trusted builds, is asked the id and the image's user
+  // and entrypoint, and saves; hostile only loads. Nothing is pulled, pushed
+  // or run, and every dk the script holds is one of these.
+  const asked = code.flatMap((l) => [...l.matchAll(/\bdk "\$\{(\w+)\}" ((?:(?!\s\d*>)[^|)])*)/g)].map((m) => `${m[1] ?? ''} ${(m[2] ?? '').trim()}`))
+  expect('what each VM is asked', asked, [
+    "host version --format '{{.Server.Version}}'",
+    'TRUSTED_HOST build --tag "${IMAGE}" --file "${CONTEXT}/Dockerfile" "${CONTEXT}"',
+    'TRUSTED_HOST image inspect --format \'{{.Id}}\' "${IMAGE}"',
+    'TRUSTED_HOST image inspect --format \'{{.Config.User}} {{json .Config.Entrypoint}}\' "${id}"',
+    'TRUSTED_HOST save "${IMAGE}"',
+    'HOSTILE_HOST load',
+    'host image inspect --format \'{{.Id}}\' "${id}"',
+  ])
+  expect('a dk this scan does not read', scan.reduce((n, l) => n + (l.match(/\bdk\b/g)?.length ?? 0), 0), asked.length + 1)
+  expect('the hostile VM loads what the trusted VM saved', code.includes('dk "${TRUSTED_HOST}" save "${IMAGE}" | dk "${HOSTILE_HOST}" load >&2'), true)
+  expect('answers and holds', where(/\b(?:answers|holds)\b/), [
+    'answers() {',
+    'answers trusted "${TRUSTED_HOST}"',
+    'answers hostile "${HOSTILE_HOST}"',
+    'holds() {',
+    'holds trusted "${TRUSTED_HOST}"',
+    'holds hostile "${HOSTILE_HOST}"',
+  ])
+
+  // The build, exactly. Its context is images/worker, whose .dockerignore
+  // admits only the two files the Dockerfile copies, never the repository;
+  // it takes no option but the tag and the file: no --build-arg (which this
+  // shell would expand before env -i, handing the VM's daemon whatever the
+  // operator's shell holds), no --platform (the VMs are arm64, and an image
+  // they cannot run natively would be found out only once pinned), no --pull.
+  // REPO_ROOT is set once and used for two things, the context and the
+  // plan: nothing else is done to the repository, so the Dockerfile and the
+  // context the build reads are the ones scripts/worker-image.ts checked.
+  expect('REPO_ROOT beyond its assignment, CONTEXT and the plan', where(/\bREPO_ROOT\b/), [
+    'REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"',
+    'CONTEXT="${REPO_ROOT}/images/worker"',
+    PLAN_LINE,
+  ])
+  expect('CONTEXT', where(/\bCONTEXT\b/), ['CONTEXT="${REPO_ROOT}/images/worker"', BUILD_LINE])
+  expect('the build', where(/\bbuild\b/), [BUILD_LINE])
+  // What the build made, checked before it is loaded anywhere, exactly: an id
+  // of sha256:<64 hex>, and the image's user and entrypoint 65534:65534 and
+  // none, anything else refused. id and runs are set there and nowhere else,
+  // in no form, and the only other case statement reads the plan.
+  const check = [
+    'id="$(dk "${TRUSTED_HOST}" image inspect --format \'{{.Id}}\' "${IMAGE}")"',
+    'if [[ ! "${id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then',
+    `echo "error: the trusted VM gives \${IMAGE} the id '\${id}', not sha256:<64 hex>" >&2`,
+    'exit 1',
+    'fi',
+    'runs="$(dk "${TRUSTED_HOST}" image inspect --format \'{{.Config.User}} {{json .Config.Entrypoint}}\' "${id}")"',
+    'case "${runs}" in',
+    "'65534:65534 null' | '65534:65534 []') ;;",
+    '*)',
+    `echo "error: \${IMAGE} (\${id}) has user and entrypoint '\${runs}', not 65534:65534 and none; do not pin it" >&2`,
+    'exit 1',
+    ';;',
+    'esac',
+  ]
+  const at = code.indexOf(check[0] ?? '')
+  expect('the id asked for after the plan', at > plan, true)
+  expect('the check of what the build made', code.slice(at, at + check.length), check)
+  expect('id or runs set', where(assigns('id|runs')), [check[0], check[5]])
+  expect('a builtin that sets, exports or unsets a variable', where(BINDS), [
+    'set -euo pipefail',
+    'while IFS= read -r line; do',
+    'local host="$1"',
+    'local domain="$1" host="$2" out',
+    'local domain="$1" host="$2" got',
+  ])
+  expect('case', where(/^case\b/), ['case "${line%%=*}" in', 'case "${runs}" in'])
+
+  // It reads exactly the lines the plan prints, each under its own name, and
+  // sets the plan's values nowhere else: each is empty until the plan reader
+  // sets it, and the base is only named, never handed to docker.
+  const arms = code.filter((l) => /^[A-Z_]+\) [A-Z_]+="\$\{line#\*=\}" ;;$/.test(l))
+  expect('the keys the plan reader reads', arms.map((l) => l.slice(0, l.indexOf(')'))), [...planKeys])
+  const values = 'BASE|IMAGE|TRUSTED_HOST|HOSTILE_HOST|AOS_DOCKER_CONFIG'
+  expect('a plan value set outside the plan reader', where(assigns(values)), [...values.split('|').map((v) => `${v}=''`), ...arms])
+  expect('BASE beyond the plan reader', where(/\bBASE\b/), [
+    "BASE=''",
+    'BASE) BASE="${line#*=}" ;;',
+    'if [[ -z "${BASE}" || -z "${IMAGE}" || -z "${TRUSTED_HOST}" || -z "${HOSTILE_HOST}" || -z "${AOS_DOCKER_CONFIG}" ]]; then',
+  ])
+  expect('the names the script assigns', [...new Set(scan.flatMap((l) => [...l.matchAll(/(?:^|[\s;&|(!])([A-Za-z_]\w*)(?:\[[^\]]*\])?\+?=/g)].map((m) => m[1])))].sort(), [
+    'AOS_DOCKER_CONFIG',
+    'BASE',
+    'CONTEXT',
+    'DOCKER_CONFIG',
+    'DOCKER_HOST',
+    'HOSTILE_HOST',
+    'IFS',
+    'IMAGE',
+    'PATH',
+    'REPO_ROOT',
+    'TRUSTED_HOST',
+    'domain',
+    'got',
+    'host',
+    'id',
+    'out',
+    'plan',
+    'runs',
+  ])
+
+  // Its stdout is the id alone: every echo goes to stderr (above), docker's
+  // build and load output too, and the one printf, last, prints the id.
+  expect("docker build's output to stderr", code.some((l) => l.startsWith('dk "${TRUSTED_HOST}" build ') && l.endsWith(' >&2')), true)
+  expect('printf', where(/\bprintf\b/), [ID_LINE])
+  expect('the last line', code.at(-1), ID_LINE)
+  return problems
+}
+
+test("scripts/build-worker-image.sh is executable and NEEDS VALIDATION, asks docker nothing before scripts/worker-image.ts has checked the base, and runs docker only as the kernel does: on kernel.yaml's sockets, building on trusted and loading into hostile, with the id alone on stdout", async () => {
+  const path = join(REPO, 'scripts/build-worker-image.sh')
+  assert.ok((statSync(path).mode & 0o111) !== 0, `mode ${statSync(path).mode.toString(8)} is not executable`)
+  const text = read('scripts/build-worker-image.sh')
+  const lines = text.split('\n')
+  assert.equal(lines[0], '#!/usr/bin/env bash')
+  // Line 2 of each, exactly: neither has met Docker, and each says so where
+  // the operator reads first.
+  assert.equal(lines[1], '# NEEDS VALIDATION: written on Linux without Docker or Colima; run once by the operator.')
+  assert.equal(read('images/worker/Dockerfile').split('\n')[1], '# NEEDS VALIDATION: written on Linux without Docker; built once by the operator.')
+
+  // Its code, whole, and then what that code must keep.
+  assert.deepEqual(scriptCode(text), BUILD_SCRIPT_CODE)
+  const names = [...new Set((await driverDockerEnvs()).map((env) => Object.keys(env).sort().join(' ')))]
+  assert.deepEqual(names, ['DOCKER_CONFIG DOCKER_HOST PATH'])
+  const driverEnv = (names[0] ?? '').split(' ')
+  const keys = planText(workerImagePlan(REPO, {})).trimEnd().split('\n').map((l) => l.slice(0, l.indexOf('=')))
+  assert.deepEqual(buildScriptProblems(text, driverEnv, keys), [])
+
+  // One-line edits, each of which bash -n accepts, that run docker other
+  // than through dk, on a socket nobody chose, print an id nobody checked,
+  // or build from a Dockerfile or context other than the one the plan read:
+  // each changes the pinned code (scriptCode trims only bash's blanks, so
+  // no line hides as a comment or as white space), and each is refused, by
+  // the label given, by what the code must keep.
+  const holdsHostile = 'holds hostile "${HOSTILE_HOST}"\n'
+  const mutants: [string, string, string, string[]][] = [
+    ['R1, a quoted docker word pushes', holdsHostile, `${holdsHostile}"docker" push "\${IMAGE}" >&2\n`, ['docker outside dk']],
+    ['R7, docker runs before the plan', 'need docker\n', "need docker\n'docker' version >&2\n", ['docker outside dk']],
+    ['R9, eval runs a pushed string', holdsHostile, `${holdsHostile}eval "$(printf 'dock%s push %s' er "\${IMAGE}")"\n`, ['a command run indirectly', 'printf']],
+    ['R2, the default profile by path', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nTRUSTED_HOST="unix://${HOME}/.colima/default/docker.sock"\n', ['a Colima path, socket, home or docker config of its own', 'a plan value set outside the plan reader']],
+    ['R3, a docker config of its own', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nAOS_DOCKER_CONFIG="${HOME}/.docker"\n', ['a Colima path, socket, home or docker config of its own', 'a plan value set outside the plan reader']],
+    [
+      "R4b, the base's id exported and the base loaded",
+      '# 4. Into the hostile VM',
+      `export id="$(dk "\${TRUSTED_HOST}" image inspect --format '{{.Id}}' "\${BASE}")"\ndk "\${TRUSTED_HOST}" save "\${BASE}" | dk "\${HOSTILE_HOST}" load >&2\n# 4. Into the hostile VM`,
+      ['id or runs set', 'a builtin that sets, exports or unsets a variable', 'what each VM is asked', 'BASE beyond the plan reader'],
+    ],
+    ['R8, id read again', holdsHostile, `${holdsHostile}read -r id <<<"$(dk "\${TRUSTED_HOST}" image inspect --format '{{.Id}}' "\${BASE}")"\n`, ['a builtin that sets, exports or unsets a variable', 'what each VM is asked', 'BASE beyond the plan reader']],
+    ['a backslashed docker word', holdsHostile, `${holdsHostile}d\\ocker push "\${IMAGE}" >&2\n`, ['docker outside dk', 'a backslash']],
+    ['an ANSI-C quoted docker word', holdsHostile, `${holdsHostile}$'\\x64ocker' push "\${IMAGE}" >&2\n`, ['ANSI-C or locale quoting', 'a backslash']],
+    ['a docker of its own on PATH', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nPATH="${REPO_ROOT}/.aos/bin:${PATH}"\n', ['PATH or a DOCKER_ name set outside dk']],
+    ['an echo that runs a command', 'echo "" >&2\n', 'echo "$(dk "${TRUSTED_HOST}" push "${IMAGE}")" >&2\n', ['an echo that runs more than echo or writes to stdout', 'what each VM is asked']],
+    // A line led by \f or U+00A0 and then #: a comment to JavaScript's
+    // trim(), a command named \f# or U+00A0# to bash, which fails (127,
+    // which set -e lets pass left of ||) and runs what follows the ||.
+    ['U1, a \\f-led # line pushes', holdsHostile, `${holdsHostile}\f# || dk "\${TRUSTED_HOST}" push "\${IMAGE}" >&2\n`, ['a character bash does not read as this test does', 'a command the script may not run', 'what each VM is asked']],
+    [
+      'U1, a U+00A0-led # line loads into the default profile',
+      holdsHostile,
+      `${holdsHostile}\u00a0# || docker --host "unix://\${HOME}/.colima/default/docker.sock" load <"\${CONTEXT}/../x.tar" >&2\n`,
+      ['a character bash does not read as this test does', 'a command the script may not run', 'docker outside dk', 'a Colima path, socket, home or docker config of its own'],
+    ],
+    // \f* as the runs case's catch-all: a pattern no word matches, to bash,
+    // so an image with any other user or entrypoint falls through to be pinned.
+    ['U1, a \\f-led catch-all', '  *)\n    echo "error: ${IMAGE} (${id})', '  \f*)\n    echo "error: ${IMAGE} (${id})', ['a character bash does not read as this test does', 'the check of what the build made']],
+    // Between the plan's check and the build, a Dockerfile or a context other
+    // than the one scripts/worker-image.ts read.
+    ['P1, a Dockerfile copied in', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\ncp "${REPO_ROOT}/../evil/Dockerfile" "${REPO_ROOT}/images/worker/Dockerfile"\n', ['REPO_ROOT beyond its assignment, CONTEXT and the plan', 'a command the script may not run']],
+    ['P2, the context checked out from a branch', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\ngit -C "${REPO_ROOT}" checkout origin/evil -- images/worker\n', ['REPO_ROOT beyond its assignment, CONTEXT and the plan', 'a command the script may not run']],
+    ['P3, the base edited in place', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', "mkdir -p \"${AOS_DOCKER_CONFIG}\"\nsed -i '' 's/@sha256:[0-9a-f]*//' \"${REPO_ROOT}/images/worker/Dockerfile\"\n", ['REPO_ROOT beyond its assignment, CONTEXT and the plan', 'a command the script may not run']],
+    ['P4, a Dockerfile fetched', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\ncurl -fsS https://example.invalid/Dockerfile | tee "${REPO_ROOT}/images/worker/Dockerfile" >&2\n', ['REPO_ROOT beyond its assignment, CONTEXT and the plan', 'a command the script may not run']],
+    ['P5, the context unfenced', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\nrm -rf "${REPO_ROOT}/images/worker/.dockerignore"\n', ['REPO_ROOT beyond its assignment, CONTEXT and the plan', 'a command the script may not run']],
+    // The same, with no REPO_ROOT to see: the command alone is refused.
+    ['P6, the Dockerfile copied in by a path of its own', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n{ cp "$(dirname "$0")/../../evil/Dockerfile" "$(dirname "$0")/../images/worker/Dockerfile"; }\n', ['a command the script may not run']],
+    // Arithmetic, which the command reading does not follow, ends its reading
+    // of the line, and the cp after it is seen only as what was not read.
+    ['P7, arithmetic before a cp', 'mkdir -p "${AOS_DOCKER_CONFIG}"\n', 'mkdir -p "${AOS_DOCKER_CONFIG}" "$((1))"; cp /tmp/evil/Dockerfile "$(dirname "$0")/../images/worker/Dockerfile"\n', ['a construct the command reading does not follow']],
+  ]
+  for (const [name, from, to, labels] of mutants) {
+    assert.equal(text.split(from).length, 2, `${name}: its anchor is not in the script exactly once`)
+    const mutant = text.replace(from, () => to)
+    assert.notDeepEqual(scriptCode(mutant), BUILD_SCRIPT_CODE, name)
+    const found = buildScriptProblems(mutant, driverEnv, keys).map((p) => p.slice(0, p.indexOf(': ')))
+    for (const label of labels) assert.ok(found.includes(label), `${name} is not refused as '${label}': ${found.join('; ')}`)
+  }
+})
+
+test("the build's plan refuses a placeholder digest and any base but node:24-bookworm-slim by digest, the default Colima profile and one socket for both domains; its sockets and DOCKER_CONFIG are those boot's driver hands docker", async () => {
+  // scripts/worker-image.ts, which scripts/build-worker-image.sh runs before
+  // any docker command and stops on: what it refuses here, the build never
+  // starts on.
+  const shipped = read('images/worker/Dockerfile')
+  const from = /^FROM \S+$/m.exec(shipped)?.[0] ?? ''
+  assert.ok(from !== '', 'the Dockerfile has no FROM line')
+  const digest = from.slice(from.indexOf('@') + 1)
+  const swap = (line: string): string => shipped.replace(from, () => line)
+  const config = parseKernelConfig(readYaml('config/kernel.yaml'), { repoRoot: REPO })
+  assert.equal(baseProblem(shipped), undefined)
+
+  // A placeholder digest, as a FROM is left when its digest is not known yet:
+  // refused, naming it and where the real one comes from.
+  for (const placeholder of [`sha256:${'0'.repeat(64)}`, `sha256:${'f'.repeat(64)}`]) {
+    const text = swap(`FROM ${WORKER_BASE}@${placeholder}`)
+    assert.match(baseProblem(text) ?? '', new RegExp(`base digest ${placeholder} is a placeholder, not a digest any registry serves`))
+    assert.throws(() => planFrom(text, config), (e: unknown) => e instanceof ConfigError && e.message.includes('is a placeholder'))
+  }
+  // Every other way the base is not the operator's, by a digest, alone.
+  const refused: [string, RegExp][] = [
+    [`FROM ${WORKER_BASE}`, /must be exactly FROM node:24-bookworm-slim@sha256:<64 lower-case hex>/],
+    [`FROM ${WORKER_BASE}@sha256:<digest>`, /must be exactly FROM/],
+    [`FROM node:22-bookworm-slim@${digest}`, /must be exactly FROM/],
+    [`FROM node:24-bookworm@${digest}`, /must be exactly FROM/],
+    [`FROM --platform=linux/amd64 ${WORKER_BASE}@${digest}`, /must be exactly FROM/],
+    [`FROM ${WORKER_BASE}@${digest} AS worker`, /must be exactly FROM/],
+    [`FROM ${WORKER_BASE}@${digest.toUpperCase().replace('SHA256', 'sha256')}`, /must be exactly FROM/],
+    [`FROM \\\n  ${WORKER_BASE}@${digest}`, /must be exactly FROM/],
+    [`${from}\nFROM alpine:3.20`, /has 2 FROM lines; it must have exactly one/],
+    [`${from}\n  from ${WORKER_BASE}@${digest}`, /has 2 FROM lines/],
+    [`# syntax=docker/dockerfile:1\n${from}`, /has a syntax directive/],
+    [`// syntax=docker/dockerfile:1\n${from}`, /has a syntax directive/],
+    [`\u0085# syntax=docker/dockerfile:1\n${from}`, /has a syntax directive/],
+    [`${from}\n\u0085FROM alpine:3.20`, /has 2 FROM lines/],
+    // Read as BuildKit reads the file, continued lines joined: a FROM split
+    // across lines is a FROM, and a FROM continued into a RUN is not one. So
+    // a second stage spelled FR\ then OM is refused, and so is a base by tag
+    // spelled that way while the pinned FROM below it is a RUN's text.
+    [`${from}\nFR\\\nOM debian:latest`, /has 2 FROM lines/],
+    [`FR\\\nOM debian:latest\nRUN true \\\n${from}`, /base is "FROM debian:latest": it must be exactly FROM/],
+    // Every \r at a line's end is dropped before the `\` is looked for, as
+    // BuildKit's trimNewline drops them all.
+    [`${from}\nFR\\\r\r\nOM debian:latest`, /has 2 FROM lines/],
+    // What BuildKit joins after a `\` with a space after it is not checked
+    // here (FROM debian:latest, or FROMdebian:latest): refused.
+    [`${from}\nFROM\\ \ndebian:latest`, /has a `\\` with a space or tab after it, on line \d+/],
+    // The keyword ends at a tab as at a space, and a comment line is dropped
+    // inside a continued instruction too, so the `\` that ends one continues
+    // nothing.
+    [`${from}\nFROM\tdebian:latest`, /has 2 FROM lines/],
+    [`${from}\n# a comment \\\nFROM debian:latest`, /has 2 FROM lines/],
+  ]
+  for (const [line, why] of refused) {
+    assert.match(baseProblem(swap(line)) ?? '', why, line)
+    assert.throws(() => planFrom(swap(line), config), (e: unknown) => e instanceof ConfigError && why.test(e.message), line)
+  }
+  // A FROM spelled on two lines that joins to exactly the pinned one is the
+  // pinned base, as BuildKit reads it.
+  assert.equal(baseProblem(swap(`FROM\\\n ${WORKER_BASE}@${digest}`)), undefined)
+  assert.match(baseProblem(shipped.replace(/^FROM .*$/m, '')) ?? '', /has 0 FROM lines/)
+  // Where the reading is not certain, refused, though the base is pinned: an
+  // empty line inside a continued instruction (BuildKit joins the line after
+  // it on, warning that it will become an error), and a last line that
+  // continues an instruction the file never ends.
+  assert.match(baseProblem(shipped.replace('ENTRYPOINT []\n', 'ENTRYPOINT [] \\\n')) ?? '', /has an empty line inside a continued instruction, on line \d+: BuildKit joins the line after it on/)
+  assert.match(baseProblem(shipped.replace(/\nUSER 65534:65534\n?$/, '\nUSER 65534:65534 \\\n')) ?? '', /ends inside a continued line/)
+  // A parser directive on line 1, before the header: escape would make a
+  // backtick the continuation, so FR` then OM debian:latest, which the
+  // reading here takes as two instructions, is BuildKit's second stage.
+  for (const first of ['# escape=`', '\uFEFF# escape=`', ' # check=skip=all', '# syntax=docker/dockerfile:1']) {
+    const text = `${first}\n${swap(`${from}\nFR\`\nOM debian:latest`)}`
+    assert.match(baseProblem(text) ?? '', /starts with a parser directive, ".*": escape changes which lines BuildKit joins/, first)
+    assert.throws(() => planFrom(text, config), (e: unknown) => e instanceof ConfigError && e.message.includes('starts with a parser directive'), first)
+  }
+  // And, once all else is read, any character that is not printable ASCII, a
+  // tab or a newline, a comment's included: how BuildKit's Go reads it never
+  // decides what is built.
+  for (const [stray, named] of [['\u00a0', 'U+00A0'], ['\uFEFF', 'U+FEFF'], ['\r', 'U+000D'], ['\u3000', 'U+3000']] as const) {
+    const text = shipped.replace('# The aos worker image', `#${stray}The aos worker image`)
+    assert.notEqual(text, shipped)
+    assert.equal(baseProblem(text), `images/worker/Dockerfile holds ${named}: it may hold only printable ASCII, tabs and newlines, so that no other character's reading decides what is built`)
+  }
+
+  // As shipped, the plan is the Dockerfile's base, kernel.yaml's tag, and the
+  // sockets and DOCKER_CONFIG boot's own driver hands docker: the build talks
+  // to the daemons the kernel does, under the kernel's docker config.
+  const plan = workerImagePlan(REPO, {})
+  assert.deepEqual(plan, {
+    base: from.slice('FROM '.length),
+    image: config.sandbox.image,
+    trusted: config.sandbox.domains.trusted.dockerHost,
+    hostile: config.sandbox.domains.hostile.dockerHost,
+    dockerConfig: join(config.dataDir, 'docker'),
+  })
+  const envs = await driverDockerEnvs()
+  assert.deepEqual([...new Set(envs.map((env) => env['DOCKER_HOST']))], [plan.trusted, plan.hostile])
+  assert.deepEqual([...new Set(envs.map((env) => env['DOCKER_CONFIG']))], [plan.dockerConfig])
+  assert.match(plan.trusted, /^unix:\/\/\/.+\/\.colima\/trusted\/docker\.sock$/)
+  // AOS_DATA_DIR moves the kernel's DOCKER_CONFIG, as it moves the daemon's (src/main.ts).
+  const elsewhere = join(REPO, '.aos', 'elsewhere')
+  assert.equal(workerImagePlan(REPO, { AOS_DATA_DIR: elsewhere }).dockerConfig, join(elsewhere, 'docker'))
+
+  // Never the default Colima profile, in either of its sockets' places, any
+  // case (APFS) and any spelling the kernel's docker calls would connect
+  // through all the same (`//`, `.`, `..`), and never one socket for both
+  // domains. Spelled outright (expandDockerHost resolves only the `~/` form),
+  // under a home no machine has, so that no socket is there to resolve:
+  // what is refused here is refused by spelling alone. The next test follows
+  // symlinks and links on a real filesystem.
+  const raw = read('config/kernel.yaml')
+  const hosts = (trusted: string, hostile: string): KernelConfig =>
+    parseKernelConfig(
+      parseYaml(raw.replace('unix://~/.colima/trusted/docker.sock', trusted).replace('unix://~/.colima/hostile/docker.sock', hostile)),
+      { repoRoot: REPO },
+    )
+  const ownHostile = 'unix://~/.colima/hostile/docker.sock'
+  const nowhere = '/nonexistent-aos-home/op'
+  for (const [trusted, hostile, domain] of [
+    ['unix://~/.colima/default/docker.sock', ownHostile, 'trusted'],
+    ['unix://~/.colima/trusted/docker.sock', 'unix://~/.colima/docker.sock', 'hostile'],
+    ['unix://~/.colima/Default/docker.sock', ownHostile, 'trusted'],
+    [`unix://${nowhere}/.colima//default/docker.sock`, ownHostile, 'trusted'],
+    [`unix://${nowhere}/.colima/./default/docker.sock`, ownHostile, 'trusted'],
+    [`unix://${nowhere}/.colima/trusted/../default/docker.sock`, ownHostile, 'trusted'],
+    ['unix://~/.colima/trusted/docker.sock', `unix://${nowhere}/.colima/default/./docker.sock`, 'hostile'],
+    ['unix://~/.colima/trusted/docker.sock', `unix://${nowhere}/.colima/hostile/../docker.sock`, 'hostile'],
+  ] as const) {
+    assert.throws(
+      () => planFrom(shipped, hosts(trusted, hostile)),
+      (e: unknown) => e instanceof ConfigError && e.message.startsWith(`sandbox.domains.${domain}.dockerHost`) && e.message.includes("is the default Colima profile's socket, which shares $HOME writable"),
+      `${trusted} ${hostile}`,
+    )
+  }
+  const ownTrusted = `unix://${nowhere}/.colima/trusted/docker.sock`
+  for (const [trusted, hostile] of [
+    ['unix://~/.colima/trusted/docker.sock', 'unix://~/.colima/trusted/docker.sock'],
+    ['unix://~/.colima/trusted/docker.sock', 'unix://~/.colima/TRUSTED/docker.sock'],
+    [ownTrusted, `unix://${nowhere}/.colima/./trusted/docker.sock`],
+    [ownTrusted, `unix://${nowhere}/.colima/trusted//docker.sock`],
+    [ownTrusted, `unix://${nowhere}//.colima/hostile/../trusted/docker.sock`],
+    [`unix://${nowhere}/.colima/Trusted/./docker.sock`, ownTrusted],
+  ] as const) {
+    assert.throws(() => planFrom(shipped, hosts(trusted, hostile)), /are one socket/, `${trusted} ${hostile}`)
+  }
+  // Two sockets of their own, spelled outright, are two VMs.
+  assert.equal(planFrom(shipped, hosts(ownTrusted, `unix://${nowhere}/.colima/hostile/docker.sock`)).hostile, `unix://${nowhere}/.colima/hostile/docker.sock`)
+
+  // A path with a space or a character outside printable ASCII in it, here at
+  // its end, which a YAML double-quoted scalar carries and `read -r` keeps:
+  // the docker CLI may trim white space from DOCKER_HOST (Go's
+  // strings.TrimSpace trims U+0085, U+00A0, U+2028 and U+3000 as well as
+  // ASCII space and tab), so the default profile's socket, or trusted's named
+  // again for hostile, would be judged as a socket that is not there and
+  // connected to as the one it is. Refused before either check, naming the
+  // key, and anywhere in the path.
+  const quoted = (host: string): string => JSON.stringify(host).replace(/[^\x20-\x7e]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`)
+  const unprintable = (domain: string) => (e: unknown): boolean =>
+    e instanceof ConfigError &&
+    e.message.startsWith(`sandbox.domains.${domain}.dockerHost "unix://`) &&
+    e.message.includes('has a space or a character that is not printable ASCII in its path') &&
+    !/[^\x20-\x7e]/.test(e.message)
+  // A case APFS folds outside ASCII (U+017F, long s, folds to s) is judged
+  // the default profile's by its spelling, and refused before that as
+  // unprintable.
+  const longS = `unix://${nowhere}/.colima/default/docker.\u017fock`
+  assert.match(namesDefaultColima(longS, macSockets(nowhere)) ?? '', /^it reaches .*\/\.colima\/default\/docker\.sock$/)
+  assert.throws(() => planFrom(shipped, hosts('unix://~/.colima/trusted/docker.sock', longS)), unprintable('hostile'))
+  for (const space of [' ', '\t', '\u00a0', '\u0085', '\u2028', '\u3000']) {
+    for (const [trusted, hostile, domain] of [
+      [`unix://~/.colima/default/docker.sock${space}`, ownHostile, 'trusted'],
+      [`unix://${nowhere}/.colima/default/docker.sock${space}`, ownHostile, 'trusted'],
+      ['unix://~/.colima/trusted/docker.sock', `unix://~/.colima/docker.sock${space}`, 'hostile'],
+      ['unix://~/.colima/trusted/docker.sock', `unix://~/.colima/trusted/docker.sock${space}`, 'hostile'],
+      [`unix://${nowhere}/.colima/hostile/docker.sock${space}`, `unix://${nowhere}/.colima/hostile/docker.sock`, 'trusted'],
+      [`unix://${nowhere}/.colima/trusted${space}/docker.sock`, ownHostile, 'trusted'],
+    ] as const) {
+      const config = hosts(quoted(trusted), quoted(hostile))
+      assert.equal(config.sandbox.domains[domain].dockerHost.endsWith(space) || config.sandbox.domains[domain].dockerHost.includes(`${space}/`), true, 'the YAML did not carry the character')
+      assert.throws(() => planFrom(shipped, config), unprintable(domain), `${JSON.stringify(trusted)} ${JSON.stringify(hostile)}`)
+    }
+  }
+
+  // The tag is a name:tag docker cannot read as an option or as an image id.
+  for (const image of ['aos-worker', '-aos-worker:0.0.1', 'Aos-Worker:0.0.1', 'aos worker:0.0.1', `sha256:${'a'.repeat(64)}`]) {
+    assert.throws(() => planFrom(shipped, { ...config, sandbox: { ...config.sandbox, image } }), /is not a name:tag the build can give the image/, image)
+  }
+
+  // One KEY=value line each, in order, and a value one line cannot carry is
+  // refused rather than read by the script as a second key.
+  assert.equal(
+    planText(plan),
+    `BASE=${plan.base}\nIMAGE=${plan.image}\nTRUSTED_DOCKER_HOST=${plan.trusted}\nHOSTILE_DOCKER_HOST=${plan.hostile}\nDOCKER_CONFIG=${plan.dockerConfig}\n`,
+  )
+  assert.throws(() => planText({ ...plan, dockerConfig: `${plan.dockerConfig}\nTRUSTED_DOCKER_HOST=unix:///elsewhere.sock` }), /DOCKER_CONFIG is empty or holds a control character/)
+  assert.throws(() => planText({ ...plan, image: '' }), /IMAGE is empty/)
+})
+
+test("the build's plan follows each socket on the Mac: a symlink or a second link to the default profile's socket is refused, and so are two names for one socket", () => {
+  // macSockets is what scripts/worker-image.ts asks the Mac when the build
+  // script runs: realpath(3) of each socket path, and its device and inode.
+  // Regular files stand in for sockets here (realpath and stat do not care),
+  // in a temporary home and a .colima of its own.
+  const shipped = read('images/worker/Dockerfile')
+  const raw = read('config/kernel.yaml')
+  const root = mkdtempSync(join(tmpdir(), 'aos-sockets-'))
+  try {
+    const home = join(root, 'home')
+    const colima = join(home, '.colima')
+    for (const profile of ['default', 'trusted', 'hostile']) {
+      mkdirSync(join(colima, profile), { recursive: true })
+      writeFileSync(join(colima, profile, 'docker.sock'), '')
+    }
+    const sock = (profile: string): string => join(colima, profile, 'docker.sock')
+    const fs = macSockets(home)
+    const plan = (trusted: string, hostile: string): unknown =>
+      planFrom(
+        shipped,
+        parseKernelConfig(
+          parseYaml(raw.replace('unix://~/.colima/trusted/docker.sock', `unix://${trusted}`).replace('unix://~/.colima/hostile/docker.sock', `unix://${hostile}`)),
+          { repoRoot: REPO },
+        ),
+        fs,
+      )
+    const isDefault = (domain: string, how: RegExp) => (e: unknown): boolean =>
+      e instanceof ConfigError &&
+      e.message.startsWith(`sandbox.domains.${domain}.dockerHost`) &&
+      e.message.includes("is the default Colima profile's socket, which shares $HOME writable") &&
+      how.test(e.message)
+
+    // Each domain's own socket, as the shipped kernel.yaml names them.
+    assert.deepEqual(plan(sock('trusted'), sock('hostile')), {
+      base: shipped.match(/^FROM (\S+)$/m)?.[1],
+      image: 'aos-worker:0.0.1',
+      trusted: `unix://${sock('trusted')}`,
+      hostile: `unix://${sock('hostile')}`,
+      dockerConfig: join(REPO, '.aos', 'docker'),
+    })
+
+    // A symlink, spelled any way, to a default profile's socket wherever its
+    // .colima is: refused by where it leads, not by its name.
+    const elsewhere = join(root, 'Volumes', 'x', '.colima', 'default')
+    mkdirSync(elsewhere, { recursive: true })
+    writeFileSync(join(elsewhere, 'docker.sock'), '')
+    symlinkSync(join(elsewhere, 'docker.sock'), join(root, 'vm.sock'))
+    assert.throws(() => plan(join(root, 'vm.sock'), sock('hostile')), isDefault('trusted', /it reaches .*\/volumes\/x\/\.colima\/default\/docker\.sock\)/))
+    // A symlinked directory before a `..`, followed as the OS opens it
+    // (realpath(3)): jump/.. is deep, whose profile is the default's. Read
+    // lexically, as Node's own realpath and path.join would, it is
+    // <root>/profile, which is not there. Spelled with a string, not join.
+    mkdirSync(join(root, 'deep', 'er'), { recursive: true })
+    symlinkSync(join(root, 'deep', 'er'), join(root, 'jump'))
+    symlinkSync(elsewhere, join(root, 'deep', 'profile'))
+    const viaDotDot = `${root}/jump/../profile/docker.sock`
+    assert.throws(() => plan(sock('trusted'), viaDotDot), isDefault('hostile', /it reaches .*\/volumes\/x\/\.colima\/default\/docker\.sock\)/))
+
+    // A hard link to the default profile's socket under the home directory,
+    // and the default profile's socket kept somewhere else behind a symlink:
+    // no spelling says default, but it is the same file.
+    linkSync(sock('default'), join(root, 'hard.sock'))
+    assert.throws(() => plan(join(root, 'hard.sock'), sock('hostile')), isDefault('trusted', /it is the same file as .*\/\.colima\/default\/docker\.sock\)/))
+    const lima = join(root, 'lima', 'colima', 'sock')
+    mkdirSync(lima, { recursive: true })
+    writeFileSync(join(lima, 'docker.sock'), '')
+    rmSync(join(colima, 'docker.sock'), { force: true })
+    symlinkSync(join(lima, 'docker.sock'), join(colima, 'docker.sock'))
+    assert.throws(() => plan(sock('trusted'), join(lima, 'docker.sock')), isDefault('hostile', /it is the same file as .*\/\.colima\/docker\.sock\)/))
+
+    // Two names for one socket: a symlink to trusted's, and a hard link.
+    symlinkSync(sock('trusted'), join(root, 'trusted-again.sock'))
+    linkSync(sock('trusted'), join(root, 'trusted-hard.sock'))
+    for (const hostile of [join(root, 'trusted-again.sock'), join(root, 'trusted-hard.sock')]) {
+      assert.throws(() => plan(sock('trusted'), hostile), /are one socket/, hostile)
+    }
+
+    // A path that is not there is judged by its spelling (no daemon answers on
+    // it); one that cannot be resolved for any other reason is refused.
+    assert.equal(fs.realpath(join(root, 'absent', 'docker.sock')), undefined)
+    assert.equal(fs.realpath(join(sock('trusted'), 'below')), undefined)
+    symlinkSync(join(root, 'loop-b'), join(root, 'loop-a'))
+    symlinkSync(join(root, 'loop-a'), join(root, 'loop-b'))
+    assert.throws(() => plan(join(root, 'loop-a'), sock('hostile')), (e: unknown) => e instanceof ConfigError && /the docker socket .*loop-a cannot be resolved/.test(e.message))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test("README and CLAUDE.md give one reason containers cannot reach pmmcp: --network none, with each domain's internal network probed as defence in depth, and the kernel's egress engine, not a proxy, denying the Mac's loopback", () => {

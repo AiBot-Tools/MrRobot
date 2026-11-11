@@ -46,7 +46,7 @@ export function homeDirectory(): string {
 }
 
 /** A name folded past any filesystem's case folding: compatibility forms, then upper, then lower. */
-function foldName(s: string): string {
+export function foldName(s: string): string {
   return s.normalize('NFKC').toUpperCase().toLowerCase().normalize('NFKC')
 }
 

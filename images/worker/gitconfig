@@ -1,0 +1,33 @@
+# /etc/gitconfig in the aos worker image (egress plan I1, images/worker/Dockerfile).
+#
+# Git's system config, read before any other. Not a boundary: a run can
+# override all of it (git -c, its own ~/.gitconfig, GIT_CONFIG_* in its env),
+# and the kernel's egress engine decides every request whatever git sends.
+# What it is for is an honest git that works under --network none and never
+# asks anyone anything.
+
+# Every https:// remote is fetched as http://, so git's libcurl sends it to
+# the mux (http_proxy, in the Dockerfile) as an absolute-form request the
+# kernel can read and judge, then dials over TLS itself, verifying the host.
+[url "http://"]
+	insteadOf = https://
+
+# No credential helper, so git stores and looks up nothing: the image holds no
+# credential, and the kernel injects one only into a request it allowed.
+[credential]
+	helper =
+
+# Neither a local path nor an external command is a transport: a submodule or
+# a remote cannot make git read another repository on disk or run a program.
+[protocol "file"]
+	allow = never
+[protocol "ext"]
+	allow = never
+
+# The workspace reaches the container through virtiofs as the operator's own
+# uid (501:20) whatever uid wrote it, so git, running as 65534, would refuse it
+# as another owner's. Bookworm's git (2.39) matches a safe.directory exactly,
+# so only a repository whose top level is /workspace itself is admitted:
+# clone into it (git clone <url> .), not into a directory under it.
+[safe]
+	directory = /workspace

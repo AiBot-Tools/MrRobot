@@ -337,8 +337,8 @@ const Sandbox = z
   .object({
     driver: z.enum(['docker', 'apple-container']).default('docker'),
     // The worker image's NAME: the tag the image build script (egress plan I1,
-    // scripts/build-worker-image.sh, not yet written) gives what it builds, so
-    // that `docker images` shows which image is the kernel's. Never what a run
+    // scripts/build-worker-image.sh) gives what it builds, so that
+    // `docker images` shows which image is the kernel's. Never what a run
     // executes: a tag is whatever image was last given it on that VM, and a
     // name the VM lacks would be pulled.
     image: z.string().min(1),

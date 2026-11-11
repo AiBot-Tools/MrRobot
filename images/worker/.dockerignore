@@ -1,0 +1,5 @@
+# The build context is exactly what the Dockerfile copies (egress plan I1):
+# everything else under images/worker stays out, whatever lands here later.
+*
+!gitconfig
+!mux.mjs

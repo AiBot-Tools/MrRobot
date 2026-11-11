@@ -128,9 +128,8 @@ export function imageIdProblem(imageId: string | undefined): string | undefined 
       'sandbox.imageId is not set in config/kernel.yaml, which ships none: the worker image is built on the ' +
       "operator's VMs, and its id is theirs to pin. " +
       'The driver runs the worker image only by that pinned id, with --pull=never, and never pulls one, so no run ' +
-      'can be built until it is set. Build the image with scripts/build-worker-image.sh, which is still to be ' +
-      'written, on the trusted VM and load it into the hostile one, then set sandbox.imageId to the ' +
-      'sha256:<64 hex> id it prints'
+      'can be built until it is set. Build the image with scripts/build-worker-image.sh, which builds it on the ' +
+      'trusted VM and loads it into the hostile one, then set sandbox.imageId to the sha256:<64 hex> id it prints'
     )
   }
   if (!isImageId(imageId)) {

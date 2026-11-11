@@ -154,9 +154,31 @@ const McpServer = z
   })
   .strict()
 
+/**
+ * The server ids tool-views.yaml gives the kernel's own tools: `kernel`
+ * (src/runtime/kernel-tools.ts KERNEL_SERVER) and `sandbox`
+ * (src/runtime/sandbox-tools.ts SANDBOX_SERVER), held equal to both by
+ * test/config.test.ts. No MCP server may take either: the hub classifies a
+ * server's tools by the tool-views section of its own id, so an MCP server
+ * called sandbox would have its `exec` exposed to agents as sandbox.exec is,
+ * and the hub would run it, with none of the kernel's checks behind it.
+ */
+export const KERNEL_NATIVE_SERVERS: readonly string[] = ['kernel', 'sandbox']
+
 const Mcp = z
   .object({
     servers: z.record(z.string().min(1), McpServer).superRefine((servers, ctx) => {
+      for (const server of Object.keys(servers)) {
+        if (KERNEL_NATIVE_SERVERS.includes(server)) {
+          ctx.addIssue({
+            code: 'custom',
+            path: [server],
+            message:
+              `mcp server id ${server} is the kernel's own: tool-views.yaml's ${server} section classifies the ` +
+              "kernel's native tools, and an MCP server of that name would have its tools exposed by it. Name the server otherwise",
+          })
+        }
+      }
       for (const [server, entry] of Object.entries(servers)) {
         if (typeof entry.tokenEnv === 'string' && entry.tokenEnv.startsWith(PMMCP_PREFIX)) {
           ctx.addIssue({ code: 'custom', path: [server, 'tokenEnv'], message: prefixRefusal(server) })
@@ -262,6 +284,17 @@ const Goals = z
   })
   .strict()
 
+/**
+ * The longest delay a Node timer takes, 2^31 - 1 ms (about 24.8 days):
+ * setTimeout and socket.setTimeout given more fire after 1 ms, with a
+ * TimeoutOverflowWarning. Every delay kernel.yaml names that becomes a timer
+ * is bounded by it: an idle limit past it would revoke every grant as idle at
+ * once, and a container wallclock past it would kill every container 1 ms
+ * after it starts (the driver's wallclock is a setTimeout, docker.ts), so each
+ * is refused here, not discovered at the first grant or run.
+ */
+export const MAX_TIMER_MS = 2_147_483_647
+
 const SandboxDomain = z
   .object({
     dockerHost: z.string().startsWith('unix://'),
@@ -340,7 +373,11 @@ const Sandbox = z
           })
           .default('2g'),
         cpus: posInt().default(2),
-        wallclockMs: posInt().default(600_000),
+        // One container's hard wallclock, at most: sandbox.exec gives a
+        // container what is left of its run's budget, never more than this
+        // (src/runtime/sandbox-tools.ts). A timer's delay, so at most
+        // MAX_TIMER_MS.
+        wallclockMs: posInt().max(MAX_TIMER_MS).default(600_000),
       })
       .strict()
       .prefault({}),
@@ -520,14 +557,6 @@ const EgressBindings = z
       })
     }
   })
-
-/**
- * The longest delay a Node timer takes, 2^31 - 1 ms (about 24.8 days):
- * setTimeout and socket.setTimeout given more fire after 1 ms, with a
- * TimeoutOverflowWarning. An idle limit past it would revoke every grant as
- * idle at once, so it is refused here, not discovered at the first grant.
- */
-export const MAX_TIMER_MS = 2_147_483_647
 
 /**
  * A count or size the session holds a grant to (events/types.ts PROXY_LIMITS

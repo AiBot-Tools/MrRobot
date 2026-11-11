@@ -44,6 +44,9 @@ import {
 import { AgentRegistry } from '../src/agents/registry.js'
 import { loadSoul } from '../src/agents/souls.js'
 import { DENY_KEYS, TOKEN_PATTERNS } from '../src/events/redact.js'
+import { APPROVAL_PREVIEW_BYTES } from '../src/policy/engine.js'
+import { CAPTURE_EDGE_BYTES, DOCKER_CLI_FAILED, KILL_WAIT_MS, STREAM_WINDOW_BYTES } from '../src/runtime/sandbox-tools.js'
+import { CAPTURE_MAX_BYTES } from '../src/sandbox/driver.js'
 import { FORCE_QUIT_LOG, PMMCP_OLLAMA_NAMES } from '../scripts/install/force-quit.js'
 import { DOCKER_NAMES } from '../scripts/install/preflight.js'
 import { credentialNames, gitignoresDotenv, parseDotenv, PLACEHOLDER_PREFIX } from '../src/secrets/dotenv.js'
@@ -331,16 +334,64 @@ test("README names no egress proxy, and its sandbox record says the internal net
   assert.doesNotMatch(bullet, /Today the internal network is/, bullet)
 })
 
+test("README's agents section: 'Both carry' follows the paragraph on the two shipped agents, and sandbox.exec's paragraph says how it ends a container and what a human approving one is shown", () => {
+  // 'Both' means researcher and writer: a paragraph set between it and the
+  // one that names them makes it read as the two of something else.
+  const paragraphs = read('README.md').split(/\n\s*\n/).map((p) => p.replace(/\s+/g, ' ').trim())
+  const neither = paragraphs.findIndex((p) => p.includes('Neither agent declares a `sandbox:`'))
+  assert.ok(neither > 0, "README has no 'Neither agent declares a `sandbox:`' paragraph")
+  assert.match(paragraphs[neither + 1] ?? '', /^Both carry `tools\.allow: \[\]`/, "the paragraph after 'Neither agent declares' is not 'Both carry'")
+  const sandbox = paragraphs.find((p) => p.startsWith('Sandbox tools are checked at load as egress is (egress plan S3).'))
+  assert.ok(sandbox !== undefined, "README has no sandbox.exec paragraph")
+  assert.ok(paragraphs.indexOf(sandbox) > neither + 1, "the sandbox.exec paragraph sits before 'Both carry'")
+  for (const fact of [
+    `kills the container by name before that end when the docker client ended with no exit status or with ${String(DOCKER_CLI_FAILED)} (its own failure`,
+    `it waits ${String(KILL_WAIT_MS / 1_000)} s at most for that kill, so that kill never holds the run.`,
+    // The bound is the kill's only: the driver's result is not bounded yet.
+    "The driver's own result is still awaited with no such bound",
+    'holds the call, and the run, past that wallclock until the wiring task (egress plan W1) bounds the wait.',
+    `An exec whose arguments the approval preview would cut (${String(APPROVAL_PREVIEW_BYTES)} bytes of their canonical JSON), would redact`,
+    'never runs, even once approved: the gate is generic, so the human is still asked first, and the runner refuses the call after.',
+    '`npm run cli -- search --type approval.requested --run <runId> --limit 1`',
+    "Each output stream keeps its own share of the result, counted in the bytes it takes in the log's JSON.",
+    `Of each stream the runner reads and redacts at most ${String(STREAM_WINDOW_BYTES / 1_024)} KiB (the largest share and ${String(CAPTURE_EDGE_BYTES / 1_024)} KiB more):`,
+    `all of a shorter one, the end of a longer one, and the start of one the driver capped at ${String(CAPTURE_MAX_BYTES / 1_048_576)} MiB,`,
+    `not the ${String(CAPTURE_EDGE_BYTES / 1_024)} KiB there, nor anything past a private key block's marker whose other marker the cut left out.`,
+    "`tool.result`'s `bytes` and `sha256` are of what was read, redacted.",
+  ]) {
+    assert.ok(sandbox.includes(fact), `README's sandbox.exec paragraph does not say: ${fact}`)
+  }
+  // The runner refuses after the human is asked, so a human does approve a
+  // command the runner then refuses: the paragraph must not say otherwise.
+  assert.doesNotMatch(sandbox, /never approves a command/)
+  // Nor that the kill's bound frees a run whose driver never answers.
+  assert.doesNotMatch(sandbox, /a daemon that never answers cannot hold/)
+})
+
 test('.npmrc keeps npm\'s cache in the program folder', () => {
   // npm resolves a relative path config against the shell's cwd
   // (@npmcli/config parse-field.js), so the README says to run npm from the root.
   assert.match(read('.npmrc'), /^cache=\.aos\/npm-cache$/m)
 })
 
-test('config/tool-views.yaml: pmmcp pins nineteen closed, and only the two kernel tools are exposed', () => {
+test('config/tool-views.yaml: pmmcp pins nineteen closed, and only the two kernel tools and sandbox.exec are exposed', () => {
   const file = parseToolViews(readYaml('config/tool-views.yaml'))
   const servers = Object.keys(file.servers).sort()
-  assert.deepEqual(servers, ['kernel', 'pmmcp'])
+  assert.deepEqual(servers, ['kernel', 'pmmcp', 'sandbox'])
+
+  // The sandbox section (egress plan S3, the operator's acceptance of
+  // 2026-11-09): exec and nothing else, write risk so a tainted run needs a
+  // human for it, and taints: true, so the first exec of a run makes every
+  // later write in it, the next exec among them, wait for a human.
+  const exposedSandbox = Object.entries(file.servers['sandbox']!.tools).filter(([, v]) => v.exposure === 'agent')
+  assert.deepEqual(exposedSandbox.map(([n]) => n), ['exec'])
+  const exec = resolveView(file, 'sandbox', 'exec')
+  assert.deepEqual(
+    { exposure: exec.exposure, risk: exec.risk, taints: exec.taints, quarantine: exec.quarantine },
+    { exposure: 'agent', risk: 'write', taints: true, quarantine: false },
+  )
+  assert.equal(file.servers['sandbox']!.default, 'kernel-only')
+  assert.equal(resolveView(file, 'sandbox', 'publish').exposure, 'kernel-only', 'sandbox.publish is task S4, not yet classified')
 
   // The kernel section: exactly the two delegation tools, both `write` so a
   // tainted orchestrator needs a human for either. Anything else appearing here
@@ -529,6 +580,15 @@ test('agents/*/agent.yaml parse against the shipped providers and tool-views; th
     // widens what an agent reaches, which waits on the Phase 2 exit (the
     // egress plan's operator decision on shipping a coder manifest).
     assert.deepEqual(record.manifest.egress, { allow: [], bind: [] }, `${record.manifest.id} ships with egress`)
+    // Nor a sandbox: block or a sandbox tool (egress plan S3): sandbox.exec
+    // is built but not wired into the daemon (W1), and a manifest that lists
+    // it waits on the Phase 2 exit, as egress does.
+    assert.equal(record.manifest.sandbox, undefined, `${record.manifest.id} ships with a sandbox: block`)
+    assert.deepEqual(
+      record.manifest.tools.allow.filter((ref) => ref.startsWith('sandbox.')),
+      [],
+      `${record.manifest.id} ships with a sandbox tool`,
+    )
     const soul = loadSoul(join(REPO, 'souls'), record.manifest.soul, { used: 0 })
     assert.equal(soul.missing, false, `${record.manifest.id} names a missing soul ${record.manifest.soul}`)
     assert.equal(soul.truncated, false, `${record.manifest.soul} exceeds the soul budget`)

@@ -16,6 +16,10 @@
 // Archive never deletes. Files stay on disk and history is kept, because an
 // audit of what an agent did needs the manifest it did it under.
 //
+// Sandbox tools (`sandbox.exec`) are held here too: only a worker with a
+// sandbox: block, at tier 2 or more, may list one (sandboxToolProblem), so no
+// other agent is ever offered one.
+//
 // Cross-file checks happen at load, not at first use. A model reference with
 // no provider entry, or a tool the views make kernel-only, is a configuration
 // error someone should see while reading config — not a mid-run failure.
@@ -33,6 +37,7 @@ import type { EventStore } from '../events/store.js'
 import { resolveView, type ToolViewsFile } from '../mcp/tool-views.js'
 import { resolveCaps, type KernelBudgets } from '../runtime/budget.js'
 import { KERNEL_SERVER } from '../runtime/kernel-tools.js'
+import { SANDBOX_SERVER, sandboxToolProblem } from '../runtime/sandbox-tools.js'
 import { parseManifest, Tier, type AgentManifest } from './manifest.js'
 
 export interface AgentRecord {
@@ -233,6 +238,10 @@ export class AgentRegistry {
         )
       }
     }
+    // Before the tier rule, so a sandbox tool below tier 2 is refused in the
+    // sandbox's own words rather than only as a write tool too high for its tier.
+    const sandboxed = this.#sandboxToolProblem(manifest)
+    if (sandboxed !== undefined) throw new ConfigError(`${source}: ${sandboxed}`)
     const tiered = this.#tierToolProblem(manifest)
     if (tiered !== undefined) throw new ConfigError(`${source}: ${tiered}`)
 
@@ -241,6 +250,24 @@ export class AgentRegistry {
 
     const egress = this.#egressProblem(manifest)
     if (egress !== undefined) throw new ConfigError(`${source}: ${egress}`)
+  }
+
+  /**
+   * Why `manifest` may not hold the sandbox tools it lists, or undefined.
+   * Sandbox tools (`sandbox.exec`) run a worker's commands in a container of
+   * its own domain, so only a manifest sandboxToolProblem admits may list one:
+   * a worker, with a sandbox: block, at tier 2 or more. The loop offers a tool
+   * only to a manifest that lists it, so no other agent is ever offered one;
+   * the runner asks again at each call. Asked at load and of every spawned
+   * child, which keeps its template's role and sandbox but may lower its tier.
+   */
+  #sandboxToolProblem(manifest: AgentManifest): string | undefined {
+    for (const ref of manifest.tools.allow) {
+      if (ref.slice(0, ref.indexOf('.')) !== SANDBOX_SERVER) continue
+      const why = sandboxToolProblem(manifest)
+      if (why !== undefined) return `tools.allow names ${ref}: ${why}`
+    }
+    return undefined
   }
 
   /**
@@ -494,10 +521,13 @@ export class AgentRegistry {
     }
 
     // The template passed these at load; a child that lowered its tier below
-    // egress's while keeping the template's hosts, or below a tool's risk
-    // while keeping the template's tools, would not.
+    // egress's while keeping the template's hosts, below a sandbox tool's while
+    // keeping the template's, or below a tool's risk while keeping the
+    // template's tools, would not.
     const egressProblem = this.#egressProblem(manifest)
     if (egressProblem !== undefined) return this.#rejectSpawn(input.templateId, egressProblem)
+    const sandboxProblem = this.#sandboxToolProblem(manifest)
+    if (sandboxProblem !== undefined) return this.#rejectSpawn(input.templateId, sandboxProblem)
     const toolProblem = this.#tierToolProblem(manifest)
     if (toolProblem !== undefined) return this.#rejectSpawn(input.templateId, toolProblem)
 

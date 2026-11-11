@@ -20,6 +20,7 @@ import {
   DEFAULT_BASIC_USER,
   EGRESS_MUX_PORT,
   EGRESS_PUSH_PREFIX,
+  KERNEL_NATIVE_SERVERS,
   KernelConfig,
   MAX_TIMER_MS,
   assertAosEntry,
@@ -35,6 +36,8 @@ import { pushBranchPrefix } from '../src/egress/routes.js'
 import { PROXY_LIMITS } from '../src/events/types.js'
 import { tmpdir } from './helpers/tmpdir.js'
 import { homeDirectory } from '../src/agents/protected.js'
+import { KERNEL_SERVER } from '../src/runtime/kernel-tools.js'
+import { SANDBOX_SERVER } from '../src/runtime/sandbox-tools.js'
 
 // The real checkout, wherever it is: the location rules read its .gitignore.
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -556,6 +559,40 @@ test('sandbox.defaults.user is never root or its group, and memory is a positive
   written.sandbox.defaults['memory'] = defaults.memory
   assert.deepEqual([defaults.user, defaults.memory], ['65534:65534', '2g'])
   assert.doesNotThrow(() => parse(written))
+})
+
+test("sandbox.defaults.wallclockMs is a timer's delay: at most MAX_TIMER_MS, at the bound and one past it", () => {
+  // Egress plan S3: sandbox.exec gives a container min(what is left of its
+  // run's budget, this), and the driver's wallclock is a setTimeout, which
+  // Node fires after 1 ms given more than 2^31 - 1 ms: 30 days here would kill
+  // every container 1 ms after it starts.
+  const at = (wallclockMs: unknown): unknown => {
+    const doc = fixture('valid.yaml') as { sandbox: { defaults: Record<string, unknown> } }
+    doc.sandbox.defaults['wallclockMs'] = wallclockMs
+    return doc
+  }
+  assert.equal(parse(at(MAX_TIMER_MS)).sandbox.defaults.wallclockMs, MAX_TIMER_MS)
+  for (const wallclockMs of [MAX_TIMER_MS + 1, 2_592_000_000, 0, -1, 1.5]) {
+    assert.match(invalid(() => parse(at(wallclockMs)), `wallclockMs ${String(wallclockMs)}`), /"wallclockMs"/)
+  }
+  // The shipped default is well inside it.
+  assert.equal(parse(fixture('minimal.yaml')).sandbox.defaults.wallclockMs, 600_000)
+})
+
+test("no MCP server may take the id of the kernel's own tools: kernel or sandbox", () => {
+  // The hub classifies a server's tools by the tool-views section of its own
+  // id, so an MCP server called sandbox would have its exec exposed to agents
+  // as the kernel's sandbox.exec is, and the hub would run it with none of the
+  // kernel's checks; one called kernel would be offered adopt_plan and
+  // delegate under the kernel's names.
+  assert.deepEqual([...KERNEL_NATIVE_SERVERS].sort(), [KERNEL_SERVER, SANDBOX_SERVER].sort())
+  for (const server of KERNEL_NATIVE_SERVERS) {
+    const message = invalid(() => parse(declaringTokenEnv('AOS_OTHER_TOKEN', server)), server)
+    assert.ok(message.includes(`mcp server id ${server} is the kernel's own`), message)
+  }
+  // Only those spellings: the section a server reads is found by its id exactly.
+  assert.doesNotThrow(() => parse(declaringTokenEnv('AOS_OTHER_TOKEN', 'Sandbox')))
+  assert.doesNotThrow(() => parse(declaringTokenEnv('AOS_OTHER_TOKEN', 'sandboxes')))
 })
 
 test('sandbox.imageId must be sha256:<64 hex>', () => {

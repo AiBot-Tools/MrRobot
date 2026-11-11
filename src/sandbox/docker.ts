@@ -667,26 +667,8 @@ export function auditRunArgs(
   imageId: string | undefined,
   channel = false,
 ): void {
-  for (const arg of args) {
-    for (const bad of FORBIDDEN_FLAGS) {
-      if (arg === bad || arg.startsWith(`${bad}=`)) {
-        throw new ConfigError(`docker args contain ${bad}, which invariant 9 forbids`)
-      }
-    }
-    for (const bad of FORBIDDEN_SUBSTRINGS) {
-      if (arg.includes(bad)) {
-        throw new ConfigError(`docker args mention ${bad}: a container may never reach the daemon`)
-      }
-    }
-  }
-
-  const mounts = args.filter((a) => a === '--mount').length
-  const volumes = args.filter((a) => a === '-v' || a === '--volume').length
-  if (mounts !== 1 || volumes !== 0) {
-    throw new ConfigError(
-      `docker args must carry exactly one --mount and no -v (found ${String(mounts)} and ${String(volumes)})`,
-    )
-  }
+  const scanned = wholeArgvRefusal(args)
+  if (scanned !== undefined) throw new ConfigError(scanned)
 
   // The home directory, never — not as the workspace and not smuggled into a
   // command argument. An empty HOME would make this vacuous, so it is skipped
@@ -726,18 +708,20 @@ export function auditRunArgs(
   // `ls -t` and `ssh -p` are not docker's -e, -t and -p, and nothing from here
   // on reads them so.
   //
-  // The whole-argv scans above still do: FORBIDDEN_FLAGS, the --mount and -v
-  // count and the home check read the command too, so `grep -v x` is refused
-  // as a second mount, `python train.py --device cpu` as a device and
-  // `--privileged` as a command argument as the flag. That over-refusal is
-  // kept on purpose until the operator decides otherwise (it narrows an
-  // invariant 9 check), and the decision is one for the count and
-  // FORBIDDEN_FLAGS together, both of which read what docker obeys: when
-  // sandbox.exec commands are exposed (S3), they may move before the image,
-  // where WIDENING and RUN_OPTIONS already read every element. Until then
-  // FORBIDDEN_FLAGS stays whole-argv like the count. FORBIDDEN_SUBSTRINGS and
-  // the home check stay whole-argv in either case: what they refuse is a path
-  // the command itself could name, the docker socket or the operator's home.
+  // The whole-argv scans above still do (wholeArgvRefusal): FORBIDDEN_FLAGS,
+  // the --mount and -v count and the home check read the command too, so
+  // `grep -v x` and `go test -v` are refused as a second mount,
+  // `python train.py --device cpu` as a device and `--privileged` as a
+  // command argument as the flag. That over-refusal is kept on purpose until
+  // the operator decides otherwise (it narrows an invariant 9 check), and the
+  // decision is one for the count and FORBIDDEN_FLAGS together, both of which
+  // read what docker obeys: now that sandbox.exec hands the model's commands
+  // to the driver (S3, which reports such a refusal as a refused call), they
+  // may move before the image, where WIDENING and RUN_OPTIONS already read
+  // every element. Until then FORBIDDEN_FLAGS stays whole-argv like the count.
+  // FORBIDDEN_SUBSTRINGS and the home check stay whole-argv in either case:
+  // what they refuse is a path the command itself could name, the docker
+  // socket or the operator's home.
   if (args[0] !== 'run') {
     throw new ConfigError(`docker args must start with run (found ${JSON.stringify(args[0] ?? '')})`)
   }
@@ -796,6 +780,43 @@ export function auditRunArgs(
   for (const option of CAP_VALUES.keys()) assertCapValue(option, values.get(option) ?? '')
   assertTheMount(mount ?? '', workspace)
   assertTheNetwork(values.get('--network') ?? '')
+}
+
+/**
+ * The audit's first scans, over every element of the argv, the command's
+ * included: a forbidden flag or the docker socket anywhere, and other than
+ * exactly one --mount and no -v. What they refuse, in the words auditRunArgs
+ * throws, or undefined.
+ *
+ * Whole-argv on purpose, so that they read what a builder edit could put
+ * anywhere, and so they also refuse ordinary commands (`grep -v x` as a
+ * second mount, `go test -v` too, `python train.py --device cpu` as a
+ * device): an over-refusal kept until the operator decides whether they move
+ * before the image (the comment in auditRunArgs). sandbox.exec reports one as
+ * a refused call. The tests' fake driver asks this of a spec's command beside
+ * the one --mount the builder writes, so a runtime test meets the refusal the
+ * real driver gives.
+ */
+export function wholeArgvRefusal(args: readonly string[]): string | undefined {
+  for (const arg of args) {
+    for (const bad of FORBIDDEN_FLAGS) {
+      if (arg === bad || arg.startsWith(`${bad}=`)) {
+        return `docker args contain ${bad}, which invariant 9 forbids`
+      }
+    }
+    for (const bad of FORBIDDEN_SUBSTRINGS) {
+      if (arg.includes(bad)) {
+        return `docker args mention ${bad}: a container may never reach the daemon`
+      }
+    }
+  }
+
+  const mounts = args.filter((a) => a === '--mount').length
+  const volumes = args.filter((a) => a === '-v' || a === '--volume').length
+  if (mounts !== 1 || volumes !== 0) {
+    return `docker args must carry exactly one --mount and no -v (found ${String(mounts)} and ${String(volumes)})`
+  }
+  return undefined
 }
 
 /**

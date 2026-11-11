@@ -691,10 +691,59 @@ kernel's egress engine is not wired to enforce one), or a `schedule:` (the only 
 one, and an unattended run that can reach it can empty an envelope).
 
 Both carry `tools.allow: []`, which is the honest state and not an oversight:
-`tool-views.yaml` exposes nothing to agents, and the registry refuses a manifest
-that names a tool the views withhold. So today the difference between the two is
+`tool-views.yaml` exposes no pmmcp tool to agents, `sandbox.exec` needs the
+`sandbox:` block neither declares, and the registry refuses a manifest that
+names a tool the views withhold. So today the difference between the two is
 enforced in three places and observable in none — each agent's `AGENTS.md` says so
 rather than implying a capability that is not wired.
+
+Sandbox tools are checked at load as egress is (egress plan S3). `sandbox.exec`, on
+`tool-views.yaml`'s `sandbox` server as `write` with `taints: true`, runs one
+command in one container of the caller's own sandbox domain: the pinned image by
+id, `--network none` and no channel (so no egress, whatever the manifest says),
+the run's own workspace `<mountRoot>/<runId>` at `/workspace`, and a hard
+wallclock of what is left of the run's budget, at most
+`sandbox.defaults.wallclockMs` (itself at most 2^31 - 1 ms, a timer's limit).
+It logs `sandbox.started` and `sandbox.killed` between `tool.call` and
+`tool.result`, and kills the container by name before that end when the docker
+client ended with no exit status or with 125 (its own failure, a lost daemon
+connection among them), since such a client may leave its container running;
+it waits 10 s at most for that kill, so that kill never holds the run. The
+driver's own result is still awaited with no such bound: the docker CLI holds
+it until it closes, and the container's wallclock is a kill by name through
+the same daemon, so a daemon that accepts and never answers (a paused Colima
+VM) holds the call, and the run, past that wallclock until the wiring task
+(egress plan W1) bounds the wait. Its output taints the run, so every exec
+after the first in a run, and every other write, waits for a human. An exec
+whose arguments the approval preview would cut (500 bytes of their canonical
+JSON), would redact (a span shaped like a credential is shown as
+`[REDACTED]`, and the PEM pattern hides everything between its markers), or
+would show with a character a screen hides or reorders text by (a bidi, format
+or C1 control, a line separator, or another default-ignorable code point: a
+Hangul filler, a variation selector, so an emoji written with VS16 too) never
+runs, even once approved: the gate is generic, so the human is still asked
+first, and the runner refuses the call after. `aos approvals` does not show
+what an approval would run (protocol v1's `ApprovalItem` carries no preview, and
+adding one is a protocol version bump for the operator), so before
+`aos approve` on an exec, read the command it was shown in its
+`approval.requested` row: `npm run cli -- search --type approval.requested
+--run <runId> --limit 1`. Each output stream keeps its own share of the
+result, counted in the bytes it takes in the log's JSON. Of each stream the
+runner reads and redacts at most 74 KiB (the largest share and 16 KiB more):
+all of a shorter one, the end of a longer one, and the start of one the driver
+capped at 1 MiB, since `redact.ts`'s PEM pattern takes time quadratic in BEGIN
+lines with no END (a MiB of them would hold the daemon's event loop some 11 s).
+A window is never shown on the side its cut is on, as that cut, like the
+driver's, is made before redaction and may split a credential: not the 16 KiB
+there, nor anything past a private key block's marker whose other marker the
+cut left out. A window that redaction shrinks is shown less of, never more;
+`tool.result`'s `bytes` and `sha256` are of what was read, redacted. Only a
+worker with a `sandbox:` block at tier 2 or more may list it; the registry
+refuses it in any other manifest, at load and in a spawned child, and no MCP
+server may be named `sandbox` or `kernel`. The runner
+(`src/runtime/sandbox-tools.ts`) is built and tested against the fake driver,
+and not yet wired into the daemon (egress plan
+W1); no shipped manifest lists it.
 
 ### Goals
 

@@ -95,6 +95,9 @@ sandbox:
     pidsLimit: 256
     memory: 2g
     cpus: 2
+    # One container's hard wallclock, at most: sandbox.exec gives a container
+    # what is left of its run's budget, never more than this. A timer's delay,
+    # so at most 2147483647 (about 24.8 days).
     wallclockMs: 600000
 
 # What the kernel's egress engine may do for a sandboxed run (egress plan,

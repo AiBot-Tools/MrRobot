@@ -760,16 +760,25 @@ test('no source file writes to souls/ or AGENTS.md', () => {
   // put a model's persona one bug away from being editable by the model.
   const WRITE = /\b(writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream|writeSync|rmSync|unlinkSync|renameSync|mkdirSync|chmodSync|fchmodSync|copyFileSync|truncateSync)\s*\(/
 
-  // Only four modules in src/ write to the filesystem at all. Three write
-  // under the data directory; the fourth is the .env writer, which writes
-  // <repo>/.env and nothing else (its own rules below). A fifth is a new writer
-  // and must be looked at.
+  // Only five modules in src/ write to the filesystem at all. Three write
+  // under the data directory; one is the .env writer, which writes
+  // <repo>/.env and nothing else (its own rules below); and sandbox.exec makes
+  // a run's workspace, one directory <mountRoot>/<runId> under a sandbox
+  // domain's mountRoot, and nothing else (egress plan S3). A sixth is a new
+  // writer and must be looked at.
   assert.deepEqual(pathsOf(hits(SRC, WRITE)), [
     'src/events/anchor.ts',
     'src/kernel.ts',
     'src/models/probe.ts',
+    'src/runtime/sandbox-tools.ts',
     'src/secrets/dotenv-append.ts',
   ])
+  const sandboxWrites = hits(SRC.filter((f) => f.path === 'src/runtime/sandbox-tools.ts'), WRITE)
+  assert.deepEqual(
+    sandboxWrites.map((h) => h.replace(/^[^ ]+ +/, '')),
+    ['mkdirSync(workspace, { mode: 0o700 })'],
+    'sandbox-tools.ts writes only the run workspace it names',
+  )
 
   // No write call site anywhere mentions a protected path.
   const suspicious = hits(SRC, WRITE).filter((h) => /soul|AGENTS|agent\.yaml/i.test(h))

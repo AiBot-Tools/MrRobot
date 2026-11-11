@@ -16,7 +16,7 @@ import { randomUUID } from 'node:crypto'
 
 import { PolicyDenied } from '../errors.js'
 import { canonicalize, sha256Hex } from '../events/canonical.js'
-import { boundOutput } from '../events/bound.js'
+import { boundOutput, type BoundedOutput } from '../events/bound.js'
 import type { EventStore } from '../events/store.js'
 import { decide, type GateInput } from './gate.js'
 import type { Approvals } from './approvals.js'
@@ -32,6 +32,34 @@ export interface GateTicket {
 /** The hash a ticket is bound to. Canonical, so key order cannot change it. */
 export function hashArgs(args: Record<string, unknown>): string {
   return sha256Hex(canonicalize(args))
+}
+
+/**
+ * The most bytes of a call's arguments a human asked to approve it is shown
+ * (approval.requested's argsPreview): redacted canonical JSON, cut past this.
+ * A tool whose arguments a human must see whole holds them to it before it
+ * runs anything (sandbox.exec, src/runtime/sandbox-tools.ts), since the ticket
+ * binds the whole arguments, the part the preview cut among them.
+ *
+ * It cannot be widened far. approval.requested stores the preview, itself
+ * canonical JSON, inside its own canonical JSON, where every byte of it may
+ * take two (a backslash the preview already shows as two takes four), and
+ * the store refuses a payload past MAX_LOGGED_OUTPUT: a bound past about half
+ * of that less the envelope, some 32 KiB, makes this append throw for a
+ * backslash-only command, and the run fail where it should ask a human.
+ * test/sandbox-exec.test.ts holds the bound with such a command. A widened
+ * preview needs sandbox.exec's MAX_EXEC_BYTES lowered to match.
+ *
+ * Redaction can hide part of what a human is asked to approve, for any tool:
+ * a span shaped like a credential is shown as [REDACTED], and the PEM pattern
+ * hides everything between its markers. sandbox.exec refuses arguments whose
+ * preview redaction changed; the gate does not, for any other tool.
+ */
+export const APPROVAL_PREVIEW_BYTES = 500
+
+/** What approval.requested shows a human of `args`, and whether that is all of them. */
+export function approvalPreview(args: Record<string, unknown>): BoundedOutput {
+  return boundOutput(canonicalize(args), APPROVAL_PREVIEW_BYTES)
 }
 
 export interface EngineOptions {
@@ -78,7 +106,7 @@ export class PolicyEngine {
     }
 
     if (verdict.decision === 'needs-human') {
-      const preview = boundOutput(canonicalize(input.args), 500)
+      const preview = approvalPreview(input.args)
       const { request, outcome } = this.#approvals.request({
         runId: input.scope.runId,
         toolRef: input.toolRef,

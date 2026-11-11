@@ -16,6 +16,9 @@
 //   refuses it.
 //
 // Where the real driver refuses or reports something, so does this: a spec
+// whose command the audit's whole-argv scans refuse (a forbidden flag, the
+// docker socket, a --mount or a -v anywhere in it, so `go test -v` too) is
+// refused in its words (wholeArgvRefusal, src/sandbox/docker.ts); a spec
 // whose image is not the pinned id, exactly, is refused, a tag among them, and
 // every spec while no valid id is pinned, with the real driver's own words
 // (imageRefusal, src/sandbox/limits.ts); a probe scripted ok reports the
@@ -49,6 +52,8 @@
 // while the name is held but before the CLI's exit is credited with a 137
 // that follows it (killedBy requested, SIGKILL): a run a kill ends is
 // scripted `hangs` here.
+// And a command that names the operator's home, which the real driver's audit
+// refuses and the fake, which does not know the home, runs.
 // And the reason a probe gives with no valid id pinned and a probe scripted
 // not ok (or none scripted): the scripted (or default) reason here, where the
 // real driver names sandbox.imageId before asking any daemon anything.
@@ -121,6 +126,7 @@ import {
   type SandboxResult,
   type SandboxSpec,
 } from '../../src/sandbox/driver.js'
+import { wholeArgvRefusal } from '../../src/sandbox/docker.js'
 import { imageIdProblem, imageRefusal } from '../../src/sandbox/limits.js'
 
 export interface ScriptedExit {
@@ -494,6 +500,13 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
       // with no scripted exit spent on it.
       const refusedChannel = channelRefusal(spec)
       if (refusedChannel !== undefined) throw new ConfigError(refusedChannel)
+      // As the real driver's audit does first (wholeArgvRefusal), over the
+      // argv its builder writes: a command that carries a forbidden flag, the
+      // docker socket, a --mount or a -v is refused, `go test -v` among them,
+      // with no scripted exit spent on it. The one --mount stands for the
+      // builder's own, which with the rest of its options passes these scans.
+      const scanned = wholeArgvRefusal(['--mount', ...spec.command])
+      if (scanned !== undefined) throw new ConfigError(scanned)
       // As the real driver's audit does (buildRunArgs): the image must be the
       // pinned id, exactly, and with none pinned no run is built at all.
       // Refused before anything starts, with no scripted exit spent on it.

@@ -29,7 +29,8 @@ import { WebSocket } from 'ws'
 import { createServer, type IncomingHttpHeaders } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
-import { bootKernel, configHash, defaultDriver, STUBS, SUBSYSTEM_ORDER } from '../src/kernel.js'
+import { bootKernel, callTaints, configHash, defaultDriver, project, STUBS, SUBSYSTEM_ORDER } from '../src/kernel.js'
+import { parseToolViews } from '../src/mcp/tool-views.js'
 import { isClean, projectRecovery } from '../src/events/projections.js'
 import { rebuildFromLog as rebuildApprovals } from '../src/policy/approvals.js'
 import { rebuildFromLog as rebuildQuarantine } from '../src/policy/quarantine.js'
@@ -61,6 +62,7 @@ import { freshProbe } from './helpers/probe.js'
 import { writeProbeRecord } from '../src/models/probe.js'
 import { mockMcp } from './helpers/mock-mcp.js'
 import { MIN_MASK_LENGTH, SecretMask } from '../src/events/redact.js'
+import { connectControl } from '../src/cli/client.js'
 
 
 /** Rows as bootKernel sees them: read-only reopen, ordered by seq. */
@@ -1086,6 +1088,91 @@ test('a scheduled agent fires through a real kernel on the minute it matches', a
   verifyAt(fx.dbPath)
 })
 
+test('a run killed while it waits for its lane: run.get shows it finished, and the scheduler no longer finds its agent busy', async (t) => {
+  // Run A of researcher holds the agent's lane, in a model call; run B of
+  // researcher queues behind it, and `aos kill B` arrives. B never starts.
+  // Its run.finished is what the daemon's run view and the scheduler's busy
+  // check read: without it B stays queued for the kernel's life and every
+  // scheduled job of researcher is skipped until a restart.
+  let clock = Date.parse('2026-09-28T09:00:00')
+  const agentsDir = join(tmpdir(t), 'agents')
+  for (const id of ['ceo', 'worker-template', 'researcher']) {
+    mkdirSync(join(agentsDir, id, 'history'), { recursive: true })
+    const shipped = readFileSync(join(REPO_ROOT, 'agents', id, 'agent.yaml'), 'utf8')
+    writeFileSync(join(agentsDir, id, 'agent.yaml'), id === 'researcher' ? `${shipped}\nschedule: "* * * * *"\n` : shipped)
+    writeFileSync(join(agentsDir, id, 'AGENTS.md'), `# ${id}\n`)
+  }
+  const provider = fakeProvider([anthropicEndTurn({ text: 'A' }), anthropicEndTurn({ text: 'scheduled' })])
+  let release: () => void = () => undefined
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let calls = 0
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    calls += 1
+    if (calls === 1) await held
+    return provider.fetch(input, init)
+  }
+  const { kernel, fx } = await withKernel(t, {
+    agentsDir,
+    env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-9c1f0b' },
+    fetch,
+    now: () => clock,
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+  t.after(() => release())
+  // Bounded, so a run that never ends fails the test, saying which, rather
+  // than hang the file.
+  const seen = (type: string, runId?: string): Promise<void> =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        stop()
+        reject(new Error(`no ${type}${runId === undefined ? '' : ` for ${runId}`} within 10 s`))
+      }, 10_000)
+      timer.unref?.()
+      const stop = kernel.store.subscribe((row) => {
+        if (row.type !== type || (runId !== undefined && row.runId !== runId)) return
+        clearTimeout(timer)
+        stop()
+        resolve()
+      })
+    })
+
+  const client = await connectControl({ port: kernel.port, token: TEST_TOKEN, timeoutMs: 20_000 })
+  t.after(() => client.close())
+  const inCall = seen('llm.request')
+  const a = (await client.call('run.start', { agentId: 'researcher', input: 'first' })) as { runId: string }
+  await inCall
+  const b = (await client.call('run.start', { agentId: 'researcher', input: 'second' })) as { runId: string }
+  const bEnded = seen('run.finished', b.runId)
+  const killed = (await client.call('run.kill', { runId: b.runId })) as { status: string }
+  await bEnded
+  const detailB = (await client.call('run.get', { runId: b.runId })) as Record<string, unknown>
+  const aWhileB = (await client.call('run.get', { runId: a.runId })) as Record<string, unknown>
+
+  const aEnded = seen('run.finished', a.runId)
+  release()
+  await aEnded
+  // The next minute: researcher has no run in flight, so its job fires.
+  clock += 60_000
+  const scheduledEnded = seen('run.finished')
+  const fired = kernel.scheduler.tick()
+  await scheduledEnded
+
+  assert.equal(killed.status, 'queued')
+  assert.deepEqual(
+    [detailB['status'], detailB['reason'], detailB['llmCalls'], detailB['toolCalls'], detailB['costMicroUsd']],
+    ['finished', 'requested', 0, 0, 0],
+  )
+  assert.equal(aWhileB['status'], 'running')
+  assert.deepEqual(fired, ['researcher'], 'the scheduler still found researcher busy')
+  const bRows = rows(fx.dbPath).filter((r) => r.type.startsWith('run.') && (JSON.parse(r.payload) as { runId?: string }).runId === b.runId)
+  assert.deepEqual(bRows.map((r) => r.type), ['run.queued', 'run.finished'])
+  assert.equal(provider.requests.length, 2, 'B called the model')
+})
+
 test('envFallback:true shows secrets degraded in status.get', async (t) => {
   // D8: while env fallback is on, a credential MAY come from the environment
   // rather than the vault. A kernel reporting ready in that state would be
@@ -1342,6 +1429,54 @@ function offeredNames(body: unknown): string[] {
   return tools.map((tool) => tool.name)
 }
 
+test("the daemon's run view is tainted by every row that taints a run in the loop, and by no other", () => {
+  // runs.list and run.get show what the gate reads. A run the loop gates as
+  // tainted and the view shows clean leaves the operator approving its next
+  // write in the belief that nothing untrusted reached it.
+  const views = parseToolViews({
+    version: 1,
+    servers: {
+      pmmcp: {
+        default: 'kernel-only',
+        tools: {
+          scrape: { exposure: 'agent', risk: 'read', taints: true, namespaceArg: 'none' },
+          recall: { exposure: 'agent', risk: 'read', namespaceArg: 'none' },
+        },
+      },
+    },
+  })
+  const clean = {
+    runId: 'run_v',
+    agentId: 'coder',
+    status: 'running' as const,
+    taint: 'clean' as const,
+    llmCalls: 0,
+    toolCalls: 0,
+    costMicroUsd: 0,
+    lastEventSeq: 0,
+  }
+  const after = (type: string, payload: Record<string, unknown>): string =>
+    project(clean, type, JSON.stringify({ schemaVersion: 1, ...payload }), 1, '2026-11-12T00:00:00.000Z', (ref) => callTaints(views, ref)).taint
+  // A sandbox tool's call always taints, whatever a view says of it: the
+  // runner marks every call it logs, refused or not.
+  assert.equal(callTaints(views, 'sandbox.exec'), true)
+  assert.equal(after('tool.call', { ticketId: 't1', toolRef: 'sandbox.exec', argsHash: 'h', quarantine: false }), 'tainted')
+  // Another tool's, as its view says.
+  assert.equal(after('tool.call', { ticketId: 't2', toolRef: 'pmmcp.scrape', argsHash: 'h', quarantine: false }), 'tainted')
+  assert.equal(after('tool.call', { ticketId: 't3', toolRef: 'pmmcp.recall', argsHash: 'h', quarantine: false }), 'clean')
+  assert.equal(after('tool.call', { ticketId: 't4', toolRef: 'kernel.delegate', argsHash: 'h', quarantine: false }), 'clean')
+  // A delegated child's result, as the child ended.
+  const result = { parentRunId: 'run_v', childRunId: 'run_c', status: 'ok', costMicroUsd: 1 }
+  assert.equal(after('delegation.result', { ...result, taint: 'tainted' }), 'tainted')
+  assert.equal(after('delegation.result', { ...result, taint: 'clean' }), 'clean')
+  // A gate's ruling or a result alone taints nothing: only the call.
+  assert.equal(after('tool.gate', { toolRef: 'sandbox.exec', decision: 'allow' }), 'clean')
+  assert.equal(after('tool.result', { ticketId: 't1', toolRef: 'sandbox.exec', ok: true }), 'clean')
+  // And taint never clears.
+  const tainted = { ...clean, taint: 'tainted' as const }
+  assert.equal(project(tainted, 'tool.call', JSON.stringify({ toolRef: 'pmmcp.recall' }), 2, '2026-11-12T00:00:00.000Z', () => false).taint, 'tainted')
+})
+
 test('the shipped fleet declares no sandbox: block, and no shipped agent is offered any sandbox tool', async (t) => {
   // bootKernel hands the run loop the sandbox runner (W1a), which offers a
   // sandbox tool only to a manifest that may hold one and lists it. No
@@ -1425,19 +1560,36 @@ test('a test fleet worker with a sandbox: block is offered sandbox.exec, runs it
   // Egress stays the stub: no channel, no grant, whatever runs.
   assert.equal(kernel.status().subsystems.egress.state, 'absent')
 
+  // While its second exec waits for a human, the daemon's view of the run
+  // (run.get, which runs.list shares) is read: the first exec tainted it, as
+  // the gate reads it, so the view says so too.
+  const client = await connectControl({ port: kernel.port, token: TEST_TOKEN, timeoutMs: 20_000 })
+  t.after(() => client.close())
   let asked: Record<string, unknown> | undefined
+  let whileAsked: Record<string, unknown> | undefined
+  let listed: unknown
   const stop = kernel.store.subscribe((row) => {
     if (row.type !== 'approval.requested') return
     asked = JSON.parse(row.payload) as Record<string, unknown>
     const id = String(asked['approvalId'])
-    queueMicrotask(() => {
-      kernel.approvals.resolve(id, mintHumanActor('conn-test'), 'denied')
-    })
+    void (async () => {
+      try {
+        whileAsked = (await client.call('run.get', { runId: row.runId })) as Record<string, unknown>
+        listed = await client.call('runs.list', {})
+      } finally {
+        kernel.approvals.resolve(id, mintHumanActor('conn-test'), 'denied')
+      }
+    })()
   })
   t.after(stop)
   const finished = await runThroughControl(kernel, 'which node, then install', 'coder')
   assert.equal(finished['status'], 'ok', String(finished['reason']))
   const runId = String(finished['runId'])
+  assert.deepEqual([whileAsked?.['runId'], whileAsked?.['status'], whileAsked?.['taint']], [runId, 'parked', 'tainted'])
+  assert.deepEqual(
+    (listed as { runId: string; taint: string }[]).filter((r) => r.runId === runId).map((r) => r.taint),
+    ['tainted'],
+  )
 
   // Offered to the worker whose manifest lists it, under its provider name.
   assert.deepEqual(offeredNames(provider.requests[0]?.body), ['sandbox__exec'])

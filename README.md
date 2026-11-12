@@ -509,7 +509,7 @@ The console, `npm run cli -- <cmd>`:
 | `search [--type T] [--run R] [--text X] [--limit N]` | **no** | search the log, read-only |
 | `probe <modelRef>` | yes | probe a model; exit 1 if it cannot call tools |
 | `run <agentId> <input>` | yes | start a run, wait, exit on its status |
-| `kill <runId> [--reason R]` | yes | abort a run |
+| `kill <runId> [--reason R]` | yes | abort a run, queued or started: it makes no further model or tool call, and ends `killed`, reason `requested` (or a budget cap's, if one ran out before the stop, or the wallclock's, if it has run out by the time the stop is read); one parked on an approval ends once that approval is answered or expires |
 | `approvals` | yes | list pending approvals and quarantine holds |
 | `approve <apr_…\|hold_…>` | yes | approve an approval, or release a hold |
 | `deny <apr_…> [--reason R]` | yes | deny an approval |
@@ -733,7 +733,11 @@ whose command the driver's own audit refuses (a `-v`, `--volume`, `--mount` or
 operator's home or a path under it, in either spelling) never
 runs, and no human is asked to approve it: the run loop asks the runner's own
 check of the arguments before the gate, and the gate denies the call, its
-`tool.gate` row giving the runner's refusal as the reason. `aos approvals`
+`tool.gate` row giving the runner's refusal as the reason. The same holds
+for every exec on a kernel whose `sandbox.imageId` is unset or is no image id,
+which can build no container, or whose `sandbox.driver` is `apple-container`,
+a stub that runs nothing: no run on it is offered the tool, and the gate
+denies a call of it before any human is asked. `aos approvals`
 does not show what an approval would run (protocol v1's `ApprovalItem` carries
 no preview, and adding one is a protocol version bump for the operator), so
 before `aos approve` on an exec, read the command it was shown in its
@@ -777,7 +781,8 @@ spawned child, and no MCP server may be named `sandbox` or `kernel`. The runner
 (`src/runtime/sandbox-tools.ts`) is wired into the daemon (egress plan W1a):
 every `sandbox.*` call goes to it, never to the hub, and the run loop offers
 `sandbox.exec` only to a run whose agent's manifest, read from the registry,
-may hold it and lists it. Any other run that names it is denied it before the
+may hold it and lists it, on a kernel that pins an image id and names a
+driver that runs one. Any other run that names it is denied it before the
 gate asks anyone, its `tool.gate` row giving the reason, and one whose agent
 the registry stops admitting while a human is asked (archived, say) is denied
 it once approved, with a `tool.result` saying so. No shipped manifest lists it,

@@ -20,6 +20,8 @@
 //   and the cap the operator set was never the cap that applied (D19).
 //   Offer a delegation tool and a child run exists with no lane, no budget
 //   and no line in the log tying its spend to its parent.
+//   Ignore the run's signal and a run the operator stopped goes on calling
+//   the provider and its tools until the model stops on its own.
 
 import './helpers/guard.js'
 
@@ -43,7 +45,7 @@ import { Quarantine } from '../src/policy/quarantine.js'
 import { mintHumanActor } from '../src/control/actor.js'
 import { Budget } from '../src/runtime/budget.js'
 import { Lanes } from '../src/runtime/lanes.js'
-import { RunLoop, type RunAgent, type ToolContext } from '../src/runtime/loop.js'
+import { RunLoop, STOP_REQUESTED, type RunAgent, type ToolContext } from '../src/runtime/loop.js'
 import { KernelTools } from '../src/runtime/kernel-tools.js'
 import { assertEgressEnforced } from '../src/runtime/egress.js'
 import { NotImplementedError } from '../src/errors.js'
@@ -128,6 +130,19 @@ function toolCall(ref: string, args: unknown, id = 'call_1'): unknown {
 const done = (text = 'all finished'): ScriptedResponse =>
   turn({ role: 'assistant', content: text }, 'stop')
 
+/** One answer of several tool calls, `c1`, `c2`, ... in order. */
+function toolCalls(...calls: readonly (readonly [string, unknown])[]): unknown {
+  return {
+    role: 'assistant',
+    content: null,
+    tool_calls: calls.map(([ref, args], i) => ({
+      id: `c${String(i + 1)}`,
+      type: 'function',
+      function: { name: ref.replace(/\./g, '__'), arguments: JSON.stringify(args) },
+    })),
+  }
+}
+
 interface Wired {
   readonly loop: RunLoop
   readonly store: ReturnType<typeof withStore>
@@ -151,6 +166,8 @@ async function wire(
     caps?: Partial<{ usdMax: number; maxLlmCalls: number; maxToolCalls: number; wallclockMs: number }>
     approvalWaitMs?: number
     fetch?: typeof globalThis.fetch
+    /** LoopOptions.maxTurns; unset, the loop's own default. */
+    maxTurns?: number
   },
 ): Promise<Wired> {
   const store = withStore(t)
@@ -201,6 +218,7 @@ async function wire(
     views: options.views,
     agentView: () => hub.agentView(),
     budgetFor: () => budget,
+    ...(options.maxTurns === undefined ? {} : { maxTurns: options.maxTurns }),
   })
 
   return {
@@ -625,6 +643,433 @@ test('budget caps stop the run through the loop with the T27b reason codes', asy
   })
   const c = await money.loop.start({ runId: 'run_3', agent: money.agent, prompt: 'go' })
   assert.equal(c.reason, 'usdMax')
+})
+
+test('a run stopped through its signal takes no further step: no tool call after the stop, no model call, and run.finished says killed, requested', async (t) => {
+  // Stopped while the last tool of a turn runs: the model is not called again.
+  {
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'read' } }),
+      script: [turn(toolCall('pmmcp.recall', { query: 'x' })), done()],
+    })
+    const stop = new AbortController()
+    w.store.subscribe((row) => {
+      if (row.type === 'tool.call') stop.abort()
+    })
+    const out = await w.loop.start({ runId: 'run_0', agent: w.agent, prompt: 'once', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason], ['killed', 'requested'])
+    assert.equal(w.mock.calls.length, 1)
+    assert.equal(w.provider.requests.length, 1, 'the model was called again after the stop')
+    assert.equal(types(w).at(-1), 'run.finished')
+  }
+
+  // Stopped while its first tool runs: the second call of the same turn is
+  // never gated, and the model is never called again.
+  {
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'read' } }),
+      script: [
+        turn({
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            { id: 'c1', type: 'function', function: { name: 'pmmcp__recall', arguments: JSON.stringify({ query: 'a' }) } },
+            { id: 'c2', type: 'function', function: { name: 'pmmcp__recall', arguments: JSON.stringify({ query: 'b' }) } },
+          ],
+        }),
+        done(),
+      ],
+    })
+    const stop = new AbortController()
+    w.store.subscribe((row) => {
+      if (row.type === 'tool.call') stop.abort()
+    })
+    const out = await w.loop.start({ runId: 'run_1', agent: w.agent, prompt: 'twice', signal: stop.signal })
+    assert.equal(out.status, 'killed')
+    assert.equal(out.reason, STOP_REQUESTED)
+    assert.equal(STOP_REQUESTED, 'requested')
+    assert.deepEqual(
+      types(w).filter((x) => x.startsWith('tool.') || x.startsWith('llm.')),
+      ['llm.request', 'llm.response', 'tool.gate', 'tool.call', 'tool.result'],
+    )
+    assert.equal(w.mock.calls.length, 1)
+    assert.equal(w.provider.requests.length, 1)
+    assert.deepEqual([payload(w, 'run.finished')['status'], payload(w, 'run.finished')['reason']], ['killed', 'requested'])
+  }
+
+  // Stopped while the model is answering: none of its tool calls runs.
+  {
+    const stop = new AbortController()
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'read' } }),
+      script: [
+        () => {
+          stop.abort()
+          return turn(toolCall('pmmcp.recall', { query: 'x' }))
+        },
+        done(),
+      ],
+    })
+    const out = await w.loop.start({ runId: 'run_2', agent: w.agent, prompt: 'go', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason], ['killed', 'requested'])
+    assert.equal(w.store.query({ type: 'tool.gate' }).length, 0)
+    assert.equal(w.mock.calls.length, 0)
+    assert.equal(w.provider.requests.length, 1)
+  }
+
+  // Stopped while a human is asked to approve a call: approved after the
+  // stop, the call does not run, and its tool.result says so.
+  {
+    const stop = new AbortController()
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'irreversible' } }),
+      script: [turn(toolCall('pmmcp.recall', { query: 'x' })), done()],
+    })
+    w.store.subscribe((row) => {
+      if (row.type !== 'approval.requested') return
+      const id = (JSON.parse(row.payload) as { approvalId: string }).approvalId
+      queueMicrotask(() => {
+        stop.abort()
+        w.approvals.resolve(id, mintHumanActor('conn-test'), 'approved')
+      })
+    })
+    const out = await w.loop.start({ runId: 'run_p', agent: w.agent, prompt: 'recall', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason], ['killed', 'requested'])
+    assert.equal(w.mock.calls.length, 0, 'the approved call ran after the stop')
+    assert.equal(w.store.query({ type: 'tool.call' }).length, 0)
+    assert.equal(payload(w, 'tool.result')['text'], '[killed] the run was stopped while its call was decided; the tool did not run')
+    assert.equal(w.provider.requests.length, 1)
+  }
+
+  // A budget stop a call met before the stop keeps its reason.
+  {
+    const stop = new AbortController()
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'read' } }),
+      caps: { maxToolCalls: 1 },
+      script: [
+        turn({
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            { id: 'c1', type: 'function', function: { name: 'pmmcp__recall', arguments: JSON.stringify({ query: 'a' }) } },
+            { id: 'c2', type: 'function', function: { name: 'pmmcp__recall', arguments: JSON.stringify({ query: 'b' }) } },
+          ],
+        }),
+        done(),
+      ],
+    })
+    w.store.subscribe((row) => {
+      if (row.type === 'tool.result') stop.abort()
+    })
+    const out = await w.loop.start({ runId: 'run_3', agent: w.agent, prompt: 'twice', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason], ['killed', 'maxToolCalls'])
+    assert.equal(w.mock.calls.length, 1)
+  }
+})
+
+test('a run killed while it waits for its lane gets run.finished killed, requested', async (t) => {
+  // Run A of the agent holds its lane, in a model call; run B of the same
+  // agent queues behind it and is killed there. B never starts, and still
+  // ends, with nothing spent: without its run.finished the daemon's view of
+  // it stays queued, its agent busy to the scheduler, for the kernel's life.
+  const provider = fakeProvider([done('first'), done('never')])
+  let release: () => void = () => undefined
+  const held = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let entered: () => void = () => undefined
+  const inCall = new Promise<void>((resolve) => {
+    entered = resolve
+  })
+  let calls = 0
+  const w = await wire(t, {
+    views: views({ recall: { exposure: 'agent', risk: 'read' } }),
+    script: [],
+    fetch: async (input, init) => {
+      calls += 1
+      if (calls === 1) {
+        entered()
+        await held
+      }
+      return provider.fetch(input, init)
+    },
+  })
+  const a = w.loop.start({ runId: 'run_a', agent: w.agent, prompt: 'first' })
+  await inCall
+  const stop = new AbortController()
+  const b = w.loop.start({ runId: 'run_b', agent: w.agent, prompt: 'second', signal: stop.signal })
+  stop.abort()
+  const outB = await b
+  assert.deepEqual(
+    [outB.status, outB.reason, outB.costMicroUsd, outB.llmCalls, outB.toolCalls, outB.taint],
+    ['killed', STOP_REQUESTED, 0, 0, 0, 'clean'],
+  )
+  const finishedOf = (runId: string): unknown =>
+    JSON.parse(w.store.query({ runId, type: 'run.finished' })[0]?.payload ?? 'null')
+  assert.deepEqual(w.store.query({ runId: 'run_b' }).map((r) => r.type), ['run.queued', 'run.finished'])
+  assert.deepEqual(finishedOf('run_b'), {
+    schemaVersion: 1,
+    runId: 'run_b',
+    status: 'killed',
+    reason: 'requested',
+    costMicroUsd: 0,
+    llmCalls: 0,
+    toolCalls: 0,
+    durationMs: 0,
+  })
+  // B's end is written while A is still in its model call: nothing waits.
+  assert.equal(w.store.query({ runId: 'run_a', type: 'run.finished' }).length, 0)
+  release()
+  const outA = await a
+  assert.equal(outA.status, 'ok')
+
+  // Stopped before it is even queued: the same end, the same row.
+  const gone = new AbortController()
+  gone.abort()
+  const outC = await w.loop.start({ runId: 'run_c', agent: w.agent, prompt: 'third', signal: gone.signal, taint: 'tainted' })
+  assert.deepEqual([outC.status, outC.reason, outC.taint], ['killed', STOP_REQUESTED, 'tainted'])
+  assert.deepEqual(w.store.query({ runId: 'run_c' }).map((r) => r.type), ['run.queued', 'run.finished'])
+  assert.equal(provider.requests.length, 1, 'a run that never started called the model')
+})
+
+test('a run stopped while the model gives its final answer ends killed, requested', async (t) => {
+  // The answer is text with no tool call, the run's end had it not been
+  // stopped: a kill during the model call, where a run spends most of its
+  // time, still ends it killed.
+  const stop = new AbortController()
+  const w = await wire(t, {
+    views: views({ recall: { exposure: 'agent', risk: 'read' } }),
+    script: [
+      () => {
+        stop.abort()
+        return done('the final answer')
+      },
+    ],
+  })
+  const out = await w.loop.start({ runId: 'run_f', agent: w.agent, prompt: 'answer', signal: stop.signal })
+  assert.deepEqual([out.status, out.reason], ['killed', STOP_REQUESTED])
+  assert.deepEqual([payload(w, 'run.finished')['status'], payload(w, 'run.finished')['reason']], ['killed', 'requested'])
+  assert.equal(out.llmCalls, 1)
+})
+
+test('a stop that arrives after the wallclock elapsed records the wallclock, not requested', async (t) => {
+  // delegate.ts kills a child once its ceiling and a grace have passed since
+  // its launch, by which time the wallclock of a child its lane admitted at
+  // once has run out: that child ran out of time, and its run.finished says
+  // so, as it would have had nobody killed it. Each row reads the stop at a
+  // different place in the loop.
+  const views1 = views({ recall: { exposure: 'agent', risk: 'read' } })
+  const cases: { name: string; script: (w: () => Wired, stop: AbortController) => ScriptEntry[]; on?: 'tool.call' | 'tool.gate' }[] = [
+    {
+      // Read before the answer's first tool call.
+      name: 'the model answers with a tool call',
+      script: (w, stop) => [
+        () => {
+          w().advance(5_000)
+          stop.abort()
+          return turn(toolCall('pmmcp.recall', { query: 'x' }))
+        },
+        done(),
+      ],
+    },
+    {
+      // Read once the model has answered with final text.
+      name: 'the model answers with final text',
+      script: (w, stop) => [
+        () => {
+          w().advance(5_000)
+          stop.abort()
+          return done('late')
+        },
+      ],
+    },
+    {
+      // Read by the tool's own charge, once it ran.
+      name: 'a tool runs',
+      script: () => [turn(toolCall('pmmcp.recall', { query: 'x' })), done()],
+      on: 'tool.call',
+    },
+    {
+      // Read at the top of the next turn: a call the gate denies charges
+      // nothing, so only that turn's read of the budget can see it ran out.
+      name: 'the gate denies a call',
+      script: () => [turn(toolCall('pmmcp.recall', { query: 'souls/ceo.md' })), done()],
+      on: 'tool.gate',
+    },
+    {
+      // Read before the answer's second call: the first, which the gate
+      // denies, charges nothing, so only the read of the stop before the
+      // second can see the wallclock ran out, and the second is never gated.
+      name: 'the gate denies the first of two calls',
+      script: () => [
+        turn(toolCalls(['pmmcp.recall', { query: 'souls/ceo.md' }], ['pmmcp.recall', { query: 'x' }])),
+        done(),
+      ],
+      on: 'tool.gate',
+    },
+  ]
+  for (const c of cases) {
+    const stop = new AbortController()
+    let wired: Wired | undefined
+    const w = await wire(t, { views: views1, caps: { wallclockMs: 1_000 }, script: c.script(() => wired as Wired, stop) })
+    wired = w
+    if (c.on !== undefined) {
+      w.store.subscribe((row) => {
+        if (row.type !== c.on) return
+        w.advance(5_000)
+        stop.abort()
+      })
+    }
+    const out = await w.loop.start({ runId: 'run_w', agent: w.agent, prompt: 'go', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason], ['killed', 'wallclock'], c.name)
+    assert.equal(payload(w, 'run.finished')['reason'], 'wallclock', c.name)
+    assert.equal(w.provider.requests.length, 1, c.name)
+    assert.ok(w.store.query({ type: 'tool.gate' }).length <= 1, `${c.name}: a call was gated after the stop`)
+  }
+})
+
+test('a stop during the model call records requested, not a count or cost cap that call then used up', async (t) => {
+  // A cap of N permits the Nth call. A run stopped while its last permitted
+  // model call is in flight was stopped by the stop: the cap, which that
+  // call's own charge used up only once it answered, stopped nothing, and
+  // the same run unstopped ends ok with its final answer. Only a cap that
+  // ran out before the stop, or the wallclock, is the reason (the rows of
+  // the test above).
+  const readable = views({ recall: { exposure: 'agent', risk: 'read' } })
+  const cases: readonly { name: string; caps: Partial<{ usdMax: number; maxLlmCalls: number }>; answer: () => ScriptedResponse }[] = [
+    { name: 'maxLlmCalls 1, a final answer', caps: { maxLlmCalls: 1 }, answer: () => done('the answer') },
+    { name: 'usdMax reached by a final answer', caps: { usdMax: COST_PER_TURN }, answer: () => done('the answer') },
+    { name: 'maxLlmCalls 1, an answer of a tool call', caps: { maxLlmCalls: 1 }, answer: () => turn(toolCall('pmmcp.recall', { query: 'x' })) },
+  ]
+  for (const c of cases) {
+    const stop = new AbortController()
+    const w = await wire(t, {
+      views: readable,
+      caps: c.caps,
+      script: [
+        () => {
+          stop.abort()
+          return c.answer()
+        },
+        done(),
+      ],
+    })
+    const out = await w.loop.start({ runId: 'run_s', agent: w.agent, prompt: 'go', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason], ['killed', STOP_REQUESTED], c.name)
+    assert.deepEqual([payload(w, 'run.finished')['status'], payload(w, 'run.finished')['reason']], ['killed', 'requested'], c.name)
+    assert.equal(out.llmCalls, 1, c.name)
+    assert.equal(w.store.query({ type: 'tool.gate' }).length, 0, c.name)
+    assert.equal(w.provider.requests.length, 1, c.name)
+  }
+  // The control: the final answers unstopped end ok, with no reason, so the
+  // cap their charge used up stopped nothing.
+  for (const c of cases.slice(0, 2)) {
+    const w = await wire(t, { views: readable, caps: c.caps, script: [c.answer()] })
+    const out = await w.loop.start({ runId: 'run_u', agent: w.agent, prompt: 'go' })
+    assert.deepEqual([out.status, out.reason], ['ok', undefined], c.name)
+  }
+})
+
+test('a run stopped during the last tool call of its last turn ends killed, requested, or its wallclock once that ran out', async (t) => {
+  // maxTurns ends the turn loop with no read of the stop after the turn's
+  // last call: without one after the loop, a run stopped there ends ok.
+  {
+    const stop = new AbortController()
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'read' } }),
+      maxTurns: 1,
+      script: [turn(toolCall('pmmcp.recall', { query: 'x' })), done()],
+    })
+    w.store.subscribe((row) => {
+      if (row.type === 'tool.call') stop.abort()
+    })
+    const out = await w.loop.start({ runId: 'run_t', agent: w.agent, prompt: 'go', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason], ['killed', STOP_REQUESTED])
+    assert.deepEqual([payload(w, 'run.finished')['status'], payload(w, 'run.finished')['reason']], ['killed', 'requested'])
+    assert.equal(w.mock.calls.length, 1)
+    assert.equal(w.provider.requests.length, 1)
+  }
+
+  // That read is the one a read before a tool call makes: the last call,
+  // denied by a human after the wallclock ran out, charged nothing, and the
+  // stop came after it ran out, so the run ends wallclock.
+  {
+    const stop = new AbortController()
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'irreversible' } }),
+      caps: { wallclockMs: 1_000 },
+      maxTurns: 1,
+      script: [turn(toolCall('pmmcp.recall', { query: 'x' })), done()],
+    })
+    w.store.subscribe((row) => {
+      if (row.type !== 'approval.requested') return
+      const id = (JSON.parse(row.payload) as { approvalId: string }).approvalId
+      queueMicrotask(() => {
+        w.advance(5_000)
+        stop.abort()
+        w.approvals.resolve(id, mintHumanActor('conn-late'), 'denied')
+      })
+    })
+    const out = await w.loop.start({ runId: 'run_tw', agent: w.agent, prompt: 'go', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason], ['killed', 'wallclock'])
+    assert.equal(payload(w, 'run.finished')['reason'], 'wallclock')
+    assert.equal(w.mock.calls.length, 0)
+  }
+})
+
+test('no call reaches the gate once a cap has run out, so no human is asked to approve a call the loop would refuse', async (t) => {
+  // Each call past a cap would only reach the gate to be refused after it
+  // ([conflict]), a human asked of it first while the run holds its lane
+  // past its cap. The run ends with the first cap it met.
+  const irreversible = views({ recall: { exposure: 'agent', risk: 'irreversible' } })
+  const twice = (): ScriptedResponse => turn(toolCalls(['pmmcp.recall', { query: 'a' }], ['pmmcp.recall', { query: 'b' }]))
+  const asked = (w: Wired): number => w.store.query({ type: 'approval.requested' }).length
+
+  // The first call's charge uses the last of maxToolCalls.
+  {
+    const w = await wire(t, { views: irreversible, caps: { maxToolCalls: 1 }, script: [twice(), done()] })
+    autoAnswer(w, 'approved')
+    const out = await w.loop.start({ runId: 'run_m', agent: w.agent, prompt: 'twice' })
+    assert.deepEqual([out.status, out.reason], ['killed', 'maxToolCalls'])
+    assert.equal(asked(w), 1, 'a human was asked of a call past the cap')
+    assert.equal(w.store.query({ type: 'tool.gate' }).length, 1)
+    assert.equal(w.mock.calls.length, 1)
+    assert.equal(w.provider.requests.length, 1)
+  }
+
+  // The wallclock elapses while a human is asked of the first, who denies
+  // it: that denial charges nothing, and the read before the second sees
+  // the wallclock.
+  {
+    const w = await wire(t, { views: irreversible, caps: { wallclockMs: 1_000 }, script: [twice(), done()] })
+    w.store.subscribe((row) => {
+      if (row.type !== 'approval.requested') return
+      const id = (JSON.parse(row.payload) as { approvalId: string }).approvalId
+      queueMicrotask(() => {
+        w.advance(5_000)
+        w.approvals.resolve(id, mintHumanActor('conn-late'), 'denied')
+      })
+    })
+    const out = await w.loop.start({ runId: 'run_w', agent: w.agent, prompt: 'twice' })
+    assert.deepEqual([out.status, out.reason], ['killed', 'wallclock'])
+    assert.equal(asked(w), 1, 'a human was asked of a call past the wallclock')
+    assert.equal(w.store.query({ type: 'tool.gate' }).length, 1)
+    assert.equal(w.mock.calls.length, 0)
+    assert.equal(w.provider.requests.length, 1)
+  }
+
+  // The turn's model call used the last of maxLlmCalls: none of its calls
+  // is gated, as none could be answered.
+  {
+    const w = await wire(t, { views: irreversible, caps: { maxLlmCalls: 1 }, script: [twice(), done()] })
+    autoAnswer(w, 'approved')
+    const out = await w.loop.start({ runId: 'run_l', agent: w.agent, prompt: 'twice' })
+    assert.deepEqual([out.status, out.reason], ['killed', 'maxLlmCalls'])
+    assert.equal(asked(w), 0, 'a human was asked of a call past the cap')
+    assert.equal(w.store.query({ type: 'tool.gate' }).length, 0)
+    assert.equal(w.mock.calls.length, 0)
+  }
 })
 
 test('tool output larger than MAX_LOGGED_OUTPUT is bounded identically for the log and the model', async (t) => {

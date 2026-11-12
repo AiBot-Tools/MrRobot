@@ -276,12 +276,16 @@ export async function withCallEvents(
     tools: [...context.tools],
     ...(context.maxOutputTokens === undefined ? {} : { maxOutputTokens: context.maxOutputTokens }),
   })
-  store.append({
-    type: 'llm.request',
-    ...(scope.runId === undefined ? {} : { runId: scope.runId }),
-    ...(scope.agentId === undefined ? {} : { agentId: scope.agentId }),
-    payload: requestPayload(loggedText(context.prompt, requestPayload)),
-  })
+  appendLogged(
+    store,
+    {
+      type: 'llm.request',
+      ...(scope.runId === undefined ? {} : { runId: scope.runId }),
+      ...(scope.agentId === undefined ? {} : { agentId: scope.agentId }),
+    },
+    context.prompt,
+    requestPayload,
+  )
 
   const startedAt = Date.now()
   const wire = credentialedFetch(options.fetch ?? globalThis.fetch, card, key)
@@ -289,7 +293,7 @@ export async function withCallEvents(
   try {
     const outcome = await perform(wire, key)
     const durationMs = Date.now() - startedAt
-    // The model's answer is bounded as the prompt is (loggedText): an answer
+    // The model's answer is bounded as the prompt is (appendLogged): an answer
     // dense in escapes (escaped JSON, code) takes up to six times its raw
     // bytes in the log's canonical JSON, and bounded by those raw bytes its
     // append would throw and end the run in error.
@@ -306,12 +310,16 @@ export async function withCallEvents(
       costMicroUsd: outcome.costMicroUsd,
       durationMs,
     })
-    store.append({
-      type: 'llm.response',
-      ...(scope.runId === undefined ? {} : { runId: scope.runId }),
-      ...(scope.agentId === undefined ? {} : { agentId: scope.agentId }),
-      payload: responsePayload(loggedText(outcome.content, responsePayload)),
-    })
+    appendLogged(
+      store,
+      {
+        type: 'llm.response',
+        ...(scope.runId === undefined ? {} : { runId: scope.runId }),
+        ...(scope.agentId === undefined ? {} : { agentId: scope.agentId }),
+      },
+      outcome.content,
+      responsePayload,
+    )
     return outcome
   } catch (e) {
     // A failed call still cost time and may have cost money upstream. It gets
@@ -370,6 +378,43 @@ function storedBytes(payload: Record<string, unknown>): number {
 }
 
 /**
+ * The start of `redacted` (a text redacted once) that the log keeps in the
+ * payload `payloadOf` builds around it, measured without redacting it again:
+ * all of it when it fits, else the longest start of it, whole code points
+ * only (canonical JSON refuses a lone surrogate), whose bytes in the
+ * payload's canonical JSON are within its share, PAYLOAD_TEXT_BUDGET, and
+ * within what the rest of the payload (a long tool list) leaves of
+ * MAX_LOGGED_OUTPUT, that rest measured as the store measures it.
+ *
+ * It holds the store's measure exactly but where the store's own two passes
+ * of redaction (the payload's values, then its canonical JSON as a text)
+ * find in the text what its first pass did not: a registered secret that is
+ * the text's canonical escape of itself, or that holds part of a [REDACTED]
+ * the first pass wrote. appendLogged lets the store say so.
+ */
+function estimatedCut(redacted: string, payloadOf: (text: string) => Record<string, unknown>): string {
+  const keep = Math.min(PAYLOAD_TEXT_BUDGET, MAX_LOGGED_OUTPUT - storedBytes(payloadOf('')))
+  if (payloadBytes(redacted) <= keep) return redacted
+  return keep <= 0 ? '' : firstFitting(redacted, keep)
+}
+
+/**
+ * The start of `redacted` the store's own measure admits, cut on from
+ * `from` (a start of it) by what the store measures the payload over its
+ * limit, until it fits. Each step redacts the payload twice, as the store
+ * does, so it is asked only once the store has refused an estimated cut.
+ */
+function fittedCut(redacted: string, payloadOf: (text: string) => Record<string, unknown>, from: string): string {
+  let cut = from
+  for (;;) {
+    const over = storedBytes(payloadOf(cut)) - MAX_LOGGED_OUTPUT
+    if (over <= 0 || cut === '') return cut
+    const keep = payloadBytes(cut) - over
+    cut = keep <= 0 ? '' : firstFitting(redacted, keep)
+  }
+}
+
+/**
  * The one long text of a payload as the log keeps it (llm.request's prompt,
  * llm.response's content): redacted, and cut, at a code point, until the
  * payload `payloadOf` builds around it fits the store's limit, as the store
@@ -378,27 +423,48 @@ function storedBytes(payload: Record<string, unknown>): number {
  * already JSON, so a tool result of many short quoted lines, which the body
  * shows as \" and \n, takes up to twice its size there, and an answer of
  * escaped JSON or code as much or more. Bounded by its raw bytes, such a text
- * is over the limit, and the append throws, ending the run in error. So the
- * text is held to its share, PAYLOAD_TEXT_BUDGET, counted in the bytes it
- * takes in the payload, and to what is left of MAX_LOGGED_OUTPUT beside the
- * rest of the payload (a long tool list); and should the store's redaction of
- * the canonical text still leave it over, cut by what it is over until it
- * fits. A cut text is a start of the redacted text, cut after redaction, as
- * boundOutput cuts, and never splits a surrogate pair, which canonical JSON
- * refuses. What the provider is sent, and what the model answered, are not
- * cut: only what the log keeps of them.
+ * is over the limit, and the append throws, ending the run in error. A cut
+ * text is a start of the redacted text, cut after redaction, as boundOutput
+ * cuts. What the provider is sent, and what the model answered, are not cut:
+ * only what the log keeps of them. appendLogged keeps the same text, and asks
+ * the store's measure only when its estimate does not fit.
  */
 export function loggedText(text: string, payloadOf: (text: string) => Record<string, unknown>): string {
   const redacted = redactString(text)
-  const room = MAX_LOGGED_OUTPUT - storedBytes(payloadOf(''))
-  let keep = Math.min(PAYLOAD_TEXT_BUDGET, room)
-  if (payloadBytes(redacted) <= keep && storedBytes(payloadOf(redacted)) <= MAX_LOGGED_OUTPUT) return redacted
-  for (;;) {
-    const cut = keep <= 0 ? '' : firstFitting(redacted, keep)
-    const over = storedBytes(payloadOf(cut)) - MAX_LOGGED_OUTPUT
-    if (over <= 0 || cut === '') return cut
-    keep = payloadBytes(cut) - over
+  return fittedCut(redacted, payloadOf, estimatedCut(redacted, payloadOf))
+}
+
+/**
+ * Append `event` with the payload `payloadOf` builds around what the log
+ * keeps of `text` (loggedText), redacting that text once before the store's
+ * own passes, where loggedText's measure would redact it twice more. Each
+ * pass is quadratic in some texts (redact.ts's JWT pattern on a long run of
+ * `-ey`), and a prompt carries every earlier result of its run, so every
+ * pass more holds the daemon's event loop again on every later call. So the
+ * text is cut by estimatedCut, which measures the rest of the payload as the
+ * store does and the text by its escaped bytes, and the store's append is
+ * its check: a payload it refuses for its size, and only that, is cut to
+ * what the store's measure admits (fittedCut) and appended again. The store
+ * refuses before it writes anything, so nothing is written twice; any other
+ * refusal is the caller's, and is thrown as it came.
+ */
+export function appendLogged(
+  store: Pick<EventStore, 'append'>,
+  event: { readonly type: string; readonly runId?: string; readonly agentId?: string },
+  text: string,
+  payloadOf: (text: string) => Record<string, unknown>,
+): void {
+  const redacted = redactString(text)
+  const estimate = estimatedCut(redacted, payloadOf)
+  try {
+    store.append({ ...event, payload: payloadOf(estimate) })
+    return
+  } catch (e) {
+    // Measured only on a refusal: a payload within the limit was refused
+    // for something a cut does not change.
+    if (storedBytes(payloadOf(estimate)) <= MAX_LOGGED_OUTPUT) throw e
   }
+  store.append({ ...event, payload: payloadOf(fittedCut(redacted, payloadOf, estimate)) })
 }
 
 /**

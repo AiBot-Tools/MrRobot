@@ -26,7 +26,7 @@ import assert from 'node:assert/strict'
 import { freshProbe } from './helpers/probe.js'
 import { withStore } from './helpers/store.js'
 import { chatStop, fakeProvider, http, FAKE_PRICING, type ScriptedResponse } from './helpers/fake-provider.js'
-import { TOKEN_PATTERNS } from '../src/events/redact.js'
+import { redactString, SecretMask, TOKEN_PATTERNS } from '../src/events/redact.js'
 import { toolName } from '../src/mcp/names.js'
 import { costForCard } from '../src/models/cost.js'
 import type { ModelCard } from '../src/models/registry.js'
@@ -40,7 +40,7 @@ import {
   type ModelBinding,
   type RouteRequest,
 } from '../src/models/router.js'
-import { loggedText, withCallEvents, type AdapterRequest, type ModelAdapter, type PreparedCall } from '../src/models/transport.js'
+import { appendLogged, loggedText, withCallEvents, type AdapterRequest, type ModelAdapter, type PreparedCall } from '../src/models/transport.js'
 import { MAX_LOGGED_OUTPUT, PAYLOAD_TEXT_BUDGET } from '../src/events/bound.js'
 import { canonicalize } from '../src/events/canonical.js'
 
@@ -546,6 +546,93 @@ test('a prompt whose cut falls inside a surrogate pair keeps whole characters, a
   assert.ok(row !== undefined, 'no llm.request row')
   assert.equal((JSON.parse(row.payload) as { prompt: string }).prompt, logged)
   assert.equal(store.query({ type: 'llm.response' }).length, 1)
+})
+
+test('a prompt is redacted once before the store redacts its payload, three passes in all over a long prompt, cut or whole, not five', async (t) => {
+  // Each pass is quadratic in some texts (the JWT pattern on a run of -ey),
+  // and a prompt carries every earlier result of its run, so a pass more is
+  // the daemon's event loop held again on every later call. SecretMask.apply
+  // is where every redaction pass begins (redactString), so a spy on it
+  // counts them: one by appendLogged over the prompt, and the store's two
+  // over its payload (the prompt among its values, then the canonical JSON
+  // as a text). Measuring the cut by the store's own measure would add two.
+  const store = withStore(t)
+  const options = { store, scope: { runId: 'run_r', agentId: 'coder' }, ref: 'openai/fake', card: card() }
+  const answer = (): Promise<{ content: string; finish: string; inputTokens: number; outputTokens: number; costMicroUsd: number }> =>
+    Promise.resolve({ content: 'ok', finish: 'stop', inputTokens: 1, outputTokens: 1, costMicroUsd: 1 })
+  const spy = t.mock.method(SecretMask, 'apply')
+  // Beside a tool list long enough that what it leaves of the limit, not the
+  // prompt's share, binds the cut: the estimate measures that rest as the
+  // store does, so the store admits its first append, with no cut on after.
+  const tools = Array.from({ length: 400 }, (_, i) => `pmmcp.a_tool_of_some_length_${String(i)}`)
+  for (const [what, prompt, offered] of [
+    ['cut', 'x'.repeat(70 * 1_024), ['pmmcp.recall']],
+    ['whole', 'x'.repeat(40_000), ['pmmcp.recall']],
+    ['cut beside a long tool list', 'x'.repeat(PAYLOAD_TEXT_BUDGET), tools],
+  ] as const) {
+    spy.mock.resetCalls()
+    await withCallEvents(options, { prompt, tools: offered }, answer)
+    const passes = spy.mock.calls.filter((c) => String(c.arguments[0]).length >= 30_000).length
+    assert.equal(passes, 3, `${what}: ${String(passes)} redaction passes over the prompt`)
+    const row = store.query({ type: 'llm.request' }).at(-1)
+    const logged = (JSON.parse(row?.payload ?? '{}') as { prompt: string }).prompt
+    if (offered === tools) {
+      // Cut to what the list leaves, below the prompt's share, and no more.
+      assert.ok(logged.length < PAYLOAD_TEXT_BUDGET && prompt.startsWith(logged), what)
+      assert.ok(Buffer.byteLength(row?.payload ?? '') > MAX_LOGGED_OUTPUT - 64, `${what}: ${String(Buffer.byteLength(row?.payload ?? ''))} bytes`)
+    } else {
+      assert.equal(logged, what === 'cut' ? prompt.slice(0, PAYLOAD_TEXT_BUDGET) : prompt, what)
+    }
+  }
+})
+
+test("a payload the store's own redaction grows past the limit is cut to what the store admits and appended, and no other refusal is retried", async (t) => {
+  // A registered secret that is the canonical JSON's escape of a text: the
+  // first pass, over the text, finds no such value, and the store's pass
+  // over the canonical JSON finds it at every quote, each 8 bytes there
+  // becoming [REDACTED]'s 10. The estimate, which measures the text by its
+  // escaped bytes, holds the payload to the limit; the store, measuring it
+  // redacted, refuses it, and appendLogged cuts it to what the store's
+  // measure admits and appends it. With no second append, the run's
+  // llm.request would throw.
+  const secret = 'a\\"bcdef'
+  assert.equal(secret.length, 8)
+  t.after(() => SecretMask.clear())
+  assert.ok(SecretMask.register(secret))
+  const store = withStore(t)
+  const options = { store, scope: { runId: 'run_g', agentId: 'coder' }, ref: 'openai/fake', card: card() }
+  const prompt = 'a"bcdef'.repeat(9_000)
+  assert.equal(redactString(prompt), prompt, 'the first pass finds nothing')
+  await withCallEvents(options, { prompt, tools: [] }, () =>
+    Promise.resolve({ content: 'ok', finish: 'stop', inputTokens: 1, outputTokens: 1, costMicroUsd: 1 }),
+  )
+  const [row] = store.query({ type: 'llm.request' })
+  assert.ok(row !== undefined, 'no llm.request row')
+  // The store keeps the canonical JSON and measures it redacted again.
+  const measured = Buffer.byteLength(redactString(row.payload))
+  assert.ok(measured <= MAX_LOGGED_OUTPUT, `${String(measured)} bytes as the store measures it`)
+  const logged = (JSON.parse(row.payload) as { prompt: string }).prompt
+  assert.ok(prompt.startsWith(logged), 'not a start of the prompt')
+  // Cut on past the estimate's 7 936 copies, which the store measures at 79 360
+  // bytes, to some 6 200, which it measures at 62 000.
+  const copies = Math.floor(logged.length / 'a"bcdef'.length)
+  assert.ok(copies < PAYLOAD_TEXT_BUDGET / 8 && copies > 6_000, `${String(copies)} copies kept`)
+  assert.equal(store.query({ type: 'llm.response' }).length, 1)
+
+  // A refusal for anything but the size is thrown as the store gave it, and
+  // nothing is appended again.
+  let appends = 0
+  const refusing = {
+    append: (): never => {
+      appends += 1
+      throw new Error('writer claim: not this run')
+    },
+  }
+  assert.throws(
+    () => appendLogged(refusing, { type: 'llm.request' }, 'short', (text) => ({ schemaVersion: 1, prompt: text })),
+    /^Error: writer claim: not this run$/,
+  )
+  assert.equal(appends, 1, 'a refusal a cut cannot change was retried')
 })
 
 test("llm.response's content is bounded by the bytes it takes in the payload's canonical JSON, so an answer of escapes is cut to fit and its row is written", async (t) => {

@@ -601,6 +601,12 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
       return commandAuditRefusal(command, options.home ?? '')
     },
 
+    everyRunRefusal(): string | undefined {
+      // As the real driver: none for itself. An unpinned id is run()'s
+      // refusal of a spec, and the runner's configRefusal reads it first.
+      return undefined
+    },
+
     async kill(name: string): Promise<void> {
       kills.push(name)
       // As the real driver does: a name without the prefix is sent nowhere.

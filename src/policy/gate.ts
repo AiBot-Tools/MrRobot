@@ -25,7 +25,8 @@
 //      is not the agent's own namespace  deny      memory is per agent
 //   3c. the tool's runner refuses the
 //      call whoever approves it (its     deny      no human is asked to
-//      caller or its arguments)                    approve what never runs
+//      caller, the kernel's config or              approve what never runs
+//      its arguments)
 //   4. risk is 'irreversible'            needs-human   always, no exceptions
 //   5. tainted run, risk is not 'read'   needs-human   invariant 3
 //   6. the tool-view says quarantine     quarantine
@@ -76,12 +77,16 @@ export const GateInput = z
     args: z.record(z.string(), z.unknown()),
     /**
      * Why the tool's own runner refuses this call whatever a human says,
-     * worked out by the kernel before the gate (sandbox tools', run loop
-     * #runnerRefusal): its caller, an agent whose manifest, read from the
-     * registry, may not hold the tool (SandboxTools.holderProblem), or a
-     * kernel with no runner for it; or its arguments, a command the approval
-     * preview would cut, redact or show unreadably, one past the runner's
-     * bounds, or one the driver's audit refuses (SandboxTools.argsRefusal).
+     * worked out by the kernel before the gate (sandbox tools', in the run
+     * loop's #handleToolCall, from #sandboxHolderProblem,
+     * SandboxTools.configRefusal and SandboxTools.argsRefusal): its caller,
+     * an agent whose manifest, read from the registry, may not hold the tool
+     * (SandboxTools.holderProblem), or a kernel with no runner for it; the
+     * kernel's own sandbox config, whose driver runs nothing or which pins
+     * no image id to run (SandboxTools.configRefusal); or its arguments, a
+     * command the approval preview would cut, redact or show unreadably, one
+     * past the runner's bounds, or one the driver's audit refuses
+     * (SandboxTools.argsRefusal).
      * Absent: the runner refuses nothing it can tell before it runs, or the
      * kernel does not ask. Used only to refuse, as the arguments are.
      */

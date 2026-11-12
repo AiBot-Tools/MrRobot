@@ -51,8 +51,10 @@
 // audit refuses for its command alone (SandboxDriver.commandRefusal: the
 // real driver's whole-argv scans, and its home check, an argument that is
 // the operator's home or a path under it). The run loop asks those checks
-// (argsRefusal) before the gate, which denies such a call before any human is
-// asked (GateInput.runnerRefusal), so no human approves a command the runner
+// (argsRefusal) before the gate, and whether the kernel's sandbox config
+// lets any exec run (configRefusal: a driver that runs one, and a pinned
+// image id), and the gate denies such a call before any human is asked
+// (GateInput.runnerRefusal), so no human approves a command the runner
 // then refuses; the runner refuses it again at execution. Its output
 // reaches the model and the log with each stream bounded to its own share,
 // counted in the bytes it takes in the logged JSON, so stderr, and the end of
@@ -105,10 +107,12 @@
 // to it and never to the hub (egress plan W1a). The loop offers a sandbox
 // tool only to a run whose agent's manifest, read from the registry by its
 // id (holderProblem), may hold it and lists it, whatever the run's own tool
-// list says; it denies a call from any other before the gate, so no human is
-// asked to approve it, and again after it, with its tool.result, should the
-// registry change while a human is asked; the runner reads the registry
-// again at the call. No shipped manifest lists one.
+// list says, and only on a kernel whose sandbox config lets a call of it run
+// (configRefusal: a driver that runs one, and a pinned image id); it denies
+// a call from any other before the gate, so no human is asked to approve
+// it, and again after it, with its tool.result, should the registry change
+// while a human is asked; the runner reads the registry again at the call.
+// No shipped manifest lists one.
 //
 // Its hard wallclock is what is left of the run's budget, at most
 // sandbox.defaults.wallclockMs: a container never outlives the run that
@@ -448,6 +452,27 @@ export class SandboxTools {
   }
 
   /**
+   * Why the runner would refuse every call of `ref`, whatever its arguments
+   * and whoever approved it, on the kernel's own sandbox config, or
+   * undefined: the driver kernel.yaml names runs no spec at all, as its own
+   * code says (SandboxDriver.everyRunRefusal: the apple-container stub,
+   * whose run() throws whatever it is handed), or kernel.yaml pins no image
+   * id, or one that is no id (imageIdProblem), so no container can be
+   * built; the driver first, as no image id makes a stub run. The run loop
+   * asks it of every sandbox schema it would offer, so no run on such a
+   * kernel is shown the tool, and before the gate, beside argsRefusal,
+   * handing the answer to it (GateInput.runnerRefusal), so no human is asked
+   * to approve an exec on a kernel that can run none; #exec refuses it again
+   * at execution. Whether a daemon answers now is not read here: the boot's
+   * probe of it is stale by the time of a call, and a fresh one would ask a
+   * daemon before every approval.
+   */
+  configRefusal(ref: string): string | undefined {
+    if (ref !== `${SANDBOX_SERVER}.exec`) return undefined
+    return this.#o.driver.everyRunRefusal() ?? imageIdProblem(this.#o.sandbox.imageId)
+  }
+
+  /**
    * Execute a sandbox tool under a gate ticket, logging exactly as the hub
    * does, and tainting the run.
    *
@@ -573,6 +598,11 @@ export class SandboxTools {
     const { command } = checked
     if (ctx.signal?.aborted === true) throw new Error('[refused] the run was stopped before the container started')
 
+    // Asked of the loop before the gate too (configRefusal), and again here,
+    // each on its own, so neither rests on the other's reading: before the
+    // workspace, which a driver that runs nothing would leave behind empty.
+    const runsNothing = this.#o.driver.everyRunRefusal()
+    if (runsNothing !== undefined) throw new Error(`[refused] ${runsNothing}`)
     const { imageId, domains, defaults } = this.#o.sandbox
     const unpinned = imageIdProblem(imageId)
     if (unpinned !== undefined || imageId === undefined) throw new Error(`[refused] ${unpinned ?? 'no image id'}`)

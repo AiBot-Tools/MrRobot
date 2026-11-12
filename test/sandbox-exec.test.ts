@@ -107,6 +107,7 @@ import {
   type SandboxCallContext,
   type SandboxToolsOptions,
 } from '../src/runtime/sandbox-tools.js'
+import { AppleContainerDriver } from '../src/sandbox/apple-container.js'
 import { DockerDriver, type ChildLike } from '../src/sandbox/docker.js'
 import { CAPTURE_MAX_BYTES, CONTAINER_PREFIX, type SandboxDriver, type SandboxResult, type SandboxSpec } from '../src/sandbox/driver.js'
 import { fakeProvider, http, FAKE_PRICING, type RecordedRequest, type ScriptEntry, type ScriptedResponse } from './helpers/fake-provider.js'
@@ -285,6 +286,12 @@ function wire(
     hub?: AgentView
     /** Wire no sandbox runner into the loop, as a kernel built without one. */
     unwired?: true
+    /** The runner's grace past a container's wallclock (SandboxToolsOptions.resultGraceMs). */
+    resultGraceMs?: number
+    /** kernel.yaml's sandbox.imageId, in place of IMAGE; undefined pins none. */
+    imageId?: string | undefined
+    /** The driver the runner is handed, in place of the fake (still `driver`, for its records). */
+    driver?: (fake: FakeSandbox) => SandboxDriver
   },
 ): Wired {
   const store = withStore(t)
@@ -292,8 +299,18 @@ function wire(
   const agents = registry(store, views)
   agents.load(agentsDir(t, options.files ?? { coder: manifest('coder') }))
   const driver = fakeSandbox({ imageId: IMAGE, script: options.exits, home: FAKE_HOME })
-  const sandbox = sandboxConfig(t, options.wallclockMs === undefined ? {} : { wallclockMs: options.wallclockMs })
-  const tools = new SandboxTools({ store, views, driver, agents: options.sandboxAgents?.(agents) ?? agents, sandbox })
+  const sandbox = sandboxConfig(t, {
+    ...(options.wallclockMs === undefined ? {} : { wallclockMs: options.wallclockMs }),
+    ...('imageId' in options ? { imageId: options.imageId } : {}),
+  })
+  const tools = new SandboxTools({
+    store,
+    views,
+    driver: options.driver?.(driver) ?? driver,
+    agents: options.sandboxAgents?.(agents) ?? agents,
+    sandbox,
+    ...(options.resultGraceMs === undefined ? {} : { resultGraceMs: options.resultGraceMs }),
+  })
 
   const provider = fakeProvider(options.script)
   const router = new Router({
@@ -631,7 +648,7 @@ test('a RunAgent whose toolAllow lists sandbox.exec, for a manifest sandboxToolP
   // they are loaded without it; a RunAgent built for one that claims it
   // anyway (a forged or stale tool list) is offered nothing: the loop reads
   // the manifest from the registry by the agent's id, not the RunAgent.
-  const w = wire(t, { script: [...UNFIT.map(() => done()), done()], exits: [], files: unfitFleet() })
+  const w = wire(t, { script: [...UNFIT.map(() => done()), done(), done()], exits: [], files: unfitFleet() })
   for (const [id] of UNFIT) {
     const out = await w.loop.start({ runId: `run_${id}`, agent: claiming(w, id), prompt: 'anything' })
     assert.equal(out.status, 'ok', `${id}: ${String(out.reason)}`)
@@ -641,7 +658,24 @@ test('a RunAgent whose toolAllow lists sandbox.exec, for a manifest sandboxToolP
   const out = await w.loop.start({ runId: 'run_fit', agent: claiming(w, 'coder'), prompt: 'anything' })
   assert.equal(out.status, 'ok', String(out.reason))
   assert.deepEqual(offered(w.provider.requests[UNFIT.length]), ['sandbox__exec'])
+  // And the other side of the intersection: the worker the manifest admits,
+  // in a run whose own tool list omits the tool, is offered nothing. The
+  // registry's admission narrows the run's list; it never adds to it.
+  const bare = await w.loop.start({ runId: 'run_bare', agent: { ...w.agent('coder'), toolAllow: [] }, prompt: 'anything' })
+  assert.equal(bare.status, 'ok', String(bare.reason))
+  assert.deepEqual(offered(w.provider.requests[UNFIT.length + 1]), [])
   assert.equal(w.driver.specs.length, 0)
+
+  // Nor is the worker the manifest admits, with the tool in its list, on a
+  // kernel whose sandbox config lets no exec run (no image id pinned, or one
+  // that is no id: configRefusal): the gate would deny every call, and a
+  // model shown the tool would spend its model calls retrying it.
+  for (const imageId of [undefined, 'aos-worker:test']) {
+    const unpinned = wire(t, { script: [done()], exits: [], imageId })
+    const out = await unpinned.loop.start({ runId: 'run_unpinned', agent: unpinned.agent('coder'), prompt: 'anything' })
+    assert.equal(out.status, 'ok', String(out.reason))
+    assert.deepEqual(offered(unpinned.provider.requests[0]), [], String(imageId))
+  }
 })
 
 test('a RunAgent whose toolAllow lists sandbox.exec, for a manifest sandboxToolProblem refuses, is denied it at execution: by the gate before any human is asked, or with its tool.result row when the registry changes while one is', async (t) => {
@@ -714,6 +748,34 @@ test('a RunAgent whose toolAllow lists sandbox.exec, for a manifest sandboxToolP
     assert.deepEqual(toolMessages(w.provider.requests[2]).slice(1), ['[denied] agent coder is archived'])
     assert.equal(w.driver.specs.length, 1, 'the second exec did not run')
     assert.equal(w.store.query({ type: 'tool.result' }).length, 1)
+  }
+
+  // A record that changes between the gate's ruling and the execution, on a
+  // clean run, where the gate allows the call with no human: denied with its
+  // tool.result, and, as nothing ran, the run stays clean.
+  {
+    let ruled = false
+    const w = wire(t, {
+      script: [exec(['id']), done()],
+      exits: [],
+      sandboxAgents: (agents) => ({
+        get: (agentId) => {
+          const record = agents.get(agentId)
+          return ruled && record !== undefined ? { ...record, status: 'archived' as const } : record
+        },
+      }),
+    })
+    w.store.subscribe((row) => {
+      if (row.type === 'tool.gate') ruled = true
+    })
+    const out = await w.loop.start({ runId: 'run_c', agent: w.agent('coder'), prompt: 'run something' })
+    assert.equal(out.status, 'ok', String(out.reason))
+    assert.equal(out.taint, 'clean', 'a call denied after the gate tainted the run')
+    assert.deepEqual(payloads(w.store, 'tool.gate').map((g) => [g.decision, g.taint]), [['allow', 'clean']])
+    assert.deepEqual(callRows(w.store), ['tool.gate', 'tool.result'])
+    assert.deepEqual(payloads(w.store, 'tool.result').map((r) => [r.ok, r.text]), [[false, '[denied] agent coder is archived']])
+    assert.deepEqual(toolMessages(w.provider.requests[1]), ['[denied] agent coder is archived'])
+    assert.equal(w.driver.specs.length, 0)
   }
 
   // And a record that changes while a human is asked: the worker is offered
@@ -1050,6 +1112,34 @@ test('a container ended by its wallclock, by the run being stopped, or outliving
   }
 })
 
+test("a run the loop is running, stopped through its RunRequest's signal mid-exec, has its container killed by name, sandbox.killed records requested, and the run ends killed", { timeout: 10_000 }, async (t) => {
+  // Through RunLoop, as bootKernel's launch hands the loop the run's
+  // signal (aos kill, a shutdown): the loop passes it to the runner, whose
+  // kill by name ends the container, and the loop takes no further step.
+  // Were the signal not passed, the hung container would be given up at its
+  // wallclock and the grace (250 ms here), with no kill by name and
+  // sandbox.killed recording error.
+  const w = wire(t, { script: [exec(['sleep', 'infinity']), done()], exits: [{ hangs: true }], wallclockMs: 200, resultGraceMs: 50 })
+  const stop = new AbortController()
+  w.store.subscribe((row) => {
+    if (row.type !== 'sandbox.started') return
+    queueMicrotask(() => {
+      stop.abort()
+    })
+  })
+  const out = await w.loop.start({ runId: 'run_s', agent: w.agent('coder'), prompt: 'wait', signal: stop.signal })
+  const name = `${CONTAINER_PREFIX}run_s-1`
+  assert.deepEqual(w.driver.kills, [name], "the stop's kill by name")
+  assert.deepEqual(w.driver.abandons, [], 'the container was given up rather than killed at the stop')
+  assert.deepEqual(payloads(w.store, 'sandbox.killed').map((p) => [p.reason, p.exitCode]), [['requested', 137]])
+  assert.deepEqual(callRows(w.store), ['tool.gate', 'tool.call', 'sandbox.started', 'sandbox.killed', 'tool.result'])
+  assert.deepEqual([out.status, out.reason], ['killed', 'requested'])
+  const [finished] = payloads(w.store, 'run.finished')
+  assert.deepEqual([finished?.status, finished?.reason], ['killed', 'requested'])
+  assert.equal(w.provider.requests.length, 1, 'the model was called again after the stop')
+  assert.equal(getEventListeners(stop.signal, 'abort').length, 0, 'the exec left a listener on the run signal')
+})
+
 test("sandbox.killed's reason reads the driver's verdict: killedBy, then overran, then a missing exit code, then exited", () => {
   const base: SandboxResult = { name: 'aos-run-x-1', exitCode: 0, signal: null, stdout: '', stderr: '', truncated: false, durationMs: 1 }
   assert.equal(endReason(base), 'exited')
@@ -1204,6 +1294,7 @@ test('a driver whose result rejects has its container killed by name, and its en
     kill: (name) => d.driver.kill(name),
     abandon: (name) => d.driver.abandon(name),
     commandRefusal: (command) => d.driver.commandRefusal(command),
+    everyRunRefusal: () => d.driver.everyRunRefusal(),
   }
   const tools = new SandboxTools({ store: d.store, views: SHIPPED_VIEWS, driver: lossy, agents: d.agents, sandbox: d.sandbox })
   const name = `${CONTAINER_PREFIX}run_j-1`
@@ -1686,6 +1777,183 @@ test('an exec whose arguments the runner refuses is refused before any approval 
   assert.equal(d.tools.argsRefusal('sandbox.other', { anything: true }), undefined)
 })
 
+/**
+ * Set the runner's sandbox config to pin `imageId` (none, for undefined): as
+ * a kernel.yaml read anew would, which only a test does, since the kernel
+ * reads it once at boot.
+ */
+function pinImage(sandbox: SandboxConfig, imageId: string | undefined): void {
+  const mutable = sandbox as { imageId?: string }
+  if (imageId === undefined) delete mutable.imageId
+  else mutable.imageId = imageId
+}
+
+test('an exec on a kernel that pins no image id, or one that is no id, is refused before any approval is filed', async (t) => {
+  // A refusal of every call, whatever its arguments (SandboxTools.
+  // configRefusal): the loop offers no such kernel's run the tool (the test
+  // below that it is not offered), and asks it again before the gate, which
+  // denies a call of it (its rule 3c) on a run that starts tainted, where it
+  // would otherwise ask a human, and on a clean one, where it would
+  // otherwise allow it. A model's call reaches the gate only once offered,
+  // so here the config pins an id at the offer and none at the call.
+  const cases: readonly (readonly [string, string | undefined, RegExp])[] = [
+    ['none pinned', undefined, /^sandbox\.imageId is not set in config\/kernel\.yaml, which ships none/],
+    ['a tag', 'aos-worker:test', /^sandbox\.imageId "aos-worker:test" is no image id: it must be sha256:<64 lower-case hex>/],
+  ]
+  for (const [what, imageId, why] of cases) {
+    // What the runner itself says, when it is called.
+    const d = direct(t, { imageId })
+    const refusal = d.tools.configRefusal(EXEC)
+    assert.match(String(refusal), why, what)
+    const args = { command: ['true'] }
+    const refused = await d.tools.call(ticketFor('run_r', args), args, context('run_r'))
+    assert.equal(refused.text, `[refused] ${String(refusal)}`, `${what}: configRefusal says what the runner refuses with`)
+
+    for (const taint of ['tainted', 'clean'] as const) {
+      const w: Wired = wire(t, {
+        script: [
+          () => {
+            pinImage(w.sandbox, imageId)
+            return exec(['true'])
+          },
+          done(),
+        ],
+        exits: [],
+      })
+      const asked = denyEveryApproval(w)
+      const out = await w.loop.start({ runId: `run_${taint}`, agent: w.agent('coder'), prompt: 'go', taint })
+      assert.equal(out.status, 'ok', `${what}, ${taint}: ${String(out.reason)}`)
+      assert.equal(asked(), 0, `${what}, ${taint}: a human was asked`)
+      assert.equal(w.store.query({ type: 'run.parked' }).length, 0, `${what}, ${taint}: the run was parked`)
+      assert.deepEqual(payloads(w.store, 'tool.gate').map((g) => [g.decision, g.taint, g.reason]), [['deny', taint, refusal]], `${what}, ${taint}`)
+      assert.deepEqual(toolMessages(w.provider.requests[1]), [`[denied] ${String(refusal)}`], `${what}, ${taint}`)
+      assert.deepEqual(callRows(w.store), ['tool.gate'], `${what}, ${taint}: no tool.call or tool.result`)
+      assert.equal(w.driver.specs.length, 0, `${what}, ${taint}`)
+    }
+
+    // Arguments the runner refuses on their own too (a home in the
+    // command): the gate's reason is the config's, the more fundamental, as
+    // no call of the tool can run on this kernel whatever its arguments.
+    const homeward = ['cat', `${FAKE_HOME}/.ssh/id_ed25519`]
+    const argsWhy = d.tools.argsRefusal(EXEC, { command: homeward })
+    assert.ok(argsWhy !== undefined && argsWhy !== refusal, `${what}: the runner refuses these arguments on their own`)
+    const w: Wired = wire(t, {
+      script: [
+        () => {
+          pinImage(w.sandbox, imageId)
+          return exec(homeward)
+        },
+        done(),
+      ],
+      exits: [],
+    })
+    const asked = denyEveryApproval(w)
+    const out = await w.loop.start({ runId: 'run_both', agent: w.agent('coder'), prompt: 'go', taint: 'tainted' })
+    assert.equal(out.status, 'ok', `${what}: ${String(out.reason)}`)
+    assert.equal(asked(), 0, `${what}: a human was asked`)
+    assert.deepEqual(payloads(w.store, 'tool.gate').map((g) => [g.decision, g.reason]), [['deny', refusal]], `${what}: the config's refusal first`)
+    assert.equal(w.driver.specs.length, 0, what)
+  }
+
+  // A pinned id refuses nothing, and a ref the kernel implements none of is
+  // not the config's to refuse.
+  const d = direct(t)
+  assert.equal(d.tools.configRefusal(EXEC), undefined)
+  assert.equal(direct(t, { imageId: undefined }).tools.configRefusal('sandbox.other'), undefined)
+})
+
+/**
+ * The fake driver until stub() is called, the apple-container stub after: as
+ * a kernel.yaml read anew whose sandbox.driver names the stub would make it,
+ * which only a test does, since the kernel builds its driver once at boot.
+ */
+function switching(base: FakeSandbox): SandboxDriver & { stub(): void } {
+  const stub = new AppleContainerDriver()
+  let now: SandboxDriver = base
+  return {
+    get name() {
+      return now.name
+    },
+    probe: () => now.probe(),
+    run: (spec) => now.run(spec),
+    kill: (name) => now.kill(name),
+    abandon: (name) => now.abandon(name),
+    commandRefusal: (command) => now.commandRefusal(command),
+    everyRunRefusal: () => now.everyRunRefusal(),
+    stub: () => {
+      now = stub
+    },
+  }
+}
+
+test('an exec on a kernel whose driver runs nothing, the apple-container stub, is never offered, and is refused before any approval is filed', async (t) => {
+  // The stub's run() throws whatever it is handed: a fact of its code, read
+  // before any approval (SandboxDriver.everyRunRefusal, SandboxTools.
+  // configRefusal), not a probe's reading of a daemon. With an image id
+  // pinned and a manifest that may hold the tool, no run is shown it, and a
+  // call of it is denied by the gate (its rule 3c) on a run that starts
+  // tainted, where it would otherwise ask a human, and on a clean one.
+  const stub = new AppleContainerDriver()
+  const why = stub.everyRunRefusal()
+  assert.match(String(why), /^the apple-container driver is not implemented: macOS 15 has no `container` binary/)
+  const probe = await stub.probe()
+  assert.equal(probe.ok ? undefined : probe.why, why, "the probe's reason and the refusal are one")
+  const neverSpawned = (): never => {
+    throw new Error('the real driver spawned something')
+  }
+  assert.equal(realDriver(sandboxConfig(t), tmpdir(t), { spawn: neverSpawned, execFile: neverSpawned }).everyRunRefusal(), undefined)
+  assert.equal(fakeSandbox({ imageId: IMAGE }).everyRunRefusal(), undefined)
+
+  // What the runner itself says, when it is called: before any workspace.
+  const d = direct(t)
+  const tools = toolsOver(d, stub)
+  assert.equal(tools.configRefusal(EXEC), why)
+  assert.equal(tools.configRefusal('sandbox.other'), undefined)
+  const args = { command: ['true'] }
+  const refused = await tools.call(ticketFor('run_r', args), args, context('run_r'))
+  assert.equal(refused.text, `[refused] ${String(why)}`)
+  assert.deepEqual(callRows(d.store), ['tool.call', 'tool.result'])
+  assert.equal(existsSync(join(d.sandbox.domains.trusted.mountRoot, 'run_r')), false, 'a workspace was made')
+
+  // Not offered: the worker the manifest admits, with the tool in its list.
+  const offeredNone = wire(t, { script: [done()], exits: [], driver: () => new AppleContainerDriver() })
+  const out = await offeredNone.loop.start({ runId: 'run_o', agent: offeredNone.agent('coder'), prompt: 'anything' })
+  assert.equal(out.status, 'ok', String(out.reason))
+  assert.deepEqual(offered(offeredNone.provider.requests[0]), [])
+
+  // Denied before the gate asks anyone. A model's call reaches the gate only
+  // once offered, so the driver runs at the offer and is the stub at the call.
+  for (const taint of ['tainted', 'clean'] as const) {
+    let driver: ReturnType<typeof switching> | undefined
+    const w = wire(t, {
+      script: [
+        () => {
+          driver?.stub()
+          return exec(['true'])
+        },
+        done(),
+      ],
+      exits: [],
+      driver: (fake) => (driver = switching(fake)),
+    })
+    const asked = denyEveryApproval(w)
+    const ran = await w.loop.start({ runId: `run_${taint}`, agent: w.agent('coder'), prompt: 'go', taint })
+    assert.equal(ran.status, 'ok', `${taint}: ${String(ran.reason)}`)
+    assert.deepEqual(offered(w.provider.requests[0]), ['sandbox__exec'], taint)
+    assert.equal(asked(), 0, `${taint}: a human was asked`)
+    assert.equal(w.store.query({ type: 'run.parked' }).length, 0, `${taint}: the run was parked`)
+    assert.deepEqual(payloads(w.store, 'tool.gate').map((g) => [g.decision, g.taint, g.reason]), [['deny', taint, why]], taint)
+    assert.deepEqual(toolMessages(w.provider.requests[1]), [`[denied] ${String(why)}`], taint)
+    assert.deepEqual(callRows(w.store), ['tool.gate'], `${taint}: no tool.call or tool.result`)
+    assert.equal(w.driver.specs.length, 0, taint)
+  }
+
+  // On a kernel that also pins no image id, the driver's refusal is the one
+  // given: no image id would make a stub run.
+  const unpinned = direct(t, { imageId: undefined })
+  assert.equal(toolsOver(unpinned, stub).configRefusal(EXEC), why)
+})
+
 test('an exec holding a character a screen hides or reorders by is refused, naming it; plain non-ASCII text runs', async (t) => {
   // Written as escapes, so this file shows no hidden or bidirectional text
   // itself, which is the hazard the test is about.
@@ -1834,6 +2102,7 @@ function withKill(base: FakeSandbox, answer: (name: string) => Promise<void>): S
     },
     abandon: (name) => base.abandon(name),
     commandRefusal: (command) => base.commandRefusal(command),
+    everyRunRefusal: () => base.everyRunRefusal(),
     kills,
   }
 }
@@ -2251,6 +2520,7 @@ test('a container the log cannot record fails the call only once it has ended', 
     kill: (name) => d.driver.kill(name),
     abandon: (name) => d.driver.abandon(name),
     commandRefusal: (command) => d.driver.commandRefusal(command),
+    everyRunRefusal: () => d.driver.everyRunRefusal(),
   }
   const append = d.store.append.bind(d.store)
   d.store.append = ((event: Parameters<EventStore['append']>[0]) => {
@@ -3257,6 +3527,7 @@ test('a driver whose kill refuses with a long text of quotes still gets its tool
         kill: (name) => base.kill(name),
         abandon: (name) => base.abandon(name),
         commandRefusal: (command) => base.commandRefusal(command),
+        everyRunRefusal: () => base.everyRunRefusal(),
       }),
     ],
   ]
@@ -3286,6 +3557,7 @@ test("a driver's text of exactly DRIVER_TEXT_BYTES payload bytes is shown whole,
     kill: (name) => base.kill(name),
     abandon: (name) => base.abandon(name),
     commandRefusal: (command) => base.commandRefusal(command),
+    everyRunRefusal: () => base.everyRunRefusal(),
   })
   // Counted in the bytes it takes in the log's JSON: 256 quotes are 512.
   const rows: readonly [string, string, string][] = [
@@ -3441,6 +3713,7 @@ test('a refusal never quotes a key the model sent, and a failure text past what 
       kill: (name) => d.driver.kill(name),
       abandon: (name) => d.driver.abandon(name),
       commandRefusal: (command) => d.driver.commandRefusal(command),
+      everyRunRefusal: () => d.driver.everyRunRefusal(),
     }
     const tools = toolsOver(d, refusing)
     const args = { command: ['true'] }

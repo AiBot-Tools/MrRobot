@@ -18,6 +18,40 @@
 // and from that point a write needs a human. Freezing taint at run start
 // would make both of those silently ineffective.
 //
+// A stopped run takes no further step. Its signal (`aos kill`, a shutdown, a
+// parent's kill of the child it delegated to) is read before every model call
+// and every tool call, after every model call, and once the turns are spent,
+// and once it has aborted the run ends `killed`, its reason STOP_REQUESTED,
+// rather than call the provider again or start another tool. What is in
+// flight when it aborts is the tool's to end: a sandbox exec's container is
+// killed by name (SandboxTools), a delegated child is killed; a model call
+// already sent runs to its answer, which is then not the run's end (an
+// answer with no tool call ends it `killed` too), and none of its tool calls
+// then runs; a call a human approves after the stop does not run either, and
+// its tool.result says so. (The approval itself is still awaited: a run
+// stopped while parked holds its lane until a human answers or the approval
+// expires.) A budget cap that ran out before the stop keeps its reason, and
+// so does a wallclock that has run out by the time the stop is read: a child
+// its parent kills for outliving its ceiling (delegate.ts) ends `wallclock`
+// when its own wallclock has run out by then, as it would have unkilled, not
+// as if the operator had asked, and `requested` when it has not (one its
+// lane admitted late, whose wallclock started late, or one killed while
+// still queued, whose wallclock never started). A count or cost cap that the model call in flight at the
+// stop then used up is not the reason: the cap permitted that call, and the
+// stop is why no step follows it. A tool call in flight at the stop is
+// charged as it ends, and a cap its charge uses up is the run's reason, as
+// it would be unstopped. A run stopped before its lane admits it (queued
+// behind its agent's other run, or behind a full lane) never starts, and
+// still ends: run.finished `killed`, `requested`, with nothing spent, so all
+// that waits on a run's end (the daemon's run view and the scheduler's busy
+// check, a client waiting for run.finished, delegation) sees it end.
+//
+// No tool call reaches the gate once a cap has run out, whether the turn's
+// model call used the last of one, a call before it in the same answer did,
+// or the wallclock elapsed while a human was asked of one: the gate would
+// only be followed by a refusal (D19), and a human would be asked to approve
+// a call the loop then refuses. The run ends with the first cap it met.
+//
 // Delegation is offered to orchestrators only. The kernel-native tools
 // (`kernel.adopt_plan`, `kernel.delegate`) join the tool array when the agent's
 // role is `orchestrator` AND its manifest allows them; a worker is never offered
@@ -28,10 +62,14 @@
 // Sandbox tools (`sandbox.exec`) go to the kernel's sandbox runner, never to
 // the hub, and are offered only to a run whose agent's manifest, read from the
 // registry by its id, may hold the tool and lists it (SandboxTools.
-// holderProblem), whatever the RunAgent's own tool list says: a run of any
-// other is never shown one. Before the gate, the runner is asked whether it
-// would refuse the call whoever approved it, for its caller (that manifest
-// again, or no runner wired at all) or for its arguments on their own, and
+// holderProblem), whatever the RunAgent's own tool list says, on a kernel
+// whose sandbox config lets a call of it run (SandboxTools.configRefusal: a
+// driver that runs one, and an image id pinned): a run of any other, or on
+// any other kernel, is never shown one. Before the gate, the runner is asked
+// whether it would refuse the call whoever approved it, for its caller (that
+// manifest again, or no runner wired at all), for the kernel's sandbox
+// config (a driver that runs nothing, or no image id pinned: configRefusal)
+// or for its arguments on their own, and
 // the gate denies such a call (its rule 3c) rather than ask a human to
 // approve a command that would then never run. A caller the registry stops
 // admitting while a human is asked (archived, or reloaded without the tool)
@@ -50,7 +88,7 @@ import type { ModelBinding, Router } from '../models/router.js'
 import type { ToolCall, ToolSchema, TurnMessage } from '../models/transport.js'
 import { Budget, type BudgetCaps, type StopReason } from './budget.js'
 import type { KernelTools } from './kernel-tools.js'
-import type { Lanes, LaneName } from './lanes.js'
+import { LaneAborted, type Lanes, type LaneName } from './lanes.js'
 import { isSandboxRef, type SandboxTools } from './sandbox-tools.js'
 import { withRunScope } from './scope.js'
 
@@ -63,6 +101,13 @@ export interface ToolContext {
 }
 
 export type RunStatus = 'ok' | 'error' | 'killed' | 'denied'
+
+/**
+ * run.finished's reason for a run stopped through its signal (`aos kill`, a
+ * shutdown, a parent's kill of its child), beside the budget's StopReasons:
+ * the word sandbox.killed records for a container killed at the run's stop.
+ */
+export const STOP_REQUESTED = 'requested'
 
 /** Mutable facts about a run in flight. Taint is the only one so far. */
 interface RunState {
@@ -165,10 +210,62 @@ export class RunLoop {
       },
     })
 
-    return this.#o.lanes.enqueue(
-      { agentId: agent.agentId, lane: agent.lane, signal: request.signal },
-      () => this.#run(request, budget),
-    )
+    // Only a refusal of the lane itself, before the run began: an error the
+    // run's own body throws is #run's to record, and it records every one.
+    let began = false
+    try {
+      return await this.#o.lanes.enqueue(
+        { agentId: agent.agentId, lane: agent.lane, signal: request.signal },
+        () => {
+          began = true
+          return this.#run(request, budget)
+        },
+      )
+    } catch (e) {
+      if (began || !(e instanceof LaneAborted)) throw e
+      return this.#finishUnstarted(request)
+    }
+  }
+
+  /**
+   * The end of a run stopped while it waited for its lane: run.finished
+   * `killed`, STOP_REQUESTED, with nothing spent and no run.started before
+   * it, since it never started. Without it a queued run killed would stay
+   * `queued` in the daemon's run view for the kernel's life, its agent busy
+   * to the scheduler, which then skips every job of that agent until a
+   * restart.
+   */
+  async #finishUnstarted(request: RunRequest): Promise<RunOutcome> {
+    const { runId, agent } = request
+    const taint = this.#taintOf(request, { taintedByTool: false })
+    await this.#inScope(request, taint === 'tainted', () => {
+      this.#o.store.append({
+        type: 'run.finished',
+        runId,
+        agentId: agent.agentId,
+        payload: {
+          schemaVersion: 1,
+          runId,
+          status: 'killed',
+          reason: STOP_REQUESTED,
+          costMicroUsd: 0,
+          llmCalls: 0,
+          toolCalls: 0,
+          durationMs: 0,
+        },
+      })
+      return Promise.resolve()
+    })
+    return {
+      runId,
+      status: 'killed',
+      reason: STOP_REQUESTED,
+      costMicroUsd: 0,
+      llmCalls: 0,
+      toolCalls: 0,
+      finalText: '',
+      taint,
+    }
   }
 
   /**
@@ -215,6 +312,31 @@ export class RunLoop {
     let reason: string | undefined
 
     const taintNow = (): boolean => this.#taintOf(request, state) === 'tainted'
+    const stopped = (): boolean => request.signal?.aborted === true
+    // Why a run stopped while no model call was in flight ends: a cap that
+    // has run out by now keeps its reason (the wallclock first, as
+    // Budget.check reads it), and only a run within its budget ends
+    // STOP_REQUESTED. Read before a tool call and once the turns are spent,
+    // where a count or cost cap that has run out ran out before the stop: a
+    // tool call in flight at the stop that used one up has set the run's
+    // reason itself, by its own charge, and is not read again here.
+    const stopReason = (): string => {
+      const now = budget.check()
+      return now.ok ? STOP_REQUESTED : now.stop
+    }
+    // Why a run stopped while its model call was in flight ends, read once
+    // that call has answered. Its counts and cost are taken as they stood
+    // before the call, which the turn's `before` found within every cap (the
+    // turn never began otherwise), so only the wallclock is read, as it
+    // stands now. A count or cost cap that call's own charge used up stopped
+    // nothing: a cap of N permits the Nth call and refuses the next, and the
+    // stop, not the cap, is why no step follows. A run past its time when
+    // its end is read overran it, which Budget.check reports first,
+    // whichever came first.
+    const stopReasonAfterCall = (): string => {
+      const now = budget.check()
+      return !now.ok && now.stop === 'wallclock' ? now.stop : STOP_REQUESTED
+    }
 
     budget.start()
     await this.#inScope(request, taintNow(), () => {
@@ -239,10 +361,16 @@ export class RunLoop {
 
     try {
       for (let turn = 0; turn < maxTurns; turn++) {
+        // The budget before the stop: a cap that ran out keeps its reason.
         const before = budget.check()
         if (!before.ok) {
           status = 'killed'
           reason = before.stop
+          break
+        }
+        if (stopped()) {
+          status = 'killed'
+          reason = STOP_REQUESTED
           break
         }
 
@@ -262,6 +390,13 @@ export class RunLoop {
 
         const calls = result.outcome.toolCalls ?? []
         const callErrors = result.outcome.toolCallErrors ?? []
+        // Answered after the stop: not the run's end, whether the answer is
+        // final text or tool calls, none of which then runs.
+        if (stopped()) {
+          status = 'killed'
+          reason = stopReasonAfterCall()
+          break
+        }
         if (calls.length === 0 && callErrors.length === 0) break
 
         messages.push({
@@ -286,6 +421,31 @@ export class RunLoop {
         }
 
         for (const call of calls) {
+          // Not one more tool once the run is stopped (during the call
+          // before). A budget stop a call before it met keeps its reason, and
+          // so does a cap that has run out by now (stopReason).
+          if (stopped()) {
+            if (reason === undefined) {
+              status = 'killed'
+              reason = stopReason()
+            }
+            break
+          }
+          // Nor once a cap has run out: this turn's model call used the last
+          // of one, a call before this one did, or the wallclock elapsed
+          // while a human was asked of one. The call would only reach the
+          // gate to be refused after it (#handleToolCall's afterPark check),
+          // so none does, and no human is asked to approve a call the loop
+          // then refuses while the run holds its lane past its cap. The
+          // first cap met is the run's reason.
+          const now = budget.check()
+          if (!now.ok) {
+            if (reason === undefined) {
+              status = 'killed'
+              reason = now.stop
+            }
+            break
+          }
           const outcome = await this.#handleToolCall(request, budget, call, state)
           if (outcome.taints) state.taintedByTool = true
           messages.push({
@@ -307,6 +467,12 @@ export class RunLoop {
           reason = afterLlm.stop
           break
         }
+      }
+      // A stop no read above met: one during the last tool call of the last
+      // turn maxTurns allows, read nowhere since. The run still ends killed.
+      if (reason === undefined && stopped()) {
+        status = 'killed'
+        reason = stopReason()
       }
     } catch (e) {
       status = 'error'
@@ -355,7 +521,9 @@ export class RunLoop {
    * tool even if a manifest somehow listed one. Sandbox tools likewise, to a
    * run whose agent's manifest, read from the registry by its id rather than
    * from the RunAgent, may hold one and lists it (holderProblem): a RunAgent
-   * whose toolAllow names sandbox.exec is not shown it otherwise.
+   * whose toolAllow names sandbox.exec is not shown it otherwise, nor is any
+   * run on a kernel whose sandbox config refuses every call of it
+   * (configRefusal).
    */
   #toolsFor(agent: RunAgent): ToolSchema[] {
     const allowed = new Set(agent.toolAllow)
@@ -363,11 +531,17 @@ export class RunLoop {
       agent.role === 'orchestrator' && this.#o.kernelTools !== undefined
         ? this.#o.kernelTools.schemas()
         : []
+    // Nor on a kernel whose sandbox config lets no call of the tool run (a
+    // driver that runs nothing, or no image id pinned: configRefusal): the
+    // gate would deny every call, and a model shown the tool would spend its
+    // model calls retrying it.
     const sandbox = this.#o.sandboxTools
     const boxed =
       sandbox === undefined
         ? []
-        : sandbox.schemas().filter((t) => sandbox.holderProblem(t.ref, agent.agentId) === undefined)
+        : sandbox
+            .schemas()
+            .filter((t) => sandbox.holderProblem(t.ref, agent.agentId) === undefined && sandbox.configRefusal(t.ref) === undefined)
     return [...this.#o.agentView().tools, ...kernel, ...boxed].filter((t) => allowed.has(t.ref))
   }
 
@@ -389,13 +563,16 @@ export class RunLoop {
     const view = resolveView(this.#o.views, serverId, toolName)
 
     // Before the gate, so that the gate denies (its rule 3c) a sandbox call
-    // the runner would refuse whoever approved it, for its caller or its
-    // arguments, rather than ask a human to approve a command that then never
-    // runs. The caller first: who may hold the tool is the more fundamental.
+    // the runner would refuse whoever approved it, for its caller, for the
+    // kernel's own sandbox config or for its arguments, rather than ask a
+    // human to approve a command that then never runs. The most fundamental
+    // first: who may hold the tool, then whether any call of it can run.
     const sandboxTools = this.#o.sandboxTools
     const isSandbox = isSandboxRef(call.ref)
     const runnerRefusal = isSandbox
-      ? (this.#sandboxHolderProblem(call.ref, agent.agentId) ?? sandboxTools?.argsRefusal(call.ref, context.args))
+      ? (this.#sandboxHolderProblem(call.ref, agent.agentId) ??
+        sandboxTools?.configRefusal(call.ref) ??
+        sandboxTools?.argsRefusal(call.ref, context.args))
       : undefined
 
     const gateInput = {
@@ -449,6 +626,13 @@ export class RunLoop {
       throw e
     }
     if (parked) this.#resume(request, parkedAt)
+
+    // A run stopped while a human was asked: the approval buys nothing, as
+    // one after the wallclock buys nothing (below), and the call's ticket is
+    // closed with its tool.result.
+    if (request.signal?.aborted === true) {
+      return this.#deniedAfterGate(request, budget, ticket, '[killed] the run was stopped while its call was decided; the tool did not run')
+    }
 
     // D19: the wallclock ran while the run was parked. An approval that
     // arrives after it expired does not buy an execution.

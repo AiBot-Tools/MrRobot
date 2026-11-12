@@ -10,10 +10,19 @@
 // that picks this driver boots degraded rather than dead, and the reason in
 // the degraded-subsystem view says this is unwritten code, not an absent
 // runtime. `commandRefusal()` answers too, refusing nothing: it is asked
-// before anything runs, and run() refuses every spec.
+// before anything runs, and run() refuses every spec, which
+// `everyRunRefusal()` says, in the probe's words, before any approval: the
+// stub's refusal is a fact of its code, not of a runtime's state, so no run
+// is offered sandbox.exec on a kernel that names this driver, and no human
+// is asked to approve an exec it would then refuse.
 
 import { NotImplementedError } from '../errors.js'
 import type { ProbeResult, RunningSandbox, SandboxDriver, SandboxSpec } from './driver.js'
+
+/** Why this driver runs nothing: probe()'s reason, and everyRunRefusal()'s. */
+const STUB_WHY =
+  'the apple-container driver is not implemented: macOS 15 has no `container` binary. ' +
+  'Use sandbox.driver: docker with Colima.'
 
 export class AppleContainerDriver implements SandboxDriver {
   readonly name = 'apple-container'
@@ -31,12 +40,7 @@ export class AppleContainerDriver implements SandboxDriver {
    * probe does: it is asked before anything is executed.
    */
   probe(): Promise<ProbeResult> {
-    return Promise.resolve({
-      ok: false,
-      why:
-        'the apple-container driver is not implemented: macOS 15 has no `container` binary. ' +
-        'Use sandbox.driver: docker with Colima.',
-    })
+    return Promise.resolve({ ok: false, why: STUB_WHY })
   }
 
   run(_spec: SandboxSpec): RunningSandbox {
@@ -51,6 +55,14 @@ export class AppleContainerDriver implements SandboxDriver {
    */
   commandRefusal(_command: readonly string[]): string | undefined {
     return undefined
+  }
+
+  /**
+   * Refuses every run, as run() does whatever the spec: a fact of this
+   * stub's code, read before any approval (SandboxDriver.everyRunRefusal).
+   */
+  everyRunRefusal(): string | undefined {
+    return STUB_WHY
   }
 
   kill(_name: string): Promise<void> {

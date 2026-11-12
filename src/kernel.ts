@@ -44,13 +44,13 @@ import { isClean, projectRecovery, type Recovery } from './events/projections.js
 import { GoalTracker } from './goals/tracker.js'
 import { Delegation } from './runtime/delegate.js'
 import { KernelTools } from './runtime/kernel-tools.js'
-import { SandboxTools } from './runtime/sandbox-tools.js'
+import { isSandboxRef, SandboxTools } from './runtime/sandbox-tools.js'
 import { GoalWriter } from './goals/writer.js'
 import { goalToolsUnusable, watchGoalTools } from './goals/tools.js'
 
 import { AgentRegistry, type AgentRecord } from './agents/registry.js'
 import { loadSoul, type SoulBudgetTracker } from './agents/souls.js'
-import { type ToolViewsFile } from './mcp/tool-views.js'
+import { resolveView, type ToolViewsFile } from './mcp/tool-views.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 
 import { McpHub, streamableHttpTransport, type ClientFactory } from './mcp/hub.js'
@@ -629,13 +629,15 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     const kernelTools = new KernelTools({ store, views: toolViews, handlers: delegation.handlers() })
     // ── sandbox tools: sandbox.exec, a worker's commands in a container ───
     //
-    // Built whatever the sandbox subsystem's mark: a driver that cannot run
-    // refuses each call itself, and the call's result says why. Every
-    // sandbox.* ref goes to this runner, never to the hub, and is offered only
-    // to a run whose agent's manifest, read from the registry, may hold it
-    // (sandboxToolProblem) and lists it. Each exec runs --network none with no
-    // channel: egress stays the stub (STUBS, egress-proxy), and no shipped
-    // manifest lists a sandbox tool.
+    // Built whatever the sandbox subsystem's mark: a driver whose runtime does
+    // not answer refuses each call itself, and the call's result says why. A
+    // kernel whose config lets no exec run (a driver that runs nothing, the
+    // apple-container stub, or no image id pinned: configRefusal) offers the
+    // tool to no run. Every sandbox.* ref goes to this runner, never to the
+    // hub, and is offered only to a run whose agent's manifest, read from the
+    // registry, may hold it (sandboxToolProblem) and lists it. Each exec runs
+    // --network none with no channel: egress stays the stub (STUBS,
+    // egress-proxy), and no shipped manifest lists a sandbox tool.
     const sandboxTools = new SandboxTools({ store, views: toolViews, driver, agents, sandbox: config.sandbox })
 
     const loop = new RunLoop({
@@ -693,7 +695,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       if (row.type === 'run.finished') delegation.forget(row.runId)
       const live = runs.get(row.runId)
       if (live === undefined) return
-      live.state = project(live.state, row.type, row.payload, row.seq, row.ts)
+      live.state = project(live.state, row.type, row.payload, row.seq, row.ts, (ref) => callTaints(toolViews, ref))
     })
 
     // Attached here, with the run projection, because both read the same stream.
@@ -849,8 +851,9 @@ function stubReason(id: string, call: () => unknown): string {
  */
 export function defaultDriver(config: KernelConfig, repoRoot: string, processes?: DockerProcesses): SandboxDriver {
   if (config.sandbox.driver === 'apple-container') return new AppleContainerDriver()
-  // The driver is constructed, not used: nothing spawns until a run asks for a
-  // container, and in Phase 0 nothing does. Boot only probes it.
+  // Boot only constructs and probes it: nothing spawns until a run asks for a
+  // container, which a sandbox.exec does (egress plan W1a), through the
+  // runner boot hands the loop.
   const options = {
     domains: config.sandbox.domains,
     defaults: config.sandbox.defaults,
@@ -981,12 +984,36 @@ function routerDegradation(
   return `no routable model: ${why.join('; ')}`
 }
 
-function project(
+/**
+ * Whether a call of `ref` that reached its tool.call taints its run, as the
+ * run loop reads it: a sandbox tool always does (SandboxTools.call, whatever
+ * its view says), and any other whose view says `taints: true`.
+ */
+export function callTaints(views: ToolViewsFile, ref: string): boolean {
+  if (isSandboxRef(ref)) return true
+  const at = ref.indexOf('.')
+  if (at <= 0) return false
+  return resolveView(views, ref.slice(0, at), ref.slice(at + 1)).taints
+}
+
+/**
+ * The daemon's view of a run, from its rows. Taint is read from every row
+ * that taints a run in the loop, so runs.list and run.get show what the gate
+ * reads: the run's start, a held output released, a call of a tool that
+ * taints (`callTaints`, from its tool.call: the loop marks the run once the
+ * call has executed, which follows it), and a delegated child's tainted
+ * result. Taint never clears.
+ *
+ * @internal Exported for its own tests; the kernel reads it through the
+ *   store's subscription in bootKernel.
+ */
+export function project(
   state: RunState,
   type: string,
   payloadText: string,
   seq: number,
   ts: string,
+  callTaintsOf: (ref: string) => boolean,
 ): RunState {
   let payload: Record<string, unknown> = {}
   try {
@@ -1025,6 +1052,12 @@ function project(
       return { ...next, llmCalls: next.llmCalls + 1, costMicroUsd: next.costMicroUsd + num('costMicroUsd') }
     case 'tool.result':
       return { ...next, toolCalls: next.toolCalls + 1 }
+    case 'tool.call':
+      return typeof payload['toolRef'] === 'string' && callTaintsOf(payload['toolRef'])
+        ? { ...next, taint: 'tainted' }
+        : next
+    case 'delegation.result':
+      return payload['taint'] === 'tainted' ? { ...next, taint: 'tainted' } : next
     case 'quarantine.released':
       return { ...next, taint: 'tainted' }
     default:

@@ -55,6 +55,7 @@ import { DENY_KEYS, TOKEN_PATTERNS } from '../src/events/redact.js'
 import { APPROVAL_PREVIEW_BYTES } from '../src/policy/engine.js'
 import { CAPTURE_EDGE_BYTES, DOCKER_CLI_FAILED, JWT_RUN_STARTS_MAX, KILL_WAIT_MS, RESULT_GRACE_MS, STREAM_WINDOW_BYTES } from '../src/runtime/sandbox-tools.js'
 import { CAPTURE_MAX_BYTES } from '../src/sandbox/driver.js'
+import { STOP_REQUESTED } from '../src/runtime/loop.js'
 import { CATALOG } from '../scripts/falsify/catalog.js'
 import { WORKSPACE_TARGET } from '../src/sandbox/docker.js'
 import { FORCE_QUIT_LOG, PMMCP_OLLAMA_NAMES } from '../scripts/install/force-quit.js'
@@ -1793,6 +1794,14 @@ test("README names no egress proxy, and its sandbox record says the internal net
   assert.doesNotMatch(bullet, /Today the internal network is/, bullet)
 })
 
+test("README's console table says what a kill does to a run, in the reason the run loop records", () => {
+  const row = read('README.md').split('\n').find((line) => line.startsWith('| `kill <runId>'))
+  assert.equal(
+    row,
+    `| \`kill <runId> [--reason R]\` | yes | abort a run, queued or started: it makes no further model or tool call, and ends \`killed\`, reason \`${STOP_REQUESTED}\` (or a budget cap's, if one ran out before the stop, or the wallclock's, if it has run out by the time the stop is read); one parked on an approval ends once that approval is answered or expires |`,
+  )
+})
+
 test("README's agents section: 'Both carry' follows the paragraph on the two shipped agents, and sandbox.exec's paragraph says how it ends a container and what a human approving one is shown", () => {
   // 'Both' means researcher and writer: a paragraph set between it and the
   // one that names them makes it read as the two of something else.
@@ -1820,6 +1829,8 @@ test("README's agents section: 'Both carry' follows the paragraph on the two shi
     // them.
     "or whose command the driver's own audit refuses (a `-v`, `--volume`, `--mount` or `--device` anywhere in it, the docker socket, or an argument that is the operator's home or a path under it, in either spelling)",
     "never runs, and no human is asked to approve it: the run loop asks the runner's own check of the arguments before the gate, and the gate denies the call, its `tool.gate` row giving the runner's refusal as the reason.",
+    // And one the kernel's own config refuses, whatever its arguments.
+    'The same holds for every exec on a kernel whose `sandbox.imageId` is unset or is no image id, which can build no container, or whose `sandbox.driver` is `apple-container`, a stub that runs nothing: no run on it is offered the tool, and the gate denies a call of it before any human is asked.',
     // Wired, and offered only to what the registry admits.
     'The runner (`src/runtime/sandbox-tools.ts`) is wired into the daemon (egress plan W1a): every `sandbox.*` call goes to it, never to the hub,',
     // Denied before the gate to a caller the registry does not admit, and

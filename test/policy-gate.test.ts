@@ -119,9 +119,10 @@ test('args pointing at souls or AGENTS.md are denied protected-path', () => {
 
 test("a runner's own refusal of the call is a deny, before any rule that asks a human, after the structural ones", () => {
   // Rule 3c (sandbox.exec's, egress plan W1a): the kernel asks the tool's
-  // runner whether it refuses this call, for its caller or its arguments,
-  // whoever approves it, and the gate denies such a call rather than put a
-  // command that never runs to a human. It wins over irreversible, a tainted write and quarantine, and
+  // runner whether it refuses this call, for its caller, the kernel's own
+  // config or its arguments, whoever approves it, and the gate denies such a
+  // call rather than put a command that never runs to a human. It wins over
+  // irreversible, a tainted write and quarantine, and
   // loses to exposure, the manifest, a protected path and the namespace pin,
   // which are the more fundamental reasons.
   const refusal = "sandbox.exec's arguments come to 501 bytes as a human approving the call is shown them"

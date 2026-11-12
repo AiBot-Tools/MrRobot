@@ -1425,8 +1425,9 @@ export class DockerDriver implements SandboxDriver {
       // longer trusts without negotiating. On the spec's own domain, which the
       // timer knows without asking anyone.
       //
-      // Not yet hard enough, and to be closed when runs are wired (plan W1,
-      // W2): this is one `docker kill` that nothing waits on, #killOn swallows
+      // Not yet hard enough, and still open now that runs start containers
+      // (sandbox.exec, egress plan W1a; plan W2 closes it): this is one
+      // `docker kill` that nothing waits on, #killOn swallows
       // every failure (a transient "Cannot connect to the Docker daemon" too,
       // with no retry and no log line), and the timer is cleared when the
       // docker CLI child exits ('exit', below; finish() clears it too, for a
@@ -1542,6 +1543,23 @@ export class DockerDriver implements SandboxDriver {
   }
 
   /**
+   * Why run() would refuse a spec for its command alone (SandboxDriver.
+   * commandRefusal): the audit's whole-argv scans and its home check, under
+   * the home run() checks against (commandAuditRefusal).
+   */
+  commandRefusal(command: readonly string[]): string | undefined {
+    return commandAuditRefusal(command, this.#options.home ?? homeDirectory())
+  }
+
+  /**
+   * Refuses no spec for itself (SandboxDriver.everyRunRefusal): whether a
+   * daemon answers is the probe's, and what a spec holds is run()'s.
+   */
+  everyRunRefusal(): string | undefined {
+    return undefined
+  }
+
+  /**
    * Idempotent: killing an unknown or already-dead container is not an error.
    *
    * A container this driver started is killed on its own domain only. A name
@@ -1564,15 +1582,6 @@ export class DockerDriver implements SandboxDriver {
    * a daemon lists. A kill of it is sent nowhere, which keeps the contract
    * (not an error) without reaching someone else's container on either VM.
    */
-  /**
-   * Why run() would refuse a spec for its command alone (SandboxDriver.
-   * commandRefusal): the audit's whole-argv scans and its home check, under
-   * the home run() checks against (commandAuditRefusal).
-   */
-  commandRefusal(command: readonly string[]): string | undefined {
-    return commandAuditRefusal(command, this.#options.home ?? homeDirectory())
-  }
-
   async kill(name: string): Promise<void> {
     if (!name.startsWith(CONTAINER_PREFIX)) return
     const held = this.#running.get(name)
@@ -1628,8 +1637,9 @@ export class DockerDriver implements SandboxDriver {
    *
    * Meant for boot: a kernel that crashed mid-run leaves a container holding
    * a workspace and a CPU, and nothing else will ever reap it. Nothing calls
-   * it yet — boot only probes the driver, and no run starts a container — so
-   * the boot sweep lands with the run wire-up (plan W2).
+   * it yet: runs start containers (sandbox.exec, wired since egress plan
+   * W1a), so a kernel that crashes mid-exec leaves one running, to its
+   * wallclock at most, until the boot sweep lands (plan W2).
    *
    * Every domain is listed at once, as kill() asks every domain at once: a
    * daemon that accepts the connection and never answers `ps` (no execFile

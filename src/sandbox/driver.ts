@@ -416,6 +416,17 @@ export interface SandboxDriver {
    */
   commandRefusal(command: readonly string[]): string | undefined
   /**
+   * Why run() refuses every spec, whatever it holds, or undefined: a fact
+   * of the driver's own code, never of a runtime's state now (probe() reads
+   * that, at boot). AppleContainerDriver, a stub, runs
+   * nothing; DockerDriver refuses no spec for itself. Asked before any
+   * sandbox tool is offered and before a human is asked to approve a call
+   * (sandbox.exec's configRefusal), so no run is shown a tool no call of
+   * which can run, and no human approves one. Starts nothing and never
+   * throws.
+   */
+  everyRunRefusal(): string | undefined
+  /**
    * Idempotent: killing an unknown or already-dead container is not an error.
    * A name without CONTAINER_PREFIX is someone else's container: a kill of it
    * is sent nowhere and ends nothing, and is not an error either.

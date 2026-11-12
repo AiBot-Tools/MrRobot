@@ -381,7 +381,7 @@ test('an optional field passed as undefined hashes the same as an omitted one', 
 
 // ── the egress rows (egress plan E4) ───────────────────────────────────────
 //
-// Nothing appends these yet (W1 wires them). What is proven here is the
+// The kernel appends these since W1. What is proven here is the
 // boundary they will be written through: what a row may hold, what it may
 // never hold, and that every row the schemas admit can be appended.
 

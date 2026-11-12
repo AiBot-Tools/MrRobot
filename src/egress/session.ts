@@ -114,7 +114,7 @@
 //     and only then appends proxy.grant.revoked, with the grant's totals.
 //
 // Who ends it: the session revokes on its own for a violation, a limit or a
-// broken append (`error`), calling kill; otherwise the caller (W1) calls
+// broken append (`error`), calling kill; otherwise the caller (the runner) calls
 // end() with the driver's verdict on the container (exited, wallclock,
 // requested, error). From that call on nothing is sent to the mux and no
 // flow is served (every flow is cut, every upstream request aborted), but
@@ -129,10 +129,16 @@
 // toward) only stops the read: the grant is revoked at once with the
 // caller's reason, its detail saying the rest was not read. The session's
 // own limits no longer count: what a flow carries is dropped unread. Nothing
-// here starts, stops or names a container; kill is the caller's.
+// here starts, stops or names a container; kill is the caller's. So is the
+// wait for a container whose command has exited: the session tells the
+// caller of the exit frame (`exited`), and the caller, which ends every
+// container by a kill by name, bounds how long the container may run on
+// after it (a flow held open by what the command left behind).
 //
-// Unwired: nothing builds a session yet (W1 does), and egress stays the stub
-// that refuses (src/runtime/egress.ts) until then.
+// Built by the sandbox runner (src/runtime/sandbox-tools.ts) for each exec
+// grant, over that container's channel, once the grant is issued and before
+// anything is awaited, and ended by it with the driver's verdict on the
+// container (egress plan W1).
 
 import {
   createServer,
@@ -287,6 +293,16 @@ export interface SessionOptions {
    * is recorded without it.
    */
   readonly kill: () => unknown
+  /**
+   * Called at most once, with the command's status, when the mux's exit
+   * frame arrives while the grant is still served (before end()): the
+   * command has exited, and its container is due to end once its flows
+   * retire (images/worker/mux.mjs). A descendant of the command that left
+   * its process group may hold a flow open past that, so the caller bounds
+   * the wait and kills the container by name past it (egress plan W1).
+   * Unset, the session tells no one.
+   */
+  readonly exited?: (status: number) => unknown
   readonly clock?: SessionClock
 }
 
@@ -304,9 +320,12 @@ export interface EgressSession {
    * after END_DRAIN_MS on the session's clock if it does not, unless the
    * session already revoked. A frame the channel refuses in the meantime is
    * a violation still (no kill); one past a channel limit revokes at once
-   * with this reason, the detail saying the rest was not read. Idempotent.
+   * with this reason, the detail saying the rest was not read. `detail`,
+   * when given, is the revocation's: the caller's words for its verdict (a
+   * container it killed by name, and why). Idempotent: a second call
+   * changes nothing.
    */
-  end(reason: SessionEndReason): Promise<SessionOutcome>
+  end(reason: SessionEndReason, detail?: string): Promise<SessionOutcome>
 }
 
 /**
@@ -704,6 +723,7 @@ class Session implements EgressSession {
   readonly #credential: CredentialInjector
   readonly #acceptReady: ReadyJudge
   readonly #kill: () => unknown
+  readonly #exited: ((status: number) => unknown) | undefined
   readonly #clock: SessionClock
   readonly #channel: FrameChannel
   readonly #server: Server
@@ -742,6 +762,7 @@ class Session implements EgressSession {
     for (const name of ['credential', 'acceptReady', 'kill'] as const) {
       if (typeof options[name] !== 'function') throw new TypeError(`egress session: ${name} must be a function`)
     }
+    if (options.exited !== undefined && typeof options.exited !== 'function') throw new TypeError('egress session: exited must be a function')
     if (typeof options.upstream?.request !== 'function') throw new TypeError('egress session: upstream must be an Upstream')
     if (typeof options.store?.append !== 'function') throw new TypeError('egress session: store must append')
     const { input, output } = options.channel
@@ -773,6 +794,7 @@ class Session implements EgressSession {
     this.#credential = options.credential
     this.#acceptReady = options.acceptReady
     this.#kill = options.kill
+    this.#exited = options.exited
     this.#clock = options.clock ?? defaultClock
     const frameLimits: FrameLimits = { frameMaxBytes: this.#limits.frameMaxBytes, maxFlows: this.#limits.maxFlows }
     this.#channel = new FrameChannel({ role: 'kernel', limits: frameLimits })
@@ -824,8 +846,9 @@ class Session implements EgressSession {
     this.#armIdle()
   }
 
-  end(reason: SessionEndReason): Promise<SessionOutcome> {
+  end(reason: SessionEndReason, detail?: string): Promise<SessionOutcome> {
     if (!SESSION_END_REASONS.includes(reason)) throw new TypeError(`egress session: no end reason ${String(reason)}`)
+    if (detail !== undefined && typeof detail !== 'string') throw new TypeError('egress session: an end detail is text')
     if (this.#state === 'revoking' || this.#state === 'ending') return this.done
     // The container is gone, or going: nothing more is served or sent, but
     // the channel is read until it ends, for the frames still in the pipe.
@@ -838,7 +861,7 @@ class Session implements EgressSession {
       // its own, is the container's doing; one a kill cut is the kill's.
       const cut = this.#inputEnded ? this.#endRefusal : undefined
       if (reason === 'exited' && cut !== undefined) void this.#revoke('violation', undefined, cut.message)
-      else void this.#revoke(reason, undefined, undefined)
+      else void this.#revoke(reason, undefined, detail)
     })
     return this.done
   }
@@ -972,9 +995,14 @@ class Session implements EgressSession {
         return this.#stdout.add(frame.payload)
       case 'stderr':
         return this.#stderr.add(frame.payload)
-      case 'exit':
-        this.#exitStatus = frame.payload[0]
+      case 'exit': {
+        const status = frame.payload[0]
+        this.#exitStatus = status
+        // While the grant is served: once end() was called the container has
+        // ended, or is being ended, already.
+        if (this.#state !== 'ending' && status !== undefined) this.#tellExited(status)
         return
+      }
       case 'go':
         // The channel refuses a go from the mux (direction).
         return
@@ -1543,6 +1571,21 @@ class Session implements EgressSession {
   }
 
   // ── the end ──────────────────────────────────────────────────────────────
+
+  /**
+   * Tell the caller the command exited: once, as the channel refuses a second
+   * exit frame (after-exit). A callback that throws or rejects is logged,
+   * never raised into the read.
+   */
+  #tellExited(status: number): void {
+    if (this.#exited === undefined) return
+    try {
+      const told = this.#exited(status)
+      if (told instanceof Promise) told.catch(() => log.error({ grantId: this.#grantId }, 'egress session: the exited callback failed'))
+    } catch {
+      log.error({ grantId: this.#grantId }, 'egress session: the exited callback threw')
+    }
+  }
 
   /** The session ends the grant itself: the container is killed once, unless the caller already ended it, then revoked. */
   #selfRevoke(reason: 'violation' | 'limit' | 'error', limit: SessionLimitName | undefined, detail: string | undefined): void {

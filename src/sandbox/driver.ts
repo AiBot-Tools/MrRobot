@@ -10,8 +10,8 @@
 // stdout open as one byte stream between the container and the kernel
 // (docker's -i), handed to the caller as RunningSandbox.channel, and what
 // crosses it is for the caller to decide: the kernel's egress engine
-// (src/egress), once it is wired (egress plan W1), and until then nothing
-// asks for one. A driver reads none of it and writes none of it. It is
+// (src/egress), which the sandbox runner serves it with under a grant
+// (egress plan W1). A driver reads none of it and writes none of it. It is
 // refused on the hostile domain (channelRefusal), whose runs reach nothing at
 // all, and a run without one has no -i, and the kernel's end of its stdin is
 // closed at once.

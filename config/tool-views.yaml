@@ -145,14 +145,16 @@ servers:
   # Kernel-native sandbox tools (egress plan S3; the operator accepted this
   # server on 2026-11-09). Not an MCP server either: the kernel runs exec
   # itself (src/runtime/sandbox-tools.ts), one container per call, in the
-  # caller's own sandbox domain with no network and no channel, through the
+  # caller's own sandbox domain with no network (its one way out, for a
+  # trusted run whose manifest names egress, is the kernel's egress engine
+  # over its channel, under a grant issued before it starts), through the
   # same gate and the same tool.call / tool.result logging, with
   # sandbox.started and sandbox.killed between them. `write`, and it TAINTS the
   # run: what a container prints is attacker-influenced, so every exec after
   # the first in a run, and every other write, waits for a human (invariant 3).
   # The registry refuses it in any manifest that is not a worker with a
-  # sandbox: block at tier 2 or more. Not wired into the daemon until the egress
-  # plan's W1, and no shipped manifest lists it.
+  # sandbox: block at tier 2 or more. The daemon wires it in (egress plan W1a,
+  # and its egress W1), and no shipped manifest lists it.
   sandbox:
     default: kernel-only
     tools:

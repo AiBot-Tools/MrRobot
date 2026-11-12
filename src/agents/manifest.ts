@@ -79,10 +79,10 @@ export const MAX_EGRESS_ALLOW = 64
 export const MAX_EGRESS_BIND = 16
 
 /**
- * What a sandboxed run of this agent may reach, once the egress engine is
- * wired (egress plan W1). Until then assertEgressEnforced throws and a run
- * reaches nothing, whatever this says; it is recorded now so a manifest
- * cannot quietly acquire hosts later.
+ * What a sandboxed run of this agent may reach, through the kernel's egress
+ * engine (egress plan W1): an exec of a run on the trusted domain is issued
+ * a grant of these hosts and of git-fetch on these bindings, and only while
+ * boot found egress ok (src/runtime/egress.ts assertEgressEnforced).
  *
  *   allow  credential-free hosts, each an EgressHost (src/egress/host.ts):
  *          one spelling, so `Docs.Example.com.` is `docs.example.com`, and

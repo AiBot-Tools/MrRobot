@@ -1,12 +1,41 @@
 // Sandbox tools: a worker's commands, run in a container (egress plan S3).
 //
 // `sandbox.exec` runs one command in one container of the run's own sandbox
-// domain, and nothing else: no network (every run is --network none), no
-// channel (so no egress, whatever the manifest's egress says, until egress is
-// wired and gives exec a grant, egress plan W1), the pinned worker image by
-// id, and the run's own workspace, <mountRoot>/<runId>, at /workspace. A
-// second exec of the same run sees what the first left there; no other run's
-// does.
+// domain, and nothing else: no network (every run is --network none), the
+// pinned worker image by id, and the run's own workspace,
+// <mountRoot>/<runId>, at /workspace. A second exec of the same run sees what
+// the first left there; no other run's does.
+//
+// Its one way out is the kernel's egress engine (egress plan W1), and only
+// for a run on the trusted domain whose manifest names egress: such an exec
+// is issued a grant BEFORE its container starts (proxy.grant.issued: the
+// manifest's credential-free hosts and, of each binding it binds, git-fetch
+// alone, never git-push or github-pulls, which only a human-approved
+// sandbox.publish may hold), its container gets the driver's channel (docker
+// -i), and an egress session (src/egress/session.ts) serves that channel
+// under the grant, every request a proxy.decision of the run before any
+// dial. The grant is entered in an in-memory table and revoked
+// (proxy.grant.revoked, with its totals) once the driver has a verdict on the
+// container: its exit, its wallclock, the run's stop, or the session's own
+// revocation for a violation or a limit, which kills the container by name on
+// its own domain. Nothing here ever ends the container's stdin: a mux whose
+// worker stopped reading may never read that end. So a container still
+// running EXIT_KILL_GRACE_MS after its command's exit frame (a flow held open
+// by a descendant the command left behind) is killed by name too, and its
+// grant revoked `requested`, saying why; and a grant whose container the
+// kernel killed by name because its docker client said nothing of it (no
+// exit status, or 125) is revoked `error`, never read as the container's own
+// violation. No grant is issued, and the exec is refused with the reason, at
+// the offer and before the gate as well as here, while boot found egress
+// degraded, while a binding it routes did not resolve at boot
+// (assertEgressEnforced), when an identifier the grant names (a host, a
+// repository, a binding id, the run's id or the agent's) is one the event log
+// would store censored, the field named by its place, never quoted, or when
+// its row is one proxy.grant.issued could not record (more than
+// PROXY_GRANT_MAX_REPOS repositories across its bindings, which the registry
+// refuses in a manifest at load). A hostile-domain run gets no channel and no
+// grant, whatever its manifest says: only the trusted domain is granted, by
+// code.
 //
 // It meets the contract every agent tool meets, as kernel-tools.ts reproduces
 // the hub's execute half for tools that have no server:
@@ -119,6 +148,7 @@
 // started it, nor the operator's cap on one container. The driver enforces it
 // (docker.ts): kill by name when it elapses.
 
+import { randomBytes } from 'node:crypto'
 import { lstatSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { z } from 'zod'
@@ -126,6 +156,10 @@ import { z } from 'zod'
 import type { AgentManifest } from '../agents/manifest.js'
 import type { AgentRecord } from '../agents/registry.js'
 import { MAX_TIMER_MS, type KernelConfig } from '../config.js'
+import { EgressGrant } from '../egress/policy.js'
+import { createEgressSession, type CredentialInjector, type EgressSession, type ReadyJudge, type SessionClock, type SessionEndReason, type SessionLimits, type SessionOutcome } from '../egress/session.js'
+import type { Upstream } from '../egress/upstream.js'
+import { PROXY_GRANT_MAX_REPOS, ProxyGrantIssuedPayload } from '../events/types.js'
 import { PolicyDenied } from '../errors.js'
 import { boundOutput, PAYLOAD_TEXT_BUDGET } from '../events/bound.js'
 import { canonicalize, sha256Hex } from '../events/canonical.js'
@@ -146,6 +180,7 @@ import {
   type SandboxSpec,
 } from '../sandbox/driver.js'
 import { imageIdProblem, memoryBytes } from '../sandbox/limits.js'
+import { assertEgressEnforced, type BindingStatus, type EgressState } from './egress.js'
 
 /** The server id sandbox tools are addressed under: `sandbox.exec`. */
 export const SANDBOX_SERVER = 'sandbox'
@@ -207,6 +242,19 @@ export const RESULT_GRACE_MS = 30_000
  * holds is harmless, so either is killed by name.
  */
 export const DOCKER_CLI_FAILED = 125
+
+/**
+ * How long a channel run's container may run on once its mux has sent the
+ * command's exit frame, before the kernel kills it by name on its own
+ * domain. An honest mux exits as soon as its last flow retires, flushing its
+ * stdout for at most its FLUSH_TIMEOUT_MS (5 s, images/worker/mux.mjs), so
+ * this is longer than that. A descendant of the command that left its
+ * process group (setsid), which the mux's group kill misses, may hold a flow
+ * open past it, and would keep the container, its grant, the exec call and
+ * the run's lane up until an egress limit or the wallclock ended it (egress
+ * plan W1: every run ends by the driver's kill by name).
+ */
+export const EXIT_KILL_GRACE_MS = 10_000
 
 /**
  * A character approval.requested's preview leaves raw (canonical JSON escapes
@@ -279,6 +327,144 @@ export interface SandboxToolsOptions {
   readonly killWaitMs?: number
   /** Unset, RESULT_GRACE_MS. A test's shorter grace, so a driver that never answers is given up in milliseconds. */
   readonly resultGraceMs?: number
+  /** Unset, EXIT_KILL_GRACE_MS. A test's shorter grace, so a container that outlives its command is killed in milliseconds. */
+  readonly exitKillGraceMs?: number
+  /**
+   * The kernel's egress engine, as boot built it (SandboxEgress). Unset, no
+   * exec is given a channel, and one whose manifest has egress on the
+   * trusted domain is refused: there is nothing to serve its grant.
+   */
+  readonly egress?: SandboxEgress
+}
+
+/**
+ * What an exec's grant is served with: boot's verdict on egress and on each
+ * binding, kernel.yaml's bindings and per-grant limits, and the pieces of
+ * one session (src/egress/session.ts), the credential injector among them,
+ * which the kernel builds over broker.use: this module never holds a
+ * SecretRef, nor reaches src/secrets.
+ */
+export interface SandboxEgress {
+  readonly state: EgressState
+  /** kernel.yaml's egress.bindings, as parsed: read by Object.hasOwn only. */
+  readonly bindings: Readonly<Record<string, { readonly host: string; readonly profiles: readonly string[]; readonly repos: readonly string[] }>>
+  /** What boot found of each binding's value. */
+  readonly resolved: ReadonlyMap<string, BindingStatus>
+  /** kernel.yaml's egress.limits: maxRequests counts the flows a container opens (session.ts). */
+  readonly limits: SessionLimits
+  readonly upstream: Upstream
+  readonly credential: CredentialInjector
+  readonly acceptReady: ReadyJudge
+  /** Unset, real timers. A test's clock, for the session's deny window, idle bound and end drain. */
+  readonly clock?: SessionClock
+}
+
+/** The profiles an exec grant may hold of a binding: git-fetch alone. git-push and github-pulls are sandbox.publish's (S4). */
+export const EXEC_PROFILES: readonly string[] = Object.freeze(['git-fetch'])
+
+/** A grant issued and not yet revoked: one row of the in-memory grant table. */
+export interface LiveGrant {
+  readonly grantId: string
+  readonly purpose: 'exec'
+  readonly runId: string
+  readonly agentId: string
+  /** Its container's name: one container is one grant. */
+  readonly sandbox: string
+  readonly grant: EgressGrant
+}
+type Issued = LiveGrant
+
+/** What a served grant came to, for the call's result. */
+interface EgressEnd {
+  readonly grantId: string
+  readonly outcome: SessionOutcome
+  /** The session revoked the grant on its own and had the container killed by name. */
+  readonly revokedBySession: boolean
+  /**
+   * The grace after the command's exit frame past which the kernel killed
+   * the container by name, it not having ended by then; undefined when no
+   * such kill ended it.
+   */
+  readonly killedAfterExitMs?: number
+}
+
+/**
+ * A grant no channel ever carried (the driver gave its run no channel, or its
+ * session would not start): its container is killed by name at once, by the
+ * kernel, and the grant revoked unserved, `detail` saying why.
+ */
+interface Unserved {
+  readonly grantId: string
+  readonly detail: string
+}
+
+/** A served grant's end: called once the driver has a verdict on the container, and what the kernel did to end it. Idempotent. */
+interface Served {
+  end(reason: SessionEndReason, detail?: string, killedAfterExitMs?: number): Promise<EgressEnd | undefined>
+  /** Set when no session serves the grant: the container was killed by name at once, by the kernel, not by a stop. */
+  readonly unserved?: Unserved
+}
+
+/** proxy.grant.revoked's totals for a grant no channel ever carried. */
+const ZERO_TOTALS = Object.freeze({ flows: 0, requests: 0, allowed: 0, denied: 0, refused: 0, failed: 0, sentBytes: 0, receivedBytes: 0, durationMs: 0 })
+
+/**
+ * The first identifier of a grant row the redaction pass would store as
+ * something else (a credential's shape, or a value the kernel's mask holds),
+ * by its place in the row, never by its text: one that holds a secret must
+ * not be quoted where the reason is shown. Undefined when every one is
+ * recorded as it is. events/types.ts refuses a credential's shape in a row
+ * already, but cannot see the mask's values; this sees both.
+ */
+function censoredField(ids: {
+  readonly grantId?: string
+  readonly runId: string
+  readonly agentId: string
+  readonly sandbox?: string
+  readonly grant: EgressGrant
+}): string | undefined {
+  const changed = (text: string): boolean => redactString(text) !== text
+  if (ids.grantId !== undefined && changed(ids.grantId)) return 'grant id'
+  if (changed(ids.runId)) return 'run id'
+  if (changed(ids.agentId)) return 'agent id'
+  if (ids.sandbox !== undefined && changed(ids.sandbox)) return 'container name'
+  for (const [i, host] of ids.grant.allow.entries()) if (changed(host)) return `credential-free host allow[${String(i)}]`
+  for (const [i, route] of ids.grant.routes.entries()) {
+    if (changed(route.bindingId)) return `binding id routes[${String(i)}]`
+    if (changed(route.host)) return `bound host routes[${String(i)}]`
+    for (const [j, repo] of route.repos.entries()) if (changed(repo)) return `repository routes[${String(i)}].repos[${String(j)}]`
+  }
+  return undefined
+}
+
+/** The stand-in for a grant's id where a row is judged before the issue mints one: the id's own shape. */
+const PLANNED_GRANT_ID = 'grant_0_000000000000'
+
+/** The proxy.grant.issued row of an exec grant: one builder for the row #planGrant judges and the row #issue appends. */
+function issuedRow(grantId: string, sandbox: string, runId: string, agentId: string, grant: EgressGrant) {
+  return {
+    schemaVersion: 1,
+    grantId,
+    purpose: 'exec' as const,
+    runId,
+    agentId,
+    sandbox,
+    domain: 'trusted' as const,
+    allow: [...grant.allow],
+    routes: grant.routes.map((route) => ({ bindingId: route.bindingId, host: route.host, profiles: [...route.profiles], repos: [...route.repos] })),
+  }
+}
+
+function unrecordableRefusal(issues: number): string {
+  return `the grant is not one proxy.grant.issued can record (${String(issues)} issue(s)), so it is not issued; no container was started`
+}
+
+function censoredRefusal(field: string): string {
+  return (
+    `the grant's ${field} is in the shape of a credential, or holds a value the kernel holds as secret, so the ` +
+    'event log would store it censored, and a grant whose row cannot say where a run could reach is not ' +
+    'issued; no container was started'
+  )
 }
 
 const NUL = '\u0000'
@@ -405,9 +591,16 @@ export class SandboxTools {
    * run's does (WORKSPACE_RUN_ID admits no `-`).
    */
   #seq = 0
+  /** The grant table: every grant issued and not yet revoked, by id. In memory: W2 closes, at boot, what a dead kernel left issued. */
+  readonly #grants = new Map<string, LiveGrant>()
 
   constructor(options: SandboxToolsOptions) {
     this.#o = options
+  }
+
+  /** The grants issued and not yet revoked, oldest first. */
+  liveGrants(): readonly LiveGrant[] {
+    return [...this.#grants.values()]
   }
 
   /** Schemas for every sandbox tool the policy file exposes to agents. */
@@ -470,6 +663,32 @@ export class SandboxTools {
   configRefusal(ref: string): string | undefined {
     if (ref !== `${SANDBOX_SERVER}.exec`) return undefined
     return this.#o.driver.everyRunRefusal() ?? imageIdProblem(this.#o.sandbox.imageId)
+  }
+
+  /**
+   * Why the runner would refuse every exec of the agent `agentId` for its
+   * egress, whatever its arguments and whoever approved it, or undefined:
+   * its manifest, read from the registry now, has egress on the trusted
+   * domain and egress is not ok (boot's verdict), a binding it routes did not
+   * resolve at boot, the grant would name an identifier the log would store
+   * censored (the run's id among them, when `runId` is given), or its
+   * proxy.grant.issued row is one the store could not record (#planGrant
+   * judges the row it would append). The
+   * run loop asks it of every sandbox schema it would offer (no runId), so
+   * no such run is shown the tool, and before the gate (with the run's id),
+   * handing the answer to it (GateInput.runnerRefusal), so no human is asked
+   * to approve an exec that would be refused; #exec asks it again. Undefined
+   * for a manifest with no egress and for every hostile-domain run, which
+   * runs with no channel, as every run did before egress.
+   */
+  egressRefusal(ref: string, agentId: string, runId?: string): string | undefined {
+    if (ref !== `${SANDBOX_SERVER}.exec`) return undefined
+    const held = this.#holderOf(ref, agentId)
+    if ('problem' in held) return undefined
+    // A run id that is no ref (the offer's placeholder) is judged by the
+    // exec's own: only the agent's egress and boot's verdict are read here.
+    const planned = this.#planGrant(held.manifest, runId ?? 'offer', agentId)
+    return planned !== undefined && 'refusal' in planned ? planned.refusal : undefined
   }
 
   /**
@@ -613,6 +832,13 @@ export class SandboxTools {
     if (box === undefined) throw new Error(`[refused] ${manifest.id} declares no sandbox: block`)
     const domain = box.domain
 
+    // The grant this exec would be issued, or why none can be: asked of the
+    // loop before the gate too (egressRefusal), and again here. Undefined for
+    // a manifest with no egress, and for every hostile-domain run, whatever
+    // its manifest says: that domain gets no channel and no grant.
+    const planned = this.#planGrant(manifest, ctx.runId, ctx.agentId)
+    if (planned !== undefined && 'refusal' in planned) throw new Error(`[refused] ${planned.refusal}`)
+
     // What is left of the run's budget, at most the operator's cap on one
     // container. Floored: a timer converts its delay to whole milliseconds.
     const wallclockMs = Math.min(Math.floor(ctx.budget.remainingMs()), defaults.wallclockMs)
@@ -635,22 +861,48 @@ export class SandboxTools {
       command,
       workspace,
       limits: { memoryMb, cpus: defaults.cpus, pids: defaults.pidsLimit, wallclockMs },
-      // No channel: no egress until egress is wired to issue exec a grant
-      // (W1), and the hostile domain never gets one. A run without one has no
-      // -i, and its stdin is closed at once.
+      // A channel only for a grant, which only a trusted run with egress is
+      // planned. A run without one has no -i, and its stdin is closed at once.
+      ...(planned === undefined ? {} : { channel: true }),
     }
+
+    // Issued BEFORE the spawn: the container's first byte on its channel is
+    // judged under a grant the log already holds.
+    const issued = planned === undefined ? undefined : this.#issue(planned.grant, spec, ctx)
 
     let running: RunningSandbox
     try {
       running = this.#o.driver.run(spec)
     } catch (e) {
       // The driver refuses before it starts anything (SandboxDriver.run), so
-      // there is no container to record.
-      throw new Error(`[refused] ${e instanceof Error ? e.message : String(e)}`)
+      // there is no container to record, and the grant served nothing.
+      const why = e instanceof Error ? e.message : String(e)
+      if (issued !== undefined) this.#revokeUnserved(issued, ctx, 'the driver refused the container before it started')
+      throw new Error(`[refused] ${why}`)
     }
     const kill = (): void => {
       void this.#killByName(spec.name)
     }
+    // A channel run's command has exited once its mux sends the exit frame,
+    // and the container is due to end once its flows retire. One still
+    // running EXIT_KILL_GRACE_MS later (a flow a descendant of the command
+    // holds open) is killed by name, unless the run was stopped by then,
+    // whose own kill went out at the stop. Cleared once the result is in.
+    const graceMs = this.#exitKillGraceMs()
+    let exitTimer: NodeJS.Timeout | undefined
+    let killedAfterExit = false
+    const exited = (): void => {
+      if (exitTimer !== undefined) return
+      exitTimer = setTimeout(() => {
+        if (ctx.signal?.aborted === true) return
+        killedAfterExit = true
+        kill()
+      }, graceMs)
+    }
+    // The session listens on the channel at once, before anything is
+    // awaited: the result of a channel run settles only once its input has
+    // been read to its end (RunningSandbox.result).
+    const served = issued === undefined ? undefined : this.#serve(issued, running, spec, ctx, exited)
     try {
       this.#o.store.append({
         type: 'sandbox.started',
@@ -673,7 +925,9 @@ export class SandboxTools {
       // a grace, with the log's refusal, whatever the driver's result says.
       kill()
       const waited = await this.#within(running.result, this.#resultBound(spec), ctx.signal)
+      clearTimeout(exitTimer)
       if ('late' in waited) await this.#giveUp(spec.name)
+      await served?.end('error')
       throw e
     }
 
@@ -686,6 +940,7 @@ export class SandboxTools {
       waited = await this.#within(running.result, boundMs, signal)
     } finally {
       signal?.removeEventListener('abort', kill)
+      clearTimeout(exitTimer)
     }
     if ('late' in waited) {
       // The driver never answered: no result past the container's wallclock
@@ -705,6 +960,7 @@ export class SandboxTools {
         agentId: ctx.agentId,
         payload: { schemaVersion: 1, sandboxId: spec.name, reason: 'error' },
       })
+      await served?.end('error')
       const within =
         waited.late === 'stopped'
           ? `within ${String(this.#graceMs())} ms of the run being stopped, which sent a kill by name to it,`
@@ -724,6 +980,7 @@ export class SandboxTools {
         agentId: ctx.agentId,
         payload: { schemaVersion: 1, sandboxId: spec.name, reason: 'error' },
       })
+      await served?.end('error')
       throw new Error(`[error] the driver lost ${spec.name}: ${e instanceof Error ? e.message : String(e)}; ${sent}`)
     }
     const result = waited.result
@@ -747,7 +1004,217 @@ export class SandboxTools {
         ...(result.exitCode === null ? {} : { exitCode: result.exitCode }),
       },
     })
-    return describe(spec, result, sent)
+    // The container has ended, by the driver's verdict, and the grant is
+    // revoked with it, its totals recorded, once what is still in the
+    // channel has been read: the command's last output and its exit status.
+    // Ended by the kernel's own kill by name, it is revoked with the
+    // kernel's reason, never the container's: a docker client that says
+    // nothing of its container (mayRunOn) is `error`, so a stream its kill
+    // cut inside a frame is not read as the container's violation; one
+    // still running past its command's exit is `requested`, saying why.
+    const egress =
+      served === undefined
+        ? undefined
+        : runsOn !== undefined
+          ? await served.end('error', `the kernel killed the container by name, ${runsOn}`)
+          : killedAfterExit && result.killedBy === 'requested'
+            ? await served.end(
+                'requested',
+                `the command exited, and its container was still running ${String(graceMs)} ms later, so the kernel killed it by name`,
+                graceMs,
+              )
+            : await served.end(endReason(result))
+    return describe(spec, result, sent, egress, served?.unserved)
+  }
+
+  /**
+   * The grant an exec of `manifest` in run `runId` would be issued, or why it
+   * cannot be, or undefined when it gets none: a manifest with no egress, or
+   * any run on the hostile domain, whatever its manifest says (only the
+   * trusted domain is granted, by code: kernel.yaml's egress names no
+   * domain). An exec grant holds the manifest's credential-free hosts and,
+   * of each binding it binds, git-fetch alone (EXEC_PROFILES): never
+   * git-push or github-pulls, which only a human-approved sandbox.publish may
+   * hold. A binding with no profile an exec may use adds no route. Refused
+   * with the egress reason when egress is not ok, or a binding it routes did
+   * not resolve at boot (assertEgressEnforced), when an identifier it names
+   * is one the log would store censored (#censoredField), and when the row
+   * #issue would append is one proxy.grant.issued refuses. Bindings are
+   * read with Object.hasOwn, never `in` or a bare index (kernel.yaml admits a
+   * binding id `constructor`).
+   */
+  #planGrant(manifest: AgentManifest, runId: string, agentId: string): { readonly grant: EgressGrant } | { readonly refusal: string } | undefined {
+    if (manifest.sandbox?.domain !== 'trusted') return undefined
+    const { allow, bind } = manifest.egress
+    if (allow.length === 0 && bind.length === 0) return undefined
+    const egress = this.#o.egress
+    if (egress === undefined) {
+      return { refusal: `${manifest.id} has egress, and no egress engine is wired into this kernel, so its exec gets no channel; no container was started` }
+    }
+    const routes: { bindingId: string; host: string; profiles: string[]; repos: string[] }[] = []
+    const unknown: string[] = []
+    for (const id of bind) {
+      const binding = Object.hasOwn(egress.bindings, id) ? egress.bindings[id] : undefined
+      if (binding === undefined) {
+        unknown.push(id)
+        continue
+      }
+      const profiles = binding.profiles.filter((p) => EXEC_PROFILES.includes(p))
+      if (profiles.length === 0) continue
+      routes.push({ bindingId: id, host: binding.host, profiles, repos: [...binding.repos] })
+    }
+    try {
+      assertEgressEnforced(egress.state, { used: routes.map((r) => r.bindingId), resolved: egress.resolved })
+    } catch (e) {
+      return { refusal: `${e instanceof Error ? e.message : String(e)}; no container was started` }
+    }
+    if (unknown.length > 0) {
+      return { refusal: `${manifest.id}'s egress.bind names ${String(unknown.length)} binding(s) kernel.yaml does not hold; no container was started` }
+    }
+    const parsed = EgressGrant.safeParse({ runId, allow: [...allow], routes })
+    if (!parsed.success) {
+      return { refusal: `the grant ${manifest.id}'s egress would be issued is not one the egress engine reads (${String(parsed.error.issues.length)} issue(s)); no container was started` }
+    }
+    const field = censoredField({ runId, agentId, grant: parsed.data })
+    if (field !== undefined) return { refusal: censoredRefusal(field) }
+    // The row #issue would append, judged now, so that a grant
+    // proxy.grant.issued cannot record is refused here, at the offer and
+    // before the gate, never once a human has approved its exec and its
+    // workspace is made: EgressGrant admits 16 routes of 64 repositories,
+    // and a row names at most PROXY_GRANT_MAX_REPOS of them. What only the
+    // issue mints, the grant's id and the container's name, stands in by
+    // its shape. The registry refuses a manifest whose bindings name more at
+    // load; this holds for a record that reached the runner otherwise.
+    const repos = parsed.data.routes.reduce((n, route) => n + route.repos.length, 0)
+    if (repos > PROXY_GRANT_MAX_REPOS) {
+      return {
+        refusal:
+          `the grant ${manifest.id}'s egress would be issued names ${String(repos)} repositories across its bindings, ` +
+          `and a proxy.grant.issued row names at most ${String(PROXY_GRANT_MAX_REPOS)}, so it could not be recorded and ` +
+          'is not issued; no container was started',
+      }
+    }
+    const row = ProxyGrantIssuedPayload.safeParse(issuedRow(PLANNED_GRANT_ID, `${CONTAINER_PREFIX}${runId}-${String(this.#seq + 1)}`, runId, agentId, parsed.data))
+    if (!row.success) return { refusal: unrecordableRefusal(row.error.issues.length) }
+    return { grant: parsed.data }
+  }
+
+  /**
+   * Issue `grant` for `spec`'s container: every identifier the row records
+   * checked against the redaction pass (a grant the kernel cannot record is
+   * not issued), proxy.grant.issued appended, and the grant entered in the
+   * table. Before the spawn, so a refusal here starts nothing.
+   */
+  #issue(grant: EgressGrant, spec: SandboxSpec, ctx: SandboxCallContext): Issued {
+    const grantId = `grant_${String(Date.now())}_${randomBytes(6).toString('hex')}`
+    const field = censoredField({ grantId, runId: ctx.runId, agentId: ctx.agentId, sandbox: spec.name, grant })
+    if (field !== undefined) throw new Error(`[refused] ${censoredRefusal(field)}`)
+    const payload = issuedRow(grantId, spec.name, ctx.runId, ctx.agentId, grant)
+    // #planGrant judged this row before the gate, by its stand-ins; judged
+    // again as it will be appended.
+    const recordable = ProxyGrantIssuedPayload.safeParse(payload)
+    if (!recordable.success) throw new Error(`[refused] ${unrecordableRefusal(recordable.error.issues.length)}`)
+    this.#o.store.append({ type: 'proxy.grant.issued', runId: ctx.runId, agentId: ctx.agentId, payload })
+    const live: LiveGrant = Object.freeze({ grantId, purpose: 'exec', runId: ctx.runId, agentId: ctx.agentId, sandbox: spec.name, grant })
+    this.#grants.set(grantId, live)
+    return live
+  }
+
+  /**
+   * Revoke a grant whose container never served it (the driver refused the
+   * spec, or gave the run no channel): proxy.grant.revoked `error`, with
+   * zero totals, since nothing crossed a channel under it.
+   */
+  #revokeUnserved(issued: Issued, ctx: SandboxCallContext, detail: string): void {
+    this.#grants.delete(issued.grantId)
+    this.#o.store.append({
+      type: 'proxy.grant.revoked',
+      runId: ctx.runId,
+      agentId: ctx.agentId,
+      payload: { schemaVersion: 1, grantId: issued.grantId, reason: 'error', detail, totals: ZERO_TOTALS },
+    })
+  }
+
+  /**
+   * Run the egress session over `running`'s channel under `issued`, and the
+   * means to end it: end(reason, detail) takes the driver's verdict on the
+   * container, or the kernel's own when its kill by name ended it, and
+   * resolves once the grant is revoked, with what the session read of the
+   * command. The session's own revocation (a violation, a limit, a broken
+   * append) kills the container by name, on its own domain, through the
+   * driver; the command's exit frame is told to `exited`, which bounds how
+   * long the container may run on after it; nothing here ever ends the
+   * container's stdin, since a mux whose worker stopped reading may never
+   * read that end (egress plan W1's note). A run the driver gave no channel,
+   * or a session that would not start, is killed by name at once and its
+   * grant revoked as unserved once it ends (Served.unserved), and its result
+   * says the kernel killed it and why, never that the run was stopped; nor,
+   * its mux having had no go, that its command exited, and it is never ok,
+   * whatever the docker client (the mux) exited (describe).
+   */
+  #serve(issued: Issued, running: RunningSandbox, spec: SandboxSpec, ctx: SandboxCallContext, exited: () => void): Served {
+    const egress = this.#o.egress
+    const channel = running.channel
+    let session: EgressSession | undefined
+    let unserved: string | undefined
+    let revokedBySession = false
+    if (egress === undefined || channel === undefined) {
+      unserved = 'the driver gave the run no channel'
+    } else {
+      try {
+        session = createEgressSession({
+          grantId: issued.grantId,
+          grant: issued.grant,
+          agentId: ctx.agentId,
+          limits: egress.limits,
+          channel: { input: channel.input, output: channel.output },
+          store: this.#o.store,
+          upstream: egress.upstream,
+          credential: egress.credential,
+          acceptReady: egress.acceptReady,
+          kill: () => {
+            revokedBySession = true
+            void this.#killByName(spec.name)
+          },
+          exited,
+          ...(egress.clock === undefined ? {} : { clock: egress.clock }),
+        })
+      } catch (e) {
+        unserved = `the egress session would not start: ${e instanceof Error ? e.message : String(e)}`
+      }
+    }
+    const never: Unserved | undefined =
+      session === undefined ? { grantId: issued.grantId, detail: unserved ?? 'the grant served no channel' } : undefined
+    if (session === undefined) void this.#killByName(spec.name)
+    let ended: Promise<EgressEnd | undefined> | undefined
+    return {
+      ...(never === undefined ? {} : { unserved: never }),
+      end: (reason, detail, killedAfterExitMs) => {
+        ended ??= (async (): Promise<EgressEnd | undefined> => {
+          try {
+            if (session === undefined) {
+              this.#revokeUnserved(issued, ctx, never?.detail ?? 'the grant served no channel')
+              return undefined
+            }
+            const outcome = await session.end(reason, detail)
+            return {
+              grantId: issued.grantId,
+              outcome,
+              revokedBySession,
+              ...(killedAfterExitMs === undefined ? {} : { killedAfterExitMs }),
+            }
+          } finally {
+            this.#grants.delete(issued.grantId)
+          }
+        })()
+        return ended
+      },
+    }
+  }
+
+  /** How long a channel run's container may outlive its command's exit frame: EXIT_KILL_GRACE_MS, or a test's. */
+  #exitKillGraceMs(): number {
+    return this.#o.exitKillGraceMs ?? EXIT_KILL_GRACE_MS
   }
 
   /** The grace past a container's wallclock its result is awaited for: RESULT_GRACE_MS, or a test's. */
@@ -1571,43 +2038,132 @@ function streamPart(stream: Stream, keep: number): { readonly cut: string; reado
  * redacts, so a cut to a share never leaves part of a credential its pattern
  * would match whole.
  */
-function describe(spec: SandboxSpec, result: SandboxResult, sent: string | undefined): Done {
+function describe(spec: SandboxSpec, result: SandboxResult, sent: string | undefined, egress?: EgressEnd, unserved?: Unserved): Done {
   const wallclock = `${String(spec.limits.wallclockMs)} ms`
+  // A grant that went unserved was a channel run's as much as a served one:
+  // its docker client's exit is the mux's, and with no session nobody sent
+  // the mux a go, so its command never ran and has no exit status at all.
+  const channel = egress !== undefined || unserved !== undefined
+  // On a channel run the command's own exit status is the exit frame's: the
+  // docker client's exit is the mux's, which says how the mux ended.
+  const commandExit = egress?.outcome.exitStatus
+  const status = commandExit ?? result.exitCode
   const code = result.exitCode === null ? '' : ` (exit ${String(result.exitCode)})`
   let how: string
   if (result.killedBy === 'wallclock') how = `was killed at its wallclock of ${wallclock}${code}`
-  else if (result.killedBy === 'requested') how = `was killed: the run was stopped${code}`
+  else if (result.killedBy === 'requested' && egress?.revokedBySession === true) {
+    how = `was killed by name when its egress grant was revoked${code}`
+  } else if (result.killedBy === 'requested' && egress?.killedAfterExitMs !== undefined) {
+    const exited = commandExit === undefined ? '' : ` ${String(commandExit)}`
+    how = `was killed by name, still running ${String(egress.killedAfterExitMs)} ms after its command exited${exited}${code}`
+  } else if (result.killedBy === 'requested' && unserved !== undefined) {
+    // The kernel's own kill of a container whose grant nothing could serve:
+    // the run was not stopped, and the head must not say it was.
+    how = `was killed by name by the kernel, which could not serve its egress grant${code}`
+  } else if (result.killedBy === 'requested') how = `was killed: the run was stopped${code}`
   else if (result.overran === true) {
     how = `outlived its wallclock of ${wallclock}: the kill it was sent ended nothing, and it then exited on its own${code}`
-  } else if (result.exitCode === null) {
+  } else if (channel && commandExit === undefined) {
+    how = `ended with no exit status from its command (${clientEnd(result)})`
+  } else if (status === null) {
     // The driver's own text, bounded: a SandboxDriver other than docker.ts's
     // may report anything here, and the head is not cut to a share.
     const signal = result.signal ?? undefined
     how = `ended with no exit status (${signal === undefined ? 'the docker client did not start' : driverText(String(signal))})`
-  } else how = `exited ${String(result.exitCode)}`
+  } else how = `exited ${String(status)}`
+  const network = egress === undefined ? 'no network' : egressSaid(egress)
   const head = [
-    `${spec.name} on the ${spec.domain} domain, no network, ${how} after ${String(result.durationMs)} ms` +
+    `${spec.name} on the ${spec.domain} domain, ${network}, ${how} after ${String(result.durationMs)} ms` +
       (sent === undefined ? '' : `; ${sent}`),
   ]
-  if (result.truncated) {
+  const revoked = egress === undefined ? undefined : revocationSaid(egress)
+  if (revoked !== undefined) head.push(revoked)
+  if (unserved !== undefined) {
+    head.push(redactString(`[egress grant ${unserved.grantId} revoked unserved: ${utf8Head(unserved.detail, DRIVER_TEXT_BYTES)}]`))
+  }
+  // On a channel run each stream is the session's capture of the command's
+  // frames, cut on its own; the docker client's stderr (the mux's own
+  // complaints) follows the command's. An unserved grant's command never
+  // ran, so its run's stderr is the docker client's alone, and said to be.
+  const clientErr = result.stderr === '' ? '' : `[the docker client's stderr]\n${result.stderr}`
+  const outText = egress === undefined ? result.stdout : decoded(egress.outcome.stdout)
+  const errText =
+    egress !== undefined
+      ? `${decoded(egress.outcome.stderr)}${clientErr === '' ? '' : `\n${clientErr}`}`
+      : channel
+        ? clientErr
+        : result.stderr
+  const outCut = egress === undefined ? result.truncated : egress.outcome.stdoutTruncated
+  const errCut = egress === undefined ? result.truncated : egress.outcome.stderrTruncated || result.truncated
+  if (outCut || errCut) {
     head.push(
       `[output cut: a stream carried more than ${String(CAPTURE_MAX_BYTES)} bytes, and the driver kept only its ` +
         'first; such a stream is shown from its start]',
     )
   }
-  const stdout = streamOf('stdout', result.stdout, result.truncated)
-  const stderr = streamOf('stderr', result.stderr, result.truncated)
+  const stdout = streamOf('stdout', outText, outCut)
+  const stderr = streamOf('stderr', errText, errCut)
   const room = PAYLOAD_TEXT_BUDGET - DESCRIBE_RESERVE - payloadBytes(head.join('\n'))
   const [outKeep, errKeep] = streamShares(payloadBytes(stdout.text), payloadBytes(stderr.text), room)
   const out = streamPart(stdout, outKeep)
   const err = streamPart(stderr, errKeep)
   const text = [...head, out.cut, err.cut].join('\n')
-  const ok = result.killedBy === undefined && result.overran !== true && result.exitCode === 0
+  // A channel run is ok only by its command's own exit status, from the exit
+  // frame, and a grant that ended with its container: the mux's exit says
+  // nothing of the command. A grant that went unserved ran no command, so
+  // its run is never ok, whatever the mux exited.
+  const exitedOk =
+    unserved !== undefined
+      ? false
+      : egress === undefined
+        ? result.exitCode === 0
+        : commandExit === 0 && egress.outcome.reason === 'exited'
+  const ok = result.killedBy === undefined && result.overran !== true && exitedOk
   // A stream shown by its window, or withheld, is not all the container
   // printed: the result is marked cut even when its text then fits whole.
   const partial = [stdout, stderr].some((stream) => stream.window !== undefined || stream.withheld !== undefined)
   if (!partial && out.cut === out.whole && err.cut === err.whole) return { ok, text }
   return { ok, text, whole: [...head, out.whole, err.whole].join('\n') }
+}
+
+/**
+ * How a channel run's docker client ended, for one whose command sent no exit
+ * status: the client's exit is the mux's (MUX_EXIT, which never uses 125),
+ * except when the client says nothing of its container (mayRunOn): no exit
+ * status, or 125, its own failure.
+ */
+function clientEnd(result: SandboxResult): string {
+  if (result.exitCode === null) {
+    const signal = result.signal ?? undefined
+    const why = signal === undefined ? 'it did not start' : driverText(String(signal))
+    return `the docker client ended with no exit status (${why}) before the mux sent one`
+  }
+  if (result.killedBy === undefined && result.exitCode === DOCKER_CLI_FAILED) {
+    return `the docker client exited ${String(DOCKER_CLI_FAILED)}, its own failure, before the mux sent one`
+  }
+  return `the mux exited ${String(result.exitCode)} before it sent one`
+}
+
+/** A session's captured bytes as text: UTF-8, a byte that is none read as U+FFFD, as the driver decodes a stream. */
+function decoded(bytes: Uint8Array): string {
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('utf8')
+}
+
+/** How a channel run reached the network, for the result's head: its grant and the grant's totals. */
+function egressSaid(egress: EgressEnd): string {
+  const t = egress.outcome.totals
+  return (
+    `no network but the kernel's egress engine (grant ${egress.grantId}: ${String(t.requests)} request(s), ` +
+    `${String(t.allowed)} allowed, ${String(t.denied)} denied)`
+  )
+}
+
+/** Why a channel run's grant ended, when not with its container's exit: a line for the result's head, redacted and bounded. */
+function revocationSaid(egress: EgressEnd): string | undefined {
+  const { reason, limit, detail } = egress.outcome
+  if (reason === 'exited') return undefined
+  const why = `${reason}${limit === undefined ? '' : ` (${limit})`}${detail === undefined ? '' : `: ${utf8Head(detail, DRIVER_TEXT_BYTES)}`}`
+  return redactString(`[egress grant ${egress.grantId} revoked: ${why}]`)
 }
 
 /**

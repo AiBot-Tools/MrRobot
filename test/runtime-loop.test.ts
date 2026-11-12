@@ -26,6 +26,7 @@
 import './helpers/guard.js'
 
 import { test, type TestContext } from 'node:test'
+import { getEventListeners } from 'node:events'
 import assert from 'node:assert/strict'
 import { parse as parseYaml } from 'yaml'
 
@@ -47,7 +48,7 @@ import { Budget } from '../src/runtime/budget.js'
 import { Lanes } from '../src/runtime/lanes.js'
 import { RunLoop, STOP_REQUESTED, type RunAgent, type ToolContext } from '../src/runtime/loop.js'
 import { KernelTools } from '../src/runtime/kernel-tools.js'
-import { assertEgressEnforced } from '../src/runtime/egress.js'
+import { assertEgressEnforced, EgressUnavailable } from '../src/runtime/egress.js'
 import { NotImplementedError } from '../src/errors.js'
 import { MAX_LOGGED_OUTPUT, PAYLOAD_TEXT_BUDGET } from '../src/events/bound.js'
 
@@ -645,6 +646,28 @@ test('budget caps stop the run through the loop with the T27b reason codes', asy
   assert.equal(c.reason, 'usdMax')
 })
 
+test('runs that share one signal leave no abort listener on it once each has finished', async (t) => {
+  // A parent's signal, or a daemon's shutdown signal, outlives the runs it
+  // is handed to: each run latches the budget on it while it runs, and
+  // removes that listener at its end, so finished runs hold none of it.
+  const w = await wire(t, {
+    views: views({ recall: { exposure: 'agent', risk: 'read' } }),
+    script: [turn(toolCall('pmmcp.recall', { query: 'x' })), done(), done()],
+  })
+  const shared = new AbortController()
+  const during: number[] = []
+  w.store.subscribe((row) => {
+    if (row.type === 'llm.request') during.push(getEventListeners(shared.signal, 'abort').length)
+  })
+  const first = await w.loop.start({ runId: 'run_s1', agent: w.agent, prompt: 'one', signal: shared.signal })
+  assert.equal(getEventListeners(shared.signal, 'abort').length, 0, 'the first run left a listener on the signal')
+  const second = await w.loop.start({ runId: 'run_s2', agent: w.agent, prompt: 'two', signal: shared.signal })
+  assert.deepEqual([first.status, second.status], ['ok', 'ok'])
+  assert.equal(getEventListeners(shared.signal, 'abort').length, 0, 'a finished run left a listener on the signal')
+  // While each ran, it listened: the check above is not of a run that never did.
+  assert.ok(during.length === 3 && during.every((n) => n >= 1), JSON.stringify(during))
+})
+
 test('a run stopped through its signal takes no further step: no tool call after the stop, no model call, and run.finished says killed, requested', async (t) => {
   // Stopped while the last tool of a turn runs: the model is not called again.
   {
@@ -741,7 +764,10 @@ test('a run stopped through its signal takes no further step: no tool call after
     assert.equal(w.provider.requests.length, 1)
   }
 
-  // A budget stop a call met before the stop keeps its reason.
+  // A cap the in-flight call's charge uses up after the stop is not the
+  // run's reason: the stop arrives at c1's tool.result, which the hub writes
+  // before the loop charges the call, so maxToolCalls ran out after the
+  // stop, and the cap permitted that call.
   {
     const stop = new AbortController()
     const w = await wire(t, {
@@ -763,8 +789,78 @@ test('a run stopped through its signal takes no further step: no tool call after
       if (row.type === 'tool.result') stop.abort()
     })
     const out = await w.loop.start({ runId: 'run_3', agent: w.agent, prompt: 'twice', signal: stop.signal })
-    assert.deepEqual([out.status, out.reason], ['killed', 'maxToolCalls'])
+    assert.deepEqual([out.status, out.reason, out.toolCalls], ['killed', STOP_REQUESTED, 1])
     assert.equal(w.mock.calls.length, 1)
+  }
+})
+
+test("a stopped run's reason is the budget as the stop found it: a cap a call in flight then used up, parked or not, is not the reason, and one that ran out before the stop is", async (t) => {
+  const twoCalls = (): ScriptedResponse => turn(toolCalls(['pmmcp.recall', { query: 'a' }], ['pmmcp.recall', { query: 'b' }]))
+
+  // Parked on a human under maxToolCalls 1, then stopped: whichever way the
+  // human answers, the call never runs and the run ends requested. Approved,
+  // its [killed] tool.result is charged as a tool call (recovery counts the
+  // rows), and that charge, made after the stop, is not the reason; denied,
+  // nothing is charged. The human's answer to a call that never ran decides
+  // nothing of the run's reason.
+  for (const decision of ['approved', 'denied'] as const) {
+    const stop = new AbortController()
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'irreversible' } }),
+      caps: { maxToolCalls: 1 },
+      script: [turn(toolCall('pmmcp.recall', { query: 'x' })), done()],
+    })
+    w.store.subscribe((row) => {
+      if (row.type !== 'approval.requested') return
+      const id = (JSON.parse(row.payload) as { approvalId: string }).approvalId
+      queueMicrotask(() => {
+        stop.abort()
+        w.approvals.resolve(id, mintHumanActor('conn-test'), decision)
+      })
+    })
+    const out = await w.loop.start({ runId: 'run_pk', agent: w.agent, prompt: 'recall', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason, out.toolCalls], ['killed', STOP_REQUESTED, decision === 'approved' ? 1 : 0], decision)
+    assert.equal(payload(w, 'run.finished')['reason'], 'requested', decision)
+    assert.equal(w.mock.calls.length, 0, decision)
+  }
+
+  // Stopped at tool.call during the last call maxToolCalls permits, before it
+  // ran or was charged: requested, though its charge then used the cap up.
+  {
+    const stop = new AbortController()
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'read' } }),
+      caps: { maxToolCalls: 1 },
+      script: [twoCalls(), done()],
+    })
+    w.store.subscribe((row) => {
+      if (row.type === 'tool.call') stop.abort()
+    })
+    const out = await w.loop.start({ runId: 'run_tc', agent: w.agent, prompt: 'twice', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason, out.toolCalls], ['killed', STOP_REQUESTED, 1])
+    assert.equal(w.mock.calls.length, 1)
+  }
+
+  // The control: a stop that arrives once the call's charge has used the cap
+  // up (at its quarantine.held row, which the loop writes after the charge)
+  // found the cap run out, and keeps its reason. And unstopped, the same run
+  // ends by the cap.
+  for (const stopAt of ['quarantine.held', undefined] as const) {
+    const stop = new AbortController()
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'read', quarantine: true } }),
+      caps: { maxToolCalls: 1 },
+      script: [twoCalls(), done()],
+    })
+    if (stopAt !== undefined) {
+      w.store.subscribe((row) => {
+        if (row.type === stopAt) stop.abort()
+      })
+    }
+    const out = await w.loop.start({ runId: 'run_q', agent: w.agent, prompt: 'twice', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason], ['killed', 'maxToolCalls'], String(stopAt))
+    assert.equal(w.mock.calls.length, 1, String(stopAt))
+    assert.equal(w.store.query({ type: 'tool.gate' }).length, 1, String(stopAt))
   }
 })
 
@@ -1016,6 +1112,74 @@ test('a run stopped during the last tool call of its last turn ends killed, requ
     assert.equal(payload(w, 'run.finished')['reason'], 'wallclock')
     assert.equal(w.mock.calls.length, 0)
   }
+
+  // Stopped first, and the wallclock runs out after the stop, before its end
+  // is read (the human answers late): the run overran its wallclock by the
+  // time its end is read, and records it, whichever came first.
+  {
+    const stop = new AbortController()
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'irreversible' } }),
+      caps: { wallclockMs: 1_000 },
+      script: [turn(toolCall('pmmcp.recall', { query: 'x' })), done()],
+    })
+    w.store.subscribe((row) => {
+      if (row.type !== 'approval.requested') return
+      const id = (JSON.parse(row.payload) as { approvalId: string }).approvalId
+      queueMicrotask(() => {
+        stop.abort()
+        w.advance(5_000)
+        w.approvals.resolve(id, mintHumanActor('conn-late'), 'denied')
+      })
+    })
+    const out = await w.loop.start({ runId: 'run_sw', agent: w.agent, prompt: 'go', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason], ['killed', 'wallclock'])
+    assert.equal(w.mock.calls.length, 0)
+  }
+})
+
+test('a run whose turns maxTurns spent ends by a cap that has run out by then, stopped or not, and a final answer on the last permitted call ends ok', async (t) => {
+  // The last turn's one call is denied by a human after the wallclock ran
+  // out: no read of a turn follows, and none of a call. Whether the run
+  // reports its overrun must not depend on whether someone stopped it.
+  for (const stopped of [false, true]) {
+    const stop = new AbortController()
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'irreversible' } }),
+      caps: { wallclockMs: 1_000 },
+      maxTurns: 1,
+      script: [turn(toolCall('pmmcp.recall', { query: 'x' })), done()],
+    })
+    w.store.subscribe((row) => {
+      if (row.type !== 'approval.requested') return
+      const id = (JSON.parse(row.payload) as { approvalId: string }).approvalId
+      queueMicrotask(() => {
+        w.advance(5_000)
+        if (stopped) stop.abort()
+        w.approvals.resolve(id, mintHumanActor('conn-late'), 'denied')
+      })
+    })
+    const out = await w.loop.start({ runId: 'run_mt', agent: w.agent, prompt: 'go', signal: stop.signal })
+    assert.deepEqual([out.status, out.reason], ['killed', 'wallclock'], `stopped ${String(stopped)}`)
+    assert.equal(payload(w, 'run.finished')['reason'], 'wallclock', `stopped ${String(stopped)}`)
+    assert.equal(w.mock.calls.length, 0)
+  }
+  // Turns spent within every cap end ok, as they did: maxTurns is no cap.
+  {
+    const w = await wire(t, {
+      views: views({ recall: { exposure: 'agent', risk: 'read' } }),
+      maxTurns: 1,
+      script: [turn(toolCall('pmmcp.recall', { query: 'x' })), done()],
+    })
+    const out = await w.loop.start({ runId: 'run_mo', agent: w.agent, prompt: 'go' })
+    assert.deepEqual([out.status, out.reason], ['ok', undefined])
+  }
+  // A final answer that used the last model call ends ok: the cap permitted it.
+  {
+    const w = await wire(t, { views: views({ recall: { exposure: 'agent', risk: 'read' } }), caps: { maxLlmCalls: 1 }, maxTurns: 1, script: [done('the answer')] })
+    const out = await w.loop.start({ runId: 'run_ma', agent: w.agent, prompt: 'go' })
+    assert.deepEqual([out.status, out.reason], ['ok', undefined])
+  }
 })
 
 test('no call reaches the gate once a cap has run out, so no human is asked to approve a call the loop would refuse', async (t) => {
@@ -1040,9 +1204,15 @@ test('no call reaches the gate once a cap has run out, so no human is asked to a
 
   // The wallclock elapses while a human is asked of the first, who denies
   // it: that denial charges nothing, and the read before the second sees
-  // the wallclock.
-  {
-    const w = await wire(t, { views: irreversible, caps: { wallclockMs: 1_000 }, script: [twice(), done()] })
+  // the wallclock. In a last turn (maxTurns 1) too, where no turn's read
+  // follows: that read records the cap, and the second is never gated.
+  for (const maxTurns of [undefined, 1] as const) {
+    const w = await wire(t, {
+      views: irreversible,
+      caps: { wallclockMs: 1_000 },
+      ...(maxTurns === undefined ? {} : { maxTurns }),
+      script: [twice(), done()],
+    })
     w.store.subscribe((row) => {
       if (row.type !== 'approval.requested') return
       const id = (JSON.parse(row.payload) as { approvalId: string }).approvalId
@@ -1052,9 +1222,22 @@ test('no call reaches the gate once a cap has run out, so no human is asked to a
       })
     })
     const out = await w.loop.start({ runId: 'run_w', agent: w.agent, prompt: 'twice' })
-    assert.deepEqual([out.status, out.reason], ['killed', 'wallclock'])
+    assert.deepEqual([out.status, out.reason], ['killed', 'wallclock'], `maxTurns ${String(maxTurns)}`)
     assert.equal(asked(w), 1, 'a human was asked of a call past the wallclock')
     assert.equal(w.store.query({ type: 'tool.gate' }).length, 1)
+    assert.equal(w.mock.calls.length, 0)
+    assert.equal(w.provider.requests.length, 1)
+  }
+
+  // The turn's model call uses up usdMax: none of its calls reaches the
+  // gate, no human is asked of one, and the run ends usdMax.
+  {
+    const w = await wire(t, { views: irreversible, caps: { usdMax: COST_PER_TURN }, script: [twice(), done()] })
+    autoAnswer(w, 'approved')
+    const out = await w.loop.start({ runId: 'run_u', agent: w.agent, prompt: 'twice' })
+    assert.deepEqual([out.status, out.reason], ['killed', 'usdMax'])
+    assert.equal(asked(w), 0, 'a human was asked of a call past usdMax')
+    assert.equal(w.store.query({ type: 'tool.gate' }).length, 0)
     assert.equal(w.mock.calls.length, 0)
     assert.equal(w.provider.requests.length, 1)
   }
@@ -1147,8 +1330,13 @@ test('a worker is never offered a kernel tool, even with a runner configured and
   for (const name of offered) {
     assert.equal(/deleg|spawn|subagent|child|kernel/i.test(name), false, name)
   }
-  // The one remaining stub still throws rather than answering plausibly.
-  assert.throws(() => assertEgressEnforced(), NotImplementedError)
+  // Egress, built since W1, still refuses rather than answering plausibly:
+  // a degraded egress throws with its reason, never a NotImplementedError
+  // and never a boolean a caller could read as a host denied.
+  assert.throws(
+    () => assertEgressEnforced({ state: 'degraded', reason: 'egress.enabled is false' }, { used: [], resolved: new Map() }),
+    (e: unknown) => e instanceof EgressUnavailable && !(e instanceof NotImplementedError) && /egress is degraded: egress\.enabled is false/.test(e.message),
+  )
 })
 
 test('ToolContext keys are exactly [agentId, args, runId, toolRef]', () => {

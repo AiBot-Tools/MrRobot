@@ -65,6 +65,7 @@ import {
   type ReceivedFrame,
 } from '../src/egress/frame.js'
 import { EgressGrant } from '../src/egress/policy.js'
+import { acceptReady, NO_ROUTE_CODES as KERNEL_NO_ROUTE_CODES, probeTarget, READY_MAX_BYTES as KERNEL_READY_MAX_BYTES, SELF_TEST as KERNEL_SELF_TEST } from '../src/egress/ready.js'
 import { createEgressSession, type SessionLimits } from '../src/egress/session.js'
 import { createUpstream } from '../src/egress/upstream.js'
 import { differential, type WalkMove } from './helpers/frame-order.js'
@@ -1935,6 +1936,50 @@ test('the minimal judge accepts only a report naming every probe in order, none 
   assert.match(judge(changed(address, { reached: true, error: 'ECONNREFUSED' })) ?? 'accepted', /reached 1 of what it must not/)
   assert.match(judge(mux.readyPayload(results.slice(1))) ?? 'accepted', /does not name every probe/)
   assert.match(judge(mux.readyPayload([...results].reverse())) ?? 'accepted', /does not name every probe/)
+})
+
+test("the kernel's own judge (src/egress/ready.ts) holds the mux's self-test probe for probe, and gives the minimal judge's verdict on every row", () => {
+  // The kernel's copy of the probe list, which boot's sessions judge every
+  // ready by (egress plan W1; W3's canary will run the same judge), is the
+  // image's own, in order, and its no-route codes and size bound are the
+  // ones the mux's header names.
+  assert.deepEqual(KERNEL_SELF_TEST.map((p) => ({ ...p })), mux.SELF_TEST.map((p) => ({ ...p })))
+  assert.deepEqual(KERNEL_SELF_TEST.map(probeTarget), mux.SELF_TEST.map(targetOf))
+  assert.equal(KERNEL_READY_MAX_BYTES, mux.READY_MAX_BYTES)
+  for (const kind of ['address', 'name', 'lookup'] as const) assert.deepEqual([...KERNEL_NO_ROUTE_CODES[kind]], [...NO_ROUTE_CODES[kind]], kind)
+  type Result = mux.ProbeResult
+  const quiet = (p: mux.Probe): Result => ({
+    probe: p.probe,
+    target: targetOf(p),
+    reached: false,
+    error: p.probe === 'lookup' ? 'ENOTFOUND' : net.isIP(p.host) === 0 ? 'EAI_AGAIN' : 'ENETUNREACH',
+  })
+  const results = mux.SELF_TEST.map(quiet)
+  const rows: Uint8Array[] = [mux.readyPayload(results), mux.readyPayload(results.slice(1)), mux.readyPayload([...results].reverse())]
+  for (const [at, p] of results.entries()) {
+    for (const error of ['ENETUNREACH', 'EAI_AGAIN', 'ENOTFOUND', 'ETIMEDOUT', 'EHOSTUNREACH', 'ECONNREFUSED', 'EOTHER', null]) {
+      rows.push(mux.readyPayload(results.map((r, i) => (i === at ? { ...r, error } : r))))
+    }
+    rows.push(mux.readyPayload(results.map((r, i) => (i === at ? { ...r, reached: true, error: 'ECONNREFUSED' } : r))))
+    void p
+  }
+  // A report that names another target in a probe's place, met by the right code.
+  rows.push(mux.readyPayload(results.map((r, i) => (i === 0 ? { ...r, target: '10.0.0.1:8766' } : r))))
+  rows.push(new Uint8Array(0), Buffer.from('not json', 'ascii'), Buffer.from('{"mux":2,"probes":[],"reached":0}', 'ascii'))
+  for (const row of rows) {
+    const text = Buffer.from(row).toString('latin1')
+    let minimal: string | undefined
+    try {
+      minimal = judge(row)
+    } catch {
+      minimal = 'refused'
+    }
+    assert.equal(acceptReady(row) === undefined, minimal === undefined, text)
+  }
+  // The kernel's clause names a probe by its own target, never the report's text.
+  const forged = results.map((r, i) => (i === 0 ? { ...r, error: 'ETIMEDOUT' } : r))
+  assert.equal(acceptReady(mux.readyPayload(forged)), "the self-test's probe of 192.168.5.2:8766 met no error that says there is no route")
+  assert.equal(acceptReady(mux.readyPayload(results.map((r, i) => (i === 4 ? { ...r, reached: true, error: 'ECONNREFUSED' } : r)))), 'the self-test reached 1 of what it must not')
 })
 
 function sessionOver(t: TestContext, toKernel: PassThrough, toMux: PassThrough, kills: number[]): ReturnType<typeof createEgressSession> {

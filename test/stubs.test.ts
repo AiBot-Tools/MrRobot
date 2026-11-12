@@ -32,7 +32,7 @@ import { parse as parseYaml } from 'yaml'
 import { STUBS } from '../src/kernel.js'
 import { NotImplementedError } from '../src/errors.js'
 import { AppleContainerDriver } from '../src/sandbox/apple-container.js'
-import { assertEgressEnforced } from '../src/runtime/egress.js'
+import { assertEgressEnforced, EgressUnavailable } from '../src/runtime/egress.js'
 import { LANE_NAMES } from '../src/runtime/lanes.js'
 import { parseManifest } from '../src/agents/manifest.js'
 
@@ -53,13 +53,12 @@ memory:
   projectId: aos/shared
 `
 
-test('every STUBS entry throws NotImplementedError or reports unavailable with a reason (table-driven: AppleContainerDriver, assertEgressEnforced)', async () => {
+test('every STUBS entry throws NotImplementedError or reports unavailable with a reason (table-driven: AppleContainerDriver); egress, built, refuses with its reason and never as not implemented', async () => {
   // Each row is a stub id and every way to reach it. A call that RETURNS is the
   // failure: a stub that answers is a feature that does not work.
   const table: { id: string; call: () => unknown }[] = [
     { id: 'apple-container-driver', call: () => new AppleContainerDriver().run({} as never) },
     { id: 'apple-container-driver', call: () => new AppleContainerDriver().kill('x') },
-    { id: 'egress-proxy', call: () => assertEgressEnforced() },
   ]
 
   for (const row of table) {
@@ -93,6 +92,29 @@ test('every STUBS entry throws NotImplementedError or reports unavailable with a
     assert.ok(exercised.has(stub.id), `STUBS lists ${stub.id} but nothing here calls it`)
   }
   assert.equal(exercised.size, STUBS.length, `exercised ${String(exercised.size)} of ${String(STUBS.length)}`)
+
+  // Egress left STUBS when it was built (egress plan W1): its refusal is the
+  // reason boot recorded, never "not implemented", and it still throws rather
+  // than answering false, so no caller can read a degraded egress as a host
+  // denied. Ok, with every binding the grant routes resolved, it returns.
+  assert.equal(STUBS.some((stub) => stub.id === 'egress-proxy' || stub.where === 'src/runtime/egress.ts'), false)
+  const resolved = new Map([['github', { bindingId: 'github', envVar: 'AOS_GITHUB_TOKEN' }]])
+  const refusals: [string, () => unknown, RegExp][] = [
+    ['degraded', () => assertEgressEnforced({ state: 'degraded', reason: 'egress.enabled is false' }, { used: [], resolved }), /^egress is degraded: egress\.enabled is false$/],
+    ['unresolved', () => assertEgressEnforced({ state: 'ok' }, { used: ['github'], resolved: new Map([['github', { bindingId: 'github', envVar: 'AOS_GITHUB_TOKEN', problem: 'AOS_GITHUB_TOKEN is not set' }]]) }), /egress binding github \(envVar AOS_GITHUB_TOKEN\) did not resolve at boot: AOS_GITHUB_TOKEN is not set/],
+    ['unknown', () => assertEgressEnforced({ state: 'ok' }, { used: ['other'], resolved }), /egress binding other was not resolved at boot/],
+  ]
+  for (const [label, call, pattern] of refusals) {
+    assert.throws(call, (e: unknown) => {
+      assert.ok(e instanceof EgressUnavailable, `${label} threw ${String(e)}`)
+      assert.equal(e instanceof NotImplementedError, false, label)
+      assert.equal(e.code, 'AOS_EGRESS_UNAVAILABLE', label)
+      assert.match(e.message, pattern, label)
+      return true
+    }, label)
+  }
+  assert.equal(assertEgressEnforced({ state: 'ok' }, { used: ['github'], resolved }), undefined)
+  assert.equal(assertEgressEnforced({ state: 'ok' }, { used: [], resolved: new Map() }), undefined)
 })
 
 test("every STUBS entry is named in README's stub section", () => {
@@ -269,7 +291,6 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   // matched on the words a human would actually write for each.
   const NAMES: Record<string, RegExp> = {
     'apple-container-driver': /Apple container driver/,
-    'egress-proxy': /egress proxy/i,
   }
   for (const stub of STUBS) {
     const pattern = NAMES[stub.id]
@@ -284,11 +305,24 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   // because it is still registry-only, and a reader must not infer from
   // "delegation exists" that an agent can mint a new one.
   for (const fragment of [
-    'assertEgressEnforced',
     'spawnEphemeral',
   ]) {
     assert.ok(section.includes(fragment), `CLAUDE.md does not say how ${fragment} refuses`)
   }
+  // Egress is built, and the paragraph says what it is and that it has never
+  // run live, rather than calling it an absent proxy that throws (egress plan
+  // W1 retired that stub).
+  for (const fact of [
+    'egress built but never yet run live',
+    "the kernel's own engine, `src/egress/`, reached by a trusted run only over its `docker -i` channel",
+    'every request a `proxy.decision` row before any dial',
+    'no proxy container, no listener',
+    'it boots degraded, naming the check that failed and its fix, until its boot checks pass',
+    'the hostile domain gets no egress',
+  ]) {
+    assert.ok(section.replace(/\s+/g, ' ').includes(fact), `CLAUDE.md Current state does not say: ${fact}`)
+  }
+  assert.doesNotMatch(section, /egress proxy sidecar|`assertEgressEnforced` throws/)
 
   // The counts are real, and they are the numbers this suite actually produces.
   // A hard-coded pair that nothing checks is how "19/19" survived.
@@ -418,9 +452,12 @@ test('a manifest schedule must be a cron expression the scheduler can run', () =
 })
 
 test('sandbox spec schema has no egress field', () => {
-  // Egress is enforced by the Phase 2 proxy sidecar, which does not exist. A
-  // field on the spec would imply the driver could constrain the network, and it
-  // cannot: the container gets an internal network and nothing else.
+  // Egress is enforced by the kernel's own egress engine (src/egress), over a
+  // trusted run's `docker -i` channel, never by the driver. A field on the
+  // spec would imply the driver could constrain the network, and it cannot:
+  // since S1 the container gets no network at all (--network none), and its
+  // one way out is that engine, over the channel a spec's `channel` asks
+  // for, whose bytes the driver neither reads nor writes.
   const driver = readFileSync(`${REPO}/src/sandbox/driver.ts`, 'utf8')
   const spec = driver.slice(driver.indexOf('export interface SandboxSpec'))
   const body = spec.slice(0, spec.indexOf('\n}'))
@@ -437,8 +474,9 @@ test('sandbox spec schema has no egress field', () => {
     assert.equal(/egress/i.test(code), false, `src/sandbox/${file} mentions egress in code`)
   }
 
-  // The refusal lives in one place, and it is reachable.
-  assert.throws(() => assertEgressEnforced(), NotImplementedError)
+  // The refusal lives in one place, src/runtime/egress.ts, and it is
+  // reachable: a degraded egress is refused with its reason.
+  assert.throws(() => assertEgressEnforced({ state: 'degraded', reason: 'the sandbox is degraded' }, { used: [], resolved: new Map() }), EgressUnavailable)
 })
 
 test('no cron lane exists', () => {

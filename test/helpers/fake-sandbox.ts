@@ -49,7 +49,8 @@
 // changes nothing for a run that has ended or whose end is already queued,
 // and every name it is passed is recorded (abandons). A hung run is never
 // ended by the fake on its own, wallclock or not: one that nothing kills,
-// overruns or abandons is a driver that never answers.
+// overruns, abandons or exits (simulateExit, a test's word that its
+// container exited on its own) is a driver that never answers.
 //
 // What still differs: when a run whose kill ended nothing exits, which here is
 // just after that kill, and on the real driver whenever its container does.
@@ -213,6 +214,15 @@ export interface FakeSandbox extends SandboxDriver {
   readonly abandons: string[]
   /** End a hanging run as a wallclock overrun would, on a later macrotask. */
   simulateOverrun(name: string): void
+  /**
+   * End a hanging run as its container exiting on its own does, on a later
+   * macrotask: its scripted exit, no killedBy, its channel's pipes closed as
+   * Node closes a child's (the result settles once the input is read to its
+   * end). What a channel run's container does once its command is done, its
+   * mux having sent the exit frame, which a test writes before this. A run
+   * that has ended, or whose end is queued, is left as it is.
+   */
+  simulateExit(name: string): void
 }
 
 const UNAVAILABLE: ProbeResult = {
@@ -639,6 +649,12 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
       if (hung === undefined) return // ended: the real driver's timer is cleared
       hung.overran = true
       if (hung.scripted.ignoresKill !== true) hung.killedBy = 'wallclock'
+      end(hung)
+    },
+
+    simulateExit(name: string): void {
+      const hung = pending.get(name)
+      if (hung === undefined) return // ended already
       end(hung)
     },
   }

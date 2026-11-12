@@ -102,12 +102,14 @@ sandbox:
     wallclockMs: 600000
 
 # What the kernel's egress engine may do for a sandboxed run (egress plan,
-# Phase 2). Only the .env loader reads this yet (a binding's envVar is a name
-# it accepts); egress itself is a stub that refuses until the wiring task
-# (W1), whatever this says. It ships disabled with no binding, because any
-# binding widens what a run can reach. Every key is strict: a typo is refused
-# at parse, not taken for a setting. Egress serves the trusted domain alone,
-# so there is no domain key: the hostile domain gets no channel and no egress.
+# Phase 2): a trusted run whose manifest names egress is issued a grant, and
+# its container reaches the hosts the grant names only through the kernel,
+# over its docker -i channel, every request a proxy.decision before any dial.
+# Boot reports egress degraded while this is disabled, naming this key. It
+# ships disabled with no binding, because any binding widens what a run can
+# reach. Every key is strict: a typo is refused at parse, not taken for a
+# setting. Egress serves the trusted domain alone, so there is no domain key:
+# the hostile domain gets no channel and no egress.
 egress:
   enabled: false
   # Where the in-image mux listens, inside the container's own network
@@ -118,6 +120,12 @@ egress:
   # The three that size what the kernel holds for a container are bounded:
   # frameMaxBytes at most 1 MiB, maxFlows at most 256, maxHeaderBytes at most
   # 64 KiB. idleMs is a timer's delay: at most 2147483647 (about 24.8 days).
+  # maxRequests counts the flows a container opens, not only the requests
+  # judged: a flow carries at most one request, and one whose head never
+  # completes costs one too. An upstream 401 or 403 (`challenged`), and an
+  # answer whose head the kernel will not write to the worker
+  # (`response-head`), are recorded as upstream proxy.decision rows, sent,
+  # and answered 502.
   limits:
     frameMaxBytes: 65536
     maxFlows: 16
@@ -132,11 +140,14 @@ egress:
   # used on. Its envVar joins the names the .env loader accepts; the operator
   # adds the value, and the installer never generates one. Never a PMMCP_ name
   # (pmmcp's own prefix, D34), and never control.tokenEnv or an MCP server's
-  # tokenEnv. A provider's key will be refused at boot once the wiring task
-  # (W1) lands; until then no request uses a binding. Its id, host and
+  # tokenEnv. A provider's key is refused at boot: the kernel will not start
+  # with a binding that would send it to the binding's host. Its id, host and
   # repositories must be names the event log would record as they are, not
-  # censored as a credential shape. Pushes and pull requests land under
-  # refs/heads/aos/<runId>/ only. A shape, for when the operator adds one:
+  # censored as a credential shape. A binding names at most 64 repositories,
+  # and the bindings one manifest binds at most 128 between them, what one
+  # proxy.grant.issued row records: a manifest past that is refused at load.
+  # Pushes and pull requests land under refs/heads/aos/<runId>/ only. A shape,
+  # for when the operator adds one:
   #   bindings:
   #     github-git:
   #       host: github.com

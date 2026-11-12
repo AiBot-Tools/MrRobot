@@ -29,7 +29,17 @@ import { WebSocket } from 'ws'
 import { createServer, type IncomingHttpHeaders } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
-import { bootKernel, callTaints, configHash, defaultDriver, project, STUBS, SUBSYSTEM_ORDER } from '../src/kernel.js'
+import {
+  bootKernel,
+  callTaints,
+  configHash,
+  defaultDriver,
+  EGRESS_CONNECT_TIMEOUT_MS,
+  egressUpstreamOptions,
+  project,
+  STUBS,
+  SUBSYSTEM_ORDER,
+} from '../src/kernel.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
 import { isClean, projectRecovery } from '../src/events/projections.js'
 import { rebuildFromLog as rebuildApprovals } from '../src/policy/approvals.js'
@@ -37,6 +47,7 @@ import { rebuildFromLog as rebuildQuarantine } from '../src/policy/quarantine.js
 import { ConfigError, NotImplementedError } from '../src/errors.js'
 import { EventStore } from '../src/events/store.js'
 import { readAllRows } from '../src/events/chain.js'
+import { EGRESS_REASON_BYTES } from '../src/events/types.js'
 import { parseKernelConfig } from '../src/config.js'
 import { readAnchor } from '../src/events/anchor.js'
 import { CONTROL_PATH } from '../src/control/auth.js'
@@ -61,7 +72,8 @@ import { mintHumanActor } from '../src/control/actor.js'
 import { freshProbe } from './helpers/probe.js'
 import { writeProbeRecord } from '../src/models/probe.js'
 import { mockMcp } from './helpers/mock-mcp.js'
-import { MIN_MASK_LENGTH, SecretMask } from '../src/events/redact.js'
+import { MIN_MASK_LENGTH, redactString, SecretMask } from '../src/events/redact.js'
+import { FakeMux, fakeUpstream, fakeUpstreamDeps, until } from './helpers/fake-egress.js'
 import { connectControl } from '../src/cli/client.js'
 
 
@@ -137,10 +149,12 @@ test('boots DEGRADED with hub, sandbox and router degraded, each with a reason, 
   // secrets.source: env needs no pmmcp, so a missing pmmcp does not degrade it.
   assert.equal(status.subsystems.secrets.state, 'ok', status.subsystems.secrets.reason ?? '')
 
-  // Absent is not degraded: egress is not built at all, and it says so in its own
-  // words rather than in a status string invented here.
-  assert.equal(status.subsystems.egress.state, 'absent')
-  assert.match(status.subsystems.egress.reason ?? '', /not implemented/)
+  // Egress is built (egress plan W1), so never absent: degraded, saying why,
+  // here both that the shipped config disables it and that no container
+  // runtime answers.
+  assert.equal(status.subsystems.egress.state, 'degraded')
+  assert.match(status.subsystems.egress.reason ?? '', /egress\.enabled is false/)
+  assert.match(status.subsystems.egress.reason ?? '', /the sandbox is degraded \(fake: fake driver: no container runtime configured for this test\)/)
 
   // The scheduler is real now, and ok even with nothing to run — which it says,
   // because "ok" alone would leave an operator wondering whether it found their
@@ -1557,8 +1571,9 @@ test('a test fleet worker with a sandbox: block is offered sandbox.exec, runs it
   })
   assert.equal(fx.config.sandbox.imageId, image)
   assert.equal(kernel.status().subsystems.sandbox.state, 'ok')
-  // Egress stays the stub: no channel, no grant, whatever runs.
-  assert.equal(kernel.status().subsystems.egress.state, 'absent')
+  // Egress is built and disabled (kernel.yaml ships egress.enabled false),
+  // and this worker holds none: no channel, no grant.
+  assert.equal(kernel.status().subsystems.egress.state, 'degraded')
 
   // While its second exec waits for a human, the daemon's view of the run
   // (run.get, which runs.list shares) is read: the first exec tainted it, as
@@ -1637,4 +1652,701 @@ test('a test fleet worker with a sandbox: block is offered sandbox.exec, runs it
   const third = JSON.stringify(provider.requests[2]?.body)
   assert.ok(third.includes('[denied] a human denied this call'), third.slice(-400))
   assert.equal(kernel.store.verifyChain(kernel.store.readAnchor()).ok, true)
+})
+
+// ── egress, wired (egress plan W1) ──────────────────────────────────────────
+
+/** A pinned image id the fake driver holds, so the sandbox probe can pass. */
+const EGRESS_IMAGE = `sha256:${'ef'.repeat(32)}`
+
+/** kernel.yaml's sandbox block with that id pinned, and `extra` appended. */
+const pinned = (extra = '') => (base: string): string =>
+  `${base.replace('  image: aos-worker:test\n', `  image: aos-worker:test\n  imageId: "${EGRESS_IMAGE}"\n`)}${extra}`
+
+/** A driver whose daemon answers, holding the pinned image. */
+const answering = (script: Parameters<typeof fakeSandbox>[0] = {}): ReturnType<typeof fakeSandbox> =>
+  fakeSandbox({ imageId: EGRESS_IMAGE, probe: { ok: true, version: 'fake 1' }, ...script })
+
+const GITHUB_BINDING = `
+egress:
+  enabled: true
+  bindings:
+    github-git:
+      host: github.com
+      scheme: Basic
+      envVar: AOS_GITHUB_TOKEN
+      profiles: [git-fetch]
+      repos: [op/fixture]
+`
+
+/** A binding value in no credential shape: only the kernel's own mask keeps it, and its Basic form, out of the log. */
+const GITHUB_VALUE = 'offline-binding-value-4f2a9c71e0'
+
+function egressRows(dbPath: string): Record<string, unknown>[] {
+  return rows(dbPath)
+    .filter((r) => r.type === 'egress.degraded')
+    .map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+}
+
+test('with no container runtime, egress is degraded and names the sandbox reason; with egress.enabled false it names the key', async (t) => {
+  // Enabled, but no container runtime answers (the fake's default probe).
+  {
+    const { kernel, fx } = await withKernel(t, { kernelYaml: (base) => `${base}\negress:\n  enabled: true\n` })
+    const egress = kernel.status().subsystems.egress
+    assert.equal(egress.state, 'degraded')
+    assert.match(egress.reason ?? '', /^the sandbox is degraded \(fake: fake driver: no container runtime configured for this test\), and egress serves only a container on the trusted domain: fix the sandbox first/)
+    assert.deepEqual(
+      egressRows(fx.dbPath).map((r) => [r['check'], r['domain'], r['bindingId']]),
+      [['sandbox', undefined, undefined]],
+      'one row, for the one check that failed',
+    )
+    assert.match(String(egressRows(fx.dbPath)[0]?.['reason']), /no container runtime configured for this test/)
+  }
+  // Enabled, no container runtime, and a binding whose value is unset: the
+  // sandbox's failure does not hide the binding's, so each failed check has
+  // its row, and the subsystem's reason names both.
+  {
+    const { kernel, fx } = await withKernel(t, { kernelYaml: (base) => `${base}${GITHUB_BINDING}` })
+    assert.equal(kernel.status().subsystems.sandbox.state, 'degraded')
+    assert.deepEqual(
+      egressRows(fx.dbPath).map((r) => [r['check'], r['bindingId']]),
+      [
+        ['sandbox', undefined],
+        ['binding', 'github-git'],
+      ],
+    )
+    const reason = kernel.status().subsystems.egress.reason ?? ''
+    assert.match(reason, /^the sandbox is degraded \(fake: fake driver: no container runtime configured for this test\)/)
+    assert.match(reason, /; egress binding github-git \(envVar AOS_GITHUB_TOKEN\) did not resolve: AOS_GITHUB_TOKEN is not set/)
+  }
+  // Disabled, as kernel.yaml ships it, on a sandbox that is ok, with a
+  // binding whose value is set: the key is named, and the value is not read.
+  {
+    const disabled = GITHUB_BINDING.replace('  enabled: true\n', '  enabled: false\n')
+    const { kernel, fx } = await withKernel(t, { kernelYaml: pinned(disabled), sandboxDriver: answering(), env: { AOS_GITHUB_TOKEN: GITHUB_VALUE } })
+    assert.equal(kernel.status().subsystems.sandbox.state, 'ok')
+    const egress = kernel.status().subsystems.egress
+    assert.equal(egress.state, 'degraded')
+    assert.match(egress.reason ?? '', /^egress\.enabled is false in config\/kernel\.yaml, so no run is given a channel: set egress\.enabled: true/)
+    assert.deepEqual(egressRows(fx.dbPath).map((r) => r['check']), ['config'])
+    // A disabled egress resolves no binding's value: no access is recorded for nothing.
+    assert.equal(rows(fx.dbPath).filter((r) => r.type === 'secret.accessed').length, 0)
+  }
+  // Both: every failed check is named, each in a row of its own, and never absent.
+  {
+    const { kernel, fx } = await withKernel(t)
+    assert.equal(kernel.status().subsystems.egress.state, 'degraded')
+    assert.deepEqual(egressRows(fx.dbPath).map((r) => r['check']), ['config', 'sandbox'])
+    const states = rows(fx.dbPath)
+      .filter((r) => r.type === 'subsystem.state')
+      .map((r) => JSON.parse(r.payload) as { subsystem: string; state: string })
+      .filter((p) => p.subsystem === 'egress')
+    assert.deepEqual(states.map((p) => p.state), ['degraded'])
+  }
+})
+
+test('degraded lists egress until the probe passes', async (t) => {
+  // Enabled, the sandbox ok, and the one binding's value unset: degraded,
+  // naming the binding and its envVar, never a value.
+  {
+    const { kernel, fx } = await withKernel(t, { kernelYaml: pinned(GITHUB_BINDING), sandboxDriver: answering() })
+    assert.ok(kernel.degraded.includes('egress'), kernel.degraded.join(', '))
+    const [row, ...more] = egressRows(fx.dbPath)
+    assert.deepEqual(more, [])
+    assert.deepEqual([row?.['check'], row?.['bindingId']], ['binding', 'github-git'])
+    assert.match(String(row?.['reason']), /^egress binding github-git \(envVar AOS_GITHUB_TOKEN\) did not resolve: AOS_GITHUB_TOKEN is not set/)
+    assert.match(kernel.status().subsystems.egress.reason ?? '', /egress binding github-git \(envVar AOS_GITHUB_TOKEN\) did not resolve/)
+  }
+  // A value that is no bearer (whitespace in it, or too short to mask) is
+  // refused by name, and never echoed.
+  for (const [value, problem] of [
+    ['two words-0123456789', /AOS_GITHUB_TOKEN contains whitespace/],
+    ['short12', /AOS_GITHUB_TOKEN is under \d+ characters, so it cannot be masked/],
+  ] as const) {
+    const { kernel, fx } = await withKernel(t, { kernelYaml: pinned(GITHUB_BINDING), sandboxDriver: answering(), env: { AOS_GITHUB_TOKEN: value } })
+    assert.ok(kernel.degraded.includes('egress'), value)
+    const reason = String(egressRows(fx.dbPath)[0]?.['reason'])
+    assert.match(reason, problem)
+    assert.equal(reason.includes(value), false, 'the reason quoted the value')
+  }
+  // Every check passes: egress is ok, and no longer listed.
+  {
+    SecretMask.clear()
+    t.after(() => SecretMask.clear())
+    const { kernel, fx } = await withKernel(t, { kernelYaml: pinned(GITHUB_BINDING), sandboxDriver: answering(), env: { AOS_GITHUB_TOKEN: GITHUB_VALUE } })
+    assert.equal(kernel.status().subsystems.egress.state, 'ok', kernel.status().subsystems.egress.reason ?? '')
+    assert.equal(kernel.degraded.includes('egress'), false, kernel.degraded.join(', '))
+    assert.deepEqual(egressRows(fx.dbPath), [])
+    // Resolved once, at boot, through the broker, with its purpose.
+    const accessed = rows(fx.dbPath)
+      .filter((r) => r.type === 'secret.accessed')
+      .map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+    assert.deepEqual(accessed, [{ schemaVersion: 1, id: 'egress.bindings.github-git', purpose: 'egress credential for github.com', source: 'env' }])
+    // The value and its Basic form are both masked before anything can quote them.
+    const basic = Buffer.from(`x-access-token:${GITHUB_VALUE}`).toString('base64')
+    assert.equal(redactString(`x ${GITHUB_VALUE} y`), 'x [REDACTED] y')
+    assert.equal(redactString(`Authorization: Basic ${basic}`).includes(basic), false)
+    for (const row of rows(fx.dbPath)) {
+      assert.equal(row.payload.includes(GITHUB_VALUE) || row.payload.includes(basic), false, row.type)
+    }
+  }
+})
+
+test('a binding read from the vault, a binding id the mask holds, and a long sandbox reason each degrade egress in their own terms, and the boot completes', async (t) => {
+  SecretMask.clear()
+  t.after(() => SecretMask.clear())
+  // secrets.source: vault, the binding's value set in the environment: a
+  // binding names an envVar and no vault id, so it is read from the
+  // environment only, and refused here, naming both keys, before the broker
+  // is asked anything (the D8 fallback included).
+  {
+    const { kernel, fx } = await withKernel(t, {
+      secretsSource: 'vault',
+      kernelYaml: pinned(GITHUB_BINDING),
+      sandboxDriver: answering(),
+      env: { AOS_GITHUB_TOKEN: GITHUB_VALUE },
+    })
+    assert.equal(kernel.status().subsystems.egress.state, 'degraded')
+    const failed = egressRows(fx.dbPath)
+    assert.deepEqual(failed.map((r) => [r['check'], r['bindingId']]), [['binding', 'github-git']])
+    assert.equal(
+      failed[0]?.['reason'],
+      'egress binding github-git (envVar AOS_GITHUB_TOKEN) did not resolve: bindings are read from the environment only ' +
+        '(envVar AOS_GITHUB_TOKEN; a binding names no vault id), and secrets.source is vault: set secrets.source: env, ' +
+        'and AOS_GITHUB_TOKEN in .env',
+    )
+    const accessed = rows(fx.dbPath).filter((r) => r.type === 'secret.accessed' && r.payload.includes('egress.bindings'))
+    assert.deepEqual(accessed, [], 'the broker was asked for a binding')
+  }
+  // A binding id that holds a value the mask took after kernel.yaml was
+  // read: its row is recorded as no binding's, check config, so no row
+  // stores a binding id censored.
+  {
+    const masked = GITHUB_BINDING.replace('    github-git:\n', '    gh-mask5e2c8a1f:\n')
+    const { kernel, fx } = await withKernel(t, {
+      kernelYaml: pinned(masked),
+      sandboxDriver: answering(),
+      beforeBoot: () => {
+        assert.ok(SecretMask.register('mask5e2c8a1f'))
+      },
+    })
+    assert.equal(kernel.status().subsystems.egress.state, 'degraded')
+    const failed = egressRows(fx.dbPath)
+    assert.deepEqual(failed.map((r) => [r['check'], 'bindingId' in r]), [['config', false]])
+    for (const row of rows(fx.dbPath)) assert.equal(row.payload.includes('mask5e2c8a1f'), false, row.type)
+    SecretMask.clear()
+  }
+  // A sandbox driver's reason past EGRESS_REASON_BYTES (one of a driver
+  // other than docker's, which bounds nothing): the egress.degraded row is
+  // cut to its bound, and the boot completes.
+  {
+    const why = `a long driver text ${'z'.repeat(EGRESS_REASON_BYTES * 2)}`
+    const { kernel, fx } = await withKernel(t, {
+      kernelYaml: (base) => `${base}\negress:\n  enabled: true\n`,
+      sandboxDriver: fakeSandbox({ probe: { ok: false, why } }),
+    })
+    assert.equal(kernel.status().subsystems.egress.state, 'degraded')
+    const failed = egressRows(fx.dbPath)
+    assert.deepEqual(failed.map((r) => r['check']), ['sandbox'])
+    const reason = String(failed[0]?.['reason'])
+    assert.ok(Buffer.byteLength(reason) <= EGRESS_REASON_BYTES, `${String(Buffer.byteLength(reason))} bytes`)
+    assert.match(reason, /^the sandbox is degraded \(fake: a long driver text z+…$/)
+    assert.equal(kernel.status().subsystems.egress.reason, reason)
+  }
+  // The same long driver text and one unresolved binding: the first failed
+  // check, whole at its row's bound, does not fit beside the count of the
+  // rest, so egress's reason is that check cut to fit, then the count: never
+  // the count alone, naming no failed check.
+  {
+    const why = `a long driver text ${'z'.repeat(EGRESS_REASON_BYTES * 2)}`
+    const { kernel, fx } = await withKernel(t, {
+      kernelYaml: (base) => `${base}${GITHUB_BINDING}`,
+      sandboxDriver: fakeSandbox({ probe: { ok: false, why } }),
+    })
+    assert.deepEqual(egressRows(fx.dbPath).map((r) => r['check']), ['sandbox', 'binding'])
+    const reason = kernel.status().subsystems.egress.reason ?? ''
+    assert.ok(Buffer.byteLength(reason) <= EGRESS_REASON_BYTES, `${String(Buffer.byteLength(reason))} bytes`)
+    assert.ok(reason.startsWith('the sandbox is degraded (fake: a long driver text'), reason.slice(0, 80))
+    assert.ok(
+      reason.endsWith("…; and 1 more failed egress check(s), each named in this boot's egress.degraded rows"),
+      reason.slice(-120),
+    )
+  }
+})
+
+test("many unresolved bindings boot degraded: each named in its own row, and egress's reason bounded, the rest counted", async (t) => {
+  // 260 bindings of 55-character ids and 52-character envVars, none set:
+  // each failure's row is bounded on its own, and the subsystem's reason,
+  // echoed into subsystem.state, status.get and every exec refusal, names
+  // the first ones whole and counts the rest, never 70 KB past the store's
+  // limit, which would refuse the boot it describes.
+  const count = 260
+  const id = (i: number): string => `binding-${String(i).padStart(3, '0')}-`.padEnd(55, 'x')
+  const envVar = (i: number): string => `AOS_BINDING_${String(i).padStart(3, '0')}_`.padEnd(52, 'X')
+  const bindings = Array.from(
+    { length: count },
+    (_, i) =>
+      `    ${id(i)}:\n      host: github.com\n      scheme: Bearer\n      envVar: ${envVar(i)}\n      profiles: [git-fetch]\n      repos: [op/r${String(i)}]\n`,
+  ).join('')
+  // A worker whose manifest has egress (a credential-free host, so none of
+  // the 260 is its own). Every exec refusal of it echoes EgressState's
+  // reason (tool.gate's reason and tool.result's text, both unbounded
+  // strings), so that reason, and not only the subsystem's, is the bounded
+  // one. Its model calls sandbox__exec though it is not offered.
+  const provider = fakeProvider([
+    anthropicToolUse({ name: 'sandbox__exec', input: { command: ['npm', 'ci'] } }),
+    anthropicEndTurn({ text: 'refused' }),
+  ])
+  const { kernel, fx } = await withKernel(t, {
+    kernelYaml: pinned(`\negress:\n  enabled: true\n  bindings:\n${bindings}`),
+    sandboxDriver: answering(),
+    agentsDir: testFleet(t, { reacher: egressWorker('reacher', ['  allow: [registry.npmjs.org]']) }),
+    env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-9c1f0b' },
+    fetch: provider.fetch,
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+  const egress = kernel.status().subsystems.egress
+  assert.equal(egress.state, 'degraded')
+  const reason = egress.reason ?? ''
+  assert.ok(Buffer.byteLength(reason) <= EGRESS_REASON_BYTES, `${String(Buffer.byteLength(reason))} bytes`)
+  assert.match(reason, /^egress binding binding-000-x+ \(envVar AOS_BINDING_000_X+\) did not resolve: AOS_BINDING_000_X+ is not set/)
+  const shown = reason.match(/egress binding binding-\d{3}-x+ \(envVar/g)?.length ?? 0
+  assert.ok(shown >= 1 && shown < count, `${String(shown)} shown`)
+  assert.match(reason, new RegExp(`; and ${String(count - shown)} more failed egress check\\(s\\), each named in this boot's egress\\.degraded rows$`))
+  // Every failure has its row, naming its binding.
+  const failed = egressRows(fx.dbPath)
+  assert.equal(failed.length, count)
+  assert.deepEqual(
+    failed.map((r) => r['bindingId']),
+    Array.from({ length: count }, (_, i) => id(i)),
+  )
+  // The subsystem.state row holds the same bounded reason.
+  const [state] = rows(fx.dbPath)
+    .filter((r) => r.type === 'subsystem.state')
+    .map((r) => JSON.parse(r.payload) as { subsystem: string; state: string; reason?: string })
+    .filter((p) => p.subsystem === 'egress')
+  assert.deepEqual([state?.state, state?.reason], ['degraded', reason])
+  // The runner the loop holds refuses its exec with that bounded reason,
+  // before the gate as at the offer: a reason of every binding joined would
+  // make a tool.gate row past the store's limit, and end the run in error.
+  const refusal = kernel.sandboxTools.egressRefusal('sandbox.exec', 'reacher', 'run_bounded')
+  assert.equal(refusal, `egress is degraded: ${reason}; no container was started`)
+  assert.equal(kernel.sandboxTools.egressRefusal('sandbox.exec', 'reacher'), refusal)
+  // So the run is offered nothing, its model's call of the tool anyway is
+  // refused as one not offered, never run, and the run ends ok.
+  const finished = await runThroughControl(kernel, 'install', 'reacher')
+  assert.equal(finished['status'], 'ok', String(finished['reason']))
+  assert.deepEqual(offeredNames(provider.requests[0]?.body), [], 'the tool was offered')
+  assert.equal(rows(fx.dbPath).filter((r) => r.type === 'tool.call' || r.type === 'sandbox.started').length, 0)
+  assert.deepEqual(kernel.sandboxTools.liveGrants(), [])
+})
+
+test('boot refuses a binding whose envVar is a provider key, naming the binding and the provider', async (t) => {
+  // KernelConfig never sees providers.yaml, so it parses; boot, where both
+  // files are in hand, refuses before it resolves anything or writes a row.
+  const fx = fixture(t, {
+    kernelYaml: (base) =>
+      `${base}\negress:\n  bindings:\n    github-git:\n      host: github.com\n      scheme: Basic\n      envVar: ANTHROPIC_API_KEY\n      profiles: [git-fetch]\n      repos: [op/fixture]\n`,
+  })
+  assert.equal(fx.config.egress.bindings['github-git']?.envVar, 'ANTHROPIC_API_KEY')
+  let refusal: unknown
+  let booted: Awaited<ReturnType<typeof bootKernel>> | undefined
+  try {
+    booted = await bootKernel({
+      config: fx.config,
+      repoRoot: REPO_ROOT,
+      providers: fx.providers,
+      toolViews: fx.toolViews,
+      env: { AOS_CONTROL_TOKEN: TEST_TOKEN, ANTHROPIC_API_KEY: 'offline-fixture-credential-9c1f0b' },
+      sandboxDriver: fakeSandbox(),
+    })
+  } catch (e) {
+    refusal = e
+  }
+  await booted?.shutdown()
+  assert.equal(booted, undefined, 'a binding on a provider key booted')
+  assert.ok(refusal instanceof ConfigError, `refused with ${String(refusal)}`)
+  assert.match(
+    refusal.message,
+    /egress\.bindings\.github-git\.envVar ANTHROPIC_API_KEY is the key of provider anthropic\/claude-sonnet-5 \(auth\.envVar in providers\.yaml\), and the binding would send it to github\.com/,
+  )
+  assert.equal(refusal.message.includes('offline-fixture-credential-9c1f0b'), false)
+  // Refused before the store: nothing was written.
+  assert.equal(existsSync(fx.dbPath), false, 'the refused boot wrote an event log')
+})
+
+test("a booted kernel serves a trusted worker's exec over its channel: the grant before the spawn, the binding's Basic credential from the broker on the bound host alone, and the chain verifies", async (t) => {
+  SecretMask.clear()
+  t.after(() => SecretMask.clear())
+  const dir = join(tmpdir(t), 'agents')
+  const files: Record<string, string> = {
+    fetcher: [
+      'id: fetcher',
+      'version: 1',
+      'kind: standard',
+      'role: worker',
+      'soul: worker.md',
+      'tier: 2',
+      'model:',
+      `  primary: ${REAL_REF}`,
+      'tools:',
+      '  allow: [sandbox.exec]',
+      'sandbox:',
+      '  domain: trusted',
+      'egress:',
+      '  bind: [github-git]',
+      'memory:',
+      '  projectId: aos/agent/fetcher',
+      '',
+    ].join('\n'),
+  }
+  for (const shipped of ['ceo', 'worker-template']) {
+    files[shipped] = readFileSync(join(REPO_ROOT, 'agents', shipped, 'agent.yaml'), 'utf8')
+  }
+  for (const [name, yaml] of Object.entries(files)) {
+    mkdirSync(join(dir, name, 'history'), { recursive: true })
+    writeFileSync(join(dir, name, 'agent.yaml'), yaml)
+    writeFileSync(join(dir, name, 'AGENTS.md'), `# ${name}\n`)
+  }
+  const order: string[] = []
+  const up = fakeUpstream((step) => order.push(step))
+  const driver = answering({ script: [{ hangs: true }] })
+  const provider = fakeProvider([
+    anthropicToolUse({ name: 'sandbox__exec', input: { command: ['git', 'fetch'] } }),
+    anthropicEndTurn({ text: 'fetched' }),
+  ])
+  const { kernel, fx } = await withKernel(t, {
+    kernelYaml: pinned(GITHUB_BINDING),
+    agentsDir: dir,
+    sandboxDriver: driver,
+    egressUpstream: up.upstream,
+    env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-9c1f0b', AOS_GITHUB_TOKEN: GITHUB_VALUE },
+    fetch: provider.fetch,
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+  assert.equal(kernel.status().subsystems.egress.state, 'ok', kernel.status().subsystems.egress.reason ?? '')
+  kernel.store.subscribe((row) => {
+    if (row.type === 'proxy.decision' || row.type.startsWith('proxy.grant.') || row.type.startsWith('sandbox.')) order.push(row.type)
+  })
+  const finished = runThroughControl(kernel, 'fetch the fixture', 'fetcher')
+  await until(() => driver.channels.length === 1, 'the channel', 20_000)
+  const mux = new FakeMux(driver.channels[0]!)
+  await mux.ready()
+  const answer = await mux.request('GET http://github.com/op/fixture.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: github.com\r\n\r\n')
+  assert.match(answer, /^HTTP\/1\.1 200 /)
+  mux.exit(0)
+  driver.simulateExit(driver.channels[0]!.name)
+  const done = await finished
+  assert.equal(done['status'], 'ok', String(done['reason']))
+
+  assert.deepEqual(
+    order.filter((step) => step !== 'sandbox.started' && step !== 'sandbox.killed'),
+    ['proxy.grant.issued', 'proxy.decision', 'resolve4 github.com', 'dial 140.82.112.3', 'proxy.grant.revoked'],
+  )
+  assert.ok(order.indexOf('proxy.grant.issued') < order.indexOf('sandbox.started'))
+  const basic = Buffer.from(`x-access-token:${GITHUB_VALUE}`).toString('base64')
+  const seen = up.seen[0]
+  const auth: string[] = []
+  for (let i = 0; i + 1 < (seen?.rawHeaders.length ?? 0); i += 2) if (seen?.rawHeaders[i]?.toLowerCase() === 'authorization') auth.push(seen.rawHeaders[i + 1] ?? '')
+  assert.deepEqual(auth, [`Basic ${basic}`])
+  for (const row of rows(fx.dbPath)) {
+    assert.equal(row.payload.includes(GITHUB_VALUE) || row.payload.includes(basic), false, row.type)
+  }
+  assert.equal(kernel.store.verifyChain(kernel.store.readAnchor()).ok, true)
+})
+
+/** A test fleet: the shipped ceo and worker-template, and each manifest given, in a temp agents dir. */
+function testFleet(t: Parameters<typeof tmpdir>[0], manifests: Record<string, readonly string[]>): string {
+  const dir = join(tmpdir(t), 'agents')
+  const files: Record<string, string> = {}
+  for (const [name, lines] of Object.entries(manifests)) files[name] = [...lines, ''].join('\n')
+  for (const shipped of ['ceo', 'worker-template']) {
+    files[shipped] = readFileSync(join(REPO_ROOT, 'agents', shipped, 'agent.yaml'), 'utf8')
+  }
+  for (const [name, yaml] of Object.entries(files)) {
+    mkdirSync(join(dir, name, 'history'), { recursive: true })
+    writeFileSync(join(dir, name, 'agent.yaml'), yaml)
+    writeFileSync(join(dir, name, 'AGENTS.md'), `# ${name}\n`)
+  }
+  return dir
+}
+
+/** A tier 2 trusted worker that lists sandbox.exec, with `egress` (its manifest lines) appended. */
+function egressWorker(id: string, egress: readonly string[]): readonly string[] {
+  return [
+    `id: ${id}`,
+    'version: 1',
+    'kind: standard',
+    'role: worker',
+    'soul: worker.md',
+    'tier: 2',
+    'model:',
+    `  primary: ${REAL_REF}`,
+    'tools:',
+    '  allow: [sandbox.exec]',
+    'sandbox:',
+    '  domain: trusted',
+    'egress:',
+    ...egress,
+    'memory:',
+    `  projectId: aos/agent/${id}`,
+  ]
+}
+
+test("two bindings on two hosts: each host is sent its own binding's credential, in its own scheme and user, and no row holds either", async (t) => {
+  // A Bearer binding on github.com and a Basic one on gitlab.com whose user
+  // is not GitHub's default: the credential injector reads the binding the
+  // route names (never another's), writes each scheme as its own, and boot
+  // masks the Basic form with the binding's own user, so a host that echoes
+  // the header it was sent puts nothing a row would keep.
+  SecretMask.clear()
+  t.after(() => SecretMask.clear())
+  const bearerValue = 'offline-bearer-value-7d3e91a0c2'
+  const basicValue = 'offline-basic-value-0b8c4e2f19'
+  const kernelYaml = pinned(`
+egress:
+  enabled: true
+  bindings:
+    github-bearer:
+      host: github.com
+      scheme: Bearer
+      envVar: AOS_GITHUB_BEARER
+      profiles: [git-fetch]
+      repos: [op/fixture]
+    lab-basic:
+      host: gitlab.com
+      scheme: Basic
+      basicUser: aos-bot
+      envVar: AOS_LAB_TOKEN
+      profiles: [git-fetch]
+      repos: [op/other]
+`)
+  const dir = testFleet(t, { fetcher: egressWorker('fetcher', ['  bind: [github-bearer, lab-basic]']) })
+  // Each host answers with the Authorization it was sent: an echo the worker
+  // then prints, as a careless script would.
+  const echo = (req: Parameters<NonNullable<Parameters<typeof fakeUpstream>[1]>>[0], res: Parameters<NonNullable<Parameters<typeof fakeUpstream>[1]>>[1]): void => {
+    res.writeHead(200, { 'content-type': 'text/plain' }).end(`you sent ${String(req.headers.authorization)}`)
+  }
+  const up = fakeUpstream(() => undefined, echo)
+  const driver = answering({ script: [{ hangs: true }] })
+  const provider = fakeProvider([
+    anthropicToolUse({ name: 'sandbox__exec', input: { command: ['git', 'fetch', '--all'] } }),
+    anthropicEndTurn({ text: 'fetched' }),
+  ])
+  const { kernel, fx } = await withKernel(t, {
+    kernelYaml,
+    agentsDir: dir,
+    sandboxDriver: driver,
+    egressUpstream: up.upstream,
+    env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-9c1f0b', AOS_GITHUB_BEARER: bearerValue, AOS_LAB_TOKEN: basicValue },
+    fetch: provider.fetch,
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+  assert.equal(kernel.status().subsystems.egress.state, 'ok', kernel.status().subsystems.egress.reason ?? '')
+  const finished = runThroughControl(kernel, 'fetch both', 'fetcher')
+  await until(() => driver.channels.length === 1, 'the channel', 20_000)
+  const mux = new FakeMux(driver.channels[0]!)
+  await mux.ready()
+  const answers: string[] = []
+  for (const [host, repo] of [
+    ['github.com', 'op/fixture'],
+    ['gitlab.com', 'op/other'],
+  ] as const) {
+    answers.push(
+      await mux.request(`GET http://${host}/${repo}.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: ${host}\r\n\r\n`),
+    )
+  }
+  for (const answer of answers) {
+    assert.match(answer, /^HTTP\/1\.1 200 /)
+    mux.stdout(`${answer}\n`)
+  }
+  mux.exit(0)
+  driver.simulateExit(driver.channels[0]!.name)
+  const done = await finished
+  assert.equal(done['status'], 'ok', String(done['reason']))
+
+  // Each host saw exactly one Authorization, its own binding's.
+  const sent = (want: string): string[] => {
+    const out: string[] = []
+    for (const seen of up.seen) {
+      const pairs: [string, string][] = []
+      for (let i = 0; i + 1 < seen.rawHeaders.length; i += 2) pairs.push([seen.rawHeaders[i]?.toLowerCase() ?? '', seen.rawHeaders[i + 1] ?? ''])
+      if (!pairs.some(([name, value]) => name === 'host' && value === want)) continue
+      for (const [name, value] of pairs) if (name === 'authorization') out.push(value)
+    }
+    return out
+  }
+  const basicForm = Buffer.from(`aos-bot:${basicValue}`).toString('base64')
+  assert.deepEqual(sent('github.com'), [`Bearer ${bearerValue}`])
+  assert.deepEqual(sent('gitlab.com'), [`Basic ${basicForm}`])
+  assert.equal(up.seen.length, 2)
+
+  // Boot masked the Basic form under the binding's own user, not GitHub's.
+  assert.equal(redactString(`x ${basicForm} y`), 'x [REDACTED] y')
+  assert.equal(redactString(`x ${bearerValue} y`), 'x [REDACTED] y')
+  assert.equal(redactString(`x ${basicValue} y`), 'x [REDACTED] y')
+  // The echo the worker printed reached tool.result censored, and no row
+  // holds either value or the Basic form.
+  const result = rows(fx.dbPath).find((r) => r.type === 'tool.result')
+  assert.ok(result?.payload.includes('you sent'), 'the echo is not in the result')
+  for (const row of rows(fx.dbPath)) {
+    for (const secret of [bearerValue, basicValue, basicForm]) {
+      assert.equal(row.payload.includes(secret), false, `${row.type} holds ${secret.slice(0, 12)}…`)
+    }
+  }
+  assert.equal(kernel.store.verifyChain(kernel.store.readAnchor()).ok, true)
+})
+
+test('egressUpstreamOptions reads its idle bound from kernel.yaml and its connect deadline from EGRESS_CONNECT_TIMEOUT_MS', () => {
+  // The helper alone; that boot builds its upstream through it is held by
+  // the test after this one.
+  const base = parseYaml(readFileSync(join(REPO_ROOT, 'config', 'kernel.yaml'), 'utf8')) as Record<string, unknown>
+  const egress = (base['egress'] ?? {}) as Record<string, unknown>
+  const config = parseKernelConfig({ ...base, egress: { ...egress, limits: { idleMs: 12_345 } } }, { repoRoot: REPO_ROOT })
+  assert.deepEqual(egressUpstreamOptions(config), { connectTimeoutMs: EGRESS_CONNECT_TIMEOUT_MS, idleTimeoutMs: 12_345 })
+  assert.equal(EGRESS_CONNECT_TIMEOUT_MS, 10_000)
+  const shipped = parseKernelConfig(base, { repoRoot: REPO_ROOT })
+  assert.deepEqual(egressUpstreamOptions(shipped), { connectTimeoutMs: 10_000, idleTimeoutMs: shipped.egress.limits.idleMs })
+})
+
+test("with no upstream injected, boot builds its own from egressUpstreamOptions(config), kernel.yaml's idle bound and EGRESS_CONNECT_TIMEOUT_MS, and a trusted run's request goes through it", async (t) => {
+  // Every other test that sends traffic injects a whole upstream, which
+  // hides the timeouts boot builds the daemon's under. Here boot builds its
+  // own (productionUpstream) over in-process deps in systemUpstreamDeps's
+  // place: the options it hands them are held, and so is that the upstream
+  // made from them is the one a run's session sends through.
+  SecretMask.clear()
+  t.after(() => SecretMask.clear())
+  const dir = join(tmpdir(t), 'agents')
+  const fetcher = [
+    'id: fetcher',
+    'version: 1',
+    'kind: standard',
+    'role: worker',
+    'soul: worker.md',
+    'tier: 2',
+    'model:',
+    `  primary: ${REAL_REF}`,
+    'tools:',
+    '  allow: [sandbox.exec]',
+    'sandbox:',
+    '  domain: trusted',
+    'egress:',
+    '  bind: [github-git]',
+    'memory:',
+    '  projectId: aos/agent/fetcher',
+    '',
+  ].join('\n')
+  const files: Record<string, string> = { fetcher }
+  for (const shipped of ['ceo', 'worker-template']) {
+    files[shipped] = readFileSync(join(REPO_ROOT, 'agents', shipped, 'agent.yaml'), 'utf8')
+  }
+  for (const [name, yaml] of Object.entries(files)) {
+    mkdirSync(join(dir, name, 'history'), { recursive: true })
+    writeFileSync(join(dir, name, 'agent.yaml'), yaml)
+    writeFileSync(join(dir, name, 'AGENTS.md'), `# ${name}\n`)
+  }
+  const up = fakeUpstreamDeps()
+  const driver = answering({ script: [{ hangs: true }] })
+  const provider = fakeProvider([
+    anthropicToolUse({ name: 'sandbox__exec', input: { command: ['git', 'fetch'] } }),
+    anthropicEndTurn({ text: 'fetched' }),
+  ])
+  const binding = GITHUB_BINDING.replace('  enabled: true\n', '  enabled: true\n  limits:\n    idleMs: 12345\n')
+  assert.notEqual(binding, GITHUB_BINDING)
+  const { kernel } = await withKernel(t, {
+    kernelYaml: pinned(binding),
+    agentsDir: dir,
+    sandboxDriver: driver,
+    egressUpstreamDeps: up.deps,
+    env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-9c1f0b', AOS_GITHUB_TOKEN: GITHUB_VALUE },
+    fetch: provider.fetch,
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+  assert.equal(kernel.config.egress.limits.idleMs, 12_345)
+  assert.deepEqual(up.limits, [{ connectTimeoutMs: EGRESS_CONNECT_TIMEOUT_MS, idleTimeoutMs: 12_345 }])
+  assert.equal(kernel.status().subsystems.egress.state, 'ok', kernel.status().subsystems.egress.reason ?? '')
+  const finished = runThroughControl(kernel, 'fetch the fixture', 'fetcher')
+  await until(() => driver.channels.length === 1, 'the channel', 20_000)
+  const mux = new FakeMux(driver.channels[0]!)
+  await mux.ready()
+  const answer = await mux.request('GET http://github.com/op/fixture.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: github.com\r\n\r\n')
+  assert.match(answer, /^HTTP\/1\.1 200 /)
+  mux.exit(0)
+  driver.simulateExit(driver.channels[0]!.name)
+  const done = await finished
+  assert.equal(done['status'], 'ok', String(done['reason']))
+  assert.deepEqual(up.steps, ['resolve4 github.com', 'dial 140.82.112.3'])
+  assert.deepEqual(up.seen.map((r) => [r.method, r.url]), [['GET', '/op/fixture.git/info/refs?service=git-upload-pack']])
+  // Built once, at boot.
+  assert.equal(up.limits.length, 1)
+  assert.equal(kernel.store.verifyChain(kernel.store.readAnchor()).ok, true)
+})
+
+test("the daemon hands the sandbox runner boot's egress verdict: a worker whose manifest names egress is offered sandbox.exec while egress is ok, and not while it is degraded", async (t) => {
+  // Boot decides once whether egress can serve a grant, and the runner reads
+  // that verdict, never one of its own: a kernel whose egress is degraded
+  // (egress.enabled false, as shipped) shows such a worker no sandbox tool,
+  // since every exec of it would be refused with the egress reason.
+  const fleet = (): string => {
+    const dir = join(tmpdir(t), 'agents')
+    const files: Record<string, string> = {
+      reacher: [
+        'id: reacher',
+        'version: 1',
+        'kind: standard',
+        'role: worker',
+        'soul: worker.md',
+        'tier: 2',
+        'model:',
+        `  primary: ${REAL_REF}`,
+        'tools:',
+        '  allow: [sandbox.exec]',
+        'sandbox:',
+        '  domain: trusted',
+        'egress:',
+        '  allow: [registry.npmjs.org]',
+        'memory:',
+        '  projectId: aos/agent/reacher',
+        '',
+      ].join('\n'),
+    }
+    for (const shipped of ['ceo', 'worker-template']) {
+      files[shipped] = readFileSync(join(REPO_ROOT, 'agents', shipped, 'agent.yaml'), 'utf8')
+    }
+    for (const [name, yaml] of Object.entries(files)) {
+      mkdirSync(join(dir, name, 'history'), { recursive: true })
+      writeFileSync(join(dir, name, 'agent.yaml'), yaml)
+      writeFileSync(join(dir, name, 'AGENTS.md'), `# ${name}\n`)
+    }
+    return dir
+  }
+  for (const [label, extra, state, names] of [
+    ['egress degraded', '', 'degraded', []],
+    ['egress ok', '\negress:\n  enabled: true\n', 'ok', ['sandbox__exec']],
+  ] as const) {
+    const provider = fakeProvider([anthropicEndTurn({ text: 'nothing to do' })])
+    const { kernel } = await withKernel(t, {
+      kernelYaml: pinned(extra),
+      agentsDir: fleet(),
+      sandboxDriver: answering(),
+      env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-9c1f0b' },
+      fetch: provider.fetch,
+      beforeBoot: (f) => {
+        writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+      },
+    })
+    assert.equal(kernel.status().subsystems.egress.state, state, label)
+    const finished = await runThroughControl(kernel, 'anything', 'reacher')
+    assert.equal(finished['status'], 'ok', `${label}: ${String(finished['reason'])}`)
+    assert.deepEqual(offeredNames(provider.requests[0]?.body), [...names], label)
+  }
 })

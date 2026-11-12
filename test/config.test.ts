@@ -1267,16 +1267,23 @@ test('bindingKeyProblem: a binding envVar that is a provider key is named, with 
   assert.match(message, /egress\.bindings\.github\.envVar ANTHROPIC_API_KEY .*; egress\.bindings\.api\.envVar AOS_MOONSHOT_KEY /)
 })
 
-test('until the wiring task, nothing in src calls bindingKeyProblem, and kernel.yaml says a provider key is refused only once W1 lands', () => {
-  // A comment telling the operator a provider-key binding "is refused at
-  // boot" would be false today: it parses and boots, harmless only because
-  // no request uses a binding before W1. W1 calls the check and rewrites
-  // both halves of this test in the same commit.
+test('boot calls bindingKeyProblem, src/kernel.ts alone, and kernel.yaml and config.ts say in the present that a provider key is refused at boot', () => {
+  // The check runs where both files are in hand (bootKernel), and boot refuses
+  // on it (test/kernel-boot.test.ts: 'boot refuses a binding whose envVar is a
+  // provider key, naming the binding and the provider'). The comments that
+  // said it would once the wiring task landed say what it does now.
   const sources = readdirSync(join(REPO_ROOT, 'src'), { recursive: true, encoding: 'utf8' }).filter((f) => f.endsWith('.ts'))
   const callers = sources.filter((f) => /\bbindingKeyProblem\s*\(/.test(readFileSync(join(REPO_ROOT, 'src', f), 'utf8').replace(/export function bindingKeyProblem\(/, '')))
-  assert.deepEqual(callers, [])
+  assert.deepEqual(callers, ['kernel.ts'])
   const yaml = readFileSync(join(REPO_ROOT, 'config', 'kernel.yaml'), 'utf8')
   const comment = yaml.split('\n').filter((line) => /^\s*#/.test(line)).map((line) => line.replace(/^\s*#\s?/, '')).join(' ')
-  assert.match(comment, /A provider's key will be refused at boot once the wiring task \(W1\) lands; until then no request uses a binding\./)
-  assert.doesNotMatch(comment, /provider's key is refused at boot/)
+  assert.match(comment, /A provider's key is refused at boot: the kernel will not start with a binding that would send it to the binding's host\./)
+  assert.doesNotMatch(comment, /will be refused at boot once|until then no request uses a binding|stub that refuses until the wiring task/)
+  // And kernel.yaml says what egress.limits.maxRequests counts, and which
+  // answers of a host are recorded as upstream rows (session.ts's reading).
+  assert.match(comment, /maxRequests counts the flows a container opens, not only the requests judged/)
+  assert.match(comment, /An upstream 401 or 403 \(`challenged`\), and an answer whose head the kernel will not write to the worker \(`response-head`\), are recorded as upstream proxy\.decision rows, sent, and answered 502\./)
+  const config = readFileSync(join(REPO_ROOT, 'src', 'config.ts'), 'utf8')
+  assert.doesNotMatch(config, /once W1 calls it|nothing calls it yet|until the wiring task|stub that refuses/)
+  assert.match(config.replace(/\n\s*(?:\/\/|\*) ?/g, ' '), /maxRequests counts the flows a container opens, as the session reads it \(session\.ts\)/)
 })

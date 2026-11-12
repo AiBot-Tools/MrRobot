@@ -1739,7 +1739,7 @@ test("README and CLAUDE.md give one reason containers cannot reach pmmcp: --netw
   for (const fact of ['Every container runs with `--network none`', 'no route at all, so no container has a route there', 'the sandbox probe still refuses a domain whose docker network is not `--internal`, as defence in depth: no run is put on it']) {
     assert.ok(contained.includes(fact), `README's containers bullet does not say: ${fact}`)
   }
-  assert.ok(denied.startsWith("The kernel's egress engine denies it** (`src/egress`, not wired yet)"), section)
+  assert.ok(denied.startsWith("The kernel's egress engine denies it** (`src/egress`, wired since egress plan W1, never yet run live)"), section)
   assert.ok(denied.includes("a worker's one way out is that engine, over its run's `docker -i` channel"), denied)
   for (const name of ['`192.168.5.2`', '`host.lima.internal`', '`host.docker.internal`']) assert.ok(denied.includes(name), `README's egress bullet does not name ${name}`)
   assert.doesNotMatch(section, /egress proxy|proxy sidecar|not `--internal`, so no container/, 'README still gives the old design as the reason')
@@ -1764,11 +1764,11 @@ test("README names no egress proxy, and its sandbox record says the internal net
   // on --network none. A README line that names a proxy, or says in the
   // present tense that a domain's internal network is what stands between a
   // container and pmmcp, tells the next reader to build or trust the old
-  // design. The stub's id, `egress-proxy`, is the one name left: the egress
-  // plan's W1 retires it, with the stub, in one commit.
+  // design. The stub's id, `egress-proxy`, went with the stub (egress plan
+  // W1), so no name of the old design is left.
   const flat = (text: string): string => text.replace(/\s+/g, ' ')
   const readme = flat(read('README.md'))
-  assert.doesNotMatch(readme.replaceAll('`egress-proxy`', ''), /egress proxy|proxy sidecar|Phase 2 proxy|no proxy/i)
+  assert.doesNotMatch(readme, /egress proxy|egress-proxy|proxy sidecar|Phase 2 proxy|no proxy/i)
   assert.ok(
     readme.includes("pmmcp fetch URLs itself and so would route around the kernel's egress engine)"),
     "README's scrape_context pin does not say it would route around the kernel's egress engine",
@@ -2126,8 +2126,8 @@ test('agents/*/agent.yaml parse against the shipped providers and tool-views; th
     // egress plan's operator decision on shipping a coder manifest).
     assert.deepEqual(record.manifest.egress, { allow: [], bind: [] }, `${record.manifest.id} ships with egress`)
     // Nor a sandbox: block or a sandbox tool (egress plan S3): sandbox.exec
-    // is wired into the daemon (W1a) with no egress, and a manifest that
-    // lists it waits on the Phase 2 exit, as egress does.
+    // is wired into the daemon (W1a), egress with it (W1), and a manifest
+    // that lists it waits on the Phase 2 exit, as egress does.
     assert.equal(record.manifest.sandbox, undefined, `${record.manifest.id} ships with a sandbox: block`)
     assert.deepEqual(
       record.manifest.tools.allow.filter((ref) => ref.startsWith('sandbox.')),

@@ -24,11 +24,11 @@
 // the kernel's egress engine (src/egress), over its own run's `docker run -i`
 // channel: a spec's `channel`, which this driver opens on the trusted domain
 // only (egress plan S2) and hands to its caller as the CLI's own stdin and
-// stdout, reading none of it. Nothing asks for one yet, since the engine is
-// not wired (egress plan W1): until it is, a worker reaches nothing. Each
-// domain's internal network (aos-trusted and aos-hostile in kernel.yaml)
-// stays all the same, and probe() still proves it Internal=true on that
-// domain's own VM, as defence in depth, the operator's decision of
+// stdout, reading none of it. The sandbox runner asks for one for an exec
+// it has issued an egress grant (egress plan W1); any other worker reaches
+// nothing. Each domain's internal network (aos-trusted and aos-hostile in
+// kernel.yaml) stays all the same, and probe() still proves it Internal=true
+// on that domain's own VM, as defence in depth, the operator's decision of
 // 2026-11-09, to be revisited at the Phase 2 exit: no run is put on it, and
 // the audit refuses a run on any network but none.
 //

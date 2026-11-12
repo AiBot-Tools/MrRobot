@@ -120,6 +120,13 @@ export interface WithKernelOptions extends FixtureOptions {
   readonly clientFactory?: BootOptions['clientFactory']
   /** Injected so a test can serve a provider without a socket. */
   readonly fetch?: BootOptions['fetch']
+  /** Injected so a run's egress is resolved and dialled in process (test/helpers/fake-egress.ts). */
+  readonly egressUpstream?: BootOptions['egressUpstream']
+  /**
+   * In place of systemUpstreamDeps, under the upstream boot builds itself
+   * (productionUpstream), so a test holds the options boot hands it.
+   */
+  readonly egressUpstreamDeps?: BootOptions['egressUpstreamDeps']
   readonly now?: () => number
   /**
    * Runs after the fixture exists and before the kernel boots, for state boot
@@ -163,6 +170,8 @@ export async function withKernel(
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.agentsDir === undefined ? {} : { agentsDir: options.agentsDir }),
+    ...(options.egressUpstream === undefined ? {} : { egressUpstream: options.egressUpstream }),
+    ...(options.egressUpstreamDeps === undefined ? {} : { egressUpstreamDeps: options.egressUpstreamDeps }),
   })
 
   registerVerify(t, fx.dbPath, async () => {
@@ -197,6 +206,8 @@ export async function bootOn(
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.agentsDir === undefined ? {} : { agentsDir: options.agentsDir }),
+    ...(options.egressUpstream === undefined ? {} : { egressUpstream: options.egressUpstream }),
+    ...(options.egressUpstreamDeps === undefined ? {} : { egressUpstreamDeps: options.egressUpstreamDeps }),
   })
   registerVerify(t, fx.dbPath, async () => {
     await kernel.shutdown()
@@ -231,6 +242,8 @@ export async function bootCrashable(
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.agentsDir === undefined ? {} : { agentsDir: options.agentsDir }),
+    ...(options.egressUpstream === undefined ? {} : { egressUpstream: options.egressUpstream }),
+    ...(options.egressUpstreamDeps === undefined ? {} : { egressUpstreamDeps: options.egressUpstreamDeps }),
   })
   let crashed = false
   const crash = async (): Promise<void> => {

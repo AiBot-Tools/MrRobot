@@ -34,6 +34,7 @@ import { BINDING_ID } from '../egress/policy.js'
 import { ConfigError } from '../errors.js'
 import { redactString } from '../events/redact.js'
 import type { EventStore } from '../events/store.js'
+import { PROXY_GRANT_MAX_REPOS } from '../events/types.js'
 import { resolveView, type ToolViewsFile } from '../mcp/tool-views.js'
 import { resolveCaps, type KernelBudgets } from '../runtime/budget.js'
 import { KERNEL_SERVER } from '../runtime/kernel-tools.js'
@@ -64,13 +65,15 @@ export interface RegistryDeps {
   readonly budgets: KernelBudgets
   /**
    * kernel.yaml's egress bindings (config.egress.bindings), keyed by id: the
-   * ids a manifest's egress.bind may name, and the hosts its egress.allow may
-   * not. Only each binding's host is read. Required for the reason budgets
+   * ids a manifest's egress.bind may name, the hosts its egress.allow may
+   * not, and how many repositories each names (a grant of the manifest's
+   * bindings must fit one proxy.grant.issued row). Only each binding's host
+   * and its repositories' count are read. Required for the reason budgets
    * is: a registry built without it would skip the bound-host check by
    * omission, so a manifest could list as credential-free a host the
    * operator bound.
    */
-  readonly egressBindings: Readonly<Record<string, { readonly host: EgressHost }>>
+  readonly egressBindings: Readonly<Record<string, { readonly host: EgressHost; readonly repos: readonly string[] }>>
 }
 
 /**
@@ -154,17 +157,22 @@ export class AgentRegistry {
   readonly #bindingHosts: ReadonlyMap<string, EgressHost>
   /** The bindings on each host, so a refusal names whose host a manifest listed. */
   readonly #boundHosts: ReadonlyMap<string, readonly string[]>
+  /** How many repositories each binding names, by id, copied as #bindingHosts is. */
+  readonly #bindingRepos: ReadonlyMap<string, number>
 
   constructor(deps: RegistryDeps) {
     this.#deps = deps
     const hosts = new Map<string, EgressHost>()
     const bound = new Map<string, string[]>()
+    const repos = new Map<string, number>()
     for (const [id, binding] of Object.entries(deps.egressBindings)) {
       hosts.set(id, binding.host)
       bound.set(binding.host, [...(bound.get(binding.host) ?? []), id])
+      repos.set(id, binding.repos.length)
     }
     this.#bindingHosts = hosts
     this.#boundHosts = bound
+    this.#bindingRepos = repos
   }
 
   /** Load every agents/<id>/agent.yaml under `agentsDir`. */
@@ -317,7 +325,12 @@ export class AgentRegistry {
    *
    * Then each entry: a bind names a binding kernel.yaml holds (looked up in
    * #bindingHosts, never the record; one in a credential's shape is refused
-   * without being repeated), and an allow host is no binding's host
+   * without being repeated), the bindings bound name at most
+   * PROXY_GRANT_MAX_REPOS repositories between them (a grant of this agent,
+   * whatever it serves, names at most those, and proxy.grant.issued records
+   * at most that many: past it no grant of the agent could be recorded, so
+   * none would be issued, and every exec it was offered would be refused
+   * once called), and an allow host is no binding's host
    * (a bound host is reached only through its binding's profiles and
    * repositories, and a request to a host both bound and credential-free
    * would not say whether a credential belongs on it), and is one the event
@@ -365,6 +378,14 @@ export class AgentRegistry {
       if (!this.#bindingHosts.has(id)) {
         return `egress.bind names ${id}, which is no binding in kernel.yaml's egress.bindings. A manifest binds only a credential the operator configured.`
       }
+    }
+    const repos = bind.reduce((n, id) => n + (this.#bindingRepos.get(id) ?? 0), 0)
+    if (repos > PROXY_GRANT_MAX_REPOS) {
+      return (
+        `${who} on bindings that name ${String(repos)} repositories between them in kernel.yaml, and one grant ` +
+        `row names at most ${String(PROXY_GRANT_MAX_REPOS)}, so no grant of it could be recorded or issued. Bind ` +
+        'fewer, or name fewer repositories in its bindings.'
+      )
     }
     for (const [i, host] of allow.entries()) {
       // Before the host is named: a refusal must not echo text in a credential's shape.

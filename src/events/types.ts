@@ -517,7 +517,9 @@ export const ProbeRecordedPayload = z
 // What the egress engine writes: a grant when one container's channel opens
 // and its revocation when the channel closes, a decision for each request a
 // worker sends through it, and egress.degraded when a boot cannot run egress
-// at all. Nothing appends these yet; the wiring task (W1) does.
+// at all. The kernel appends them (egress plan W1): the grant issuer
+// (src/runtime/sandbox-tools.ts), the session (src/egress/session.ts) and
+// boot's egress probe (src/kernel.ts).
 //
 // Three rules hold every field:
 //
@@ -556,8 +558,9 @@ export const ProbeRecordedPayload = z
 // (EGRESS_TOKEN_PATTERNS): a grant the kernel cannot record is not issued, as
 // one past PROXY_GRANT_MAX_REPOS is not, and config refuses such a binding
 // host, repository or id before a grant is built (E5, E6). A registered secret
-// value (redact.ts SecretMask) is the broker's, unknown here: the issuer (W1)
-// checks a grant's identifiers against redactString before it appends. A deny
+// value (redact.ts SecretMask) is the broker's, unknown here: the issuer
+// (src/runtime/sandbox-tools.ts) checks a grant's identifiers against
+// redactString before it appends, and issues nothing if one changes. A deny
 // whose host the worker spelled in a credential's shape is recorded without
 // it (E8). Only `path` and the free text may hold the mark.
 //

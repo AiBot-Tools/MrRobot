@@ -17,6 +17,7 @@ import { AgentRegistry, type RegistryDeps } from '../src/agents/registry.js'
 import { MAX_EGRESS_ALLOW, MAX_EGRESS_BIND, parseManifest, type AgentManifest } from '../src/agents/manifest.js'
 import { parseKernelConfig } from '../src/config.js'
 import { EgressGrant } from '../src/egress/policy.js'
+import { PROXY_GRANT_MAX_REPOS } from '../src/events/types.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
 import type { EventStore } from '../src/events/store.js'
 import { ConfigError } from '../src/errors.js'
@@ -844,6 +845,40 @@ test('a manifest egress holds at most what one grant can: 64 hosts and 16 bindin
     /egress\.allow lists a host twice/,
   )
   assert.throws(() => parseManifest(manifest('  bind: [github-git, github-git]'), 'agent.yaml'), /egress\.bind names a binding twice/)
+})
+
+test('a manifest whose bindings name more repositories than one grant row records is refused at load, by the count', (t) => {
+  // EgressGrant admits 16 routes of 64 repositories each, and kernel.yaml 64
+  // a binding, but one proxy.grant.issued row names at most
+  // PROXY_GRANT_MAX_REPOS: a manifest past it could never be issued a grant,
+  // and would be offered an exec that is then refused. Three bindings on
+  // github.com of 64 repositories each: any two load, all three do not.
+  const raw = parseYaml(readFileSync(join(REPO_ROOT, 'config/kernel.yaml'), 'utf8')) as { egress: { bindings: Record<string, unknown> } }
+  const repos = (b: number): string[] => Array.from({ length: 64 }, (_, i) => `op/b${String(b)}-r${String(i)}`)
+  raw.egress.bindings = Object.fromEntries(
+    [0, 1, 2].map((b) => [`gh-${String(b)}`, { host: 'github.com', scheme: 'Basic', envVar: `AOS_GH_${String(b)}_TOKEN`, profiles: ['git-fetch'], repos: repos(b) }]),
+  )
+  const bindings = parseKernelConfig(raw, { repoRoot: REPO_ROOT }).egress.bindings
+  assert.equal(PROXY_GRANT_MAX_REPOS, 128)
+
+  const store = withStore(t)
+  assert.throws(
+    () => registry(store, bindings).load(agentsDir(t, { reacher: egressAgent('reacher', '  bind: [gh-0, gh-1, gh-2]') })),
+    (e: unknown) => {
+      assert.ok(e instanceof ConfigError, `threw ${String(e)}`)
+      assert.match(
+        e.message,
+        /reacher\/agent\.yaml: reacher holds egress on bindings that name 192 repositories between them in kernel\.yaml, and one grant row names at most 128, so no grant of it could be recorded or issued/,
+      )
+      return true
+    },
+  )
+  assert.equal(store.query({ type: 'agent.registered' }).length, 0)
+
+  // At the bound, it loads.
+  const reg = registry(withStore(t), bindings)
+  reg.load(agentsDir(t, { reacher: egressAgent('reacher', '  bind: [gh-0, gh-2]') }))
+  assert.deepEqual(reg.get('reacher')?.manifest.egress.bind, ['gh-0', 'gh-2'])
 })
 
 test('spawnEphemeral refuses a tier that is no integer from 0 to 3 before any other check, and registers nothing', (t) => {

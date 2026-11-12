@@ -539,7 +539,58 @@ the CLI, and kernel boot.
 | Stub | Where | How it refuses |
 |---|---|---|
 | `apple-container-driver` | `src/sandbox/apple-container.ts` | `probe()` reports unavailable with a reason so boot degrades; `run()` and `kill()` throw `NotImplementedError`. macOS 15 has no `container` binary |
-| `egress-proxy` | `src/runtime/egress.ts` | `assertEgressEnforced()` throws `NotImplementedError`, so no run can reach the network |
+
+**Egress: built, and never yet run live.** The kernel's own egress engine
+(`src/egress/`) is the one way a container reaches anything (egress plan W1,
+the operator's design of 2026-11-09). It runs in the kernel's process: nothing
+listens for it, nothing stands between a worker and the kernel but the run's
+own `docker -i` channel and the image's mux, and no credential is in any VM.
+A run on the trusted domain whose manifest names egress (`egress.allow`,
+`egress.bind`) is issued a grant before its container starts
+(`proxy.grant.issued`, naming the run, the agent, the container, its
+credential-free hosts and, of each binding, git-fetch alone: an exec grant
+never holds `git-push` or `github-pulls`), and every request its container
+sends is a `proxy.decision` row of that run before anything is resolved or
+dialled. The grant is revoked (`proxy.grant.revoked`, with its totals) when the
+container exits, meets its wallclock, breaks the channel's protocol or a
+per-grant limit, or the run is stopped; the kernel ends a container only by
+killing it by name on its own domain, never by closing its stdin. A container
+still running 10 s after its command's exit status arrived (a flow held open
+by what the command left behind, a `setsid` child say) is killed by name, and
+its grant revoked `requested`, saying so; one whose docker client ended with
+no exit status or 125, its own failure, is killed by name and its grant
+revoked `error`, the kernel's verdict, never read as the container breaking
+the protocol. A grant whose host, repository, binding id, run id or agent id
+the event log would store censored is not issued, and the exec is refused
+naming the field; so is one naming more repositories across its bindings
+than one `proxy.grant.issued` row records (128), which the registry refuses
+in a manifest at load. Each refusal is made when the run is offered tools and
+again before the gate, so no human is asked to approve an exec that would be
+refused, but the run id's, which is judged before the gate only: the offer
+is judged without a run, so a run whose id the event log would store
+censored is shown the tool, and its exec is denied at the gate, with no
+human asked and nothing run. The hostile domain gets no channel and no
+grant, whatever its manifest says.
+
+Boot reports egress `ok` or `degraded`, never absent: degraded appends one
+`egress.degraded` row per failed check, naming what failed and the key or
+command that fixes it (`egress.enabled: false`, which kernel.yaml ships; a
+sandbox that cannot run a container; a binding whose value did not resolve,
+named with its envVar, never its value). While it is degraded no run is offered
+`sandbox.exec` for a manifest with egress, and a call of it is refused with the
+egress reason before any human is asked. That reason, which `status` shows and
+each refusal quotes, names the failed checks while they fit 2 KiB and counts the
+rest, each named in its own row. Each binding's value is resolved once,
+at boot, outside any run, through the broker (`secret.accessed` with purpose
+`egress credential for <host>`), checked as a bearer, and, for a Basic
+binding, its derived value (base64 of `<basicUser>:<value>`) masked before
+anything can quote it; a binding whose envVar is a provider's key refuses the
+boot. Of `egress.limits`, `maxRequests` counts the flows a container opens, not
+only the requests judged (a flow carries at most one request, and one whose
+head never completes costs one too). An upstream 401 or 403 (`challenged`), and
+an answer whose head the kernel will not write to the worker
+(`response-head`), are recorded as upstream `proxy.decision` rows, sent, and
+answered 502, so git never prompts.
 
 Not a stub, but not a tool either: **ephemeral spawning** (`spawnEphemeral` in the
 registry) exists only as a registry capability. No tool mints a new agent;
@@ -676,20 +727,21 @@ without that decision written down, so the first `recall` exposure cannot open
 every namespace by accident.
 
 Tier is checked at load as well as at call time: a manifest naming a tool whose
-risk exceeds its tier is refused with the file named. Budgets are checked at load
-too — a manifest may only lower a kernel ceiling. So is egress, though nothing
-serves it yet (the `egress-proxy` stub): an `egress.allow` host must be a DNS
-name, kept in one spelling (never an IP literal, a port, a wildcard or a
-special-use name like `host.lima.internal`), an `egress.bind` id must name a
-binding in kernel.yaml's `egress.bindings`, no allow host may be a binding's
-host, and only a tier 2 or higher worker sandboxed in the trusted domain may
-hold either; a spawned child keeps a subset of its template's hosts and
-bindings, and only at tier 2 or more. No shipped manifest holds egress. Neither
-agent declares a `sandbox:` (a worker with one at tier 2 or more that lists
-`sandbox.exec` has its commands run in containers since egress plan W1a, and a
-shipped manifest that does waits on the Phase 2 exit, as egress does), an `egress.allow` host (the
-kernel's egress engine is not wired to enforce one), or a `schedule:` (the only routable model is a frontier
-one, and an unattended run that can reach it can empty an envelope).
+risk exceeds its tier is refused with the file named. Budgets are checked at
+load too — a manifest may only lower a kernel ceiling. So is egress, which the
+kernel's egress engine serves to a trusted run (above): an `egress.allow` host
+must be a DNS name, kept in one spelling (never an IP literal, a port, a
+wildcard or a special-use name like `host.lima.internal`), an `egress.bind` id
+must name a binding in kernel.yaml's `egress.bindings`, no allow host may be a
+binding's host, and only a tier 2 or higher worker sandboxed in the trusted
+domain may hold either; a spawned child keeps a subset of its template's hosts
+and bindings, and only at tier 2 or more. No shipped manifest holds egress.
+Neither agent declares a `sandbox:` (a worker with one at tier 2 or more that
+lists `sandbox.exec` has its commands run in containers since egress plan W1a,
+and a shipped manifest that does waits on the Phase 2 exit, as egress does), an
+`egress.allow` host (egress has never yet run live), or a `schedule:` (the only
+routable model is a frontier one, and an unattended run that can reach it can
+empty an envelope).
 
 Both carry `tools.allow: []`, which is the honest state and not an oversight:
 `tool-views.yaml` exposes no pmmcp tool to agents, `sandbox.exec` needs the
@@ -701,7 +753,9 @@ rather than implying a capability that is not wired.
 Sandbox tools are checked at load as egress is (egress plan S3). `sandbox.exec`, on
 `tool-views.yaml`'s `sandbox` server as `write` with `taints: true`, runs one
 command in one container of the caller's own sandbox domain: the pinned image by
-id, `--network none` and no channel (so no egress, whatever the manifest says),
+id, `--network none`, with a channel to the kernel's egress engine only for a
+run on the trusted domain whose manifest has egress, served under a grant
+issued before its container starts (above), and none on the hostile domain,
 the run's own workspace `<mountRoot>/<runId>` at `/workspace`, and a hard
 wallclock of what is left of the run's budget, at most
 `sandbox.defaults.wallclockMs` (itself at most 2^31 - 1 ms, a timer's limit).
@@ -1205,7 +1259,7 @@ kernel enforces or will enforce:
   route at all, so no container has a route there. Each domain's internal
   network stays, and the sandbox probe still refuses a domain whose docker
   network is not `--internal`, as defence in depth: no run is put on it.
-- **The kernel's egress engine denies it** (`src/egress`, not wired yet): a
+- **The kernel's egress engine denies it** (`src/egress`, wired since egress plan W1, never yet run live): a
   worker's one way out is that engine, over its run's `docker -i` channel, and
   it refuses `192.168.5.2`, `host.lima.internal` and `host.docker.internal`.
 

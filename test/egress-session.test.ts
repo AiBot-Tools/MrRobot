@@ -325,6 +325,8 @@ interface HarnessOptions {
   readonly failAppend?: (input: AppendInput) => boolean
   /** The host answers on the head, before it has read the body: true when it did, and serve is not called. */
   readonly early?: (req: IncomingMessage, res: ServerResponse) => boolean
+  /** SessionOptions.exited: told the command's status when its exit frame arrives while the grant is served. */
+  readonly exited?: (status: number) => unknown
 }
 
 interface Harness {
@@ -339,7 +341,7 @@ interface Harness {
   readonly kills: number[]
   readonly clock: FakeClock
   /** The container exited, or was stopped, as W1 sees it: the channel's input ends, and the caller ends the session. */
-  end(reason: SessionEndReason): Promise<SessionOutcome>
+  end(reason: SessionEndReason, detail?: string): Promise<SessionOutcome>
 }
 
 function harness(t: TestContext, o: HarnessOptions = {}): Harness {
@@ -429,11 +431,12 @@ function harness(t: TestContext, o: HarnessOptions = {}): Harness {
       }),
     acceptReady: o.acceptReady ?? (() => undefined),
     kill: () => kills.push(1),
+    ...(o.exited === undefined ? {} : { exited: o.exited }),
     clock,
   })
-  const end = (reason: SessionEndReason): Promise<SessionOutcome> => {
+  const end = (reason: SessionEndReason, detail?: string): Promise<SessionOutcome> => {
     mux.input.end()
-    return session.end(reason)
+    return session.end(reason, detail)
   }
   return { store, steps, seen, injected, upstreamCalls, mux, session, kills, clock, end }
 }
@@ -2011,6 +2014,62 @@ test('end() records one revocation after every decision, with totals that add up
   }
 })
 
+test("the command's exit frame is told to exited once, while the grant is served, and end()'s detail is the revocation's", async (t) => {
+  // Served: the caller hears of the exit at once, so it can bound how long
+  // the container runs on (a flow held open past the command), and its
+  // end() with a detail of its own words is recorded with them.
+  const statuses: number[] = []
+  const h = harness(t, { exited: (status) => statuses.push(status) })
+  await h.mux.handshake()
+  h.mux.send({ type: 'exit', flow: 0, payload: exitPayload(3) })
+  await until(() => statuses.length === 1, 'the exit told')
+  assert.deepEqual(statuses, [3])
+  const detail = 'the command exited, and its container was still running 50 ms later, so the kernel killed it by name'
+  const outcome = await h.end('requested', detail)
+  assert.deepEqual([outcome.reason, outcome.detail, outcome.exitStatus], ['requested', detail, 3])
+  const [revoked] = rows(h.store, 'proxy.grant.revoked')
+  assert.deepEqual([revoked?.['reason'], revoked?.['detail']], ['requested', detail])
+  assert.deepEqual(statuses, [3], 'told twice')
+  assert.deepEqual(h.kills, [], 'the session killed a container the caller ends')
+
+  // Once end() was called the container is ending already: its exit frame,
+  // still read, is kept and told to no one.
+  const late: number[] = []
+  const ending = harness(t, { exited: (status) => late.push(status) })
+  await ending.mux.handshake()
+  const done = ending.session.end('requested')
+  ending.mux.send({ type: 'exit', flow: 0, payload: exitPayload(0) })
+  ending.mux.input.end()
+  const ended = await done
+  assert.equal(ended.exitStatus, 0)
+  assert.deepEqual(late, [])
+
+  // A cut stream from a container that exited on its own is a violation,
+  // whatever detail the caller gave: the violation's is recorded.
+  const cut = harness(t)
+  await cut.mux.handshake()
+  cut.mux.raw(Uint8Array.of(0, 0, 0))
+  cut.mux.input.end()
+  await new Promise((resolve) => setImmediate(resolve))
+  const violated = await cut.session.end('exited', 'the caller says it exited')
+  assert.equal(violated.reason, 'violation')
+  assert.match(violated.detail ?? '', /truncated-header/)
+  assert.throws(() => void harness(t).session.end('error', 7 as unknown as string), /an end detail is text/)
+
+  // A callback that throws is logged, never raised into the read: the grant
+  // is served on and ends as the caller says.
+  const throwing = harness(t, {
+    exited: () => {
+      throw new Error('the caller broke')
+    },
+  })
+  await throwing.mux.handshake()
+  throwing.mux.send({ type: 'exit', flow: 0, payload: exitPayload(0) })
+  await new Promise((resolve) => setImmediate(resolve))
+  const fine = await throwing.end('exited')
+  assert.deepEqual([fine.reason, fine.exitStatus], ['exited', 0])
+})
+
 test("end() keeps reading the channel until its input ends: the command's last frames are kept, nothing is served after the call, and an input that never ends is waited for END_DRAIN_MS", async (t) => {
   // W1 may act on the child's 'exit' before its stdout has drained: the
   // frames still in the pipe are the command's last output and its status.
@@ -2191,5 +2250,6 @@ test('a session refuses a grant it could not record, and options that are not wh
   assert.throws(() => createEgressSession({ ...base, grantId: 'grant id' }))
   assert.throws(() => createEgressSession({ ...base, limits: { ...LIMITS, idleMs: 0 } }))
   assert.throws(() => createEgressSession({ ...base, kill: undefined as unknown as () => void }), /kill must be a function/)
+  assert.throws(() => createEgressSession({ ...base, exited: 'later' as unknown as () => void }), /exited must be a function/)
   assert.throws(() => createEgressSession({ ...base, channel: { input: {} as PassThrough, output: new PassThrough() } }), /stdout/)
 })

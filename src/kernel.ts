@@ -34,11 +34,17 @@ import { join } from 'node:path'
 
 import { VERSION } from './version.js'
 import { log } from './log.js'
-import { ConfigError, NotImplementedError } from './errors.js'
-import type { KernelConfig } from './config.js'
+import { ConfigError, PolicyDenied } from './errors.js'
+import { bindingKeyProblem, type EgressBinding, type KernelConfig } from './config.js'
 
 import { EventStore } from './events/store.js'
 import { canonicalize } from './events/canonical.js'
+import { recordable } from './events/bound.js'
+import { redactString, SecretMask } from './events/redact.js'
+import { EGRESS_REASON_BYTES } from './events/types.js'
+import { acceptReady } from './egress/ready.js'
+import type { CredentialInjector } from './egress/session.js'
+import { createUpstream, systemUpstreamDeps, type Upstream, type UpstreamDeps, type UpstreamLimits } from './egress/upstream.js'
 import { readAllRows } from './events/chain.js'
 import { isClean, projectRecovery, type Recovery } from './events/projections.js'
 import { GoalTracker } from './goals/tracker.js'
@@ -72,7 +78,7 @@ import { PolicyEngine } from './policy/engine.js'
 import { Lanes } from './runtime/lanes.js'
 import { Budget, resolveCaps, type BudgetCaps } from './runtime/budget.js'
 import { RunLoop, type RunAgent, type RunOutcome } from './runtime/loop.js'
-import { assertEgressEnforced } from './runtime/egress.js'
+import type { BindingStatus, EgressState } from './runtime/egress.js'
 import { Scheduler } from './runtime/scheduler.js'
 import { AppleContainerDriver } from './sandbox/apple-container.js'
 import { DockerDriver, realDockerDriver, type DockerProcesses } from './sandbox/docker.js'
@@ -111,12 +117,41 @@ export const STUBS: readonly { id: string; where: string; how: string }[] = [
     where: 'src/sandbox/apple-container.ts',
     how: 'probe() reports unavailable with a reason so boot degrades; run() and kill() throw NotImplementedError. macOS 15 has no `container` binary',
   },
-  {
-    id: 'egress-proxy',
-    where: 'src/runtime/egress.ts',
-    how: 'assertEgressEnforced() throws NotImplementedError, so no run can reach the network',
-  },
 ]
+
+/**
+ * How long the egress upstream may take to resolve, connect and finish its
+ * TLS handshake for one request (upstream.ts connectTimeoutMs). Its idle
+ * bound, once connected, is kernel.yaml's egress.limits.idleMs.
+ */
+export const EGRESS_CONNECT_TIMEOUT_MS = 10_000
+
+/**
+ * The production upstream's two timeouts, as boot hands them to
+ * systemUpstreamDeps: the connect deadline the kernel fixes
+ * (EGRESS_CONNECT_TIMEOUT_MS) and kernel.yaml's egress.limits.idleMs.
+ * Exported so a test can hold both, since every test that sends traffic
+ * injects an upstream of its own.
+ */
+export function egressUpstreamOptions(config: KernelConfig): UpstreamLimits {
+  return { connectTimeoutMs: EGRESS_CONNECT_TIMEOUT_MS, idleTimeoutMs: config.egress.limits.idleMs }
+}
+
+/**
+ * The upstream boot builds when none is injected, and the one place it is
+ * built: createUpstream over `deps` (systemUpstreamDeps, the real resolver,
+ * dialer and interfaces) made from egressUpstreamOptions(config). `deps`
+ * takes the options and never chooses them, so a test that hands boot a
+ * factory of its own (BootOptions.egressUpstreamDeps) holds the timeouts the
+ * daemon's upstream runs under, which no test that injects a whole upstream
+ * can see.
+ */
+export function productionUpstream(
+  config: KernelConfig,
+  deps: (limits: UpstreamLimits) => UpstreamDeps = systemUpstreamDeps,
+): Upstream {
+  return createUpstream(deps(egressUpstreamOptions(config)))
+}
 
 export interface BootOptions {
   readonly config: KernelConfig
@@ -139,6 +174,21 @@ export interface BootOptions {
   readonly sandboxDriver?: SandboxDriver
   /** Injected by tests so no boot opens a socket to a real pmmcp. */
   readonly clientFactory?: ClientFactory
+  /**
+   * The egress upstream (src/egress/upstream.ts) a run's allowed requests are
+   * sent through. Injected by tests, over an in-process resolver and dialer,
+   * so no test resolves or dials; boot builds the real one otherwise, which
+   * resolves only a name decide() allowed and dials only the address it
+   * checked.
+   */
+  readonly egressUpstream?: Upstream
+  /**
+   * Tests only: what boot builds its production upstream over, in place of
+   * systemUpstreamDeps (productionUpstream), handed the options boot chose,
+   * so a test can hold them and serve the run in process. Unread when
+   * egressUpstream is given.
+   */
+  readonly egressUpstreamDeps?: (limits: UpstreamLimits) => UpstreamDeps
   readonly fetch?: typeof globalThis.fetch
   readonly now?: () => number
 }
@@ -165,6 +215,12 @@ export interface Kernel {
   readonly approvals: Approvals
   readonly quarantine: Quarantine
   readonly scheduler: Scheduler
+  /**
+   * The sandbox runner the run loop holds: its refusals as the loop reads
+   * them (egressRefusal, with boot's egress verdict) and its grant table
+   * (liveGrants), held by tests the way the hub and the router are.
+   */
+  readonly sandboxTools: SandboxTools
   status(): StatusResult
   shutdown(reason?: 'requested' | 'signal' | 'error', signal?: string): Promise<void>
 }
@@ -218,6 +274,14 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
   const token = env[config.control.tokenEnv]
   // Throws when absent or under the 32-char floor.
   assertTokenUsable(token)
+  // Where kernel.yaml and providers.yaml are both in hand, and before any
+  // binding is resolved: a binding whose envVar is a provider's key would
+  // have that key injected into requests to the binding's host. A refused
+  // boot, not a degraded egress: the operator's config names one credential
+  // for two uses, and no reading of it is safe. Before the store, so it
+  // writes nothing.
+  const sharedKey = bindingKeyProblem(config, providers)
+  if (sharedKey !== undefined) throw new ConfigError(sharedKey)
 
   // The store cannot open a database in a directory that does not exist, and on
   // a first boot .aos/ does not: without this, a clean machine fails with
@@ -387,8 +451,8 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       // file is read, not on the first run that reaches for it.
       budgets: config.budgets,
       // So a manifest's egress.bind names only a binding kernel.yaml holds, and
-      // its egress.allow no host one binds. Read at load only: egress itself is
-      // the egress-proxy stub (STUBS), so no run reaches either.
+      // its egress.allow no host one binds. The grant issuer reads both again
+      // at each exec (SandboxTools), from the record.
       egressBindings: config.egress.bindings,
     })
     agents.load(options.agentsDir ?? join(repoRoot, 'agents'))
@@ -591,8 +655,89 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     }
     mark('router', routerReason === undefined ? 'ok' : 'degraded', routerReason)
 
-    // ── absent by design, and saying so ──────────────────────────────────
-    mark('egress', 'absent', stubReason('egress-proxy', assertEgressEnforced))
+    // ── egress (degradable): built, so ok or degraded, never absent ────────
+    //
+    // Ok only once every check passes; otherwise one egress.degraded row per
+    // failed check, each saying what failed and the key or command that fixes
+    // it, as sandbox.degraded does, and the subsystem's reason joins them, as
+    // many as fit EGRESS_REASON_BYTES (egressSummary). In
+    // order: the config (egress.enabled), the sandbox (egress serves only a
+    // container on the trusted domain, so a sandbox that cannot run one is
+    // egress that cannot), and each binding's value, resolved here, ONCE,
+    // outside any run scope, as the provider keys are above, and only while
+    // egress is enabled: a disabled egress uses no credential, and resolving
+    // one would record an access for nothing.
+    const egressFailures: EgressFailure[] = []
+    if (!config.egress.enabled) {
+      egressFailures.push({
+        check: 'config',
+        reason:
+          'egress.enabled is false in config/kernel.yaml, so no run is given a channel: set egress.enabled: true ' +
+          'once the worker image is built and pinned (sandbox.imageId), to serve the egress a trusted manifest names',
+      })
+    }
+    if (!sandboxProbe.ok) {
+      egressFailures.push({
+        check: 'sandbox',
+        reason:
+          `the sandbox is degraded (${driver.name}: ${sandboxProbe.why}), and egress serves only a container on the ` +
+          "trusted domain: fix the sandbox first, as the sandbox subsystem's reason says",
+      })
+    }
+    const bindingRefs = new Map<string, SecretRef>()
+    const bindingStatus = new Map<string, BindingStatus>()
+    if (config.egress.enabled) {
+      for (const [id, binding] of Object.entries(config.egress.bindings)) {
+        const resolved = await resolveBinding(broker, config, id, binding)
+        if ('ref' in resolved) {
+          bindingRefs.set(id, resolved.ref)
+          bindingStatus.set(id, { bindingId: id, envVar: binding.envVar })
+          continue
+        }
+        bindingStatus.set(id, { bindingId: id, envVar: binding.envVar, problem: resolved.problem })
+        egressFailures.push({
+          check: 'binding',
+          bindingId: id,
+          reason: `egress binding ${id} (envVar ${binding.envVar}) did not resolve: ${resolved.problem}`,
+        })
+      }
+    }
+    // W3's seam: the pinned image id as each VM holds it, and a canary on each
+    // domain (judged by src/egress/ready.ts's acceptReady), join these checks
+    // here, each a failure of its own naming its domain (check 'image' or
+    // 'canary'), and egress is ok only when they pass too.
+    const egressReasons: string[] = []
+    for (const failure of egressFailures) {
+      // A binding id the log would store censored is recorded as no binding's.
+      const named = failure.bindingId !== undefined && redactString(failure.bindingId) === failure.bindingId
+      const reason = recordable(failure.reason, EGRESS_REASON_BYTES)
+      egressReasons.push(reason)
+      store.append({
+        type: 'egress.degraded',
+        payload: {
+          schemaVersion: 1,
+          check: failure.bindingId !== undefined && !named ? 'config' : failure.check,
+          ...(named ? { bindingId: failure.bindingId } : {}),
+          reason,
+        },
+      })
+    }
+    const egressState: EgressState =
+      egressReasons.length === 0 ? { state: 'ok' } : { state: 'degraded', reason: egressSummary(egressReasons) }
+    mark('egress', egressState.state, egressState.state === 'ok' ? undefined : egressState.reason)
+    const upstream = options.egressUpstream ?? productionUpstream(config, options.egressUpstreamDeps)
+    // The one header a binding injects, set from the broker's value and
+    // nowhere else: the session hands its setter in, and never holds a
+    // SecretRef. A binding boot did not resolve sets none, and the session
+    // refuses that request unsent.
+    const credential: CredentialInjector = (bindingId, set) => {
+      const ref = bindingRefs.get(bindingId)
+      const binding = Object.hasOwn(config.egress.bindings, bindingId) ? config.egress.bindings[bindingId] : undefined
+      if (ref === undefined || binding === undefined) return
+      broker.use(ref, (value) => {
+        set(binding.header, binding.scheme === 'Bearer' ? `Bearer ${value}` : `Basic ${basicValue(binding.basicUser, value)}`)
+      })
+    }
 
     // ── lanes, policy, loop ──────────────────────────────────────────────
     const lanes = new Lanes({ main: config.lanes.main, subagent: config.lanes.subagent })
@@ -636,9 +781,27 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     // tool to no run. Every sandbox.* ref goes to this runner, never to the
     // hub, and is offered only to a run whose agent's manifest, read from the
     // registry, may hold it (sandboxToolProblem) and lists it. Each exec runs
-    // --network none with no channel: egress stays the stub (STUBS,
-    // egress-proxy), and no shipped manifest lists a sandbox tool.
-    const sandboxTools = new SandboxTools({ store, views: toolViews, driver, agents, sandbox: config.sandbox })
+    // --network none; one whose manifest has egress on the trusted domain is
+    // issued a grant before its container starts and served over its channel
+    // by the egress engine, while egress is ok (egressRefusal otherwise), and
+    // the hostile domain gets no channel and no grant. No shipped manifest
+    // lists a sandbox tool or holds egress.
+    const sandboxTools = new SandboxTools({
+      store,
+      views: toolViews,
+      driver,
+      agents,
+      sandbox: config.sandbox,
+      egress: {
+        state: egressState,
+        bindings: config.egress.bindings,
+        resolved: bindingStatus,
+        limits: config.egress.limits,
+        upstream,
+        credential,
+        acceptReady,
+      },
+    })
 
     const loop = new RunLoop({
       store,
@@ -772,6 +935,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       approvals,
       quarantine,
       scheduler,
+      sandboxTools,
       status: () => surface.status(),
       async shutdown(reason = 'requested', signal) {
         if (stopped) return
@@ -828,17 +992,88 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
-/** The reason string for something absent by design, taken from its own throw. */
-function stubReason(id: string, call: () => unknown): string {
-  try {
-    call()
-  } catch (e) {
-    if (e instanceof NotImplementedError) return e.message
-    return e instanceof Error ? e.message : String(e)
+/** One failed egress check, as boot records it (egress.degraded). */
+interface EgressFailure {
+  readonly check: 'config' | 'sandbox' | 'binding'
+  readonly bindingId?: string
+  readonly reason: string
+}
+
+/**
+ * The egress subsystem's reason, and EgressState's, from each failed check's
+ * reason as its egress.degraded row holds it: all of them joined while that
+ * fits EGRESS_REASON_BYTES, and otherwise the first ones, whole, as many as
+ * fit beside a count of the rest, which this boot's egress.degraded rows
+ * name one by one. Bounded because it is echoed far: into subsystem.state,
+ * status.get, and every exec refusal (assertEgressEnforced, so tool.gate's
+ * reason and tool.result's text), and kernel.yaml admits any number of
+ * bindings, so a joined reason of a few hundred unresolved ones would make
+ * those rows past the store's limit and refuse the boot it describes. A
+ * first reason that does not fit beside the count is cut to (recordable).
+ */
+function egressSummary(reasons: readonly string[]): string {
+  const joined = reasons.join('; ')
+  if (Buffer.byteLength(joined) <= EGRESS_REASON_BYTES) return joined
+  const rest = (more: number): string =>
+    `; and ${String(more)} more failed egress check(s), each named in this boot's egress.degraded rows`
+  let kept = ''
+  let shown = 0
+  for (const reason of reasons) {
+    const next = shown === 0 ? reason : `${kept}; ${reason}`
+    if (Buffer.byteLength(next) + Buffer.byteLength(rest(reasons.length - shown - 1)) > EGRESS_REASON_BYTES) break
+    kept = next
+    shown += 1
   }
-  // If a stub stops throwing, that is a real change and must not be reported
-  // as "absent" — the honesty tests exist to catch exactly this.
-  throw new ConfigError(`${id} is listed as absent but did not refuse when called`)
+  if (shown === 0) {
+    const tail = rest(reasons.length - 1)
+    return `${recordable(reasons[0] ?? '', EGRESS_REASON_BYTES - Buffer.byteLength(tail))}${tail}`
+  }
+  return `${kept}${rest(reasons.length - shown)}`
+}
+
+/**
+ * Resolve one binding's value through the broker, once, at boot: its ref, or
+ * why not, naming the binding's envVar and never its value. Read from the
+ * environment only (a binding names an envVar and no vault id: the vault is
+ * dormant), checked as a bearer (bearerRefusal: whitespace, a character
+ * outside printable ASCII, a joined NAME=value line, or one too short to
+ * mask), and, for a Basic binding, its derived value (base64 of
+ * `<basicUser>:<value>`) registered with SecretMask before anything can
+ * quote it: a host that echoes the header it was sent would otherwise put a
+ * function of the credential in a row.
+ */
+async function resolveBinding(
+  broker: SecretsBroker,
+  config: KernelConfig,
+  id: string,
+  binding: EgressBinding,
+): Promise<{ readonly ref: SecretRef } | { readonly problem: string }> {
+  if (config.secrets.source !== 'env') {
+    return {
+      problem:
+        `bindings are read from the environment only (envVar ${binding.envVar}; a binding names no vault id), and ` +
+        `secrets.source is ${config.secrets.source}: set secrets.source: env, and ${binding.envVar} in .env`,
+    }
+  }
+  let ref: SecretRef
+  try {
+    ref = await broker.ref(`egress.bindings.${id}`, `egress credential for ${binding.host}`, { envVar: binding.envVar })
+  } catch (e) {
+    return { problem: e instanceof PolicyDenied ? e.reason : e instanceof Error ? e.message : String(e) }
+  }
+  const refusal = broker.use(ref, (value) => bearerRefusal(binding.envVar, value))
+  if (refusal !== undefined) return { problem: refusal }
+  if (binding.scheme === 'Basic') {
+    const user = binding.basicUser
+    const masked = broker.use(ref, (value) => SecretMask.register(basicValue(user, value)))
+    if (!masked) return { problem: `${binding.envVar}'s Basic credential could not be masked` }
+  }
+  return { ref }
+}
+
+/** A Basic credential's value: base64 of `<user>:<value>` (RFC 7617). */
+function basicValue(user: string, value: string): string {
+  return Buffer.from(`${user}:${value}`, 'utf8').toString('base64')
 }
 
 /**
@@ -852,8 +1087,8 @@ function stubReason(id: string, call: () => unknown): string {
 export function defaultDriver(config: KernelConfig, repoRoot: string, processes?: DockerProcesses): SandboxDriver {
   if (config.sandbox.driver === 'apple-container') return new AppleContainerDriver()
   // Boot only constructs and probes it: nothing spawns until a run asks for a
-  // container, which a sandbox.exec does (egress plan W1a), through the
-  // runner boot hands the loop.
+  // container, which a sandbox.exec does, through the runner boot hands the
+  // loop.
   const options = {
     domains: config.sandbox.domains,
     defaults: config.sandbox.defaults,

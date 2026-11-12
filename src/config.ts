@@ -387,11 +387,12 @@ const Sandbox = z
 // ── egress (egress plan E5) ─────────────────────────────────────────────────
 //
 // What the kernel's egress engine (src/egress) may do for a sandboxed run,
-// as data. Only the .env loader reads it yet (a binding's envVar is a name it
-// accepts, and the daemon loads that value into kernel memory at boot);
-// egress itself is the stub that refuses (src/runtime/egress.ts) until the
-// wiring task (W1). It ships disabled with no binding, and every field is
-// strict, because each one decides what a run can reach:
+// as data. Boot reads it (kernel.ts: the egress probe, each binding's value
+// resolved once through the broker, and every grant's limits), and so does
+// the .env loader (a binding's envVar is a name it accepts, and the daemon
+// loads that value into kernel memory at boot). It ships disabled with no
+// binding, and every field is strict, because each one decides what a run
+// can reach:
 //
 //   A binding is a credential for one host, named by the .env name its value
 //   is read from (never a value, never a vault id: the vault is dormant), the
@@ -400,9 +401,9 @@ const Sandbox = z
 //   (credentialNames, src/secrets/dotenv.ts); the installer mints none. It
 //   names a credential of its own: never a bearer the kernel holds for
 //   another use, which it would send to the binding's host (the control
-//   token and MCP bearers here; a provider's key by bindingKeyProblem, once
-//   the wiring task calls it at boot, where kernel.yaml and providers.yaml
-//   are both read: nothing calls it yet).
+//   token and MCP bearers here; a provider's key by bindingKeyProblem,
+//   which boot calls where kernel.yaml and providers.yaml are both read,
+//   and refuses to boot on).
 //
 //   Every identifier a grant row records (a binding's id, its host, its
 //   repositories) must be one the redaction pass leaves alone: the store
@@ -564,7 +565,13 @@ const EgressBindings = z
  * The three that size what the kernel holds for a container (one frame, the
  * open flows, one request's head) are bounded too: the container is hostile,
  * and the kernel holds the provider keys. idleMs is a timer's delay, so at
- * most MAX_TIMER_MS.
+ * most MAX_TIMER_MS. maxRequests counts the flows a container opens, as the
+ * session reads it (session.ts): a flow carries at most one request, so it
+ * bounds the requests, and a flow whose head never completes (a hangup, no
+ * violation) costs one too. Of what the session records, an upstream 401 or
+ * 403 (`challenged`) and an answer whose head node:http will not write to
+ * the worker (`response-head`) are upstream proxy.decision rows, sent, and
+ * answered 502.
  */
 const EgressLimits = z
   .object({
@@ -640,8 +647,8 @@ export const KernelConfig = z
     // the kernel already holds would be sent to the binding's host: the
     // control plane's token, or an MCP server's (pmmcp's among them).
     // Providers' keys are in providers.yaml, which this schema never sees:
-    // bindingKeyProblem will hold a binding to those once W1 calls it where
-    // both files are read (nothing calls it yet).
+    // bindingKeyProblem holds a binding to those, called by boot where both
+    // files are read.
     const held = new Map<string, string>([[config.control.tokenEnv, "the control plane's bearer (control.tokenEnv)"]])
     for (const [server, entry] of Object.entries(config.mcp.servers)) {
       if (entry.tokenEnv !== undefined) held.set(entry.tokenEnv, `mcp server ${server}'s bearer (mcp.servers.${server}.tokenEnv)`)
@@ -665,8 +672,8 @@ export type KernelConfig = z.output<typeof KernelConfig>
  * would send that key, the most valuable bearer the kernel holds, to the
  * binding's host. KernelConfig refuses the control token and an MCP bearer
  * itself, but never sees providers.yaml, so this is checked where both files
- * are read. Pure, and nothing calls it yet: boot (egress plan W1) throws what
- * it returns as a ConfigError before it resolves any binding.
+ * are read. Pure: boot (bootKernel) throws what it returns as a ConfigError
+ * before it resolves any binding, and before it writes anything.
  */
 export function bindingKeyProblem(config: KernelConfig, providers: ProvidersFile): string | undefined {
   const keyOf = new Map<string, string[]>()

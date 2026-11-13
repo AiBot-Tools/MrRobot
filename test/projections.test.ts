@@ -422,7 +422,7 @@ test('recovery’s own rows close every delegation-shaped orphan, so a second re
 // a grant already revoked, and one that never closed it would leave the log
 // saying a run could still reach a host.
 
-/** A proxy.grant.issued row as the runner appends it (sandbox-tools.ts issuedRow), under its run and agent. */
+/** A proxy.grant.issued row as the runner appends it (sandbox-tools.ts grantIssuedRow), under its run and agent. */
 function issued(store: Store, grantId: string, runId: string, agentId = 'coder'): void {
   store.append({
     type: 'proxy.grant.issued',

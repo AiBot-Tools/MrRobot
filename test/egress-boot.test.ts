@@ -25,6 +25,11 @@
 //   A canary named alike on two boots can be ended by a kill an earlier
 //   boot's sweep left pending, and one the log names nowhere is never swept
 //   once a kernel dies during its boot.
+//   A grant a dead kernel left open, a run's or a canary's, that the next
+//   boot does not close stays open in the log for ever (egress plan W2).
+//   A Basic binding whose derived value boot does not mask puts base64 of the
+//   credential in a row the moment a host echoes the header it was sent
+//   (egress plan W1): the redaction pass reads no bare base64.
 //
 // Everything is in process: the driver is test/helpers/fake-sandbox.ts, and
 // each canary's container is played as the worker image's mux plays it
@@ -37,14 +42,14 @@ import assert from 'node:assert/strict'
 import { lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { sweepTargets, type Kernel } from '../src/kernel.js'
+import { GRANT_RECOVERED_DETAIL, sweepTargets, type Kernel } from '../src/kernel.js'
 import { readAllRows } from '../src/events/chain.js'
 import { closedSandboxDomains, openRunlessSandboxes, projectRecovery } from '../src/events/projections.js'
 import { EventStore } from '../src/events/store.js'
 import { acceptReady, SELF_TEST, probeTarget } from '../src/egress/ready.js'
 import { DENY_WINDOW_MS } from '../src/egress/session.js'
 import { EGRESS_DETAIL_BYTES } from '../src/events/types.js'
-import { redactString } from '../src/events/redact.js'
+import { redactString, SecretMask } from '../src/events/redact.js'
 import {
   CANARY_COMMANDS,
   CANARY_MIN_WALLCLOCK_MS,
@@ -69,7 +74,7 @@ import {
 } from './helpers/fake-egress.js'
 import { fakeSandbox, type FakeSandbox, type FakeSandboxOptions } from './helpers/fake-sandbox.js'
 import { anthropicEndTurn, anthropicToolUse, fakeProvider } from './helpers/fake-provider.js'
-import { bootOn, fixture, REPO_ROOT, runThroughControl, withKernel, type KernelFixture } from './helpers/kernel.js'
+import { bootOn as bootFixture, fixture, REPO_ROOT, runThroughControl, withKernel as bootFresh, type KernelFixture, type WithKernelOptions } from './helpers/kernel.js'
 import { freshProbe } from './helpers/probe.js'
 import { tmpdir } from './helpers/tmpdir.js'
 import { writeProbeRecord } from '../src/models/probe.js'
@@ -79,6 +84,26 @@ import { closeVerified, withStore } from './helpers/store.js'
 const IMAGE = `sha256:${'ab'.repeat(32)}`
 /** Another image's id, as a VM loaded with another build prints it. */
 const OTHER = `sha256:${'cd'.repeat(32)}`
+
+/**
+ * How long boot waits on a canary in this file, in place of CANARY_WAIT_MS
+ * (30 s), unless a test names its own. Under the in-process fake a canary
+ * that passes or fails ends in milliseconds; one a broken kernel never ends
+ * (a refused ready whose container is never killed, egress suite mutant
+ * EG330) must be given up while its test still runs, before the canary
+ * player stops waiting for go at 5 s (fake-egress.ts until) and fails the
+ * test: a boot that finished after its test had ended would leave a kernel
+ * nobody shuts down, and the file would never exit, which the falsifier
+ * reads as hung, never as a kill.
+ */
+const TEST_CANARY_WAIT_MS = 3_000
+
+/** helpers/kernel.ts withKernel, with this file's canary wait. */
+const withKernel = (t: TestContext, options: WithKernelOptions = {}) => bootFresh(t, { canaryWaitMs: TEST_CANARY_WAIT_MS, ...options })
+
+/** helpers/kernel.ts bootOn, with this file's canary wait. */
+const bootOn = (t: TestContext, fx: KernelFixture, options: Parameters<typeof bootFixture>[2] = {}): Promise<Kernel> =>
+  bootFixture(t, fx, { canaryWaitMs: TEST_CANARY_WAIT_MS, ...options })
 
 /** kernel.yaml's sandbox block with IMAGE pinned, and egress enabled (or not). */
 const yaml =
@@ -1303,5 +1328,107 @@ test("the next boot's sweep kills by name a canary of either domain that a kerne
   // This boot's own canaries are named anew, so no kill the sweep sent can reach them.
   const names = canaryNames(driver)
   assert.ok(![left.trusted, left.hostile, done].includes(names.trusted) && ![left.trusted, left.hostile, done].includes(names.hostile))
+  await kernel.shutdown()
+})
+
+test("a grant a dead kernel left open, a run's exec grant or a canary's, is revoked recovered at the next boot, once, under its own run and agent, before the run it served is closed", async (t) => {
+  // The log a kernel that died mid-exec, and mid-boot, leaves: a run's exec
+  // grant with no revocation, and a trusted canary's grant with no end.
+  const fx = fixture(t, { kernelYaml: yaml() })
+  {
+    const store = withStore(t, { path: fx.dbPath, headFile: fx.headFile })
+    store.append({ type: 'run.started', runId: 'run_dead', agentId: 'coder', payload: { schemaVersion: 1, runId: 'run_dead', agentId: 'coder', lane: 'main', tier: 2, taint: 'clean' } })
+    store.append({
+      type: 'proxy.grant.issued',
+      runId: 'run_dead',
+      agentId: 'coder',
+      payload: {
+        schemaVersion: 1,
+        grantId: 'grant_run_dead',
+        purpose: 'exec',
+        runId: 'run_dead',
+        agentId: 'coder',
+        sandbox: 'aos-run-run_dead-1',
+        domain: 'trusted',
+        allow: ['registry.npmjs.org'],
+        routes: [],
+      },
+    })
+    closeVerified(store)
+  }
+  const canary = 'aos-run-canary-5-00000000abcd-trusted'
+  seedRunlessCanaries(t, fx, [canary])
+  {
+    const store = new EventStore(fx.dbPath, { readOnly: true })
+    const all = readAllRows(store.db)
+    store.close()
+    assert.deepEqual(projectRecovery(all).openGrants.map((g) => g.grantId), ['grant_run_dead', 'grant_5_00000000abcd'])
+  }
+
+  const kernel = await bootOn(t, fx, { sandboxDriver: driverWith() })
+  // This boot's own canaries, under grants of their own, pass as ever.
+  assert.deepEqual(kernel.status().subsystems.egress, { state: 'ok' })
+  await kernel.shutdown()
+  const all = allRows(fx.dbPath)
+  const recovered = ofType(all, 'proxy.grant.revoked').filter((r) => r.payload['reason'] === 'recovered')
+  // Each once, under the grant's own run and agent (a canary's under none),
+  // with the boot's fixed words and no totals: the counts died with the
+  // kernel that kept them.
+  assert.deepEqual(
+    recovered.map((r) => [r.runId, r.agentId, r.payload]),
+    [
+      ['run_dead', 'coder', { schemaVersion: 1, grantId: 'grant_run_dead', reason: 'recovered', detail: GRANT_RECOVERED_DETAIL }],
+      [null, null, { schemaVersion: 1, grantId: 'grant_5_00000000abcd', reason: 'recovered', detail: GRANT_RECOVERED_DETAIL }],
+    ],
+  )
+  // After this boot's kernel.booted, and before the run the grant served is
+  // closed, the order a live kernel writes them in.
+  const booted = ofType(all, 'kernel.booted').map((r) => r.seq)
+  const closed = ofType(all, 'run.finished').find((r) => r.runId === 'run_dead')
+  assert.ok(closed !== undefined, 'the dead run was not closed')
+  for (const r of recovered) {
+    assert.ok((booted[0] ?? Infinity) < r.seq, 'a grant was revoked before kernel.booted')
+    assert.ok(r.seq < closed.seq, 'a grant was revoked after the run it served was closed')
+  }
+  // Nothing is left open, this boot's canary grant included.
+  {
+    const store = new EventStore(fx.dbPath, { readOnly: true })
+    const rows = readAllRows(store.db)
+    store.close()
+    assert.deepEqual(projectRecovery(rows).openGrants, [])
+  }
+
+  // A second boot finds nothing to close, and appends no other.
+  const again = await bootOn(t, fx, { sandboxDriver: driverWith() })
+  await again.shutdown()
+  assert.equal(ofType(allRows(fx.dbPath), 'proxy.grant.revoked').filter((r) => r.payload['reason'] === 'recovered').length, 2)
+})
+
+test("a Basic binding's derived value is masked at boot under the binding's own user, so the redaction every row passes through hides it", async (t) => {
+  // The redaction pass reads no bare base64: only the kernel's mask keeps
+  // base64(<basicUser>:<value>) out of the log, registered at boot before
+  // anything can quote it (kernel.ts resolveBinding). No host echoes a
+  // header here: the mask is shown through redactString, which every row
+  // passes through, and boot's own rows.
+  SecretMask.clear()
+  t.after(() => SecretMask.clear())
+  const value = 'offline-binding-value-7c31d9a2f4'
+  const basic = (user: string): string => Buffer.from(`${user}:${value}`, 'utf8').toString('base64')
+  assert.equal(redactString(`echoed ${basic('aos-bot')} back`), `echoed ${basic('aos-bot')} back`, 'the patterns alone hide it')
+  const { kernel, fx } = await withKernel(t, {
+    kernelYaml: (base) =>
+      `${yaml(true)(base)}  bindings:\n    gh:\n      host: github.com\n      scheme: Basic\n      basicUser: aos-bot\n      envVar: AOS_GITHUB_TOKEN\n      profiles: [git-fetch]\n      repos: [op/fixture]\n`,
+    sandboxDriver: driverWith(),
+    env: { AOS_GITHUB_TOKEN: value },
+  })
+  assert.deepEqual(kernel.status().subsystems.egress, { state: 'ok' })
+  // The value, and its Basic form under the binding's own user.
+  assert.equal(redactString(`x ${value} y`), 'x [REDACTED] y')
+  assert.equal(redactString(`echoed ${basic('aos-bot')} back`), 'echoed [REDACTED] back')
+  assert.equal(redactString(JSON.stringify({ authorization: `Basic ${basic('aos-bot')}` })).includes(basic('aos-bot')), false)
+  for (const row of allRows(fx.dbPath)) {
+    const text = JSON.stringify(row.payload)
+    assert.equal(text.includes(value) || text.includes(basic('aos-bot')), false, row.type)
+  }
   await kernel.shutdown()
 })

@@ -1088,7 +1088,7 @@ const sandbox: Suite = {
     { id: 'Z429', file: SANDBOX_TOOLS, from: "      const profiles = binding.profiles.filter((p) => EXEC_PROFILES.includes(p))\n", to: "      const profiles = [...binding.profiles]\n", why: "an exec grant holds every profile its binding names, git-push and github-pulls among them" },
     { id: "Z430", file: SANDBOX_TOOLS, from: "      assertEgressEnforced(egress.state, { used: routes.map((r) => r.bindingId), resolved: egress.resolved })\n    } catch (e) {\n      return { refusal: `${e instanceof Error ? e.message : String(e)}; no container was started` }", to: "      void egress.state\n    } catch (e) {\n      return { refusal: `${e instanceof Error ? e.message : String(e)}; no container was started` }", why: "a run whose manifest names egress is issued a grant while egress is degraded, or for a binding that never resolved" },
     { id: 'Z431', file: SANDBOX_TOOLS, from: "  const changed = (text: string): boolean => redactString(text) !== text\n", to: "  const changed = (text: string): boolean => text === ''\n", why: "a grant whose repository, host or run id holds a value the kernel masks is issued, and its row records that identifier censored" },
-    { id: 'Z432', file: SANDBOX_TOOLS, from: "    if (manifest.sandbox?.domain !== 'trusted') return undefined\n", to: "    if (manifest.sandbox === undefined) return undefined\n", why: "a hostile-domain run whose manifest names egress is planned a grant and asks for a channel, which the driver refuses, so its exec never runs" },
+    { id: 'Z432', file: SANDBOX_TOOLS, from: "    if (manifest.sandbox?.domain !== 'trusted') return undefined\n", to: "    if (manifest.sandbox === undefined) return undefined\n", why: "a hostile-domain run whose manifest names egress is planned a grant, refused only because its row names the hostile domain (and, were that dropped too, by the driver's refusal of a hostile channel), so its exec never runs" },
     { id: 'Z433', file: SANDBOX_TOOLS, from: "            revokedBySession = true\n            void this.#killByName(spec.name)\n", to: "            revokedBySession = true\n", why: "a session that revokes its grant for a violation never has its container killed, so the container runs on to its wallclock with nothing serving it" },
     { id: 'Z434', file: SANDBOX_TOOLS, from: "            : await served.end(endReason(result))\n", to: "            : undefined\n", why: "a container's end never revokes its grant: no proxy.grant.revoked, the table keeps the grant, and the result never says what crossed the channel" },
     { id: 'Z435', file: SANDBOX_TOOLS, from: "            this.#grants.delete(issued.grantId)\n          }\n", to: "          }\n", why: "a revoked grant stays in the in-memory grant table for the kernel's life" },
@@ -1185,7 +1185,7 @@ const sandbox: Suite = {
     { id: "Z519", file: SANDBOX_TOOLS, from: "            { bindingId: push.bindingId, host: push.host, profiles: held(push, PUSH_PROFILES), repos: [repo] },\n", to: "            { bindingId: push.bindingId, host: push.host, profiles: held(push, PUSH_PROFILES), repos: [...pushers.keys()] },\n", why: "a publish grant pushes to every repository its push binding holds, not the one it publishes to, so an approved publish can push to another" },
     { id: "Z520", file: SANDBOX_TOOLS, from: "    const domain = this.#runnableDomain(manifest)\n    // Asked of the loop before the gate too (egressRefusal), and again here,\n    // now with what", to: "    const domain = manifest.sandbox?.domain ?? 'trusted'\n    // Asked of the loop before the gate too (egressRefusal), and again here,\n    // now with what", why: "a publish whose ticket was minted without the loop's pre-gate asks runs on a domain boot closed, or with no image pinned" },
     { id: "Z521", file: SANDBOX_TOOLS, from: "    if (unknown.length > 0) {\n      return { refusal: `${manifest.id}'s egress.bind names ${String(unknown.length)} binding(s) kernel.yaml does not hold${no}` }\n", to: "    if (false) {\n      return { refusal: `${manifest.id}'s egress.bind names ${String(unknown.length)} binding(s) kernel.yaml does not hold${no}` }\n", why: "a forged record binding an id kernel.yaml does not hold publishes through the bindings it does hold, the unknown one quietly left out" },
-    { id: "Z522", file: SANDBOX_TOOLS, from: "    const field = censoredField({ runId, agentId, grant: parsed.data })\n    if (field !== undefined) return { refusal: censoredRefusal(field) }\n    const row = ProxyGrantIssuedPayload.safeParse(issuedRow(PLANNED_GRANT_ID, containerName(runId, this.#seq + 1), runId, agentId, parsed.data, 'publish'))\n", to: "    const row = ProxyGrantIssuedPayload.safeParse(issuedRow(PLANNED_GRANT_ID, containerName(runId, this.#seq + 1), runId, agentId, parsed.data, 'publish'))\n", why: "a publish whose repository or host the mask holds as secret is offered and put to a human, then refused once its workspace is made" },
+    { id: "Z522", file: SANDBOX_TOOLS, from: "    const field = censoredField({ runId, agentId, grant: parsed.data })\n    if (field !== undefined) return { refusal: censoredRefusal(field) }\n    const row = grantIssuedRow(PLANNED_GRANT_ID, { name: containerName(runId, this.#seq + 1), domain: manifest.sandbox.domain }, runId, agentId, parsed.data, 'publish')\n", to: "    const row = grantIssuedRow(PLANNED_GRANT_ID, { name: containerName(runId, this.#seq + 1), domain: manifest.sandbox.domain }, runId, agentId, parsed.data, 'publish')\n", why: "a publish whose repository or host the mask holds as secret is offered and put to a human, then refused once its workspace is made" },
     { id: "Z523", file: SANDBOX_TOOLS, from: "    if (ctx.signal?.aborted === true) throw new Error('[refused] the run was stopped before the container started')\n    const domain = this.#runnableDomain(manifest)\n    // Asked of the loop before the gate too (egressRefusal), and again here,\n    // now with what", to: "    const domain = this.#runnableDomain(manifest)\n    // Asked of the loop before the gate too (egressRefusal), and again here,\n    // now with what", why: "a publish of a run already stopped makes its workspace, issues its grant and starts its container" },
     { id: "Z524", file: SANDBOX_TOOLS, from: "      .refine((text) => !text.includes(NUL), { message: 'a title may not hold a NUL character' }),\n", to: "      .refine(() => true, { message: 'a title may not hold a NUL character' }),\n", why: "a publish whose title holds NUL is put to a human, who approves a call Node's spawn then refuses" },
     { id: "Z525", file: SANDBOX_TOOLS, from: "      .refine((text) => !text.includes(NUL), { message: 'a body may not hold a NUL character' }),\n", to: "", why: "a publish whose body holds NUL is put to a human, who approves a call Node's spawn then refuses" },
@@ -1220,7 +1220,8 @@ const PUBLISH = 'images/worker/publish.mjs'
 // name or an address the kernel must never dial is let through, a request
 // reaches somewhere nobody allowed, a credential goes where nobody bound it,
 // or a row records what the log must never hold or the kernel must never do.
-// F1 adds the rest of the egress suite.
+// Egress plan F1 completed it: EGRESS_COVERAGE, below the suite, names the
+// mutants that stand for each check F1 lists.
 const egress: Suite = {
   name: 'egress',
   // hygiene.test.ts for the pins on who names mintEgressAllow and who imports decision.ts (EG79, EG112);
@@ -1261,7 +1262,16 @@ const egress: Suite = {
   // approved and to one pull request (EG641 to EG651);
   // and its review round 3's: egress-session.test.ts for a spent grant's pull request judged on its head (EG652);
   // and its review round 4's, fixed in round 5: egress-publish.test.ts for the files main() hands publish(), which read
-  // no link and write only a new file at 0600 (EG653 to EG656).
+  // no link and write only a new file at 0600 (EG653 to EG656);
+  // and F1's (EG657 to EG670, item by item in EGRESS_COVERAGE): egress-address.test.ts and egress-upstream.test.ts for
+  // the deny list and the upstream's check of every answer, egress-session.test.ts for the injector's one Authorization
+  // and an allow row refused, egress-policy.test.ts for the push prefix, egress-boot.test.ts for the Basic mask and the
+  // recovered revoke, sandbox-docker.test.ts and egress-grants.test.ts for the hostile channel, the grant before the
+  // spawn and its revocation; and egress-publish.test.ts for a link above the last component of a path the publisher
+  // reads (EG671, EG672); and F1's review round 1's: sandbox-docker.test.ts for the docker builder's own refusal of a
+  // hostile channel, and egress-grants.test.ts for a served grant revoked when its container ends (EG673, EG674);
+  // and its review round 2's: egress-grants.test.ts for the publish plan's refusal of the hostile domain, a grant's
+  // row naming its container's domain and the registry's refusal of egress on a hostile manifest (EG675 to EG677).
   tests: [
     'test/egress-address.test.ts',
     'test/egress-upstream.test.ts',
@@ -1274,6 +1284,12 @@ const egress: Suite = {
     'test/egress-mux.test.ts',
     'test/egress-boot.test.ts',
     'test/egress-publish.test.ts',
+    // F1: the hostile-channel refusal, grant-before-spawn and revoke-on-exit, held where the runner and the driver
+    // are run. Not test/sandbox-exec.test.ts, which holds them too: it waits on the runner without a bound of its
+    // own, so a session mutant that stops a container ending (EG316, EG330, EG331, seen) hangs it, and a hang is
+    // never a kill. test/egress-grants.test.ts bounds every wait.
+    'test/egress-grants.test.ts',
+    'test/sandbox-docker.test.ts',
   ],
   mutants: [
     { id: 'EG1', file: ADDR, from: "  if (value >> 32n === 0xffffn) return [['ipv4-mapped', Number(value & LOW_32)]]\n", to: '  if (value >> 32n === 0xffffn) return []\n', why: 'an IPv4-mapped answer is recognised and never judged, so ::ffff:127.0.0.1 and ::ffff:192.168.5.2 are dialled' },
@@ -1955,13 +1971,94 @@ const egress: Suite = {
     { id: "EG650", file: SESSION, from: "    if (decision.verdict === 'allow' && decision.reason === 'github-pulls') this.#pullRequests++\n", to: "", why: "the session never counts the pull requests it allowed, so a publish grant opens one after another" },
     { id: "EG651", file: SESSION, from: "    const decision = decide(this.#grant, leading === undefined ? head : { ...head, leading }, { pullRequests: this.#pullRequests })\n", to: "    const decision = decide(this.#grant, leading === undefined ? head : { ...head, leading })\n", why: "the session judges every pull request as the grant's first, so a publish grant opens one after another" },
     { id: "EG652", file: SESSION, from: "    const need = leadingNeed(this.#grant, head, { pullRequests: this.#pullRequests })\n", to: "    const need = leadingNeed(this.#grant, head)\n", why: "a publish grant's second pull request has its whole body read before it is denied not-granted, so its head alone, a Content-Length and no body, is never answered" },
-    { id: "EG653", file: PUBLISH, from: "    return lstatSync(path).isFile() ? readFileSync(path, 'utf8') : undefined\n", to: "    return !lstatSync(path).isDirectory() ? readFileSync(path, 'utf8') : undefined\n", why: "the publisher reads HEAD and refs through a link a run left in the workspace, so the commit it pushes is named by a file outside .git" },
-    { id: "EG654", file: PUBLISH, from: "    return lstatSync(path).isDirectory()\n", to: "    return lstatSync(path).isDirectory() || lstatSync(path).isSymbolicLink()\n", why: "the publisher takes a link for a directory of its own, so a workspace whose .git or objects is a link to elsewhere is read as a plain repository" },
+    { id: "EG653", file: PUBLISH, from: "    return lstatSync(path).isFile() && realParent(path) ? readFileSync(path, 'utf8') : undefined\n", to: "    return !lstatSync(path).isDirectory() && realParent(path) ? readFileSync(path, 'utf8') : undefined\n", why: "the publisher reads HEAD and refs through a link a run left in the workspace, so the commit it pushes is named by a file outside .git" },
+    { id: "EG654", file: PUBLISH, from: "    return lstatSync(path).isDirectory() && realParent(path)\n", to: "    return (lstatSync(path).isDirectory() || lstatSync(path).isSymbolicLink()) && realParent(path)\n", why: "the publisher takes a link for a directory of its own, so a workspace whose .git or objects is a link to elsewhere is read as a plain repository" },
     { id: "EG655", file: PUBLISH, from: "{ flag: 'wx', mode: 0o600 }", to: "{ flag: 'w', mode: 0o600 }", why: "the publisher writes over a path that is there already, and through a link at it, where it should write only a file that is not there yet" },
     { id: "EG656", file: PUBLISH, from: "{ flag: 'wx', mode: 0o600 }", to: "{ flag: 'wx' }", why: "a file the publisher makes is readable by other users, not its own alone" },
+    // Egress plan F1 (EG657 to EG670, and EG673 to EG677 below): the items EGRESS_COVERAGE names that no mutant above
+    // stood for, each killed by a test/egress-*.test.ts or test/sandbox-*.test.ts file the suite runs. Where a mutant of
+    // another suite stands at the same check (Y16, Y63, Z170, Z171, Z427, Z432, Z434, Z504, K6), the one here is another
+    // edit of it, so each id still means one mutant.
+    { id: "EG657", file: ADDR, from: "  ['loopback', ['127.0.0.0/8']],\n", to: "", why: "127.0.0.0/8 is not denied, so a name whose answer is 127.0.0.1, the Mac's own loopback, is dialled" },
+    { id: "EG658", file: UPSTREAM, from: "    if (denial !== undefined) {\n      return refused('denied-address'", to: "    if (false) {\n      return refused('denied-address'", why: "the upstream never asks addr.ts of an answer, so a name that resolves to 192.168.5.2, 10.0.0.1 or any address no interface of the Mac holds is dialled" },
+    { id: "EG659", file: SESSION, from: "      if (typeof name !== 'string' || name.toLowerCase() !== 'authorization' || typeof given !== 'string' || given === '') return\n", to: "      if (typeof name !== 'string' || typeof given !== 'string' || given === '') return\n", why: "the injector's header name is never read, so a credential closure that sets X-Api-Key or Cookie has its value sent as the request's one Authorization" },
+    { id: "EG660", file: SESSION, from: "    if (!this.#appendRow('proxy.decision', { ...fields, stage: 'policy', verdict: 'allow', why: recordable(decision.why, EGRESS_WHY_BYTES) })) {\n", to: "    if (!this.#appendRow('proxy.decision', { ...fields, stage: 'policy', verdict: 'allow', why: recordable(decision.why, EGRESS_WHY_BYTES) }) && false) {\n", why: "a request whose allow row the store refused is resolved, dialled and sent, so a request leaves that the log never holds a decision for" },
+    { id: "EG661", file: ROUTES, from: "  return `${PUSH_ROOT}/${runId}/`\n", to: "  return `${PUSH_ROOT}/${runId}`\n", why: "a run's push prefix has no closing slash, so run run_1 pushes to aos/run_10/<branch>, another run's branch, and opens pull requests from it" },
+    { id: "EG662", file: KERNEL, from: "SecretMask.register(basicValue(user, value))", to: "SecretMask.register(value)", why: "boot masks a Basic binding's raw value, which the broker masks already, and not its Basic form, so a host that echoes the header it was sent puts base64 of the credential in a row" },
+    { id: "EG663", file: 'src/sandbox/driver.ts', from: "  if (spec.domain === 'trusted') return undefined\n", to: "  return undefined\n", why: "channelRefusal admits a channel on any domain, so the real driver and the fake both give a hostile run a byte stream to the kernel" },
+    { id: "EG664", file: SANDBOX_TOOLS, from: "    if (manifest.sandbox?.domain !== 'trusted') return undefined\n", to: "", why: "a hostile-domain exec whose record names egress is planned a grant, and only its row's domain (proxy.grant.issued admits the trusted one alone) and then the driver's refusal of a hostile channel keep the domain that must reach nothing off the kernel, its exec failing where it should run with no network" },
+    { id: "EG665", file: SANDBOX_TOOLS, from: "    this.#o.store.append({ type: 'proxy.grant.issued', runId: ctx.runId, agentId: ctx.agentId, payload })\n", to: "    queueMicrotask(() => this.#o.store.append({ type: 'proxy.grant.issued', runId: ctx.runId, agentId: ctx.agentId, payload }))\n", why: "a grant's row is appended after its container is spawned and its sandbox.started written, so the container's first bytes may be judged under a grant the log does not hold, and a kernel that dies between them leaves a container no grant names" },
+    { id: "EG666", file: SANDBOX_TOOLS, from: "      if (issued !== undefined) this.#revokeUnserved(issued, ctx, 'the driver refused the container before it started')\n", to: "", why: "a grant whose container the driver refused before it started stays open, in the grant table and in the log, though nothing will ever serve it" },
+    { id: "EG667", file: SANDBOX_TOOLS, from: "              this.#revokeUnserved(issued, ctx, never?.detail ?? 'the grant served no channel')\n", to: "", why: "a grant the driver gave no channel, or whose session would not start, is not revoked when its container ends, and stays open in the log until the next boot" },
+    { id: "EG668", file: SANDBOX_TOOLS, from: "            : await served.end(endReason(result))\n", to: "            : await served.end('exited')\n", why: "every container's end revokes its grant as exited, so a run killed at its wallclock, or stopped, is recorded as one whose command ended on its own" },
+    { id: "EG669", file: KERNEL, from: "    for (const grant of recovered.openGrants) {\n", to: "    for (const grant of recovered.openGrants.filter((open) => open.runId === null)) {\n", why: "boot closes only a canary's grant a dead kernel left open: a run's exec grant stays open in the log for ever, and every later boot names its run to the sweep" },
+    { id: "EG670", file: KERNEL, from: "    for (const grant of recovered.openGrants) {\n", to: "    for (const grant of recovered.openGrants.filter((open) => open.runId !== null)) {\n", why: "boot closes only a run's grant a dead kernel left open: a canary's stays open in the log for ever, and every later boot names its container to the sweep" },
+    // Round 5's review of S4, carried to F1: the publisher's readers took a link in a directory above
+    // the last component (.git/refs a link to ../elsewhere) for a path of the workspace's own.
+    { id: "EG671", file: PUBLISH, from: "    return lstatSync(path).isFile() && realParent(path) ? readFileSync(path, 'utf8') : undefined\n", to: "    return lstatSync(path).isFile() ? readFileSync(path, 'utf8') : undefined\n", why: "the publisher reads a ref under a linked directory (.git/refs a link to ../elsewhere), so the commit it pushes is named by a file outside .git" },
+    { id: "EG672", file: PUBLISH, from: "    return lstatSync(path).isDirectory() && realParent(path)\n", to: "    return lstatSync(path).isDirectory()\n", why: "the publisher takes a directory reached through a linked one above it for a directory of the workspace's own" },
+    // F1's review round 1: the docker builder's own call of channelRefusal and the served grant's revocation
+    // stood only in the sandbox suite (Z170, Z434), so `npm run falsify -- egress` would not show either dropped.
+    // Each here is another edit of the same line, so each id still means one mutant.
+    { id: "EG673", file: DOCKER, from: "  if (refusedChannel !== undefined) throw new ConfigError(refusedChannel)\n", to: "  if (refusedChannel !== undefined && spec.domain === 'trusted') throw new ConfigError(refusedChannel)\n", why: "the docker builder heeds channelRefusal only on a trusted spec, where it refuses only a value that is no boolean, so a hostile run asking for a channel is built with -i, a byte stream between the domain that must reach nothing and the kernel" },
+    { id: "EG674", file: SANDBOX_TOOLS, from: "            : await served.end(endReason(result))\n", to: "            : void served\n", why: "a served grant is never revoked when its container ends: no proxy.grant.revoked, the grant table keeps it, and the result never says what crossed the channel" },
+    // F1's review round 2: the publish plan's own refusal of the hostile domain stood only in the sandbox suite (Z504),
+    // as the registry's refusal of egress on a hostile manifest at load stood only in the registry suite (Y15, Y16),
+    // each here another edit of the line; and the grant's row named the trusted domain whatever its container's, so a
+    // dropped domain check had the kernel append a trusted grant for a container on the hostile domain.
+    { id: "EG675", file: SANDBOX_TOOLS, from: "    if (manifest.sandbox?.domain !== 'trusted') {\n", to: "    if (manifest.sandbox === undefined) {\n", why: "a hostile-domain publish whose record names egress is planned a grant, refused only by what follows the domain check (its row, or the driver's refusal of a hostile channel), never for the domain that gets no egress" },
+    { id: "EG676", file: SANDBOX_TOOLS, from: "    domain: container.domain,\n", to: "    domain: 'trusted' as const,\n", why: "a grant's row names the trusted domain whatever its container's, so a grant for a container on the hostile domain is recorded as a trusted one, and proxy.grant.issued never judges where its container runs" },
+    { id: "EG677", file: REGISTRY, from: "    if (manifest.sandbox?.domain !== 'trusted') {\n", to: "    if (manifest.sandbox?.domain === undefined) {\n", why: "a hostile-domain manifest that names egress loads, so every exec and publish of it reaches the runner with egress, whose own refusals are all that keep the domain that must reach nothing off the kernel's egress engine" },
   ],
   control: { id: 'C', file: ADDR, from: '// The egress address classifier (egress plan E1).', to: '// The egress address classifier (egress plan E1). (control)', why: 'comment only' },
 }
+
+/** One check egress plan F1 holds the egress suite to: the suite's mutants that stand for it, and the test files that kill them. */
+export interface EgressCoverage {
+  readonly ids: readonly string[]
+  /** Each one of test/egress-*.test.ts or test/sandbox-*.test.ts, and in the suite's own list. */
+  readonly killedBy: readonly string[]
+}
+
+/**
+ * Egress plan F1: each check the plan names, and the egress suite's mutants
+ * that stand for it. A mutant the suite already held is named here, not
+ * written again; the rest are F1's own (EG657 to EG670, EG673 to EG677). Every id is a
+ * mutant of the egress suite, so `npm run falsify -- egress` runs them all,
+ * and each item's are killed by the files named with it (seen on a run of
+ * those files alone). test/falsify.test.ts holds this table, and the
+ * suite's membership of every id in it.
+ */
+export const EGRESS_COVERAGE: Readonly<Record<string, EgressCoverage>> = Object.freeze({
+  // addr.ts's deny list, and the upstream's check of every answer against it.
+  'deny-address': { ids: ['EG5', 'EG6', 'EG7', 'EG8', 'EG26', 'EG657', 'EG658'], killedBy: ['test/egress-address.test.ts', 'test/egress-upstream.test.ts'] },
+  // An IPv6 answer judged by the IPv4 address it carries.
+  'ipv4-mapped-unwrap': { ids: ['EG1', 'EG44'], killedBy: ['test/egress-address.test.ts', 'test/egress-upstream.test.ts'] },
+  // decide() compares a host whole, never by suffix, and the upstream resolves only that spelling.
+  'host-equality': { ids: ['EG24', 'EG89', 'EG90'], killedBy: ['test/egress-policy.test.ts', 'test/egress-upstream.test.ts'] },
+  // The worker's auth, cookie, hop-by-hop and forwarding headers never reach the host.
+  'header-strip': { ids: ['EG316', 'EG317', 'EG318', 'EG319', 'EG356', 'EG503'], killedBy: ['test/egress-session.test.ts'] },
+  // Exactly one Authorization on a bound route, set by the kernel's closure, and none elsewhere.
+  'exactly-one-auth': { ids: ['EG320', 'EG321', 'EG659'], killedBy: ['test/egress-session.test.ts'] },
+  // proxy.decision is in the log before anything is resolved or dialled.
+  'decision-before-dial': { ids: ['EG322', 'EG660'], killedBy: ['test/egress-session.test.ts'] },
+  // A push updates only refs/heads/aos/<runId>/..., and deletes nothing.
+  'push-ref-prefix': { ids: ['EG86', 'EG87', 'EG641', 'EG661'], killedBy: ['test/egress-policy.test.ts'] },
+  // A Basic binding's derived value is in SecretMask before anything can quote it.
+  'basic-mask': { ids: ['EG662'], killedBy: ['test/egress-boot.test.ts'] },
+  // The hostile domain gets no channel: not from channelRefusal, which both drivers call, not from the docker
+  // builder's own call of it, not from the runner's exec plan or its publish plan, not in a grant's row, not for
+  // its canary, and no egress from the registry, which refuses it on a hostile manifest at load.
+  'hostile-channel': { ids: ['EG565', 'EG663', 'EG664', 'EG673', 'EG675', 'EG676', 'EG677'], killedBy: ['test/egress-boot.test.ts', 'test/sandbox-docker.test.ts', 'test/egress-grants.test.ts'] },
+  // W1b: the grant is in the log before its container is spawned.
+  'grant-before-spawn': { ids: ['EG665'], killedBy: ['test/egress-grants.test.ts'] },
+  // W1b: a grant is revoked when its container ends, with the driver's verdict, served or not.
+  'revoke-on-exit': { ids: ['EG666', 'EG667', 'EG668', 'EG674'], killedBy: ['test/egress-grants.test.ts'] },
+  // W2: a grant a dead kernel left open is revoked recovered at the next boot, a run's and a canary's.
+  'recovered-revoke': { ids: ['EG669', 'EG670'], killedBy: ['test/egress-boot.test.ts'] },
+  // W3: the canary passes only on a self-test the judge accepts and a round trip the kernel denied and recorded.
+  'canary-judge': { ids: ['EG543', 'EG544', 'EG545', 'EG561', 'EG566', 'EG567', 'EG568', 'EG569', 'EG570', 'EG597'], killedBy: ['test/egress-boot.test.ts', 'test/egress-mux.test.ts'] },
+})
 
 const DOTENV = 'src/secrets/dotenv.ts'
 

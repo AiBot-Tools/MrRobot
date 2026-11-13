@@ -23,7 +23,7 @@ import './helpers/guard.js'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { lstatSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { PassThrough, Writable } from 'node:stream'
 
@@ -175,11 +175,14 @@ test("what the publisher reads of the workspace is HEAD and the ref it names, as
   assert.equal(defaultBranch('ref: refs/tags/v1\tHEAD\n'), undefined)
 })
 
-test("the files main() hands publish() read no link, and its writes make a new file at 0600 and never replace one", (t) => {
+test("the files main() hands publish() read no link, in any component of a path, and its writes make a new file at 0600 and never replace one", (t) => {
   // Every other test hands in fake files, which hold no link by
   // construction: this one holds SYSTEM_DEPS itself, the readers and the
   // writer the publisher runs with in the container, on a real directory.
-  const root = tmpdir(t)
+  // Its real path: the readers refuse a path any directory of which is a
+  // link, and the system's temporary directory may sit under one (macOS's
+  // /var is /private/var).
+  const root = realpathSync(tmpdir(t))
   const file = join(root, 'HEAD')
   const dir = join(root, 'objects')
   writeFileSync(file, `${OID}\n`)
@@ -195,6 +198,27 @@ test("the files main() hands publish() read no link, and its writes make a new f
   assert.equal(SYSTEM_DEPS.isDirectory(join(root, 'dir-link')), false, 'a link to a directory is none')
   assert.equal(SYSTEM_DEPS.isDirectory(file), false, 'a file is no directory')
   assert.equal(SYSTEM_DEPS.isDirectory(join(root, 'missing')), false, 'a missing path is no directory')
+
+  // A link above the last component: a workspace whose .git and objects are
+  // directories of its own, and whose .git/refs is a link to ../elsewhere, a
+  // directory of the workspace outside .git. lstat on the last component
+  // alone sees a regular file and a directory there, so a ref would read from
+  // outside .git (the commit the publisher pushes named by a file the run
+  // wrote there): no component of a path read may be a link.
+  const ws = join(root, 'ws')
+  const elsewhere = join(ws, 'elsewhere')
+  mkdirSync(join(ws, '.git', 'objects'), { recursive: true })
+  mkdirSync(join(elsewhere, 'heads', 'deeper'), { recursive: true })
+  writeFileSync(join(elsewhere, 'heads', 'main'), `${OID}\n`)
+  symlinkSync('../elsewhere', join(ws, '.git', 'refs'))
+  assert.equal(SYSTEM_DEPS.isDirectory(join(ws, '.git')), true, '.git is a directory of its own')
+  assert.equal(SYSTEM_DEPS.isDirectory(join(ws, '.git', 'objects')), true, 'objects is a directory of its own')
+  assert.equal(lstatSync(join(ws, '.git', 'refs', 'heads', 'main')).isFile(), true, 'lstat alone reads the ref as a regular file')
+  assert.equal(SYSTEM_DEPS.readFile(join(ws, '.git', 'refs', 'heads', 'main')), undefined, 'a ref under a linked refs directory reads as no file')
+  assert.equal(SYSTEM_DEPS.isDirectory(join(ws, '.git', 'refs', 'heads', 'deeper')), false, 'a directory under a linked one is none')
+  // The same files reached by their own path read as they are.
+  assert.equal(SYSTEM_DEPS.readFile(join(elsewhere, 'heads', 'main')), `${OID}\n`)
+  assert.equal(SYSTEM_DEPS.isDirectory(join(elsewhere, 'heads', 'deeper')), true)
 
   const made = join(root, 'alternates')
   SYSTEM_DEPS.writeFile(made, '/workspace/.git/objects\n')
@@ -560,7 +584,7 @@ test('the publisher imports only what it uses, runs only as the program, and is 
     source.split('\n').filter((line) => /^\s*import\b/.test(line)),
     [
       "import { spawn as spawnChild } from 'node:child_process'",
-      "import { lstatSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'",
+      "import { lstatSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'",
       "import { request as httpRequest } from 'node:http'",
     ],
   )

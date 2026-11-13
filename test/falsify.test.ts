@@ -21,11 +21,11 @@ import { CREDENTIAL_NAME } from './helpers/guard.js'
 
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
-import { CATALOG } from '../scripts/falsify/catalog.js'
+import { CATALOG, EGRESS_COVERAGE } from '../scripts/falsify/catalog.js'
 import {
   CHILD_CREDENTIAL_NAME,
   childEnv,
@@ -619,6 +619,120 @@ test("the sandbox suite says what a domain network kernel.yaml should refuse doe
   const comment = [...configTest.slice(at + title.length).matchAll(/^ {2}\/\/ ?(.*)\n/gmy)].map((m) => m[1]).join(' ')
   assert.ok(comment.includes('probe() would degrade the kernel, refusing it by name without inspecting it (domainNetwork), and no internal network would be kept beside --network none'), comment)
   assert.doesNotMatch(comment, /docker network rm|advise/, comment)
+})
+
+test("the egress suite holds a mutant for each check egress plan F1 names, names for each item the egress and sandbox tests the suite runs that kill its mutants, and a control that edits a comment", () => {
+  // `npm run falsify -- egress` is F1's acceptance: every check the plan
+  // names has mutants in this one suite, each item's killed by the
+  // test/egress-*.test.ts or test/sandbox-*.test.ts files named with it, and
+  // the control survives. This test can hold only the names: that those
+  // files are such tests and in the suite's list. The kills themselves were
+  // seen on a run of those files alone, and on the suite's run of the ids.
+  // The table is held whole, so an id moved out of the suite, an item left
+  // with fewer mutants or a file dropped from the suite's list is a change
+  // made here, on purpose.
+  const egress = CATALOG.find((s) => s.name === 'egress')
+  assert.ok(egress, 'the catalog has no egress suite')
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(EGRESS_COVERAGE).map(([item, c]) => [item, c.ids])),
+    {
+      'deny-address': ['EG5', 'EG6', 'EG7', 'EG8', 'EG26', 'EG657', 'EG658'],
+      'ipv4-mapped-unwrap': ['EG1', 'EG44'],
+      'host-equality': ['EG24', 'EG89', 'EG90'],
+      'header-strip': ['EG316', 'EG317', 'EG318', 'EG319', 'EG356', 'EG503'],
+      'exactly-one-auth': ['EG320', 'EG321', 'EG659'],
+      'decision-before-dial': ['EG322', 'EG660'],
+      'push-ref-prefix': ['EG86', 'EG87', 'EG641', 'EG661'],
+      'basic-mask': ['EG662'],
+      'hostile-channel': ['EG565', 'EG663', 'EG664', 'EG673', 'EG675', 'EG676', 'EG677'],
+      'grant-before-spawn': ['EG665'],
+      'revoke-on-exit': ['EG666', 'EG667', 'EG668', 'EG674'],
+      'recovered-revoke': ['EG669', 'EG670'],
+      'canary-judge': ['EG543', 'EG544', 'EG545', 'EG561', 'EG566', 'EG567', 'EG568', 'EG569', 'EG570', 'EG597'],
+    },
+  )
+  const inSuite = new Set(egress.mutants.map((mu) => mu.id))
+  const named: string[] = []
+  for (const [item, { ids, killedBy }] of Object.entries(EGRESS_COVERAGE)) {
+    for (const id of ids) assert.ok(inSuite.has(id), `${item}: ${id} is no mutant of the egress suite, so npm run falsify -- egress does not run it`)
+    named.push(...ids)
+    assert.ok(killedBy.length > 0, `${item} names no test file that kills its mutants`)
+    for (const file of killedBy) {
+      assert.match(file, /^test\/(?:egress|sandbox)-[a-z-]+\.test\.ts$/, `${item}: ${file} is neither an egress nor a sandbox test`)
+      assert.ok(egress.tests.includes(file), `${item}: ${file} is not among the egress suite's tests`)
+    }
+  }
+  assert.deepEqual(named.filter((id, i) => named.indexOf(id) !== i), [], 'an id stands for two items')
+  // F1's own mutants (EG657 to EG670, and its reviews' EG673 to EG677) are
+  // all in the suite and each stands for an item: none was added without
+  // saying which check it falsifies. (EG671 and EG672 are the publisher's
+  // readers, S4's review carried to F1, and stand for no F1 item.)
+  const own = [...Array.from({ length: 14 }, (_, i) => `EG${String(657 + i)}`), 'EG673', 'EG674', 'EG675', 'EG676', 'EG677']
+  assert.deepEqual(egress.mutants.map((mu) => mu.id).filter((id) => own.includes(id)), own)
+  for (const id of own) assert.ok(named.includes(id), `${id} is in the suite and stands for no item`)
+  // An item's mutants stand at each place its check is made, not only at a
+  // function those places share: else the suite would not show that place
+  // dropping its check. The hostile channel is refused in channelRefusal
+  // (driver.ts, which both drivers call), by the docker builder's own call of
+  // it (docker.ts), by the runner's exec plan (#planGrant) and its publish
+  // plan (#planPublish) and by the row a grant is issued under, which names
+  // its container's domain (grantIssuedRow), all in sandbox-tools.ts, and by
+  // the canary (canary.ts); egress on a hostile manifest is refused at load
+  // (registry.ts), so only a forged record brings it to the runner. A grant
+  // is revoked when its container ends whether it was served (served.end) or
+  // not (revokeUnserved), and a mutant that only renames the end's reason
+  // leaves the revocation there.
+  const mutantOf = (id: string): { readonly file: string; readonly from: string; readonly to: string } => {
+    const mu = egress.mutants.find((m) => m.id === id)
+    assert.ok(mu, id)
+    return mu
+  }
+  const filesOf = (item: string): string[] => [...new Set((EGRESS_COVERAGE[item]?.ids ?? []).map((id) => mutantOf(id).file))].sort()
+  assert.deepEqual(filesOf('hostile-channel'), ['src/agents/registry.ts', 'src/runtime/canary.ts', 'src/runtime/sandbox-tools.ts', 'src/sandbox/docker.ts', 'src/sandbox/driver.ts'])
+  // Within sandbox-tools.ts, a mutant in each of the three. An anchor occurs
+  // once in its file, so one that lies in a function's body edits it there.
+  const runner = readFileSync(join(REPO_ROOT, 'src/runtime/sandbox-tools.ts'), 'utf8')
+  const bodyOf = (opening: string, closing: string): string => {
+    const start = runner.indexOf(opening)
+    assert.notEqual(start, -1, opening)
+    const end = runner.indexOf(closing, start)
+    assert.notEqual(end, -1, `${opening} has no end`)
+    return runner.slice(start, end)
+  }
+  const hostileIn = (body: string): string[] =>
+    (EGRESS_COVERAGE['hostile-channel']?.ids ?? []).filter((id) => {
+      const mu = mutantOf(id)
+      return mu.file === 'src/runtime/sandbox-tools.ts' && body.includes(mu.from)
+    })
+  assert.notDeepEqual(hostileIn(bodyOf('\n  #planGrant(', '\n  }\n')), [], 'no hostile-channel mutant stands in the exec plan')
+  assert.notDeepEqual(hostileIn(bodyOf('\n  #planPublish(', '\n  }\n')), [], 'no hostile-channel mutant stands in the publish plan')
+  assert.notDeepEqual(hostileIn(bodyOf('\nexport function grantIssuedRow(', '\n}\n')), [], "no hostile-channel mutant stands in a grant's row")
+  const revokes = (EGRESS_COVERAGE['revoke-on-exit']?.ids ?? []).map(mutantOf)
+  assert.ok(
+    revokes.some((mu) => mu.from.includes('served.end(endReason(result))') && !mu.to.includes('served.end(')),
+    'no revoke-on-exit mutant drops the revocation of a served grant',
+  )
+  assert.ok(
+    revokes.some((mu) => mu.from.includes('#revokeUnserved(') && !mu.to.includes('#revokeUnserved(')),
+    'no revoke-on-exit mutant drops the revocation of an unserved grant',
+  )
+  // Every egress test file is run, and the driver's. Not
+  // test/sandbox-exec.test.ts, which waits on the runner with no bound of its
+  // own: a session mutant that stops a container ending (EG330) hangs it,
+  // and a hang is never a kill, so the whole suite would read as hung.
+  // test/egress-grants.test.ts holds the runner's part of the items with
+  // every wait bounded.
+  const egressFiles = readdirSync(join(REPO_ROOT, 'test'))
+    .filter((f) => /^egress-[a-z-]+\.test\.ts$/.test(f))
+    .map((f) => `test/${f}`)
+  assert.ok(egressFiles.includes('test/egress-grants.test.ts'), egressFiles.join(', '))
+  for (const file of [...egressFiles, 'test/sandbox-docker.test.ts']) {
+    assert.ok(egress.tests.includes(file), `the egress suite does not run ${file}`)
+  }
+  assert.equal(egress.tests.includes('test/sandbox-exec.test.ts'), false, 'the egress suite runs a file a session mutant hangs')
+  // The control edits a comment, in a file the suite mutates.
+  assert.ok(egress.control.from.trimStart().startsWith('//'), egress.control.from)
+  assert.ok(egress.mutants.some((mu) => mu.file === egress.control.file))
 })
 
 test('no mutant that could steer an entry point at a credentials file runs beside a test that spawns entry points from this checkout', () => {

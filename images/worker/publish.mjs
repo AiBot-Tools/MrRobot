@@ -57,7 +57,7 @@
 // it stands (images/worker/Dockerfile; test/hygiene.test.ts).
 
 import { spawn as spawnChild } from 'node:child_process'
-import { lstatSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 
 /** @import { ChildProcess, SpawnOptions } from 'node:child_process' */
@@ -207,15 +207,16 @@ export function headOf(args) {
 
 /**
  * @typedef {object} Files
- * @property {(path: string) => string | undefined} readFile a regular file's text, never through a link; undefined when there is none
- * @property {(path: string) => boolean} isDirectory a directory, never through a link
+ * @property {(path: string) => string | undefined} readFile a regular file's text, read through no link in any component of its path; undefined when there is none
+ * @property {(path: string) => boolean} isDirectory a directory, reached through no link in any component of its path
  */
 
 /**
  * The commit /workspace's HEAD names, read from its files and no git: HEAD as
  * an object name, or `ref: refs/heads/<branch>` and that branch's loose ref,
  * else its line in packed-refs. Anything else (a worktree's or submodule's
- * .git file, a link, a reftable, a ref outside refs/heads) is refused, named.
+ * .git file, a link anywhere in a path read, a reftable, a ref outside
+ * refs/heads) is refused, named.
  * @param {Files} files
  * @returns {{ readonly oid: string } | { readonly refusal: string }}
  */
@@ -519,10 +520,24 @@ export async function publish(args, deps) {
   }
 }
 
+/**
+ * True when no component of the directory `path` sits in is a link: that
+ * directory's real path is its own spelling. lstat reads only the last
+ * component, so .git/refs a link to elsewhere would otherwise have
+ * .git/refs/heads/main read from outside .git, and the commit pushed named
+ * by a file the run wrote there.
+ * @param {string} path an absolute path
+ */
+function realParent(path) {
+  const at = path.lastIndexOf('/')
+  const parent = at <= 0 ? '/' : path.slice(0, at)
+  return realpathSync(parent) === parent
+}
+
 /** @param {string} path */
 function readOwnFile(path) {
   try {
-    return lstatSync(path).isFile() ? readFileSync(path, 'utf8') : undefined
+    return lstatSync(path).isFile() && realParent(path) ? readFileSync(path, 'utf8') : undefined
   } catch {
     return undefined
   }
@@ -531,7 +546,7 @@ function readOwnFile(path) {
 /** @param {string} path */
 function isOwnDirectory(path) {
   try {
-    return lstatSync(path).isDirectory()
+    return lstatSync(path).isDirectory() && realParent(path)
   } catch {
     return false
   }

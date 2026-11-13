@@ -578,19 +578,40 @@ const PLANNED_GRANT_ID = 'grant_0_000000000000'
 /** What a run's grant serves: one sandbox.exec, or one human-approved sandbox.publish. */
 export type GrantPurpose = 'exec' | 'publish'
 
-/** The proxy.grant.issued row of a run's grant: one builder for the row #planGrant and #planPublish judge and the row #issue appends. */
-function issuedRow(grantId: string, sandbox: string, runId: string, agentId: string, grant: EgressGrant, purpose: GrantPurpose) {
-  return {
+/** The container a grant's row names: the spec #contain hands the driver, or, at a plan, its stand-in. */
+export type GrantContainer = Pick<SandboxSpec, 'name' | 'domain'>
+
+/**
+ * The proxy.grant.issued row of a run's grant, judged as the store will
+ * judge it, or why the grant is not issued: one builder for the row
+ * #planGrant and #planPublish judge and the row #issue appends. The row names
+ * the domain its container runs on, never a constant: proxy.grant.issued
+ * admits the trusted domain alone, so a grant for a container on any other
+ * is refused here, before the spawn, whichever check before it was dropped,
+ * and the log never holds a trusted grant for a container on the hostile
+ * domain.
+ */
+export function grantIssuedRow(
+  grantId: string,
+  container: GrantContainer,
+  runId: string,
+  agentId: string,
+  grant: EgressGrant,
+  purpose: GrantPurpose,
+): { readonly payload: Record<string, unknown> } | { readonly refusal: string } {
+  const payload = {
     schemaVersion: 1,
     grantId,
     purpose,
     runId,
     agentId,
-    sandbox,
-    domain: 'trusted' as const,
+    sandbox: container.name,
+    domain: container.domain,
     allow: [...grant.allow],
     routes: grant.routes.map((route) => ({ bindingId: route.bindingId, host: route.host, profiles: [...route.profiles], repos: [...route.repos] })),
   }
+  const row = ProxyGrantIssuedPayload.safeParse(payload)
+  return row.success ? { payload } : { refusal: unrecordableRefusal(row.error.issues.length) }
 }
 
 function unrecordableRefusal(issues: number): string {
@@ -1486,8 +1507,10 @@ export class SandboxTools {
           'is not issued; no container was started',
       }
     }
-    const row = ProxyGrantIssuedPayload.safeParse(issuedRow(PLANNED_GRANT_ID, containerName(runId, this.#seq + 1), runId, agentId, parsed.data, 'exec'))
-    if (!row.success) return { refusal: unrecordableRefusal(row.error.issues.length) }
+    // The container stands in on the manifest's domain, where #contain will
+    // run it (#runnableDomain).
+    const row = grantIssuedRow(PLANNED_GRANT_ID, { name: containerName(runId, this.#seq + 1), domain: manifest.sandbox.domain }, runId, agentId, parsed.data, 'exec')
+    if ('refusal' in row) return { refusal: row.refusal }
     return { grant: parsed.data }
   }
 
@@ -1620,8 +1643,8 @@ export class SandboxTools {
     }
     const field = censoredField({ runId, agentId, grant: parsed.data })
     if (field !== undefined) return { refusal: censoredRefusal(field) }
-    const row = ProxyGrantIssuedPayload.safeParse(issuedRow(PLANNED_GRANT_ID, containerName(runId, this.#seq + 1), runId, agentId, parsed.data, 'publish'))
-    if (!row.success) return { refusal: unrecordableRefusal(row.error.issues.length) }
+    const row = grantIssuedRow(PLANNED_GRANT_ID, { name: containerName(runId, this.#seq + 1), domain: manifest.sandbox.domain }, runId, agentId, parsed.data, 'publish')
+    if ('refusal' in row) return { refusal: row.refusal }
     const target: PublishTarget = { gitHost: push.host, apiHost: pull.host, repo }
     const audit = this.#o.driver.commandRefusal(targetArgs(target, runId))
     if (audit !== undefined) {
@@ -1644,11 +1667,11 @@ export class SandboxTools {
     const grantId = `grant_${String(Date.now())}_${randomBytes(6).toString('hex')}`
     const field = censoredField({ grantId, runId: ctx.runId, agentId: ctx.agentId, sandbox: spec.name, grant })
     if (field !== undefined) throw new Error(`[refused] ${censoredRefusal(field)}`)
-    const payload = issuedRow(grantId, spec.name, ctx.runId, ctx.agentId, grant, purpose)
-    // #planGrant judged this row before the gate, by its stand-ins; judged
-    // again as it will be appended.
-    const recordable = ProxyGrantIssuedPayload.safeParse(payload)
-    if (!recordable.success) throw new Error(`[refused] ${unrecordableRefusal(recordable.error.issues.length)}`)
+    // The plan judged this row before the gate, by its stand-ins; judged
+    // again as it will be appended, on the domain the spec runs on.
+    const row = grantIssuedRow(grantId, spec, ctx.runId, ctx.agentId, grant, purpose)
+    if ('refusal' in row) throw new Error(`[refused] ${row.refusal}`)
+    const { payload } = row
     this.#o.store.append({ type: 'proxy.grant.issued', runId: ctx.runId, agentId: ctx.agentId, payload })
     const live: LiveGrant = Object.freeze({ grantId, purpose, runId: ctx.runId, agentId: ctx.agentId, sandbox: spec.name, grant })
     this.#grants.set(grantId, live)

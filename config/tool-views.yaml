@@ -163,3 +163,15 @@ servers:
         risk: write
         taints: true
         note: runs one command in a container of the caller's sandbox domain, with no network; taints the run
+      # sandbox.publish (egress plan S4; the operator accepted its exposure and
+      # risk on 2026-11-09): pushes the workspace's HEAD to
+      # refs/heads/aos/<runId>/<branch> of the one bound repository the
+      # caller's manifest may publish to and opens a pull request from it, by
+      # the image's fixed /opt/aos/publish.mjs, never a command of the
+      # caller's. `irreversible`, so a human approves every call (invariant 3),
+      # seeing its branch, title and body whole, and only such a call's grant
+      # holds git-push and github-pulls. The registry admits it only at tier 3.
+      publish:
+        exposure: agent
+        risk: irreversible
+        note: pushes the run's branch to its one bound repository and opens a pull request; a human approves every call

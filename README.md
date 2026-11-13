@@ -891,10 +891,11 @@ a stub that runs nothing: no run on it is offered the tool, and the gate
 denies a call of it before any human is asked. `aos approvals`
 does not show what an approval would run (protocol v1's `ApprovalItem` carries
 no preview, and adding one is a protocol version bump for the operator), so
-before `aos approve` on an exec, read the command it was shown in its
-`approval.requested` row: `npm run cli -- search --type approval.requested
---run <runId> --limit 1`. Each output stream keeps its own share of the
-result, counted in the bytes it takes in the log's JSON. Of each stream the
+before `aos approve` on an exec or a publish, read what it was shown in its
+`approval.requested` row (an exec's command; a publish's branch, title and
+body): `npm run cli -- search --type approval.requested --run <runId>
+--limit 1`. Each output stream keeps its own share of the result, counted in
+the bytes it takes in the log's JSON. Of each stream the
 runner reads and redacts at most 74 KiB (the largest share and 16 KiB more):
 all of a shorter one, the end of a longer one, and the start of one the driver
 capped at 1 MiB, since `redact.ts`'s PEM pattern takes time quadratic in BEGIN
@@ -938,6 +939,43 @@ gate asks anyone, its `tool.gate` row giving the reason, and one whose agent
 the registry stops admitting while a human is asked (archived, say) is denied
 it once approved, with a `tool.result` saying so. No shipped manifest lists it,
 so no shipped agent is offered it.
+
+`sandbox.publish` (egress plan S4), on the same server, as `irreversible`, takes
+`{branch, title, body}` and runs no command of the caller's: its container runs
+the worker image's fixed publisher (`/opt/aos/publish.mjs`, from
+`images/worker/publish.mjs`) under the mux, which reads the commit the
+workspace's `HEAD` names from `/workspace/.git`'s files, reads the repository's
+default branch, pushes the commit to `refs/heads/aos/<runId>/<branch>` from a
+bare repository of its own whose object store borrows the workspace's (so no git
+it starts reads the workspace's config or hooks), and opens a pull request from
+that branch into the default branch, with the title and body given. A human
+approves every call, whatever the run's taint, shown the branch, title and body
+whole (they must fit the 500-byte approval preview, unredacted, with no
+character a screen hides: 466 bytes of plain text together, as the preview
+counts its JSON), and the ticket binds the three: read them in its
+`approval.requested` row before `aos approve` (the search above). The approval
+names no repository: the publish goes to the one repository the manifest's
+`egress.bind` bindings name in kernel.yaml (`egress.bindings.<id>.repos`),
+which the log first records in `proxy.grant.issued`, after the approval, so read
+that binding before approving, in the agent's manifest
+(`agents/<id>/agent.yaml`, its `egress.bind`) and in kernel.yaml, each as of the
+kernel's last boot: the running kernel reads both only at boot and publishes to
+the bindings it booted with, so an edit to either takes effect only at the next
+boot, and a file edited since shows a repository this publish will not go to.
+Its grant (`proxy.grant.issued`, purpose `publish`) is the only one that holds
+`git-push` or `github-pulls`: `git-fetch` and `git-push`
+of the binding that pushes the one repository the manifest may publish to,
+`github-pulls` of the binding that opens its pull requests, each only where
+kernel.yaml gave that binding the profile, on that repository alone, and no
+credential-free host. Since the arguments name no repository, a manifest whose
+bindings make that more than one place, or none, or that pushes and opens pull
+requests through two bindings on one host, is refused, as is a run off the
+trusted domain or while egress is degraded, before any human is asked. The grant
+also names what the human approved, and the egress engine holds each request to
+it: a push only to `refs/heads/aos/<runId>/<branch>`, and one pull request, from
+that branch, with that title and body and no other field set (its base, the
+default branch the publisher read, is held to a branch name); a second is denied
+`not-granted`. Only a tier 3 worker may list it.
 
 ### Goals
 
@@ -1091,9 +1129,10 @@ unparseable or stops the test files loading is **invalid**, never a kill.
 
 It edits the working tree, in the files its mutants name: those under `src/`,
 six helpers under `test/helpers/`, and `images/worker/mux.mjs`,
-`scripts/falsify.ts`, `scripts/falsify/runner.ts`, `scripts/worker-image.ts`,
-`test/config-files.test.ts`, `test/egress-address.test.ts`,
-`test/egress-frame.test.ts` and `test/hygiene.test.ts`. So:
+`images/worker/publish.mjs`, `scripts/falsify.ts`, `scripts/falsify/runner.ts`,
+`scripts/worker-image.ts`, `test/config-files.test.ts`,
+`test/egress-address.test.ts`, `test/egress-frame.test.ts` and
+`test/hygiene.test.ts`. So:
 
 - it refuses a file with uncommitted changes (`--allow-dirty` to override);
 - it holds `.falsify/lock.json` for the whole run, naming its pid and that

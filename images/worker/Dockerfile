@@ -41,12 +41,14 @@ RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Git's system config (images/worker/gitconfig) and the mux, both root's and
-# read-only to everyone else.
+# Git's system config (images/worker/gitconfig), the mux, and the publisher
+# sandbox.publish runs (images/worker/publish.mjs, egress plan S4), all root's
+# and read-only to everyone else.
 COPY gitconfig /etc/gitconfig
 COPY mux.mjs /opt/aos/mux.mjs
+COPY publish.mjs /opt/aos/publish.mjs
 RUN chmod 0755 /opt/aos \
- && chmod 0444 /etc/gitconfig /opt/aos/mux.mjs
+ && chmod 0444 /etc/gitconfig /opt/aos/mux.mjs /opt/aos/publish.mjs
 
 # Every HTTP client a run uses sends its requests to the mux: git's libcurl
 # reads the lower-case forms (libcurl ignores an upper-case HTTP_PROXY), and

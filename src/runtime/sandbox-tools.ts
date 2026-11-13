@@ -42,6 +42,32 @@
 // so a container there may have a route the kernel did not give it, and a
 // run with no channel has no self-test of its own (src/runtime/canary.ts).
 //
+// `sandbox.publish` (egress plan S4) runs no command of the caller's: its
+// container runs the worker image's fixed publisher (images/worker/
+// publish.mjs, publishCommand) under the mux, which pushes the workspace's
+// HEAD to refs/heads/aos/<runId>/<branch> and opens a pull request from it,
+// with the branch, title and body the call names {branch, title, body}.
+// tool-views.yaml holds it `irreversible`, so the gate asks a human for every
+// call, whatever the run's taint, and its ticket binds those three. Its grant
+// (purpose `publish`, issued as an exec's is, before the spawn) is the only
+// one that holds git-push or github-pulls: git-fetch and git-push of the
+// binding that pushes the one repository the manifest may publish to (one
+// binding holding both on it, and one holding github-pulls; #planPublish
+// refuses a manifest that makes that no one place, since the call's
+// arguments name none), github-pulls of the binding that opens its pull
+// requests, each only where kernel.yaml gave that binding the profile, on
+// that repository alone, and no credential-free host. The grant also names
+// what the human approved (EgressGrant.publish), and the egress engine holds
+// each request to it, not only to the run's prefix: a push only to
+// refs/heads/aos/<runId>/<branch>, and one pull request, from that branch,
+// with exactly that title and body and no other field (src/egress/routes.ts
+// judgeCommands and judgePullsBody; policy.ts decide()'s count of what the
+// grant spent), so a publisher subverted through the workspace's objects
+// sends nothing past the approval. It runs only on the trusted domain, with
+// egress ok, and is refused, before the gate and at execution, with the
+// reason otherwise. Its arguments are held to the approval preview as an exec's
+// are, and to the driver's audit as the publisher's own arguments.
+//
 // It meets the contract every agent tool meets, as kernel-tools.ts reproduces
 // the hub's execute half for tools that have no server:
 //
@@ -162,11 +188,12 @@ import type { AgentManifest } from '../agents/manifest.js'
 import type { AgentRecord } from '../agents/registry.js'
 import { MAX_TIMER_MS, type KernelConfig } from '../config.js'
 import { EgressGrant } from '../egress/policy.js'
+import { isBranchName, MAX_BRANCH_CHARS } from '../egress/routes.js'
 import { createEgressSession, type CredentialInjector, type EgressSession, type ReadyJudge, type SessionClock, type SessionEndReason, type SessionLimits, type SessionOutcome } from '../egress/session.js'
 import type { Upstream } from '../egress/upstream.js'
-import { PROXY_GRANT_MAX_REPOS, ProxyGrantIssuedPayload } from '../events/types.js'
+import { EGRESS_DETAIL_BYTES, PROXY_GRANT_MAX_REPOS, ProxyGrantIssuedPayload } from '../events/types.js'
 import { PolicyDenied } from '../errors.js'
-import { boundOutput, PAYLOAD_TEXT_BUDGET } from '../events/bound.js'
+import { boundOutput, PAYLOAD_TEXT_BUDGET, recordable } from '../events/bound.js'
 import { canonicalize, sha256Hex } from '../events/canonical.js'
 import { redactString } from '../events/redact.js'
 import type { EventStore } from '../events/store.js'
@@ -193,6 +220,11 @@ export const SANDBOX_SERVER = 'sandbox'
 /** Whether `ref` is a sandbox tool's, which the run loop routes to SandboxTools and never to the hub. */
 export function isSandboxRef(ref: string): boolean {
   return ref.startsWith(`${SANDBOX_SERVER}.`)
+}
+
+/** Whether `ref` is a sandbox tool the runner implements: sandbox.exec or sandbox.publish. */
+function implemented(ref: string): boolean {
+  return ref === `${SANDBOX_SERVER}.exec` || ref === `${SANDBOX_SERVER}.publish`
 }
 
 /** The tier a sandbox tool starts at: tier 2 is the first that runs sandboxed (plan D15). */
@@ -395,6 +427,69 @@ export function muxCommand(command: readonly string[]): readonly string[] {
 /** The profiles an exec grant may hold of a binding: git-fetch alone. git-push and github-pulls are sandbox.publish's (S4). */
 export const EXEC_PROFILES: readonly string[] = Object.freeze(['git-fetch'])
 
+/** The two tools the runner implements. */
+const EXEC_REF = `${SANDBOX_SERVER}.exec`
+const PUBLISH_REF = `${SANDBOX_SERVER}.publish`
+
+/**
+ * The worker image's publisher, as a container runs it:
+ * images/worker/Dockerfile copies images/worker/publish.mjs to
+ * /opt/aos/publish.mjs. sandbox.publish's one program (publishCommand), run
+ * by the mux as any channel run's command is (muxCommand), never a command
+ * the caller names.
+ */
+export const PUBLISH_ARGV: readonly string[] = Object.freeze(['node', '/opt/aos/publish.mjs'])
+
+/**
+ * The profiles a publish grant holds, and of which binding: git-fetch and
+ * git-push of the binding that pushes its one repository (the default branch
+ * the pull request is opened into, then the push), and github-pulls of the
+ * one that opens its pull requests; all three on one route when one binding
+ * does both. Only a publish grant holds git-push or github-pulls.
+ */
+export const PUBLISH_PROFILES: readonly string[] = Object.freeze(['git-fetch', 'git-push', 'github-pulls'])
+const PUSH_PROFILES: readonly string[] = Object.freeze(['git-fetch', 'git-push'])
+const PULLS_PROFILES: readonly string[] = Object.freeze(['github-pulls'])
+
+/** The most bytes a publish's title takes, and its body: argv bounds, under the approval preview's own. */
+export const MAX_PUBLISH_TITLE_BYTES = 256
+export const MAX_PUBLISH_BODY_BYTES = MAX_EXEC_ARG_BYTES
+
+/** Where a publish lands: the bound repository, the host its push binding binds, and the one its pull-request binding binds. */
+export interface PublishTarget {
+  readonly gitHost: string
+  readonly apiHost: string
+  readonly repo: string
+}
+
+/** What a human approved of a publish: its branch under aos/<runId>/, its title and its body. */
+export interface PublishFields {
+  readonly branch: string
+  readonly title: string
+  readonly body: string
+}
+
+/** The publisher's arguments that only the kernel's config and the run decide: hosts, repository, run id (publish.mjs FLAGS, in order). */
+function targetArgs(target: PublishTarget, runId: string): readonly string[] {
+  return [`--git-host=${target.gitHost}`, `--api-host=${target.apiHost}`, `--repo=${target.repo}`, `--run=${runId}`]
+}
+
+/** The publisher's arguments a human approved, each joined to its flag (publish.mjs FLAGS, in order). */
+function fieldArgs(fields: PublishFields): readonly string[] {
+  return [`--branch=${fields.branch}`, `--title=${fields.title}`, `--body=${fields.body}`]
+}
+
+/**
+ * sandbox.publish's container command, before the mux wraps it: the
+ * publisher and every argument it reads (images/worker/publish.mjs
+ * parseArgs, which test/egress-publish.test.ts holds to this), each joined to
+ * its flag in one element, so no value a human approved stands as an
+ * argument of its own.
+ */
+export function publishCommand(target: PublishTarget, runId: string, fields: PublishFields): readonly string[] {
+  return Object.freeze([...PUBLISH_ARGV, ...targetArgs(target, runId), ...fieldArgs(fields)])
+}
+
 /**
  * A grant issued whose end has not yet come: one row of the in-memory grant
  * table. It leaves the table once its session has ended and the grant's
@@ -404,7 +499,8 @@ export const EXEC_PROFILES: readonly string[] = Object.freeze(['git-fetch'])
  */
 export interface LiveGrant {
   readonly grantId: string
-  readonly purpose: 'exec'
+  /** An exec's (git-fetch and credential-free hosts) or a publish's (PUBLISH_PROFILES, on one repository). */
+  readonly purpose: GrantPurpose
   readonly runId: string
   readonly agentId: string
   /** Its container's name: one container is one grant. */
@@ -479,12 +575,15 @@ function censoredField(ids: {
 /** The stand-in for a grant's id where a row is judged before the issue mints one: the id's own shape. */
 const PLANNED_GRANT_ID = 'grant_0_000000000000'
 
-/** The proxy.grant.issued row of an exec grant: one builder for the row #planGrant judges and the row #issue appends. */
-function issuedRow(grantId: string, sandbox: string, runId: string, agentId: string, grant: EgressGrant) {
+/** What a run's grant serves: one sandbox.exec, or one human-approved sandbox.publish. */
+export type GrantPurpose = 'exec' | 'publish'
+
+/** The proxy.grant.issued row of a run's grant: one builder for the row #planGrant and #planPublish judge and the row #issue appends. */
+function issuedRow(grantId: string, sandbox: string, runId: string, agentId: string, grant: EgressGrant, purpose: GrantPurpose) {
   return {
     schemaVersion: 1,
     grantId,
-    purpose: 'exec' as const,
+    purpose,
     runId,
     agentId,
     sandbox,
@@ -536,13 +635,14 @@ const ExecArgs = z
  * zod's own text for keys the schema does not take quotes each key, raw, and
  * a key of quotes or control characters takes several times its size in the
  * log's JSON, past what tool.result can hold. Every other issue's path is
- * `command` and an index, and its message zod's or ExecArgs' own, which quote
- * no value.
+ * `command` and an index (or a PublishArgs field's name), and its message
+ * zod's or the schema's own, which quote no value. `takes` is what the tool
+ * takes, for the unrecognized-keys case.
  */
-function issueText(issue: z.core.$ZodIssue): string {
+function issueText(issue: z.core.$ZodIssue, takes = 'command'): string {
   if (issue.code === 'unrecognized_keys') {
     const n = issue.keys.length
-    return `(arguments): ${String(n)} ${n === 1 ? 'key' : 'keys'} it does not take; it takes only command`
+    return `(arguments): ${String(n)} ${n === 1 ? 'key' : 'keys'} it does not take; it takes only ${takes}`
   }
   return `${issue.path.map(String).join('.') || '(arguments)'}: ${issue.message}`
 }
@@ -561,11 +661,18 @@ function execCommand(
 ): { readonly command: readonly string[] } | { readonly refusal: string } {
   const parsed = ExecArgs.safeParse(args)
   if (!parsed.success) {
-    const issues = parsed.error.issues.map(issueText).join('; ')
+    const issues = parsed.error.issues.map((issue) => issueText(issue)).join('; ')
     return { refusal: `sandbox.exec takes {command: [program, ...args]}: ${issues}` }
   }
   const { command } = parsed.data
-  const unshown = previewRefusal(args, command)
+  const unshown = previewRefusal(args, {
+    tool: 'sandbox.exec',
+    fields: command.map((arg, i) => [`command[${String(i)}]`, arg] as const),
+    noun: 'a command',
+    tooLong: 'a human could approve a command whose end they never saw. Keep each command within that, and write a longer script in steps.',
+    keepOut: 'keep anything of that shape out of the command, and make a test key inside the container rather than writing one into it.',
+    reads: 'the command as it runs',
+  })
   if (unshown !== undefined) return { refusal: unshown }
   // Before the workspace is made: the driver's audit would refuse it too,
   // after, in docker's terms rather than the command's.
@@ -624,6 +731,115 @@ const EXEC_SCHEMA: Record<string, unknown> = {
   additionalProperties: false,
 }
 
+/** sandbox.publish's arguments. Strict: a key it does not name is refused, never ignored. */
+const PublishArgs = z
+  .object({
+    branch: z.string().refine(isBranchName, {
+      message:
+        'a branch name: components of letters, digits, ., _ and -, none starting with . or -, none ending with . or ' +
+        `.lock, no .., at most ${String(MAX_BRANCH_CHARS)} characters`,
+    }),
+    title: z
+      .string()
+      .min(1, { message: 'a pull request has a title' })
+      .refine((text) => Buffer.byteLength(text) <= MAX_PUBLISH_TITLE_BYTES, { message: `a title is at most ${String(MAX_PUBLISH_TITLE_BYTES)} bytes` })
+      .refine((text) => !text.includes(NUL), { message: 'a title may not hold a NUL character' }),
+    body: z
+      .string()
+      .refine((text) => Buffer.byteLength(text) <= MAX_PUBLISH_BODY_BYTES, { message: `a body is at most ${String(MAX_PUBLISH_BODY_BYTES)} bytes` })
+      .refine((text) => !text.includes(NUL), { message: 'a body may not hold a NUL character' }),
+  })
+  .strict()
+
+/**
+ * sandbox.publish's fields, or why the runner refuses `args` on them alone,
+ * in the order #publish reads them: PublishArgs' bounds, then what a human
+ * approving the call would not be shown as it runs (previewRefusal), then
+ * what `driver`'s audit refuses of the arguments the fields become (each
+ * joined to its flag, fieldArgs). Each refusal names a field by its name, and
+ * quotes none of it.
+ */
+function publishFields(
+  args: Record<string, unknown>,
+  driver: Pick<SandboxDriver, 'commandRefusal'>,
+): { readonly fields: PublishFields } | { readonly refusal: string } {
+  const parsed = PublishArgs.safeParse(args)
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map((issue) => issueText(issue, 'branch, title and body')).join('; ')
+    return { refusal: `sandbox.publish takes {branch, title, body}: ${issues}` }
+  }
+  const fields = parsed.data
+  const unshown = previewRefusal(args, {
+    tool: 'sandbox.publish',
+    fields: [
+      ['branch', fields.branch],
+      ['title', fields.title],
+      ['body', fields.body],
+    ],
+    noun: 'a pull request',
+    tooLong:
+      'a human could approve a pull request whose end they never saw. Keep the branch, title and body within that; ' +
+      'a longer account belongs in the commits you push.',
+    keepOut: 'keep anything of that shape out of the pull request.',
+    reads: 'the pull request as it is opened',
+  })
+  if (unshown !== undefined) return { refusal: unshown }
+  const own = fieldArgs(fields)
+  if (driver.commandRefusal(own) === undefined) return { fields }
+  const at = own.findIndex((arg) => driver.commandRefusal([arg]) !== undefined)
+  const name = ['branch', 'title', 'body'][at] ?? 'the branch, title and body together'
+  const said = driver.commandRefusal(at === -1 ? own : [own[at] ?? ''])
+  return {
+    refusal:
+      `sandbox.publish's ${name} is refused by the sandbox's audit, which reads the publisher's arguments as part of ` +
+      `the docker run's own (${said ?? 'refused'}). Leave that out of it.`,
+  }
+}
+
+/**
+ * The bytes a publish's branch, title and body may take together, as the
+ * approval preview counts them (previewRefusal): APPROVAL_PREVIEW_BYTES less
+ * the canonical JSON around three empty fields,
+ * {"body":"","branch":"","title":""}. JSON escapes a quote, a backslash and a
+ * control character (a line break among them) in two bytes or more, so plain
+ * text up to this many bytes is shown whole, and text holding those fits in
+ * fewer.
+ */
+export const PUBLISH_FIELDS_BYTES = APPROVAL_PREVIEW_BYTES - Buffer.byteLength(canonicalize({ body: '', branch: '', title: '' }))
+
+/**
+ * What every model offered sandbox.publish is told of it: what it does, that
+ * it is a fixed program and not a command, that a human approves every call
+ * seeing all of what it sends, and that its arguments must fit what that
+ * human is shown, in the bytes the preview counts (PUBLISH_FIELDS_BYTES), and
+ * each field its own bound (MAX_PUBLISH_TITLE_BYTES, MAX_BRANCH_CHARS), which
+ * is narrower than that budget: a title or branch within the three's bytes
+ * together is still refused past its own.
+ */
+export const PUBLISH_DESCRIPTION =
+  "Publish your work for review: push the commit your workspace's HEAD names to the branch " +
+  'aos/<your run id>/<branch> of the one repository your manifest may publish to, then open a pull request from ' +
+  "that branch into the repository's default branch, with the title and body you give. It runs a fixed program " +
+  'in a fresh container of your sandbox, never a command of yours, from /workspace, which must be a plain git ' +
+  'repository (clone into it with git clone <url> .). A human approves every call before it runs, and is shown ' +
+  `exactly the branch, title and body you send: keep the three within ${String(PUBLISH_FIELDS_BYTES)} bytes ` +
+  'together, in plain text, and fewer with quotes, backslashes or line breaks, which the human is shown escaped; ' +
+  `of those, the title takes at most ${String(MAX_PUBLISH_TITLE_BYTES)} bytes and the branch at most ` +
+  `${String(MAX_BRANCH_CHARS)} characters. ` +
+  'You get what was pushed and the pull request\'s address, or why not. Its output is ' +
+  'untrusted, as sandbox.exec\'s is.'
+
+const PUBLISH_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    branch: { type: 'string', description: `The branch, pushed as aos/<your run id>/<branch>; at most ${String(MAX_BRANCH_CHARS)} characters.` },
+    title: { type: 'string', description: `The pull request's title; at most ${String(MAX_PUBLISH_TITLE_BYTES)} bytes.` },
+    body: { type: 'string', description: "The pull request's body; may be empty." },
+  },
+  required: ['branch', 'title', 'body'],
+  additionalProperties: false,
+}
+
 /** What a tool's work came to, before it is bounded for the log and the model. */
 interface Done {
   readonly ok: boolean
@@ -670,10 +886,13 @@ export class SandboxTools {
     return [...this.#grants.values()]
   }
 
-  /** Schemas for every sandbox tool the policy file exposes to agents. */
+  /** Schemas for every sandbox tool the policy file exposes to agents: exec, then publish. */
   schemas(): ToolSchema[] {
-    if (resolveView(this.#o.views, SANDBOX_SERVER, 'exec').exposure !== 'agent') return []
-    return [{ ref: `${SANDBOX_SERVER}.exec`, description: EXEC_DESCRIPTION, inputSchema: EXEC_SCHEMA }]
+    const exposed = (name: string): boolean => resolveView(this.#o.views, SANDBOX_SERVER, name).exposure === 'agent'
+    return [
+      ...(exposed('exec') ? [{ ref: EXEC_REF, description: EXEC_DESCRIPTION, inputSchema: EXEC_SCHEMA }] : []),
+      ...(exposed('publish') ? [{ ref: PUBLISH_REF, description: PUBLISH_DESCRIPTION, inputSchema: PUBLISH_SCHEMA }] : []),
+    ]
   }
 
   isSandboxRef(ref: string): boolean {
@@ -703,10 +922,15 @@ export class SandboxTools {
    * (GateInput.runnerRefusal), so a call the runner refuses
    * whoever approved it is denied before any human is asked to approve it.
    * Undefined for a ref with no arguments the runner reads: call() refuses
-   * a tool the kernel does not implement at execution.
+   * a tool the kernel does not implement at execution. For sandbox.publish,
+   * what #publish refuses of its fields alone (publishFields).
    */
   argsRefusal(ref: string, args: Record<string, unknown>): string | undefined {
-    if (ref !== `${SANDBOX_SERVER}.exec`) return undefined
+    if (ref === PUBLISH_REF) {
+      const fields = publishFields(args, this.#o.driver)
+      return 'refusal' in fields ? fields.refusal : undefined
+    }
+    if (ref !== EXEC_REF) return undefined
     const checked = execCommand(args, this.#o.driver)
     return 'refusal' in checked ? checked.refusal : undefined
   }
@@ -728,7 +952,7 @@ export class SandboxTools {
    * daemon before every approval.
    */
   configRefusal(ref: string): string | undefined {
-    if (ref !== `${SANDBOX_SERVER}.exec`) return undefined
+    if (!implemented(ref)) return undefined
     return this.#o.driver.everyRunRefusal() ?? imageIdProblem(this.#o.sandbox.imageId)
   }
 
@@ -745,7 +969,7 @@ export class SandboxTools {
    * registry does not admit (holderProblem says why).
    */
   domainRefusal(ref: string, agentId: string): string | undefined {
-    if (ref !== `${SANDBOX_SERVER}.exec`) return undefined
+    if (!implemented(ref)) return undefined
     const held = this.#holderOf(ref, agentId)
     if ('problem' in held) return undefined
     const domain = held.manifest.sandbox?.domain
@@ -773,14 +997,21 @@ export class SandboxTools {
    * handing the answer to it (GateInput.runnerRefusal), so no human is asked
    * to approve an exec that would be refused; #exec asks it again. Undefined
    * for a manifest with no egress and for every hostile-domain run, which
-   * runs with no channel, as every run did before egress.
+   * runs with no channel, as every run did before egress. For sandbox.publish,
+   * which never runs without its grant, why #planPublish would issue it none:
+   * a run off the trusted domain, egress not ok, no one bound repository to
+   * publish to, or any reason an exec's grant is refused.
    */
   egressRefusal(ref: string, agentId: string, runId?: string): string | undefined {
-    if (ref !== `${SANDBOX_SERVER}.exec`) return undefined
+    if (!implemented(ref)) return undefined
     const held = this.#holderOf(ref, agentId)
     if ('problem' in held) return undefined
     // A run id that is no ref (the offer's placeholder) is judged by the
     // exec's own: only the agent's egress and boot's verdict are read here.
+    if (ref === PUBLISH_REF) {
+      const planned = this.#planPublish(held.manifest, runId ?? 'offer', agentId)
+      return 'refusal' in planned ? planned.refusal : undefined
+    }
     const planned = this.#planGrant(held.manifest, runId ?? 'offer', agentId)
     return planned !== undefined && 'refusal' in planned ? planned.refusal : undefined
   }
@@ -810,7 +1041,7 @@ export class SandboxTools {
     if (view.exposure !== 'agent') {
       throw new PolicyDenied(ref, `exposure is ${view.exposure}; agents may only call agent tools`)
     }
-    if (name !== 'exec') throw new PolicyDenied(ref, `the kernel implements no sandbox tool ${name}`)
+    if (!implemented(ref)) throw new PolicyDenied(ref, `the kernel implements no sandbox tool ${name}`)
     const manifest = this.#holder(ref, ctx.agentId)
 
     this.#o.store.append({
@@ -829,7 +1060,7 @@ export class SandboxTools {
     const startedAt = Date.now()
     let done: Done
     try {
-      done = await this.#exec(args, ctx, manifest)
+      done = ref === PUBLISH_REF ? await this.#publish(args, ctx, manifest) : await this.#exec(args, ctx, manifest)
     } catch (e) {
       // A refusal or a failure is a failed call the model can read, not a
       // crashed run: what an MCP tool that threw gets.
@@ -910,15 +1141,65 @@ export class SandboxTools {
     if ('refusal' in checked) throw new Error(`[refused] ${checked.refusal}`)
     const { command } = checked
     if (ctx.signal?.aborted === true) throw new Error('[refused] the run was stopped before the container started')
+    const domain = this.#runnableDomain(manifest)
 
-    // Asked of the loop before the gate too (configRefusal), and again here,
-    // each on its own, so neither rests on the other's reading: before the
-    // workspace, which a driver that runs nothing would leave behind empty.
+    // The grant this exec would be issued, or why none can be: asked of the
+    // loop before the gate too (egressRefusal), and again here. Undefined for
+    // a manifest with no egress, and for every hostile-domain run, whatever
+    // its manifest says: that domain gets no channel and no grant.
+    const planned = this.#planGrant(manifest, ctx.runId, ctx.agentId)
+    if (planned !== undefined && 'refusal' in planned) throw new Error(`[refused] ${planned.refusal}`)
+    // A channel run's container runs the worker image's mux around the
+    // command (muxCommand): with no mux, the session would read the command's
+    // own stdout as frames, no ready report would come, and the run would
+    // fail closed every time.
+    return this.#contain(ctx, domain, planned === undefined ? command : muxCommand(command), planned === undefined ? undefined : { grant: planned.grant, purpose: 'exec' })
+  }
+
+  /**
+   * One publish: the image's publisher (publishCommand) in one container of
+   * the trusted domain, under a publish grant (#planPublish), start to end,
+   * as an exec's channel run is. Never without its grant: there is nothing
+   * for it to do with no network.
+   */
+  async #publish(args: Record<string, unknown>, ctx: SandboxCallContext, manifest: AgentManifest): Promise<Done> {
+    // Asked of the loop before the gate too (argsRefusal), and again here.
+    const checked = publishFields(args, this.#o.driver)
+    if ('refusal' in checked) throw new Error(`[refused] ${checked.refusal}`)
+    if (ctx.signal?.aborted === true) throw new Error('[refused] the run was stopped before the container started')
+    const domain = this.#runnableDomain(manifest)
+    // Asked of the loop before the gate too (egressRefusal), and again here,
+    // now with what the human approved, which the grant names, so the egress
+    // engine holds the push and the pull request to it (EgressGrant.publish).
+    const planned = this.#planPublish(manifest, ctx.runId, ctx.agentId, checked.fields)
+    if ('refusal' in planned) throw new Error(`[refused] ${planned.refusal}`)
+    const command = muxCommand(publishCommand(planned.target, ctx.runId, checked.fields))
+    // The whole command, as the driver's audit will read it: its parts were
+    // judged apart before the gate (the fields in argsRefusal, the target in
+    // egressRefusal); judged together here, before any workspace. Defence in
+    // depth: today's docker.ts audit refuses no whole whose parts it passed
+    // (it reads each element on its own, and no joined --flag=value argument
+    // counts as a -v or a --mount), but one that read across elements would
+    // refuse here, not at the driver after a workspace and a grant
+    // (test/sandbox-exec.test.ts holds this check with such an audit).
+    const audit = this.#o.driver.commandRefusal(command)
+    if (audit !== undefined) throw new Error(`[refused] the publisher's command is one the sandbox's audit refuses (${audit}); no container was started`)
+    return this.#contain(ctx, domain, command, { grant: planned.grant, purpose: 'publish' })
+  }
+
+  /**
+   * The manifest's domain, once the kernel's sandbox config lets a container
+   * run at all (a driver that runs one, a pinned image id) and boot has not
+   * closed that domain; else a refusal, thrown. Asked of the loop before the
+   * gate too (configRefusal, domainRefusal), and again here, each on its own,
+   * so neither rests on the other's reading: before any workspace, which a
+   * driver that runs nothing would leave behind empty.
+   */
+  #runnableDomain(manifest: AgentManifest): SandboxDomain {
     const runsNothing = this.#o.driver.everyRunRefusal()
     if (runsNothing !== undefined) throw new Error(`[refused] ${runsNothing}`)
-    const { imageId, domains, defaults } = this.#o.sandbox
-    const unpinned = imageIdProblem(imageId)
-    if (unpinned !== undefined || imageId === undefined) throw new Error(`[refused] ${unpinned ?? 'no image id'}`)
+    const unpinned = imageIdProblem(this.#o.sandbox.imageId)
+    if (unpinned !== undefined || this.#o.sandbox.imageId === undefined) throw new Error(`[refused] ${unpinned ?? 'no image id'}`)
 
     // The manifest's own domain. #holder admitted only a manifest with one;
     // this says so to the compiler without choosing a domain for it.
@@ -930,13 +1211,23 @@ export class SandboxTools {
     // loop before the gate too (domainRefusal), and again here.
     const closed = this.#closedRefusal(domain)
     if (closed !== undefined) throw new Error(`[refused] ${closed}`)
+    return domain
+  }
 
-    // The grant this exec would be issued, or why none can be: asked of the
-    // loop before the gate too (egressRefusal), and again here. Undefined for
-    // a manifest with no egress, and for every hostile-domain run, whatever
-    // its manifest says: that domain gets no channel and no grant.
-    const planned = this.#planGrant(manifest, ctx.runId, ctx.agentId)
-    if (planned !== undefined && 'refusal' in planned) throw new Error(`[refused] ${planned.refusal}`)
+  /**
+   * Run `command` in one container on `domain`, start to end: its wallclock,
+   * its workspace, its grant issued before the spawn (with a channel) when
+   * `planned` names one, its sandbox.started and sandbox.killed rows, its
+   * grant's revocation, and what the call comes to (describe).
+   */
+  async #contain(
+    ctx: SandboxCallContext,
+    domain: SandboxDomain,
+    command: readonly string[],
+    planned: { readonly grant: EgressGrant; readonly purpose: GrantPurpose } | undefined,
+  ): Promise<Done> {
+    const { imageId, domains, defaults } = this.#o.sandbox
+    if (imageId === undefined) throw new Error('[refused] no image id')
 
     // What is left of the run's budget, at most the operator's cap on one
     // container. Floored: a timer converts its delay to whole milliseconds.
@@ -957,21 +1248,19 @@ export class SandboxTools {
       agentId: ctx.agentId,
       domain,
       image: imageId,
-      // A channel run's container runs the worker image's mux around the
-      // command (muxCommand): with no mux, the session would read the
-      // command's own stdout as frames, no ready report would come, and the
-      // run would fail closed every time.
-      command: planned === undefined ? command : muxCommand(command),
+      // A channel run's command arrives wrapped in the mux's (muxCommand).
+      command,
       workspace,
       limits: { memoryMb, cpus: defaults.cpus, pids: defaults.pidsLimit, wallclockMs },
-      // A channel only for a grant, which only a trusted run with egress is
-      // planned. A run without one has no -i, and its stdin is closed at once.
+      // A channel only for a grant, which only a trusted run with egress, or
+      // a publish, is planned. A run without one has no -i, and its stdin is
+      // closed at once.
       ...(planned === undefined ? {} : { channel: true }),
     }
 
     // Issued BEFORE the spawn: the container's first byte on its channel is
     // judged under a grant the log already holds.
-    const issued = planned === undefined ? undefined : this.#issue(planned.grant, spec, ctx)
+    const issued = planned === undefined ? undefined : this.#issue(planned.grant, spec, ctx, planned.purpose)
 
     let running: RunningSandbox
     try {
@@ -1197,9 +1486,152 @@ export class SandboxTools {
           'is not issued; no container was started',
       }
     }
-    const row = ProxyGrantIssuedPayload.safeParse(issuedRow(PLANNED_GRANT_ID, containerName(runId, this.#seq + 1), runId, agentId, parsed.data))
+    const row = ProxyGrantIssuedPayload.safeParse(issuedRow(PLANNED_GRANT_ID, containerName(runId, this.#seq + 1), runId, agentId, parsed.data, 'exec'))
     if (!row.success) return { refusal: unrecordableRefusal(row.error.issues.length) }
     return { grant: parsed.data }
+  }
+
+  /**
+   * The grant a publish of `manifest` in run `runId` would be issued, and
+   * where it publishes, or why it cannot. A publish runs only under its
+   * grant, on the trusted domain (the only one granted, by code), and its
+   * arguments name no repository, so it publishes only where the manifest's
+   * bindings make that one place: exactly one repository that one binding
+   * holds git-fetch and git-push on (the push, and the default branch it is
+   * read from) and one holds github-pulls on (the pull request; the same
+   * binding when it holds all three). The grant routes that repository
+   * alone, each binding with only the profiles of those it holds that its
+   * half needs, and no credential-free host: the image's publisher reaches
+   * nothing else. With `fields`, what a human approved of the call, the grant
+   * names them (EgressGrant.publish), so the egress engine holds its push to
+   * that branch alone and its one pull request to that branch, title and
+   * body; without them (the offer, the pre-gate ask) it is judged as the same
+   * grant would be. Refused, as an exec's grant is, when egress is not ok or
+   * a binding it routes did not resolve at boot (assertEgressEnforced), when
+   * the manifest binds a binding kernel.yaml does not hold, when an
+   * identifier it names is one the log would store censored, when the row
+   * #issue would append is one proxy.grant.issued refuses, and when the
+   * driver's audit refuses the publisher's arguments the grant decides (its
+   * hosts, its repository, the run's id: targetArgs), so no human approves a
+   * publish that then never runs. Bindings are read with Object.hasOwn.
+   */
+  #planPublish(
+    manifest: AgentManifest,
+    runId: string,
+    agentId: string,
+    fields?: PublishFields,
+  ): { readonly grant: EgressGrant; readonly target: PublishTarget } | { readonly refusal: string } {
+    const no = '; no container was started'
+    if (manifest.sandbox?.domain !== 'trusted') {
+      return {
+        refusal:
+          `${manifest.id} is not sandboxed in the trusted domain, and sandbox.publish reaches its repository only ` +
+          `through the kernel's egress engine, which serves the trusted domain alone${no}`,
+      }
+    }
+    const egress = this.#o.egress
+    if (egress === undefined) {
+      return { refusal: `sandbox.publish reaches its repository only through the kernel's egress engine, and none is wired into this kernel${no}` }
+    }
+    try {
+      assertEgressEnforced(egress.state, { used: [], resolved: egress.resolved })
+    } catch (e) {
+      return { refusal: `${e instanceof Error ? e.message : String(e)}${no}` }
+    }
+    /** A binding able to serve one half of a publish on a repository: its id, its host, and its own profiles. */
+    type Half = { readonly bindingId: string; readonly host: string; readonly profiles: readonly string[] }
+    const pushers = new Map<string, Half[]>()
+    const pullers = new Map<string, Half[]>()
+    const unknown: string[] = []
+    for (const id of manifest.egress.bind) {
+      const binding = Object.hasOwn(egress.bindings, id) ? egress.bindings[id] : undefined
+      if (binding === undefined) {
+        unknown.push(id)
+        continue
+      }
+      const pushes = PUSH_PROFILES.every((p) => binding.profiles.includes(p))
+      const pulls = PULLS_PROFILES.every((p) => binding.profiles.includes(p))
+      const half: Half = { bindingId: id, host: binding.host, profiles: [...binding.profiles] }
+      for (const repo of binding.repos) {
+        if (pushes) pushers.set(repo, [...(pushers.get(repo) ?? []), half])
+        if (pulls) pullers.set(repo, [...(pullers.get(repo) ?? []), half])
+      }
+    }
+    if (unknown.length > 0) {
+      return { refusal: `${manifest.id}'s egress.bind names ${String(unknown.length)} binding(s) kernel.yaml does not hold${no}` }
+    }
+    const repos = [...pushers.keys()].filter((repo) => pullers.has(repo))
+    const [repo] = repos
+    if (repo === undefined) {
+      return {
+        refusal:
+          `${manifest.id}'s egress binds no repository sandbox.publish can publish to: one binding holding git-fetch ` +
+          `and git-push on it, and one holding github-pulls${no}`,
+      }
+    }
+    if (repos.length > 1) {
+      return {
+        refusal:
+          `${manifest.id}'s egress binds ${String(repos.length)} repositories sandbox.publish could publish to, and its ` +
+          `arguments name none, so it publishes only where its bindings make that one repository${no}`,
+      }
+    }
+    const pusher = pushers.get(repo) ?? []
+    const puller = pullers.get(repo) ?? []
+    const [push] = pusher
+    const [pull] = puller
+    if (push === undefined || pull === undefined || pusher.length > 1 || puller.length > 1) {
+      const many = pusher.length > 1 ? pusher.length : puller.length
+      return {
+        refusal:
+          `${String(many)} of ${manifest.id}'s bindings ${pusher.length > 1 ? 'push' : 'open pull requests in'} its ` +
+          `one repository to publish to, and its arguments name none, so where it would publish is not one place${no}`,
+      }
+    }
+    // Two bindings, one host: a request there would not say whose credential
+    // it carries, so a grant routes a repository on a host through one
+    // binding alone (EgressGrant), and this one could not be issued.
+    if (push.bindingId !== pull.bindingId && push.host === pull.host) {
+      return {
+        refusal:
+          `${manifest.id}'s egress pushes its one repository to publish to through one binding and opens its pull ` +
+          'requests through another on the same host, and a grant routes a repository on a host through one binding ' +
+          `alone: bind one binding there holding git-fetch, git-push and github-pulls, or put the pull requests on a host of their own${no}`,
+      }
+    }
+    // Each route holds the profiles its half needs that its binding holds,
+    // and no other: never wider than kernel.yaml gave the binding.
+    const held = (half: Half, needs: readonly string[]): string[] => needs.filter((p) => half.profiles.includes(p))
+    const routes =
+      push.bindingId === pull.bindingId
+        ? [{ bindingId: push.bindingId, host: push.host, profiles: held(push, PUBLISH_PROFILES), repos: [repo] }]
+        : [
+            { bindingId: push.bindingId, host: push.host, profiles: held(push, PUSH_PROFILES), repos: [repo] },
+            { bindingId: pull.bindingId, host: pull.host, profiles: held(pull, PULLS_PROFILES), repos: [repo] },
+          ]
+    try {
+      assertEgressEnforced(egress.state, { used: routes.map((r) => r.bindingId), resolved: egress.resolved })
+    } catch (e) {
+      return { refusal: `${e instanceof Error ? e.message : String(e)}${no}` }
+    }
+    const parsed = EgressGrant.safeParse({ runId, allow: [], routes, ...(fields === undefined ? {} : { publish: { ...fields } }) })
+    if (!parsed.success) {
+      return { refusal: `the grant ${manifest.id}'s publish would be issued is not one the egress engine reads (${String(parsed.error.issues.length)} issue(s))${no}` }
+    }
+    const field = censoredField({ runId, agentId, grant: parsed.data })
+    if (field !== undefined) return { refusal: censoredRefusal(field) }
+    const row = ProxyGrantIssuedPayload.safeParse(issuedRow(PLANNED_GRANT_ID, containerName(runId, this.#seq + 1), runId, agentId, parsed.data, 'publish'))
+    if (!row.success) return { refusal: unrecordableRefusal(row.error.issues.length) }
+    const target: PublishTarget = { gitHost: push.host, apiHost: pull.host, repo }
+    const audit = this.#o.driver.commandRefusal(targetArgs(target, runId))
+    if (audit !== undefined) {
+      return {
+        refusal:
+          `the publisher's arguments for ${manifest.id}'s bound repository are refused by the sandbox's audit, which ` +
+          `reads them as part of the docker run's own (${audit}): its host or repository names what no docker run may${no}`,
+      }
+    }
+    return { grant: parsed.data, target }
   }
 
   /**
@@ -1208,25 +1640,29 @@ export class SandboxTools {
    * not issued), proxy.grant.issued appended, and the grant entered in the
    * table. Before the spawn, so a refusal here starts nothing.
    */
-  #issue(grant: EgressGrant, spec: SandboxSpec, ctx: SandboxCallContext): Issued {
+  #issue(grant: EgressGrant, spec: SandboxSpec, ctx: SandboxCallContext, purpose: GrantPurpose): Issued {
     const grantId = `grant_${String(Date.now())}_${randomBytes(6).toString('hex')}`
     const field = censoredField({ grantId, runId: ctx.runId, agentId: ctx.agentId, sandbox: spec.name, grant })
     if (field !== undefined) throw new Error(`[refused] ${censoredRefusal(field)}`)
-    const payload = issuedRow(grantId, spec.name, ctx.runId, ctx.agentId, grant)
+    const payload = issuedRow(grantId, spec.name, ctx.runId, ctx.agentId, grant, purpose)
     // #planGrant judged this row before the gate, by its stand-ins; judged
     // again as it will be appended.
     const recordable = ProxyGrantIssuedPayload.safeParse(payload)
     if (!recordable.success) throw new Error(`[refused] ${unrecordableRefusal(recordable.error.issues.length)}`)
     this.#o.store.append({ type: 'proxy.grant.issued', runId: ctx.runId, agentId: ctx.agentId, payload })
-    const live: LiveGrant = Object.freeze({ grantId, purpose: 'exec', runId: ctx.runId, agentId: ctx.agentId, sandbox: spec.name, grant })
+    const live: LiveGrant = Object.freeze({ grantId, purpose, runId: ctx.runId, agentId: ctx.agentId, sandbox: spec.name, grant })
     this.#grants.set(grantId, live)
     return live
   }
 
   /**
    * Revoke a grant whose container never served it (the driver refused the
-   * spec, or gave the run no channel): proxy.grant.revoked `error`, with
-   * zero totals, since nothing crossed a channel under it.
+   * spec, gave the run no channel, or its session would not start):
+   * proxy.grant.revoked `error`, with zero totals, since nothing crossed a
+   * channel under it. `detail` is redacted and cut to EGRESS_DETAIL_BYTES
+   * (recordable), as canary.ts cuts its own: a session's refusal quotes its
+   * schema's message, which may run past what the row holds, and a row the
+   * store refuses would leave the grant open until the next boot.
    */
   #revokeUnserved(issued: Issued, ctx: SandboxCallContext, detail: string): void {
     this.#grants.delete(issued.grantId)
@@ -1234,7 +1670,7 @@ export class SandboxTools {
       type: 'proxy.grant.revoked',
       runId: ctx.runId,
       agentId: ctx.agentId,
-      payload: { schemaVersion: 1, grantId: issued.grantId, reason: 'error', detail, totals: ZERO_TOTALS },
+      payload: { schemaVersion: 1, grantId: issued.grantId, reason: 'error', detail: recordable(detail, EGRESS_DETAIL_BYTES), totals: ZERO_TOTALS },
     })
   }
 
@@ -1542,42 +1978,56 @@ export function mayRunOn(result: SandboxResult): string | undefined {
  * unseen, whoever approved it. Nothing of the arguments is echoed: a span
  * that redaction would hide is named by its place only.
  */
-function previewRefusal(args: Record<string, unknown>, command: readonly string[]): string | undefined {
+function previewRefusal(args: Record<string, unknown>, shown: Shown): string | undefined {
   const preview = approvalPreview(args)
   if (preview.truncated) {
     return (
-      `sandbox.exec's arguments come to ${String(preview.bytes)} bytes as a human approving the call is ` +
+      `${shown.tool}'s arguments come to ${String(preview.bytes)} bytes as a human approving the call is ` +
       `shown them (redacted canonical JSON), and approval.requested shows at most ${String(APPROVAL_PREVIEW_BYTES)}: ` +
-      'a human could approve a command whose end they never saw. Keep each command within that, and write a ' +
-      'longer script in steps.'
+      shown.tooLong
     )
   }
   // The preview is the canonical JSON redacted (redact.ts): any difference is
   // a span it would show as [REDACTED], and the PEM pattern hides everything
   // between its BEGIN and END markers, a whole command among it.
   if (preview.text !== canonicalize(args)) {
-    const at = command.findIndex((arg) => redactString(arg) !== arg)
-    const where = at === -1 ? "sandbox.exec's arguments hold, across more than one of them," : `command[${String(at)}] holds`
+    const at = shown.fields.find(([, text]) => redactString(text) !== text)
+    const where = at === undefined ? `${shown.tool}'s arguments hold, across more than one of them,` : `${at[0]} holds`
     return (
       `${where} a span the log redacts as a credential (a PEM private key block, a bearer token, a provider, ` +
       'GitHub, Slack or AWS key, a JWT, or a value the kernel holds as secret), so a human approving this call ' +
-      'would be shown [REDACTED] in its place, and could approve a command they cannot read. A worker never holds ' +
-      'a credential: keep anything of that shape out of the command, and make a test key inside the container ' +
-      'rather than writing one into it.'
+      `would be shown [REDACTED] in its place, and could approve ${shown.noun} they cannot read. A worker never holds ` +
+      `a credential: ${shown.keepOut}`
     )
   }
-  for (const [index, arg] of command.entries()) {
-    const unseen = UNSEEN.exec(arg)
+  for (const [label, text] of shown.fields) {
+    const unseen = UNSEEN.exec(text)
     if (unseen === null) continue
     const point = `U+${(unseen[0].codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0')}`
     return (
-      `command[${String(index)}] holds ${point}, a character a screen shows as nothing or uses to reorder the text ` +
+      `${label} holds ${point}, a character a screen shows as nothing or uses to reorder the text ` +
       'around it (a format, bidi or C1 control, a filler or variation selector, or a line separator), so a human ' +
-      'approving this call would not read the command as it runs. Write it as an escape the program decodes, or ' +
+      `approving this call would not read ${shown.reads}. Write it as an escape the program decodes, or ` +
       'leave it out.'
     )
   }
   return undefined
+}
+
+/** What previewRefusal says of one tool's arguments: each by its place, and the words its refusals use. */
+interface Shown {
+  /** sandbox.exec or sandbox.publish. */
+  readonly tool: string
+  /** Each argument a human reads, by its place (command[0], branch), and its text. */
+  readonly fields: readonly (readonly [string, string])[]
+  /** What a human could approve that they cannot read: a command, a pull request. */
+  readonly noun: string
+  /** What to do about arguments the preview would cut. */
+  readonly tooLong: string
+  /** What to do about a span the preview would redact. */
+  readonly keepOut: string
+  /** What a hidden character keeps a human from reading. */
+  readonly reads: string
 }
 
 /**

@@ -511,13 +511,14 @@ test('the worker Dockerfile FROM is pinned by digest, USER is 65534:65534, the p
 
   // The image's own files are every file in its build context but the
   // Dockerfile and the context's .dockerignore, each copied once: git's
-  // config to /etc/gitconfig, the rest (the mux) to /opt/aos, where the mux's
+  // config to /etc/gitconfig, the rest (the mux, and the publisher
+  // sandbox.publish runs, egress plan S4) to /opt/aos, where each one's
   // header says it runs from. The .dockerignore admits exactly those, so
   // nothing else that lands in images/worker reaches a build. Read from the
   // directory rather than named here: only test/egress-mux.test.ts spells the
   // mux's file name (test/hygiene.test.ts).
   const context = readdirSync(join(REPO, 'images/worker')).filter((f) => f !== 'Dockerfile' && f !== '.dockerignore').sort()
-  assert.ok(context.length >= 2 && context.includes('gitconfig'), context.join(', '))
+  assert.ok(context.length === 3 && context.includes('gitconfig') && context.includes('publish.mjs'), context.join(', '))
   assert.deepEqual([...of('COPY')].sort(), context.map((f) => `${f} ${f === 'gitconfig' ? '/etc/gitconfig' : `/opt/aos/${f}`}`))
   const ignore = read('images/worker/.dockerignore').split('\n').map((l) => l.trim()).filter((l) => l !== '' && !l.startsWith('#'))
   assert.deepEqual(ignore, ['*', ...context.map((f) => `!${f}`)])
@@ -1919,24 +1920,31 @@ test('.npmrc keeps npm\'s cache in the program folder', () => {
   assert.match(read('.npmrc'), /^cache=\.aos\/npm-cache$/m)
 })
 
-test('config/tool-views.yaml: pmmcp pins nineteen closed, and only the two kernel tools and sandbox.exec are exposed', () => {
+test('config/tool-views.yaml: pmmcp pins nineteen closed, and only the two kernel tools, sandbox.exec and sandbox.publish are exposed', () => {
   const file = parseToolViews(readYaml('config/tool-views.yaml'))
   const servers = Object.keys(file.servers).sort()
   assert.deepEqual(servers, ['kernel', 'pmmcp', 'sandbox'])
 
-  // The sandbox section (egress plan S3, the operator's acceptance of
-  // 2026-11-09): exec and nothing else, write risk so a tainted run needs a
-  // human for it, and taints: true, so the first exec of a run makes every
-  // later write in it, the next exec among them, wait for a human.
+  // The sandbox section (egress plan S3 and S4, the operator's acceptance of
+  // 2026-11-09): exec and publish and nothing else. exec is write risk so a
+  // tainted run needs a human for it, and taints: true, so the first exec of
+  // a run makes every later write in it, the next exec among them, wait for a
+  // human. publish is irreversible, so a human approves every call of it,
+  // whatever the run's taint (gate rule 4, invariant 3).
   const exposedSandbox = Object.entries(file.servers['sandbox']!.tools).filter(([, v]) => v.exposure === 'agent')
-  assert.deepEqual(exposedSandbox.map(([n]) => n), ['exec'])
+  assert.deepEqual(exposedSandbox.map(([n]) => n), ['exec', 'publish'])
   const exec = resolveView(file, 'sandbox', 'exec')
   assert.deepEqual(
     { exposure: exec.exposure, risk: exec.risk, taints: exec.taints, quarantine: exec.quarantine },
     { exposure: 'agent', risk: 'write', taints: true, quarantine: false },
   )
+  const publish = resolveView(file, 'sandbox', 'publish')
+  assert.deepEqual(
+    { exposure: publish.exposure, risk: publish.risk, quarantine: publish.quarantine },
+    { exposure: 'agent', risk: 'irreversible', quarantine: false },
+  )
   assert.equal(file.servers['sandbox']!.default, 'kernel-only')
-  assert.equal(resolveView(file, 'sandbox', 'publish').exposure, 'kernel-only', 'sandbox.publish is task S4, not yet classified')
+  assert.equal(resolveView(file, 'sandbox', 'shell').exposure, 'kernel-only', 'a sandbox tool nobody classified')
 
   // The kernel section: exactly the two delegation tools, both `write` so a
   // tainted orchestrator needs a human for either. Anything else appearing here

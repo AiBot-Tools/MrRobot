@@ -27,7 +27,10 @@
 //     decide() and the upstream head both read only that record. When the
 //     route judges the body's start (git-push's command list, github-pulls'
 //     JSON), the session reads exactly what leadingNeed() asks, at most 64
-//     KiB, and hands decide() those bytes. An allow's proxy.decision row is
+//     KiB, and hands decide() those bytes, and what the grant has spent: the
+//     pull requests decide() allowed under it, counted in the tick of each
+//     allow, so a grant serving one approved sandbox.publish (which names
+//     what the human approved) opens one. An allow's proxy.decision row is
 //     appended before upstream.request() is called, so before anything is
 //     resolved or dialled; an append that fails sends nothing. A deny is
 //     answered 403 at once and never reaches the upstream. A decision row
@@ -457,7 +460,7 @@ const OptionsData = z
   .strip()
   .superRefine((data, ctx) => {
     if (data.canary !== true) return
-    if (data.grant.allow.length > 0 || data.grant.routes.length > 0) ctx.addIssue({ code: 'custom', message: 'a canary grant reaches nothing' })
+    if (data.grant.allow.length > 0 || data.grant.routes.length > 0 || data.grant.publish !== undefined) ctx.addIssue({ code: 'custom', message: 'a canary grant reaches nothing' })
     if (data.agentId !== undefined) ctx.addIssue({ code: 'custom', message: 'a canary grant serves no agent' })
   })
 
@@ -776,6 +779,8 @@ class Session implements EgressSession {
   #killed = false
   /** Decision rows the store refused, whenever: the revocation's detail says how many. */
   #unrecordedRows = 0
+  /** The pull requests decide() allowed under the grant (policy.ts GrantSpent): a publish grant opens one. */
+  #pullRequests = 0
   readonly #totals = { requests: 0, allowed: 0, denied: 0, refused: 0, failed: 0, sentBytes: 0, receivedBytes: 0 }
 
   constructor(options: SessionOptions) {
@@ -1249,7 +1254,7 @@ class Session implements EgressSession {
     const target = req.url ?? ''
     const headers = headerRecord(req.rawHeaders)
     const head = { method, target, headers: headers as EgressHeaders }
-    const need = leadingNeed(this.#grant, head)
+    const need = leadingNeed(this.#grant, head, { pullRequests: this.#pullRequests })
     let read: Leading | undefined
     if (need.kind !== 'none') {
       read = await readLeading(req, need)
@@ -1260,7 +1265,11 @@ class Session implements EgressSession {
       }
     }
     const leading = read?.ok === true ? read.bytes.subarray(0, need.kind === 'command-list' ? Math.min(read.bytes.length, need.max) : read.bytes.length) : undefined
-    const decision = decide(this.#grant, leading === undefined ? head : { ...head, leading })
+    const decision = decide(this.#grant, leading === undefined ? head : { ...head, leading }, { pullRequests: this.#pullRequests })
+    // Counted in the tick decide() allowed it, before anything is awaited: a
+    // pull request judged on another flow meanwhile reads the count, so a
+    // publish grant's second one is denied however the two interleave.
+    if (decision.verdict === 'allow' && decision.reason === 'github-pulls') this.#pullRequests++
     this.#totals.requests++
     const parsed = parseTarget(target)
     if (decision.verdict === 'deny') {

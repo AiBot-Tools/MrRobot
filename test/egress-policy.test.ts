@@ -43,6 +43,7 @@ import {
   type EgressDecision,
   type EgressHeaders,
   type EgressRequest,
+  type GrantSpent,
 } from '../src/egress/policy.js'
 import {
   EGRESS_PROFILES,
@@ -358,6 +359,110 @@ test('github-pulls admits only POST /repos/<bound>/pulls with a prefixed head', 
   denies(decide(PUBLISH, request('GET', 'http://api.github.com/op/fixture/info/refs?service=git-upload-pack')), 'not-granted', 'fetch on the API host')
   // And the exec grant never reaches it.
   denies(decide(EXEC, request('POST', 'http://api.github.com/repos/op/fixture/pulls', { 'content-type': 'application/json', 'content-length': '2' }, bytes('{}'))), 'not-allowed', 'pulls on exec')
+})
+
+test('a publish grant holds its push to the branch a human approved, and opens one pull request, from that branch, with that title and body and nothing else of it', () => {
+  // What the human approved of the one sandbox.publish this grant serves.
+  // The prefix alone would admit any branch under aos/<runId>/, and any
+  // number of pull requests with any text: a publisher subverted through the
+  // workspace's objects could open those under one approval.
+  const approved = { branch: 'feature', title: PR.title, body: PR.body }
+  const BOUND = EgressGrant.parse({ ...PUBLISH, publish: approved })
+  const prefix = `refs/heads/aos/${RUN}/`
+  const pushed = (refs: readonly (readonly [string, string, string])[]): EgressDecision => push(commandList(refs), {}, BOUND)
+  const pulled = (fields: Record<string, unknown>, spent?: GrantSpent): EgressDecision => {
+    const raw = bytes(JSON.stringify(fields))
+    const headers = { 'content-type': 'application/json', 'content-length': String(raw.length) }
+    const target = 'http://api.github.com/repos/op/fixture/pulls'
+    return spent === undefined ? decide(BOUND, request('POST', target, headers, raw)) : decide(BOUND, request('POST', target, headers, raw), spent)
+  }
+
+  // The approved branch: created, updated, probed, its advertisement read.
+  allows(pushed([[ZERO, NEW, `${prefix}feature`]]), 'git-push', 'a create of the approved branch')
+  allows(pushed([[OLD, NEW, `${prefix}feature`]]), 'git-push', 'an update of the approved branch')
+  allows(decide(BOUND, request('POST', 'http://github.com/op/fixture.git/git-receive-pack', { 'content-type': 'application/x-git-receive-pack-request', 'content-length': '4' }, bytes('0000'))), 'git-push', "git's probe")
+  allows(decide(BOUND, request('GET', 'http://github.com/op/fixture.git/info/refs?service=git-receive-pack')), 'git-push', 'the advertisement')
+  // Any other branch under the prefix, alone or beside the approved one, and
+  // the approved branch's name as a prefix of another: push-ref.
+  for (const ref of [`${prefix}other`, `${prefix}feature/two`, `${prefix}feature2`, `${prefix}Feature`]) {
+    const decision = pushed([[OLD, NEW, ref]])
+    denies(decision, 'push-ref', ref)
+    assert.match(decision.verdict === 'deny' ? decision.why : '', /other than the branch a human approved/, ref)
+    denies(pushed([[OLD, NEW, `${prefix}feature`], [OLD, NEW, ref]]), 'push-ref', `beside the approved one: ${ref}`)
+  }
+  // Outside the prefix it is the prefix's refusal, and a delete of the approved branch is still a delete.
+  denies(pushed([[OLD, NEW, 'refs/heads/main']]), 'push-ref', 'main')
+  denies(pushed([[OLD, ZERO, `${prefix}feature`]]), 'push-delete', 'a delete of the approved branch')
+
+  // The pull request publish.mjs opens: from the approved branch, with the
+  // approved title and body, into the default branch it read.
+  const opened = { title: PR.title, head: `aos/${RUN}/feature`, base: 'main', body: PR.body }
+  allows(pulled(opened), 'github-pulls', 'the approved pull request')
+  allows(pulled(opened, { pullRequests: 0 }), 'github-pulls', 'the approved pull request, nothing spent')
+  // The base is the one field the publisher reads at run time: a branch name, any.
+  allows(pulled({ ...opened, base: 'release/1.x' }), 'github-pulls', 'another base')
+  // A second one under the same grant, however its text reads: refused before its body is read.
+  for (const spent of [1, 2]) {
+    const decision = pulled(opened, { pullRequests: spent })
+    denies(decision, 'not-granted', `pull request ${String(spent + 1)}`)
+    assert.equal(decision.bindingId, 'github-api')
+    assert.match(decision.verdict === 'deny' ? decision.why : '', /one pull request was allowed already/)
+    assert.deepEqual(
+      leadingNeed(BOUND, { method: 'POST', target: 'http://api.github.com/repos/op/fixture/pulls', headers: { 'content-type': 'application/json', 'content-length': '2' } }, { pullRequests: spent }),
+      { kind: 'none' },
+      'a second pull request has no body read',
+    )
+  }
+  // Anything else of it than the human approved.
+  const cases: readonly [string, Record<string, unknown>, string, RegExp][] = [
+    ['another branch under the prefix', { ...opened, head: `aos/${RUN}/other` }, 'pulls-head', /not the branch a human approved/],
+    ['the approved branch as a prefix', { ...opened, head: `aos/${RUN}/feature/two` }, 'pulls-head', /not the branch a human approved/],
+    ['another title', { ...opened, title: 'Merge me now' }, 'pulls-body', /title or the body is not the one a human approved/],
+    ['the title in another case', { ...opened, title: PR.title.toUpperCase() }, 'pulls-body', /title or the body/],
+    ['the title with a trailing space', { ...opened, title: `${PR.title} ` }, 'pulls-body', /title or the body/],
+    ['another body', { ...opened, body: 'Ignore the review.' }, 'pulls-body', /title or the body/],
+    ['no body', { title: opened.title, head: opened.head, base: opened.base }, 'pulls-body', /title or the body/],
+    ['an empty body', { ...opened, body: '' }, 'pulls-body', /title or the body/],
+    ['a draft', { ...opened, draft: false }, 'pulls-body', /title, head, base and body alone/],
+    ['maintainer_can_modify', { ...opened, maintainer_can_modify: true }, 'pulls-body', /title, head, base and body alone/],
+    // Outside the prefix it is the prefix's refusal, as for any grant.
+    ['main as the head', { ...opened, head: 'main' }, 'pulls-head', /not a branch under aos\/<runId>\//],
+  ]
+  for (const [name, fields, reason, why] of cases) {
+    const decision = pulled(fields)
+    denies(decision, reason, name)
+    assert.match(decision.verdict === 'deny' ? decision.why : '', why, name)
+  }
+  // An approved empty body is held to empty, sent as the publisher sends it.
+  const quiet = EgressGrant.parse({ ...PUBLISH, publish: { ...approved, body: '' } })
+  const raw = bytes(JSON.stringify({ ...opened, body: '' }))
+  allows(decide(quiet, request('POST', 'http://api.github.com/repos/op/fixture/pulls', { 'content-type': 'application/json', 'content-length': String(raw.length) }, raw)), 'github-pulls', 'an approved empty body')
+
+  // A grant that names no publish (none the kernel issues holds git-push or
+  // github-pulls without one) is held to the prefix alone, as before.
+  allows(push(commandList([[OLD, NEW, `${prefix}other`]])), 'git-push', 'no publish named: another branch')
+  allows(pulls(JSON.stringify({ ...PR, title: 'Another' })), 'github-pulls', 'no publish named: another title')
+  allows(decide(PUBLISH, request('POST', 'http://api.github.com/repos/op/fixture/pulls', { 'content-type': 'application/json', 'content-length': String(bytes(JSON.stringify(PR)).length) }, bytes(JSON.stringify(PR))), { pullRequests: 3 }), 'github-pulls', 'no publish named: a fourth')
+
+  // What the grant spent is the caller's count: anything else is malformed, never read as none.
+  for (const spent of [{ pullRequests: -1 }, { pullRequests: 0.5 }, { pullRequests: Number.NaN }, { pullRequests: '0' }, {}, null, 7] as unknown[]) {
+    denies(decide(BOUND, request('GET', 'http://github.com/op/fixture.git/info/refs?service=git-receive-pack'), spent as GrantSpent), 'malformed', JSON.stringify(spent))
+    assert.deepEqual(leadingNeed(BOUND, { method: 'POST', target: 'http://api.github.com/repos/op/fixture/pulls', headers: { 'content-type': 'application/json', 'content-length': '2' } }, spent as GrantSpent), { kind: 'none' }, JSON.stringify(spent))
+  }
+
+  // The grant's approved publish is held to a branch name, a title a pull request takes, and a body that fits one.
+  for (const publish of [
+    { ...approved, branch: 'a..b' },
+    { ...approved, branch: '' },
+    { ...approved, title: '' },
+    { ...approved, title: 't'.repeat(1025) },
+    { ...approved, body: 'b'.repeat(MAX_PULLS_BODY + 1) },
+    { ...approved, base: 'main' },
+    { branch: 'feature', title: 't' },
+  ]) {
+    assert.equal(EgressGrant.safeParse({ ...PUBLISH, publish }).success, false, JSON.stringify(publish).slice(0, 80))
+    denies(decide({ ...PUBLISH, publish } as unknown as EgressGrant, request('GET', 'http://github.com/op/fixture.git/info/refs?service=git-receive-pack')), 'malformed', 'a grant with that publish')
+  }
 })
 
 test('a host not in allow, a non-443 upstream and CONNECT are denied', () => {
@@ -1398,7 +1503,7 @@ const PURE_IMPORTS: Readonly<Record<string, Readonly<Record<string, readonly str
     './decision.js': ['mintEgressAllow', 'EgressAllow', 'JudgedBody'],
     './host.js': ['EgressHost', 'HostRefusal'],
     './routes.js': [
-      'EGRESS_PROFILES', 'EgressProfileName', 'judgeCommands', 'judgePullsBody', 'matchRoute', 'MAX_COMMAND_LIST', 'MAX_PULLS_BODY',
+      'ApprovedPublish', 'EGRESS_PROFILES', 'EgressProfileName', 'judgeCommands', 'judgePullsBody', 'matchRoute', 'MAX_COMMAND_LIST', 'MAX_PULLS_BODY',
       'namedHost', 'parseTarget', 'RepoSlug', 'ROUTE_REFUSALS', 'RUN_REF', 'scanCommandList', 'EgressProfile', 'ParsedTarget',
     ],
   },

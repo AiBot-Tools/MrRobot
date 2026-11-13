@@ -305,13 +305,20 @@ test('node:child_process is imported only by src/sandbox/docker.ts and five test
   // does not break it.
   assert.deepEqual(pathsOf(hits([...SRC, ...TEST], /\brealDockerProcesses\b/)), ['src/sandbox/docker.ts', 'test/sandbox-docker.test.ts'])
 
-  // Inside the worker image, the one spawner is images/worker/mux.mjs, which
-  // runs the agent's command in the container as docker.ts runs the container
-  // on the Mac: in its own process group, with no stdin, through no shell. A
-  // second one would have none of that. Scanned by every way a module gets in
-  // (moduleUses below), so an import() or a bare 'child_process' counts too.
+  // Inside the worker image, two files spawn. images/worker/mux.mjs runs the
+  // agent's command in the container as docker.ts runs the container on the
+  // Mac: in its own process group, with no stdin, through no shell. And
+  // images/worker/publish.mjs (egress plan S4) runs the image's own git,
+  // /usr/bin/git by its path, with an argv and an environment of its own, no
+  // stdin and no shell (test/egress-publish.test.ts pins its spawn); it runs
+  // no command an agent names. A third would have none of that. Scanned by
+  // every way a module gets in (moduleUses below), so an import() or a bare
+  // 'child_process' counts too.
   const spawners = imageFiles('images').filter((f) => moduleUses(f).specifiers.some((s) => /^(?:node:)?child_process$/.test(s)))
-  assert.deepEqual(spawners.map((f) => f.path), ['images/worker/mux.mjs'])
+  assert.deepEqual(spawners.map((f) => f.path), ['images/worker/mux.mjs', 'images/worker/publish.mjs'])
+  // The publisher is imported by one test, as the mux is: the one that pins
+  // what it spawns and sends.
+  assert.deepEqual(importersOfModule(TEST, 'images/worker/publish.mjs'), ['test/egress-publish.test.ts'])
   // One test runs the mux's spawner for real, without importing
   // node:child_process itself: test/egress-mux.test.ts, through
   // mux.spawnCommand, since only a real process group shows that killTree

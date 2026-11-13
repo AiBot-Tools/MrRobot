@@ -612,6 +612,55 @@ test('a routed request reaches the fake upstream with exactly one injected heade
   assert.deepEqual(h.kills, [])
 })
 
+test("a grant that names its publish opens one pull request: a second, after it or beside it on another flow, is denied not-granted before its body is read, and never sent", async (t) => {
+  // decide() reads what the grant has spent; the session counts it in the
+  // tick of each allow, before it awaits anything, so two pull requests
+  // judged on two flows at once are never both allowed.
+  const approved = { branch: 'fix', title: PR.title, body: 'one change' }
+  const opened = JSON.stringify({ title: approved.title, head: PR.head, base: PR.base, body: approved.body })
+  for (const together of [false, true]) {
+    const h = harness(t, { grant: EgressGrant.parse({ ...ALL, publish: approved }) })
+    await h.mux.handshake()
+    const answers = together
+      ? await Promise.all([h.mux.exchange(pulls(opened)), h.mux.exchange(pulls(opened))])
+      : [await h.mux.exchange(pulls(opened)), await h.mux.exchange(pulls(opened))]
+    assert.deepEqual(answers.map(statusOf).sort(), [200, 403], `together: ${String(together)}`)
+    // A third, the same text: the grant's one is spent.
+    assert.equal(statusOf(await h.mux.exchange(pulls(opened))), 403)
+    await h.end('exited')
+    assert.equal(h.seen.length, 1, 'only one pull request reached the host')
+    const decisions = rows(h.store, 'proxy.decision')
+    assert.deepEqual(decisions.filter((r) => r['verdict'] === 'allow').map((r) => r['reason']), ['github-pulls'])
+    const denied = decisions.filter((r) => r['verdict'] === 'deny')
+    assert.deepEqual(denied.map((r) => [r['reason'], r['bindingId']]), [['not-granted', 'github-api']])
+    assert.equal(denied.reduce((n, r) => n + Number(r['count']), 0), 2)
+  }
+  // A second one's head alone, its Content-Length declared and not one byte
+  // of its body sent: the spent grant is judged on the head, so it is
+  // answered 403 at once. A session that asked leadingNeed() for the body
+  // without the count would wait for bytes that never come, and no answer
+  // would.
+  {
+    const h = harness(t, { grant: EgressGrant.parse({ ...ALL, publish: approved }) })
+    await h.mux.handshake()
+    assert.equal(statusOf(await h.mux.exchange(pulls(opened))), 200)
+    const side = h.mux.open()
+    side.write(http('POST', 'http://api.github.com/repos/op/fixture/pulls', [['Content-Type', 'application/json'], ['Content-Length', String(Buffer.byteLength(opened))]]))
+    await until(() => /egress: denied \(not-granted\)\n$/.test(side.text()), 'the answer to a second pull request whose body was never sent', 1_000)
+    assert.equal(statusOf(side.text()), 403, side.text())
+    await h.end('exited')
+    assert.equal(h.seen.length, 1, 'only one pull request reached the host')
+    const denied = rows(h.store, 'proxy.decision').filter((r) => r['verdict'] === 'deny')
+    assert.deepEqual(denied.map((r) => [r['reason'], r['bindingId'], r['count']]), [['not-granted', 'github-api', 1]])
+  }
+  // A grant that names no publish is held to the prefix alone, as before: two are sent.
+  const h = harness(t, { grant: ALL })
+  await h.mux.handshake()
+  assert.deepEqual([statusOf(await h.mux.exchange(pulls(opened))), statusOf(await h.mux.exchange(pulls(opened)))], [200, 200])
+  await h.end('exited')
+  assert.equal(h.seen.length, 2)
+})
+
 test('a worker header spelt as another a backend folds it into (Proxy_Authorization, X_Forwarded_For, X.Real.IP) is stripped as that one is, and a Connection naming one names it', async (t) => {
   // Rack's HTTP_* and a CGI gateway read every non-alphanumeric of a name as
   // one separator, so these are the headers they alias there

@@ -2244,6 +2244,8 @@ test("a canary session refuses a grant that reaches anything or serves an agent"
   }
   assert.throws(() => createEgressSession({ ...base, grant: EgressGrant.parse({ runId: 'canary', allow: ['registry.npmjs.org'], routes: [] }) }), /a canary grant reaches nothing/)
   assert.throws(() => createEgressSession({ ...base, grant: GRANT }), /a canary grant reaches nothing/)
+  // Nor holds a publish a human approved, though it routes nowhere to send one.
+  assert.throws(() => createEgressSession({ ...base, grant: EgressGrant.parse({ runId: 'canary', allow: [], routes: [], publish: { branch: 'b', title: 't', body: '' } }) }), /a canary grant reaches nothing/)
   assert.throws(() => createEgressSession({ ...base, grant: EgressGrant.parse({ runId: 'canary', allow: [], routes: [] }), agentId: 'coder' }), /a canary grant serves no agent/)
 })
 

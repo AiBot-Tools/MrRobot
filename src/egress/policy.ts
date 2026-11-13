@@ -5,10 +5,12 @@
 // only an allow from here reaches the upstream (upstream.ts), because only
 // here is an EgressAllow minted (decision.ts; a hygiene test pins who names
 // mintEgressAllow and who imports decision.ts). decide() reads nothing but
-// its two arguments: no clock, no environment, no log, no model output, no
+// its arguments: no clock, no environment, no log, no model output, no
 // network. The grant is the kernel's (which hosts this run may reach, which
-// bound routes and profiles it holds); the request is the worker's, and every
-// field of it is attacker-chosen text, read once and parsed, never trusted:
+// bound routes and profiles it holds, and for a publish what a human
+// approved), and so is what the grant has spent (the session's count); the
+// request is the worker's, and every field of it is attacker-chosen text,
+// read once and parsed, never trusted:
 //
 //   * A CONNECT is denied 'use-route', whatever it names: egress has no
 //     tunnel mode, and a tunnel's bytes are opaque to every check below. The
@@ -77,15 +79,25 @@
 // body declaration it judged, and caches none; the upstream spends it on the
 // first request it carries. decide() never throws: a grant that does not
 // parse, a request that is no record, a field that throws when read, a
-// leading that is not what leadingNeed() asked for, and anything else
-// unforeseen are denied 'malformed'. A decision is frozen, and its `why`
-// never holds the input.
+// leading that is not what leadingNeed() asked for, a count of what the grant
+// spent that is no count, and anything else unforeseen are denied
+// 'malformed'. A decision is frozen, and its `why` never holds the input.
+//
+// A grant serving one human-approved sandbox.publish names what the human
+// approved (EgressGrant.publish, routes.ts ApprovedPublish), and is held to
+// it: its push to that branch alone, its pull request from that branch with
+// that title and body alone (routes.ts judgeCommands, judgePullsBody), and
+// one pull request: decide() reads what the grant has spent (`spent`, the
+// pull requests the caller has had allowed under it, which the session
+// counts) and denies a second 'not-granted', before its body is read. That
+// count is the only state decide() is handed; it keeps none.
 
 import { z } from 'zod'
 
 import { mintEgressAllow, type EgressAllow, type JudgedBody } from './decision.js'
 import { EgressHost, type HostRefusal } from './host.js'
 import {
+  ApprovedPublish,
   EGRESS_PROFILES,
   EgressProfileName,
   judgeCommands,
@@ -142,13 +154,16 @@ export const EgressRoute = z
  * What one run may reach: credential-free hosts and bound routes. A host is
  * one or the other, never both (a request to it would not say whether a
  * credential belongs on it), and a repository on a host is in one route only
- * (it would not say whose).
+ * (it would not say whose). A grant serving one human-approved
+ * sandbox.publish names what the human approved (`publish`), and decide()
+ * holds its push and its one pull request to that.
  */
 export const EgressGrant = z
   .object({
     runId: z.string().regex(RUN_REF),
     allow: z.array(EgressHost).max(64),
     routes: z.array(EgressRoute).max(16),
+    publish: ApprovedPublish.optional(),
   })
   .strict()
   .superRefine((grant, ctx) => {
@@ -226,6 +241,26 @@ export type LeadingNeed =
   | { readonly kind: 'whole-body'; readonly length: number }
 
 const NO_LEADING: LeadingNeed = Object.freeze({ kind: 'none' as const })
+
+/**
+ * What the caller has had allowed under the grant so far that decide() must
+ * know: the pull requests (allows whose reason is github-pulls). A grant that
+ * names its publish (EgressGrant.publish) opens one. The session counts it,
+ * at each allow, before it awaits anything, so two pull requests judged on
+ * two flows at once are never both allowed.
+ */
+export interface GrantSpent {
+  readonly pullRequests: number
+}
+
+const NOTHING_SPENT: GrantSpent = Object.freeze({ pullRequests: 0 })
+
+/** The pull requests a grant has spent, read once, or undefined when `spent` is no count. */
+function readSpent(spent: unknown): number | undefined {
+  if (typeof spent !== 'object' || spent === null) return undefined
+  const count: unknown = Reflect.get(spent, 'pullRequests')
+  return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : undefined
+}
 
 interface Where {
   readonly host?: EgressHost | undefined
@@ -345,6 +380,8 @@ const JSON_TYPE = /^application\/json(?:\s*;\s*charset=utf-8)?$/
 
 interface Judging {
   readonly grant: EgressGrant
+  /** The pull requests the grant has spent (GrantSpent). */
+  readonly pullRequests: number
   readonly method: string
   readonly target: ParsedTarget
   /** Content-Type and Content-Encoding as sent, one value each or none: what the allow holds the upstream's head to. */
@@ -422,13 +459,17 @@ function judgeRoute(j: Judging, routes: EgressGrant['routes']): HeadVerdict {
           if (scan.commands.length === 0 && body.length !== scan.end) {
             return deny('push-commands', 'an empty command list is admitted only as the whole body, as git probes', where)
           }
-          const judged = judgeCommands(scan.commands, j.grant.runId)
+          const judged = judgeCommands(scan.commands, j.grant.runId, j.grant.publish?.branch)
           if (!judged.ok) return deny(judged.reason, judged.why, where)
           return allowed(j, profile, "a push of this run's branches to a bound repository", bound, leading.slice(0, scan.end))
         },
       }
     }
     case 'pulls': {
+      // A publish opens one pull request: a second is refused before its body is read.
+      if (j.grant.publish !== undefined && j.pullRequests > 0) {
+        return denied(deny('not-granted', "this publish grant's one pull request was allowed already", where))
+      }
       const length = j.body?.length
       if (length === undefined) return denied(deny('body', 'a pull request is opened with a body of declared length', where))
       if (length > MAX_PULLS_BODY) return denied(deny('body', `a pull request's body is at most ${String(MAX_PULLS_BODY)} bytes`, where))
@@ -441,7 +482,7 @@ function judgeRoute(j: Judging, routes: EgressGrant['routes']): HeadVerdict {
         need: Object.freeze({ kind: 'whole-body' as const, length }),
         finish: (leading) => {
           if (leading.length !== length) return deny('malformed', 'the bytes read are not the whole body leadingNeed() asked for', where)
-          const judged = judgePullsBody(leading, j.grant.runId)
+          const judged = judgePullsBody(leading, j.grant.runId, j.grant.publish)
           if (!judged.ok) return deny(judged.reason, judged.why, where)
           return allowed(j, profile, "a pull request from this run's branch, in a bound repository", bound, leading.slice())
         },
@@ -451,9 +492,11 @@ function judgeRoute(j: Judging, routes: EgressGrant['routes']): HeadVerdict {
 }
 
 /** Judge a request on its head: everything but the leading bytes of a body. */
-function judgeHead(grant: unknown, method: unknown, target: unknown, headersGiven: unknown): HeadVerdict {
+function judgeHead(grant: unknown, method: unknown, target: unknown, headersGiven: unknown, spent: unknown): HeadVerdict {
   const parsedGrant = EgressGrant.safeParse(grant)
   if (!parsedGrant.success) return denied(deny('malformed', 'the grant is not one EgressGrant reads'))
+  const pullRequests = readSpent(spent)
+  if (pullRequests === undefined) return denied(deny('malformed', 'what the grant has spent is not a count'))
   if (typeof method !== 'string' || typeof target !== 'string') return denied(deny('malformed', 'the method or the target is not text'))
   if (method.toUpperCase() === 'CONNECT') {
     // Where it was headed, for the row: a probe of the Mac's loopback is told from a tunnel to a real host.
@@ -479,7 +522,7 @@ function judgeHead(grant: unknown, method: unknown, target: unknown, headersGive
   const encoding = single(headers, 'content-encoding')
   if (encoding === MANY) return denied(deny('content-encoding', 'the request sends Content-Encoding twice', { host }))
   const content = Object.freeze({ type, encoding })
-  const j: Judging = { grant: parsedGrant.data, method, target: parsed, content, body: declared.body }
+  const j: Judging = { grant: parsedGrant.data, pullRequests, method, target: parsed, content, body: declared.body }
   const free = j.grant.allow.includes(host)
   const routes = j.grant.routes.filter((r) => r.host === host)
   if (!free && routes.length === 0) {
@@ -499,11 +542,12 @@ function readRequest(request: unknown): { readonly method: unknown; readonly tar
 }
 
 /**
- * Judge one request against one grant: allow, with the EgressAllow the
- * upstream takes, or deny, with a reason from DENY_REASONS. Pure and
- * model-blind; never throws.
+ * Judge one request against one grant, and what the grant has spent
+ * (GrantSpent: none when unset): allow, with the EgressAllow the upstream
+ * takes, or deny, with a reason from DENY_REASONS. Pure and model-blind;
+ * never throws.
  */
-export function decide(grant: EgressGrant, request: EgressRequest): EgressDecision {
+export function decide(grant: EgressGrant, request: EgressRequest, spent: GrantSpent = NOTHING_SPENT): EgressDecision {
   try {
     const read = readRequest(request)
     if (read === undefined) return deny('malformed', 'the request is not a record')
@@ -511,7 +555,7 @@ export function decide(grant: EgressGrant, request: EgressRequest): EgressDecisi
     if (leading !== undefined && !(leading instanceof Uint8Array)) return deny('malformed', 'the leading bytes are not bytes')
     // A copy: the bytes judged stay the bytes judged, whatever the caller later writes into its buffer.
     const bytes = leading === undefined ? undefined : new Uint8Array(leading)
-    const verdict = judgeHead(grant, read.method, read.target, read.headers)
+    const verdict = judgeHead(grant, read.method, read.target, read.headers, spent)
     switch (verdict.kind) {
       case 'decided':
         return verdict.decision
@@ -532,11 +576,11 @@ export function decide(grant: EgressGrant, request: EgressRequest): EgressDecisi
  * request: nothing, unless the head alone admits a route that judges its
  * body. Pure; never throws.
  */
-export function leadingNeed(grant: EgressGrant, request: Omit<EgressRequest, 'leading'>): LeadingNeed {
+export function leadingNeed(grant: EgressGrant, request: Omit<EgressRequest, 'leading'>, spent: GrantSpent = NOTHING_SPENT): LeadingNeed {
   try {
     const read = readRequest(request)
     if (read === undefined) return NO_LEADING
-    const verdict = judgeHead(grant, read.method, read.target, read.headers)
+    const verdict = judgeHead(grant, read.method, read.target, read.headers, spent)
     return verdict.kind === 'read' ? verdict.need : NO_LEADING
   } catch {
     return NO_LEADING

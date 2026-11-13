@@ -24,6 +24,16 @@
 //                 head is a branch under aos/<runId>/ of the same repository
 //                 (never a cross-repository owner:branch)
 //
+// A grant serving one human-approved sandbox.publish names what the human
+// approved (ApprovedPublish: the branch, the title, the body), and is held to
+// it, not only to the prefix: a push may update refs/heads/aos/<runId>/<branch>
+// alone, and a pull request must come from aos/<runId>/<branch> with exactly
+// that title and body and nothing else of it (no draft, no
+// maintainer_can_modify), so a publisher subverted through the workspace's
+// objects cannot push another branch or open a pull request with text no
+// human read. That the grant opens one pull request is the caller's count
+// (policy.ts decide()'s `spent`), since nothing here keeps state.
+//
 // The request target is read here too, and refused rather than normalised:
 // whatever a peer might read another way is not sent at all. Only absolute
 // form (http:// or https://, lower-case) is a target; userinfo is a second
@@ -160,19 +170,39 @@ export function pushRefPrefix(runId: string): string {
   return `refs/heads/${pushBranchPrefix(runId)}`
 }
 
+/** The most characters a branch name holds (isBranchName). */
+export const MAX_BRANCH_CHARS = 200
+
 /**
  * A branch name in a spelling git, a shell and a URL all read the same way:
  * components of letters, digits, dot, underscore and hyphen, none starting
  * with a dot or a hyphen (an option to the script that pushes it), none
- * ending with a dot or `.lock`, no `..`, at most 200 characters. Narrower than
- * git's check_refname_format, never wider.
+ * ending with a dot or `.lock`, no `..`, at most MAX_BRANCH_CHARS characters.
+ * Narrower than git's check_refname_format, never wider.
  */
 export function isBranchName(text: string): boolean {
-  if (text.length === 0 || text.length > 200 || text.includes('..')) return false
+  if (text.length === 0 || text.length > MAX_BRANCH_CHARS || text.includes('..')) return false
   return text
     .split('/')
     .every((part) => /^[A-Za-z0-9_][A-Za-z0-9._-]*$/.test(part) && !part.endsWith('.') && !part.endsWith('.lock'))
 }
+
+/**
+ * What a human approved of the one sandbox.publish a grant serves (egress
+ * plan S4): the branch under aos/<runId>/ that its push updates and its pull
+ * request comes from, and the pull request's title and body, as the call's
+ * arguments held them (src/runtime/sandbox-tools.ts PublishArgs, which bounds
+ * them tighter). A grant that names one (policy.ts EgressGrant.publish) is
+ * held to it by judgeCommands and judgePullsBody.
+ */
+export const ApprovedPublish = z
+  .object({
+    branch: z.string().refine(isBranchName, { message: 'the approved branch is no branch name' }),
+    title: z.string().min(1).max(1024),
+    body: z.string().max(MAX_PULLS_BODY),
+  })
+  .strict()
+export type ApprovedPublish = z.output<typeof ApprovedPublish>
 
 /** A GitHub owner: a login or organisation, letters, digits and hyphens. */
 const OWNER = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/
@@ -528,15 +558,20 @@ export type CommandsJudged = { readonly ok: true; readonly count: number } | Rou
 
 /**
  * A complete command list is admitted only when every command creates or
- * updates a ref under refs/heads/aos/<runId>/, with a branch after it. A
- * delete is refused under the prefix too: a run's push never removes a ref.
- * An empty list is the caller's to judge (git's probe before a large push).
+ * updates a ref under refs/heads/aos/<runId>/, with a branch after it, and,
+ * for a grant that names the branch a human approved (`approved`, its
+ * ApprovedPublish's), that ref alone. A delete is refused under the prefix
+ * too: a run's push never removes a ref. An empty list is the caller's to
+ * judge (git's probe before a large push).
  */
-export function judgeCommands(commands: readonly PushCommand[], runId: string): CommandsJudged {
+export function judgeCommands(commands: readonly PushCommand[], runId: string, approved?: string): CommandsJudged {
   const prefix = pushRefPrefix(runId)
   for (const command of commands) {
     if (!command.ref.startsWith(prefix) || !isBranchName(command.ref.slice(prefix.length))) {
       return refused('push-ref', "a command names a ref outside refs/heads/aos/<runId>/ of this run, or one that is no branch")
+    }
+    if (approved !== undefined && command.ref !== `${prefix}${approved}`) {
+      return refused('push-ref', 'a command names a ref under aos/<runId>/ other than the branch a human approved for this publish')
     }
     if (/^0+$/.test(command.new)) return refused('push-delete', 'a command deletes a ref, which a run never does')
   }
@@ -568,9 +603,15 @@ export type PullsJudged = { readonly ok: true; readonly head: string; readonly b
  * spelling (what JSON.stringify writes of what it parses to, so no
  * duplicate key a host may resolve the other way, no escape it may read
  * differently, no byte-order mark), the fields PullsBody names, a head under
- * aos/<runId>/ in this repository, and a base that is a branch.
+ * aos/<runId>/ in this repository, and a base that is a branch. For a grant
+ * that names what a human approved (`approved`), the head is
+ * aos/<runId>/<its branch>, the title and the body are its own, exactly, and
+ * nothing else is set (no draft, no maintainer_can_modify): the pull request
+ * images/worker/publish.mjs opens, and no other. The base is the one field
+ * the publisher reads at run time (the repository's default branch), so it is
+ * held to a branch name only.
  */
-export function judgePullsBody(bytes: Uint8Array, runId: string): PullsJudged {
+export function judgePullsBody(bytes: Uint8Array, runId: string, approved?: ApprovedPublish): PullsJudged {
   if (bytes.length > MAX_PULLS_BODY) return refused('pulls-body', `the body is longer than ${String(MAX_PULLS_BODY)} bytes`)
   let parsed: unknown
   try {
@@ -589,5 +630,15 @@ export function judgePullsBody(bytes: Uint8Array, runId: string): PullsJudged {
     return refused('pulls-head', 'the head is not a branch under aos/<runId>/ of this run')
   }
   if (!isBranchName(base)) return refused('pulls-body', 'the base is not a branch name')
+  if (approved !== undefined) {
+    if (head !== `${prefix}${approved.branch}`) return refused('pulls-head', 'the head is not the branch a human approved for this publish')
+    const { title, body, draft, maintainer_can_modify: modify } = fields.data
+    if (title !== approved.title || body !== approved.body) {
+      return refused('pulls-body', 'the title or the body is not the one a human approved for this publish')
+    }
+    if (draft !== undefined || modify !== undefined) {
+      return refused('pulls-body', 'a publish opens its pull request with the title, head, base and body alone')
+    }
+  }
   return { ok: true, head, base }
 }

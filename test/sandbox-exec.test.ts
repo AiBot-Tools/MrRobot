@@ -79,7 +79,7 @@ import { canonicalize, sha256Hex } from '../src/events/canonical.js'
 import { projectRecovery } from '../src/events/projections.js'
 import { redactString, SecretMask, TOKEN_PATTERNS } from '../src/events/redact.js'
 import type { EventStore } from '../src/events/store.js'
-import { PROXY_GRANT_MAX_REPOS } from '../src/events/types.js'
+import { EGRESS_DETAIL_BYTES, PROXY_GRANT_MAX_REPOS } from '../src/events/types.js'
 import type { AgentView } from '../src/mcp/hub.js'
 import { parseToolViews, type ToolViewsFile } from '../src/mcp/tool-views.js'
 import type { ModelCard } from '../src/models/registry.js'
@@ -113,6 +113,12 @@ import {
   SandboxTools,
   MUX_ARGV,
   muxCommand,
+  PUBLISH_ARGV,
+  PUBLISH_DESCRIPTION,
+  PUBLISH_FIELDS_BYTES,
+  PUBLISH_PROFILES,
+  MAX_PUBLISH_TITLE_BYTES,
+  publishCommand,
   endReason,
   jwtRunStarts,
   pemEndHolds,
@@ -123,6 +129,7 @@ import {
   type SandboxToolsOptions,
 } from '../src/runtime/sandbox-tools.js'
 import type { EgressHost } from '../src/egress/host.js'
+import { MAX_BRANCH_CHARS } from '../src/egress/routes.js'
 import { acceptReady } from '../src/egress/ready.js'
 import type { CredentialInjector } from '../src/egress/session.js'
 import { readAllRows } from '../src/events/chain.js'
@@ -141,6 +148,7 @@ const REF = 'anthropic/claude-sonnet-5'
 const KEY = 'Yt7bN3mQ9wE5rT1uI6oP2aS8dF4gH0jK'
 const IMAGE = `sha256:${'ab'.repeat(32)}`
 const EXEC = 'sandbox.exec'
+const PUBLISH = 'sandbox.publish'
 /** The home the fake driver's audit refuses, as the real driver refuses the operator's. */
 const FAKE_HOME = '/Users/operator'
 
@@ -1273,7 +1281,7 @@ test('the runner refuses, before any row, a ticket for other arguments, another 
     ['other arguments', (d) => d.tools.call(ticketFor('run_t', { command: ['false'] }), args, context('run_t')), /ticket argsHash does not match/],
     ['another run', (d) => d.tools.call(ticketFor('run_other', args), args, context('run_t')), /the ticket was issued for run run_other, and this call is run run_t's/],
     ['a kernel tool', (d) => d.tools.call(ticketFor('run_t', args, 'kernel.delegate'), args, context('run_t')), /not a sandbox tool/],
-    ['a tool the views do not expose', (d) => d.tools.call(ticketFor('run_t', args, 'sandbox.publish'), args, context('run_t')), /exposure is kernel-only; agents may only call agent tools/],
+    ['a tool the views do not expose', (d) => d.tools.call(ticketFor('run_t', args, 'sandbox.shell'), args, context('run_t')), /exposure is kernel-only; agents may only call agent tools/],
     ['an agent the registry does not hold', (d) => d.tools.call(ticketFor('run_t', args), args, context('run_t', { agentId: 'ghost' })), /no agent ghost is registered/],
     ['an agent whose manifest lacks the tool', (d) => d.tools.call(ticketFor('run_t', args), args, context('run_t', { agentId: 'plain' })), /sandbox\.exec is not in agent plain's manifest \(default deny\)/],
     [
@@ -1337,7 +1345,7 @@ test('a tool-views file that withholds exec offers no sandbox tool, and the runn
     (e: unknown) => e instanceof PolicyDenied && /exposure is kernel-only; agents may only call agent tools/.test(e.message),
   )
   assert.equal(d.driver.specs.length, 0)
-  assert.deepEqual(d.tools.schemas().map((s) => s.ref), [EXEC])
+  assert.deepEqual(d.tools.schemas().map((s) => s.ref), [EXEC, PUBLISH])
 })
 
 test('sandboxToolProblem admits a worker with a sandbox: block at tier 2 or 3, in either domain, and nothing else', () => {
@@ -4173,6 +4181,31 @@ test('an exec grant never includes git-push or github-pulls', async (t) => {
   const decisions = payloads(d.store, 'proxy.decision')
   assert.ok(decisions.length >= 1)
   assert.ok(decisions.every((row) => row['verdict'] === 'deny'), JSON.stringify(decisions))
+
+  // An agent that may publish too (egress plan S4) gets the same: its exec's
+  // grant holds git-fetch alone, while the publish beside it, which a human
+  // approved, holds the profiles that write, on its one repository.
+  const both = direct(t, { files: { coder: PUBLISHER }, egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress, exits: [{ hangs: true }, { hangs: true }] })
+  const execCall = both.tools.call(ticketFor('run_y', args), args, context('run_y'))
+  const publishing = both.tools.call(ticketFor('run_y', PUBLISH_ARGS, PUBLISH), PUBLISH_ARGS, context('run_y'))
+  await until(() => both.driver.channels.length === 2, 'both channels')
+  const byPurpose = Object.fromEntries(both.tools.liveGrants().map((g) => [g.purpose, g.grant.routes.map((r) => [r.bindingId, [...r.profiles]])]))
+  assert.deepEqual(byPurpose, {
+    exec: [['github', ['git-fetch']]],
+    publish: [
+      ['github', ['git-fetch', 'git-push']],
+      ['github-api', ['github-pulls']],
+    ],
+  })
+  assert.deepEqual(payloads(both.store, 'proxy.grant.issued').map((r) => r['purpose']), ['exec', 'publish'])
+  for (const channel of both.driver.channels) {
+    const m = new FakeMux(channel)
+    await m.ready()
+    m.exit(0)
+    both.driver.simulateExit(channel.name)
+  }
+  await Promise.all([execCall, publishing])
+  assert.deepEqual(both.tools.liveGrants(), [])
 })
 
 test('a hostile-domain run gets no channel and no grant', async (t) => {
@@ -4334,6 +4367,35 @@ test('a run the driver gives no channel, though its spec asked for one, is kille
   )
   assert.doesNotMatch(out.text, /the run was stopped/)
   assert.deepEqual(tools.liveGrants(), [])
+})
+
+test("a grant whose egress session will not start is revoked once, unserved, its detail the session's refusal cut to what the row holds", { timeout: 10_000 }, async (t) => {
+  // Limits the session's schema refuses, whose error runs past the revoked
+  // row's bound: the session will not start, the container is killed by name
+  // at once, and the grant revoked unserved. A detail past the row's bound
+  // would have the store refuse the row, and the grant would stay open in the
+  // log, with the store's schema error as the call's result.
+  const fx = egressOf()
+  const refused = { ...EGRESS_LIMITS, frameMaxBytes: 0, maxFlows: 0, maxHeaderBytes: 0, maxRequests: 0, maxBytes: 0, maxDenied: 0, idleMs: 0 }
+  const d = direct(t, { files: { coder: EGRESS_CODER }, egress: { ...fx.egress, limits: refused }, exits: [{ hangs: true }] })
+  const args = { command: ['git', 'fetch'] }
+  const out = await d.tools.call(ticketFor('run_u', args), args, context('run_u'))
+  const name = d.driver.specs[0]?.name
+  assert.deepEqual(d.driver.kills, [name], 'the container was not killed by name')
+  const issued = payloads(d.store, 'proxy.grant.issued')
+  const revoked = payloads(d.store, 'proxy.grant.revoked')
+  assert.equal(issued.length, 1)
+  assert.equal(revoked.length, 1, 'the grant was left open')
+  assert.deepEqual([revoked[0]?.['grantId'], revoked[0]?.['reason']], [issued[0]?.['grantId'], 'error'])
+  const detail = String(revoked[0]?.['detail'])
+  assert.ok(detail.startsWith('the egress session would not start: '), detail)
+  assert.ok(detail.endsWith('…'), `the detail was not cut, so it does not show the bound: ${detail}`)
+  assert.ok(Buffer.byteLength(detail) <= EGRESS_DETAIL_BYTES, String(Buffer.byteLength(detail)))
+  assert.equal(out.ok, false)
+  assert.match(out.text, /was killed by name by the kernel, which could not serve its egress grant/)
+  assert.match(out.text, /\[egress grant grant_\S+ revoked unserved: the egress session would not start: /)
+  assert.deepEqual(d.tools.liveGrants(), [])
+  assert.equal(d.store.verifyChain(d.store.readAnchor()).ok, true)
 })
 
 test("a trusted run's container reaches an allowed host over its channel through an injected dialer: every flow is a proxy.decision of that run before the dial, one credential injected, and the chain verifies", async (t) => {
@@ -5139,4 +5201,762 @@ test("a channel run's result is assembled from the session's capture of each str
     assert.match(out.text, /\n\[output cut: a stream carried more than \d+ bytes/)
     assert.match(out.text, /\n--- stderr \(its start, redacted: \d+ bytes, of the \d+ bytes its capture kept; the stream may have carried more\) ---\n\n\[the docker client's stderr\]\nm/)
   }
+})
+
+// ── sandbox.publish (egress plan S4) ────────────────────────────────────────
+
+/** The push binding and the pull-request binding, on the fixture repository, as the Phase 2 exit binds them. */
+const GIT_BINDING = Object.freeze({ host: 'github.com', profiles: ['git-fetch', 'git-push'], repos: ['op/fixture'] })
+const API_BINDING = Object.freeze({ host: 'api.github.com', profiles: ['github-pulls'], repos: ['op/fixture'] })
+const PUBLISH_BINDINGS = Object.freeze({ github: GIT_BINDING, 'github-api': API_BINDING })
+
+/** A tier 3 worker that may exec and publish, with the two bindings. */
+const PUBLISHER = manifest('coder', { tier: 3, allow: [EXEC, PUBLISH], egress: { allow: ['registry.npmjs.org'], bind: ['github', 'github-api'] } })
+
+const PUBLISH_ARGS = Object.freeze({ branch: 'fix/readme', title: 'Fix the README', body: 'Opened by the fixture run.' })
+
+function publishCall(args: Record<string, unknown>, id = 'call_1'): ScriptedResponse {
+  return turn({
+    role: 'assistant',
+    content: null,
+    tool_calls: [{ id, type: 'function', function: { name: 'sandbox__publish', arguments: JSON.stringify(args) } }],
+  })
+}
+
+const ZERO_OID = '0'.repeat(40)
+const NEW_OID = 'b'.repeat(40)
+
+/** One pkt-line, as git writes it. */
+function pktLine(payload: string): string {
+  return (payload.length + 4).toString(16).padStart(4, '0') + payload
+}
+
+/** A git-receive-pack request for `ref`, as git's send-pack writes one over smart HTTP: its command list, then a pack. */
+function receivePack(ref: string): string {
+  const body = `${pktLine(`${ZERO_OID} ${NEW_OID} ${ref}\0 report-status side-band-64k agent=git/2.39.5`)}0000PACK\x00\x00\x00\x02\x00\x00\x00\x00`
+  return (
+    'POST http://github.com/op/fixture.git/git-receive-pack HTTP/1.1\r\nHost: github.com\r\n' +
+    `Content-Type: application/x-git-receive-pack-request\r\nContent-Length: ${String(body.length)}\r\n\r\n${body}`
+  )
+}
+
+/** A pull request from `head` into main, as images/worker/publish.mjs sends one through the mux. */
+function pullsRequest(head: string, fields: { title: string; body: string } = PUBLISH_ARGS): string {
+  const body = JSON.stringify({ title: fields.title, head, base: 'main', body: fields.body })
+  return (
+    'POST http://api.github.com/repos/op/fixture/pulls HTTP/1.1\r\nHost: api.github.com\r\nContent-Type: application/json\r\n' +
+    `Content-Length: ${String(Buffer.byteLength(body))}\r\nAccept: application/vnd.github+json\r\nUser-Agent: aos-publish\r\nConnection: close\r\n\r\n${body}`
+  )
+}
+
+/** The publisher's container, as the mux and images/worker/publish.mjs play it: default branch, push, pull request, exit. */
+async function playPublisher(mux: FakeMux, runId: string, branch: string): Promise<string[]> {
+  await mux.ready()
+  const answers = [
+    await mux.request('GET http://github.com/op/fixture.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: github.com\r\n\r\n'),
+    await mux.request('GET http://github.com/op/fixture.git/info/refs?service=git-receive-pack HTTP/1.1\r\nHost: github.com\r\n\r\n'),
+    await mux.request(receivePack(`refs/heads/aos/${runId}/${branch}`)),
+    await mux.request(pullsRequest(`aos/${runId}/${branch}`)),
+  ]
+  mux.stdout(`pushed ${NEW_OID} to refs/heads/aos/${runId}/${branch} of op/fixture on github.com\nopened pull request #7: https://github.com/op/fixture/pull/7 (from aos/${runId}/${branch} into main)\n`)
+  mux.exit(0)
+  return answers
+}
+
+/** Approve every approval the loop files, recording each one's request as the approvals table held it. */
+function approveEvery(w: Wired, decision: (n: number) => 'approved' | 'denied' = () => 'approved'): { readonly hashes: string[]; readonly previews: string[] } {
+  const hashes: string[] = []
+  const previews: string[] = []
+  w.store.subscribe((row) => {
+    if (row.type !== 'approval.requested') return
+    const { approvalId, argsPreview } = JSON.parse(row.payload) as { approvalId: string; argsPreview: string }
+    hashes.push(w.approvals.pending().find((p) => p.approvalId === approvalId)?.argsHash ?? '')
+    previews.push(argsPreview)
+    const n = hashes.length
+    queueMicrotask(() => {
+      w.approvals.resolve(approvalId, mintHumanActor('conn-test'), decision(n))
+    })
+  })
+  return { hashes, previews }
+}
+
+test('publish always files an approval, and its argsHash binds branch/title/body', async (t) => {
+  // An untainted run's first call, and a second one after an approved one:
+  // each is asked of a human, irreversible, whatever the run's taint.
+  const fx = egressOf({ bindings: PUBLISH_BINDINGS })
+  const second = { ...PUBLISH_ARGS, title: 'Fix the README again' }
+  const w = wire(t, {
+    script: [publishCall(PUBLISH_ARGS), publishCall(second, 'call_2'), done()],
+    exits: [{ hangs: true }],
+    files: { coder: PUBLISHER },
+    egress: fx.egress,
+  })
+  const asked = approveEvery(w, (n) => (n === 1 ? 'approved' : 'denied'))
+  const started = w.loop.start({ runId: 'run_pa', agent: w.agent('coder'), prompt: 'publish it' })
+  await until(() => w.driver.channels.length === 1, 'the publish channel')
+  const mux = new FakeMux(w.driver.channels[0]!)
+  await mux.ready()
+  mux.exit(0)
+  w.driver.simulateExit(w.driver.channels[0]!.name)
+  const out = await started
+  assert.equal(out.status, 'ok', String(out.reason))
+
+  const gates = payloads(w.store, 'tool.gate')
+  assert.deepEqual(
+    gates.map((g) => [g.toolRef, g.decision, g.risk, g.taint]),
+    [
+      [PUBLISH, 'needs-human', 'irreversible', 'clean'],
+      [PUBLISH, 'needs-human', 'irreversible', 'tainted'],
+    ],
+  )
+  assert.match(String(gates[0]?.reason), /sandbox\.publish is irreversible and always needs a human/)
+  // The human is shown the three whole, and the approval is bound to the
+  // hash of exactly them.
+  assert.deepEqual(asked.previews, [canonicalize(PUBLISH_ARGS), canonicalize(second)])
+  assert.deepEqual(asked.hashes, [hashArgs(PUBLISH_ARGS), hashArgs(second)])
+  assert.deepEqual(payloads(w.store, 'approval.requested').map((r) => [r.toolRef, r.risk]), [
+    [PUBLISH, 'irreversible'],
+    [PUBLISH, 'irreversible'],
+  ])
+  // The denied one ran nothing.
+  assert.equal(w.driver.specs.length, 1)
+  assert.deepEqual(toolMessages(w.provider.requests[2]).slice(1), ['[denied] a human denied this call'])
+
+  // Each of the three moves the hash, and a ticket for one set of them
+  // buys no other: the runner refuses it before anything is logged or run.
+  for (const changed of [
+    { ...PUBLISH_ARGS, branch: 'fix/other' },
+    { ...PUBLISH_ARGS, title: 'Another title' },
+    { ...PUBLISH_ARGS, body: 'Another body.' },
+  ]) {
+    assert.notEqual(hashArgs(changed), hashArgs(PUBLISH_ARGS))
+    const d = direct(t, { files: { coder: PUBLISHER }, egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress, exits: [{ hangs: true }] })
+    await assert.rejects(
+      d.tools.call(ticketFor('run_pb', PUBLISH_ARGS, PUBLISH), changed, context('run_pb')),
+      (e: unknown) => e instanceof PolicyDenied && /ticket argsHash does not match/.test(e.message),
+    )
+    assert.deepEqual(callRows(d.store), [])
+    assert.equal(d.driver.specs.length, 0)
+  }
+})
+
+test('a push to a ref outside aos/<runId>/ inside publish is denied push-ref', async (t) => {
+  const fx = egressOf({ bindings: PUBLISH_BINDINGS })
+  const d = direct(t, { files: { coder: PUBLISHER }, egress: fx.egress, exits: [{ hangs: true }] })
+  const call = d.tools.call(ticketFor('run_pr', PUBLISH_ARGS, PUBLISH), PUBLISH_ARGS, context('run_pr'))
+  await until(() => d.driver.channels.length === 1, 'the publish channel')
+  const mux = new FakeMux(d.driver.channels[0]!)
+  await mux.ready()
+  // Outside the prefix: the default branch, another run's, and the prefix with no branch after it.
+  for (const ref of ['refs/heads/main', 'refs/heads/aos/run_other/fix', 'refs/heads/aos/run_pr/', 'refs/tags/aos/run_pr/fix']) {
+    assert.match(await mux.request(receivePack(ref)), /^HTTP\/1\.1 403 /, ref)
+  }
+  // A pull request from outside the prefix, the same way.
+  assert.match(await mux.request(pullsRequest('main')), /^HTTP\/1\.1 403 /)
+  // Its own: admitted.
+  assert.match(await mux.request(receivePack('refs/heads/aos/run_pr/fix/readme')), /^HTTP\/1\.1 200 /)
+  mux.exit(0)
+  d.driver.simulateExit(d.driver.channels[0]!.name)
+  await call
+
+  const decisions = payloads(d.store, 'proxy.decision')
+  const denies = decisions.filter((r) => r['verdict'] === 'deny')
+  assert.ok(denies.some((r) => r['reason'] === 'push-ref'), JSON.stringify(denies))
+  for (const row of denies.filter((r) => r['reason'] === 'push-ref')) {
+    assert.deepEqual([row['stage'], row['host'], row['bindingId']], ['policy', 'github.com', 'github'])
+  }
+  // Coalesced or not, every one of the four was a push-ref deny, and the
+  // pull request a pulls-head one.
+  const counted = (reason: string): number => denies.filter((r) => r['reason'] === reason).reduce((n, r) => n + Number(r['count']), 0)
+  assert.deepEqual([counted('push-ref'), counted('pulls-head')], [4, 1])
+  // Only the admitted push was sent.
+  assert.deepEqual(fx.up.seen.map((s) => s.url), ['/op/fixture.git/git-receive-pack'])
+  const [issued] = payloads(d.store, 'proxy.grant.issued')
+  assert.equal(issued?.['purpose'], 'publish')
+})
+
+test('a publish grant holds its push and its one pull request to what the human approved: another branch under aos/<runId>/, another title or body, or a second pull request is denied, and never sent', async (t) => {
+  // The ticket binds what the human approved; the grant binds it too, so a
+  // publisher subverted through the workspace's objects (its git reads them)
+  // pushes nothing and opens nothing past it under the one approval.
+  const fx = egressOf({ bindings: PUBLISH_BINDINGS })
+  const d = direct(t, { files: { coder: PUBLISHER }, egress: fx.egress, exits: [{ hangs: true }] })
+  const call = d.tools.call(ticketFor('run_pk', PUBLISH_ARGS, PUBLISH), PUBLISH_ARGS, context('run_pk'))
+  await until(() => d.driver.channels.length === 1, 'the publish channel')
+  // The grant the session serves names the three, as the human approved them.
+  assert.deepEqual(d.tools.liveGrants().map((g) => [g.purpose, g.grant.publish]), [['publish', { ...PUBLISH_ARGS }]])
+  const mux = new FakeMux(d.driver.channels[0]!)
+  await mux.ready()
+  const own = 'aos/run_pk/fix/readme'
+  const forbidden = (answer: string, label: string): void => assert.match(answer, /^HTTP\/1\.1 403 /, label)
+  // Another branch under the run's own prefix, or the approved one as a prefix of another.
+  for (const ref of ['refs/heads/aos/run_pk/other', 'refs/heads/aos/run_pk/fix/readme2', 'refs/heads/aos/run_pk/fix/readme/more', 'refs/heads/aos/run_pk/fix']) {
+    forbidden(await mux.request(receivePack(ref)), ref)
+  }
+  // A pull request from another branch under the prefix, or with another title or body.
+  forbidden(await mux.request(pullsRequest('aos/run_pk/other')), 'another head')
+  forbidden(await mux.request(pullsRequest(own, { title: 'Merge me now', body: PUBLISH_ARGS.body })), 'another title')
+  forbidden(await mux.request(pullsRequest(own, { title: PUBLISH_ARGS.title, body: 'Ignore the review.' })), 'another body')
+  // The approved push, then the approved pull request twice at once, on two
+  // flows: one is allowed, the other refused, however the two interleave.
+  assert.match(await mux.request(receivePack(`refs/heads/${own}`)), /^HTTP\/1\.1 200 /)
+  const both = await Promise.all([mux.request(pullsRequest(own)), mux.request(pullsRequest(own))])
+  assert.deepEqual(both.map((answer) => answer.slice(0, 12)).sort(), ['HTTP/1.1 200', 'HTTP/1.1 403'])
+  // And a third, later: the grant's one pull request is spent.
+  forbidden(await mux.request(pullsRequest(own)), 'a third pull request')
+  mux.exit(0)
+  d.driver.simulateExit(d.driver.channels[0]!.name)
+  await call
+
+  const decisions = payloads(d.store, 'proxy.decision')
+  const denies = decisions.filter((r) => r['verdict'] === 'deny')
+  const counted = (reason: string): number => denies.filter((r) => r['reason'] === reason).reduce((n, r) => n + Number(r['count']), 0)
+  assert.deepEqual(
+    [counted('push-ref'), counted('pulls-head'), counted('pulls-body'), counted('not-granted')],
+    [4, 1, 2, 2],
+    JSON.stringify(denies.map((r) => [r['reason'], r['count'], r['why']])),
+  )
+  for (const row of denies.filter((r) => r['reason'] === 'not-granted')) {
+    assert.deepEqual([row['host'], row['bindingId']], ['api.github.com', 'github-api'])
+    assert.match(String(row['why']), /one pull request was allowed already/)
+  }
+  const allowed = decisions.filter((r) => r['stage'] === 'policy' && r['verdict'] === 'allow').map((r) => r['reason'])
+  assert.deepEqual(allowed, ['git-push', 'github-pulls'])
+  // Only the approved push and the one pull request reached the host.
+  assert.deepEqual(fx.up.seen.map((s) => [s.method, s.url]), [
+    ['POST', '/op/fixture.git/git-receive-pack'],
+    ['POST', '/repos/op/fixture/pulls'],
+  ])
+  assert.deepEqual(d.tools.liveGrants(), [])
+  assert.equal(d.store.verifyChain(d.store.readAnchor()).ok, true)
+})
+
+test('an approved publish pushes aos/<runId>/<branch> and opens its pull request: both proxy.decision rows of that run, allowed, before any dial, and the chain verifies', async (t) => {
+  const order: string[] = []
+  const fx = egressOf({ bindings: PUBLISH_BINDINGS, onStep: (step) => order.push(step) })
+  const w = wire(t, { script: [publishCall(PUBLISH_ARGS), done()], exits: [{ hangs: true }], files: { coder: PUBLISHER }, egress: fx.egress })
+  w.store.subscribe((row) => {
+    if (row.type !== 'proxy.decision') {
+      order.push(row.type)
+      return
+    }
+    const p = JSON.parse(row.payload) as { verdict: string; reason: string; stage: string }
+    order.push(`decision ${p.stage} ${p.verdict} ${p.reason}`)
+  })
+  approveEvery(w)
+  const started = w.loop.start({ runId: 'run_pub', agent: w.agent('coder'), prompt: 'publish the fix' })
+  await until(() => w.driver.channels.length === 1, 'the publish channel')
+  const answers = await playPublisher(new FakeMux(w.driver.channels[0]!), 'run_pub', 'fix/readme')
+  for (const answer of answers) assert.match(answer, /^HTTP\/1\.1 200 /)
+  w.driver.simulateExit(w.driver.channels[0]!.name)
+  const out = await started
+  assert.equal(out.status, 'ok', String(out.reason))
+  assert.equal(out.taint, 'tainted')
+
+  // The container ran the image's publisher under the mux, with what the
+  // human approved and what only the kernel's config decides, on a channel.
+  const [spec] = w.driver.specs
+  const target = { gitHost: 'github.com', apiHost: 'api.github.com', repo: 'op/fixture' }
+  assert.deepEqual(spec?.command, [...muxCommand(publishCommand(target, 'run_pub', PUBLISH_ARGS))])
+  assert.deepEqual(spec?.command.slice(MUX_ARGV.length + 1, MUX_ARGV.length + 1 + PUBLISH_ARGV.length), [...PUBLISH_ARGV])
+  assert.deepEqual([spec?.channel, spec?.domain], [true, 'trusted'])
+
+  // Its grant is a publish grant, issued before the spawn: git-fetch and
+  // git-push of the push binding, github-pulls of the API's, on the one
+  // repository, and no credential-free host.
+  const [issued] = payloads(w.store, 'proxy.grant.issued')
+  assert.deepEqual(issued, {
+    schemaVersion: 1,
+    grantId: issued?.['grantId'],
+    purpose: 'publish',
+    runId: 'run_pub',
+    agentId: 'coder',
+    sandbox: 'aos-run-run_pub-1',
+    domain: 'trusted',
+    allow: [],
+    routes: [
+      { bindingId: 'github', host: 'github.com', profiles: ['git-fetch', 'git-push'], repos: ['op/fixture'] },
+      { bindingId: 'github-api', host: 'api.github.com', profiles: ['github-pulls'], repos: ['op/fixture'] },
+    ],
+  })
+  assert.deepEqual([...PUBLISH_PROFILES], ['git-fetch', 'git-push', 'github-pulls'])
+
+  // Every request is a proxy.decision of this run and this grant; the push
+  // to aos/run_pub/fix/readme is allowed, then the pull request, each
+  // recorded before the upstream resolves or dials for it.
+  const rows = w.store.query({ type: 'proxy.decision' })
+  for (const row of rows) {
+    assert.equal(row.runId, 'run_pub')
+    assert.equal(row.agentId, 'coder')
+    assert.equal((JSON.parse(row.payload) as { grantId: string }).grantId, issued?.['grantId'])
+  }
+  const allowed = payloads(w.store, 'proxy.decision').filter((r) => r['stage'] === 'policy' && r['verdict'] === 'allow')
+  assert.deepEqual(
+    allowed.map((r) => [r['reason'], r['method'], r['host'], r['path'], r['bindingId'], r['repo']]),
+    [
+      ['git-fetch', 'GET', 'github.com', '/op/fixture.git/info/refs', 'github', 'op/fixture'],
+      ['git-push', 'GET', 'github.com', '/op/fixture.git/info/refs', 'github', 'op/fixture'],
+      ['git-push', 'POST', 'github.com', '/op/fixture.git/git-receive-pack', 'github', 'op/fixture'],
+      ['github-pulls', 'POST', 'api.github.com', '/repos/op/fixture/pulls', 'github-api', 'op/fixture'],
+    ],
+  )
+  assert.equal(payloads(w.store, 'proxy.decision').filter((r) => r['verdict'] === 'deny').length, 0)
+  const steps = order.filter((step) => /^(decision policy|resolve4|dial)/.test(step))
+  assert.deepEqual(steps, [
+    'decision policy allow git-fetch',
+    'resolve4 github.com',
+    'dial 140.82.112.3',
+    'decision policy allow git-push',
+    'resolve4 github.com',
+    'dial 140.82.112.3',
+    'decision policy allow git-push',
+    'resolve4 github.com',
+    'dial 140.82.112.3',
+    'decision policy allow github-pulls',
+    'resolve4 api.github.com',
+    'dial 140.82.112.3',
+  ])
+  // The push reached the host with the ref the human approved under the
+  // run's prefix, and the pull request with the head, title and body.
+  assert.deepEqual(fx.up.seen.map((s) => [s.method, s.url]), [
+    ['GET', '/op/fixture.git/info/refs?service=git-upload-pack'],
+    ['GET', '/op/fixture.git/info/refs?service=git-receive-pack'],
+    ['POST', '/op/fixture.git/git-receive-pack'],
+    ['POST', '/repos/op/fixture/pulls'],
+  ])
+  assert.deepEqual(fx.injected, ['github', 'github', 'github', 'github-api'])
+  const lifecycle = order.filter((step) => /^(proxy\.grant\.|sandbox\.|decision)/.test(step))
+  assert.deepEqual([lifecycle[0], lifecycle[1], lifecycle.at(-1)], ['proxy.grant.issued', 'sandbox.started', 'proxy.grant.revoked'])
+  const [revoked] = payloads(w.store, 'proxy.grant.revoked')
+  assert.equal(revoked?.['reason'], 'exited')
+
+  // The call's result is what the publisher printed, and taints the run.
+  const [result] = payloads(w.store, 'tool.result')
+  assert.equal(result?.['ok'], true)
+  assert.match(String(result?.['text']), /no network but the kernel's egress engine \(grant grant_\S+: 4 request\(s\), 4 allowed, 0 denied\), exited 0/)
+  assert.match(String(result?.['text']), /opened pull request #7: https:\/\/github\.com\/op\/fixture\/pull\/7/)
+  for (const row of readAllRows(w.store.db)) assert.equal(row.payload.includes(BINDING_VALUE), false, row.type)
+  assert.equal(w.store.verifyChain(w.store.readAnchor()).ok, true)
+})
+
+test('publish is offered only where it could run, and refused before the gate and at execution, with no container and no workspace, where it could not', async (t) => {
+  const unresolved = new Map([
+    ['github', { bindingId: 'github', envVar: 'AOS_GITHUB_TOKEN', problem: 'AOS_GITHUB_TOKEN is not set (secrets.source: env)' }],
+    ['github-api', { bindingId: 'github-api', envVar: 'AOS_GITHUB_TOKEN' }],
+  ])
+  const twoRepos = { github: { host: 'github.com', profiles: ['git-fetch', 'git-push', 'github-pulls'], repos: ['op/a', 'op/b'] } }
+  const twoPushers = {
+    github: GIT_BINDING,
+    mirror: { host: 'git.example.com', profiles: ['git-fetch', 'git-push'], repos: ['op/fixture'] },
+    'github-api': API_BINDING,
+  }
+  // Two that push it on one host: the refusal names no host of its own for each.
+  const twoPushersOneHost = {
+    github: GIT_BINDING,
+    'github-two': { host: 'github.com', profiles: ['git-fetch', 'git-push'], repos: ['op/fixture'] },
+    'github-api': API_BINDING,
+  }
+  const twoPullers = {
+    github: GIT_BINDING,
+    'github-api': API_BINDING,
+    'api-two': { host: 'api.example.com', profiles: ['github-pulls'], repos: ['op/fixture'] },
+  }
+  // A push binding and a pulls binding on the same host: a grant routes a
+  // repository on a host through one binding alone.
+  const pushAndPullsOneHost = {
+    github: GIT_BINDING,
+    'github-pr': { host: 'github.com', profiles: ['github-pulls'], repos: ['op/fixture'] },
+  }
+  // kernel.yaml gave the git binding fetch alone: never a pusher, whatever
+  // the pulls binding beside it holds.
+  const fetchOnly = {
+    github: { host: 'github.com', profiles: ['git-fetch'], repos: ['op/fixture'] },
+    'github-api': API_BINDING,
+  }
+  const plain = manifest('coder', { tier: 3, allow: [EXEC, PUBLISH] })
+  const cases: readonly { name: string; files: string; egress: SandboxEgress | undefined; refusal: string | RegExp }[] = [
+    {
+      name: 'a hostile-domain worker',
+      files: manifest('coder', { tier: 3, sandbox: 'hostile', allow: [EXEC, PUBLISH] }),
+      egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress,
+      refusal: "coder is not sandboxed in the trusted domain, and sandbox.publish reaches its repository only through the kernel's egress engine, which serves the trusted domain alone; no container was started",
+    },
+    {
+      name: 'no egress engine',
+      files: plain,
+      egress: undefined,
+      refusal: "sandbox.publish reaches its repository only through the kernel's egress engine, and none is wired into this kernel; no container was started",
+    },
+    {
+      name: 'egress degraded',
+      files: PUBLISHER,
+      egress: egressOf({ bindings: PUBLISH_BINDINGS, state: DEGRADED }).egress,
+      refusal: 'egress is degraded: egress.enabled is false in config/kernel.yaml, so no run is given a channel; no container was started',
+    },
+    {
+      name: 'a binding it routes did not resolve',
+      files: PUBLISHER,
+      egress: egressOf({ bindings: PUBLISH_BINDINGS, resolved: unresolved }).egress,
+      refusal: 'egress binding github (envVar AOS_GITHUB_TOKEN) did not resolve at boot: AOS_GITHUB_TOKEN is not set (secrets.source: env); no container was started',
+    },
+    {
+      name: 'no egress at all',
+      files: plain,
+      egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress,
+      refusal: "coder's egress binds no repository sandbox.publish can publish to: one binding holding git-fetch and git-push on it, and one holding github-pulls; no container was started",
+    },
+    {
+      name: 'only a fetch binding',
+      files: manifest('coder', { tier: 3, allow: [EXEC, PUBLISH], egress: { bind: ['github'] } }),
+      egress: egressOf({ bindings: { github: { host: 'github.com', profiles: ['git-fetch'], repos: ['op/fixture'] } } }).egress,
+      refusal: /^coder's egress binds no repository sandbox\.publish can publish to/,
+    },
+    {
+      name: 'push but no pull requests',
+      files: manifest('coder', { tier: 3, allow: [EXEC, PUBLISH], egress: { bind: ['github'] } }),
+      egress: egressOf({ bindings: { github: GIT_BINDING } }).egress,
+      refusal: /^coder's egress binds no repository sandbox\.publish can publish to/,
+    },
+    {
+      name: 'two repositories to publish to',
+      files: manifest('coder', { tier: 3, allow: [EXEC, PUBLISH], egress: { bind: ['github'] } }),
+      egress: egressOf({ bindings: twoRepos }).egress,
+      refusal: "coder's egress binds 2 repositories sandbox.publish could publish to, and its arguments name none, so it publishes only where its bindings make that one repository; no container was started",
+    },
+    {
+      name: 'a bound repository whose name the audit refuses',
+      files: manifest('coder', { tier: 3, allow: [EXEC, PUBLISH], egress: { bind: ['github'] } }),
+      egress: egressOf({ bindings: { github: { host: 'github.com', profiles: ['git-fetch', 'git-push', 'github-pulls'], repos: ['op/docker.sock'] } } }).egress,
+      refusal:
+        "the publisher's arguments for coder's bound repository are refused by the sandbox's audit, which reads them as part of the docker run's own (docker args mention docker.sock: a container may never reach the daemon): its host or repository names what no docker run may; no container was started",
+    },
+    {
+      name: 'two hosts that push its repository',
+      files: manifest('coder', { tier: 3, allow: [EXEC, PUBLISH], egress: { bind: ['github', 'mirror', 'github-api'] } }),
+      egress: egressOf({ bindings: twoPushers }).egress,
+      refusal: "2 of coder's bindings push its one repository to publish to, and its arguments name none, so where it would publish is not one place; no container was started",
+    },
+    {
+      name: 'two bindings that push its repository on one host',
+      files: manifest('coder', { tier: 3, allow: [EXEC, PUBLISH], egress: { bind: ['github', 'github-two', 'github-api'] } }),
+      egress: egressOf({ bindings: twoPushersOneHost }).egress,
+      refusal: "2 of coder's bindings push its one repository to publish to, and its arguments name none, so where it would publish is not one place; no container was started",
+    },
+    {
+      name: 'two bindings that open its pull requests',
+      files: manifest('coder', { tier: 3, allow: [EXEC, PUBLISH], egress: { bind: ['github', 'github-api', 'api-two'] } }),
+      egress: egressOf({ bindings: twoPullers }).egress,
+      refusal: "2 of coder's bindings open pull requests in its one repository to publish to, and its arguments name none, so where it would publish is not one place; no container was started",
+    },
+    {
+      name: 'a push binding and a pulls binding on one host',
+      files: manifest('coder', { tier: 3, allow: [EXEC, PUBLISH], egress: { bind: ['github', 'github-pr'] } }),
+      egress: egressOf({ bindings: pushAndPullsOneHost }).egress,
+      refusal:
+        "coder's egress pushes its one repository to publish to through one binding and opens its pull requests through another on the same host, and a grant routes a repository on a host through one binding alone: bind one binding there holding git-fetch, git-push and github-pulls, or put the pull requests on a host of their own; no container was started",
+    },
+    {
+      name: 'a fetch-only binding beside a pulls binding',
+      files: manifest('coder', { tier: 3, allow: [EXEC, PUBLISH], egress: { bind: ['github', 'github-api'] } }),
+      egress: egressOf({ bindings: fetchOnly }).egress,
+      refusal: "coder's egress binds no repository sandbox.publish can publish to: one binding holding git-fetch and git-push on it, and one holding github-pulls; no container was started",
+    },
+  ]
+  for (const c of cases) {
+    const d = direct(t, { files: { coder: c.files }, ...(c.egress === undefined ? {} : { egress: c.egress }) })
+    for (const got of [d.tools.egressRefusal(PUBLISH, 'coder', 'run_q'), d.tools.egressRefusal(PUBLISH, 'coder')]) {
+      if (typeof c.refusal === 'string') assert.equal(got, c.refusal, c.name)
+      else assert.match(String(got), c.refusal, c.name)
+    }
+    const out = await d.tools.call(ticketFor('run_q', PUBLISH_ARGS, PUBLISH), PUBLISH_ARGS, context('run_q'))
+    assert.equal(out.ok, false, c.name)
+    assert.equal(out.taints, true, c.name)
+    assert.ok(out.text.startsWith('[refused] '), c.name)
+    assert.equal(d.driver.specs.length, 0, `${c.name}: a container was started`)
+    assert.deepEqual(payloads(d.store, 'proxy.grant.issued'), [], c.name)
+    assert.equal(existsSync(join(d.sandbox.domains[c.name.startsWith('a hostile') ? 'hostile' : 'trusted'].mountRoot, 'run_q')), false, `${c.name}: a workspace was made`)
+  }
+
+  // On its arguments alone, before any approval: the bounds, what a human
+  // approving it would not be shown whole, and what the driver's audit
+  // refuses of the arguments they become. None quotes what it refuses.
+  const argCases: readonly [string, Record<string, unknown>, RegExp][] = [
+    ['a branch that is none', { ...PUBLISH_ARGS, branch: 'a..b' }, /^sandbox\.publish takes \{branch, title, body\}: branch: a branch name: /],
+    ['no body', { branch: 'x', title: 'y' }, /^sandbox\.publish takes \{branch, title, body\}: body: /],
+    ['a key it does not take', { ...PUBLISH_ARGS, base: 'main' }, /^sandbox\.publish takes \{branch, title, body\}: \(arguments\): 1 key it does not take; it takes only branch, title and body$/],
+    ['an empty title', { ...PUBLISH_ARGS, title: '' }, /title: a pull request has a title/],
+    ['a title past its bound', { ...PUBLISH_ARGS, title: 't'.repeat(257) }, /title: a title is at most 256 bytes/],
+    // Node's spawn refuses an argument holding NUL, and nothing else here
+    // reads U+0000 as unseen: a human would approve a publish that never runs.
+    ['a NUL in the title', { ...PUBLISH_ARGS, title: 'Fix\u0000it' }, /^sandbox\.publish takes \{branch, title, body\}: title: a title may not hold a NUL character$/],
+    ['a NUL in the body', { ...PUBLISH_ARGS, body: 'Opened\u0000here' }, /^sandbox\.publish takes \{branch, title, body\}: body: a body may not hold a NUL character$/],
+    ['more than a human is shown', { ...PUBLISH_ARGS, body: 'b'.repeat(600) }, /^sandbox\.publish's arguments come to \d+ bytes as a human approving the call is shown them \(redacted canonical JSON\), and approval\.requested shows at most 500: a human could approve a pull request whose end they never saw\./],
+    ['a credential in the body', { ...PUBLISH_ARGS, body: `token ghp_${'a'.repeat(36)}` }, /^body holds a span the log redacts as a credential .* could approve a pull request they cannot read\. A worker never holds a credential: keep anything of that shape out of the pull request\.$/],
+    ['a character a screen hides', { ...PUBLISH_ARGS, title: 'Fix‮it' }, /^title holds U\+202E, .* would not read the pull request as it is opened\./],
+    ['the docker socket', { ...PUBLISH_ARGS, body: 'see /var/run/docker.sock' }, /^sandbox\.publish's body is refused by the sandbox's audit, which reads the publisher's arguments as part of the docker run's own \(docker args mention docker\.sock: a container may never reach the daemon\)\. Leave that out of it\.$/],
+  ]
+  for (const [name, args, why] of argCases) {
+    const d = direct(t, { files: { coder: PUBLISHER }, egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress })
+    const refusal = d.tools.argsRefusal(PUBLISH, args)
+    assert.match(String(refusal), why, name)
+    if (name === 'a credential in the body') assert.equal(String(refusal).includes('ghp_'), false)
+    const out = await d.tools.call(ticketFor('run_a', args, PUBLISH), args, context('run_a'))
+    assert.equal(out.text, `[refused] ${String(refusal)}`, name)
+    assert.equal(d.driver.specs.length, 0, name)
+    assert.equal(existsSync(join(d.sandbox.domains.trusted.mountRoot, 'run_a')), false, `${name}: a workspace was made`)
+  }
+
+  // A push binding that binds more repositories than the one it publishes
+  // to: the grant routes that one alone, on both bindings, and each route
+  // holds only the profiles its half needs.
+  {
+    const wider = {
+      github: { host: 'github.com', profiles: ['git-fetch', 'git-push'], repos: ['op/fixture', 'op/other'] },
+      'github-api': API_BINDING,
+    }
+    const fx = egressOf({ bindings: wider })
+    const d = direct(t, { files: { coder: manifest('coder', { tier: 3, allow: [PUBLISH], egress: { bind: ['github', 'github-api'] } }) }, egress: fx.egress, exits: [{ hangs: true }] })
+    assert.equal(d.tools.egressRefusal(PUBLISH, 'coder', 'run_w'), undefined)
+    const call = d.tools.call(ticketFor('run_w', PUBLISH_ARGS, PUBLISH), PUBLISH_ARGS, context('run_w'))
+    await until(() => d.driver.channels.length === 1, 'the publish channel')
+    const routes = [
+      { bindingId: 'github', host: 'github.com', profiles: ['git-fetch', 'git-push'], repos: ['op/fixture'] },
+      { bindingId: 'github-api', host: 'api.github.com', profiles: ['github-pulls'], repos: ['op/fixture'] },
+    ]
+    assert.deepEqual(d.tools.liveGrants().map((g) => g.grant.routes), [routes])
+    const mux = new FakeMux(d.driver.channels[0]!)
+    await mux.ready()
+    // The other repository the binding holds is no route of this grant.
+    assert.match(await mux.request(receivePack('refs/heads/aos/run_w/fix/readme').replace(/op\/fixture/g, 'op/other')), /^HTTP\/1\.1 403 /)
+    mux.exit(0)
+    d.driver.simulateExit(d.driver.channels[0]!.name)
+    await call
+    const [issued] = payloads(d.store, 'proxy.grant.issued')
+    assert.deepEqual(issued?.['routes'], routes)
+    assert.deepEqual(payloads(d.store, 'proxy.decision').map((r) => [r['verdict'], r['reason']]), [['deny', 'repo']])
+    assert.deepEqual(fx.up.seen, [])
+  }
+
+  // At execution, for a ticket minted without the loop's pre-gate asks, each
+  // as an exec's is refused: a domain boot closed, no image pinned or one
+  // that is no id, a run already stopped. Each before any workspace, grant or
+  // container.
+  const stopped = new AbortController()
+  stopped.abort()
+  const late: readonly { name: string; d: Direct; ctx: SandboxCallContext; refusal: string | RegExp }[] = [
+    {
+      name: 'a domain boot closed',
+      d: direct(t, { files: { coder: PUBLISHER }, egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress, closedDomains: { trusted: 'a boot canary showed a route out of the trusted domain' } }),
+      ctx: context('run_c'),
+      refusal: '[refused] a boot canary showed a route out of the trusted domain; no container was started',
+    },
+    {
+      name: 'no image pinned',
+      d: direct(t, { files: { coder: PUBLISHER }, egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress, imageId: undefined }),
+      ctx: context('run_c'),
+      refusal: /^\[refused\] sandbox\.imageId is not set in config\/kernel\.yaml, which ships none/,
+    },
+    {
+      name: 'an image tag, not an id',
+      d: direct(t, { files: { coder: PUBLISHER }, egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress, imageId: 'aos-worker:test' }),
+      ctx: context('run_c'),
+      refusal: /^\[refused\] sandbox\.imageId "aos-worker:test" is no image id: it must be sha256:<64 lower-case hex>/,
+    },
+    {
+      name: 'a run already stopped',
+      d: direct(t, { files: { coder: PUBLISHER }, egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress }),
+      ctx: context('run_c', { signal: stopped.signal }),
+      refusal: '[refused] the run was stopped before the container started',
+    },
+  ]
+  for (const c of late) {
+    const out = await c.d.tools.call(ticketFor('run_c', PUBLISH_ARGS, PUBLISH), PUBLISH_ARGS, c.ctx)
+    assert.equal(out.ok, false, c.name)
+    if (typeof c.refusal === 'string') assert.equal(out.text, c.refusal, c.name)
+    else assert.match(out.text, c.refusal, c.name)
+    assert.equal(c.d.driver.specs.length, 0, `${c.name}: a container was started`)
+    assert.deepEqual(payloads(c.d.store, 'proxy.grant.issued'), [], c.name)
+    assert.equal(existsSync(join(c.d.sandbox.domains.trusted.mountRoot, 'run_c')), false, `${c.name}: a workspace was made`)
+  }
+  // What the loop asks before the gate says the same of the config.
+  assert.match(String(late[1]?.d.tools.configRefusal(PUBLISH)), /^sandbox\.imageId is not set/)
+
+  // A forged record whose egress binds an id kernel.yaml does not hold: refused
+  // by name at the offer, before the gate and at execution, never published
+  // through the bindings it does hold.
+  {
+    const d = direct(t, {
+      files: { coder: PUBLISHER },
+      egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress,
+      exits: [{ hangs: true }],
+      sandboxAgents: (r) => ({
+        get: (id) => {
+          const record = r.get(id)
+          return record === undefined ? undefined : { ...record, manifest: { ...record.manifest, egress: { allow: [], bind: ['github', 'github-api', 'gitlab'] } } }
+        },
+      }),
+    })
+    const refusal = "coder's egress.bind names 1 binding(s) kernel.yaml does not hold; no container was started"
+    assert.equal(d.tools.egressRefusal(PUBLISH, 'coder'), refusal)
+    assert.equal(d.tools.egressRefusal(PUBLISH, 'coder', 'run_f'), refusal)
+    const out = await d.tools.call(ticketFor('run_f', PUBLISH_ARGS, PUBLISH), PUBLISH_ARGS, context('run_f'))
+    assert.deepEqual([out.ok, out.text], [false, `[refused] ${refusal}`])
+    assert.equal(d.driver.specs.length, 0)
+    assert.deepEqual(payloads(d.store, 'proxy.grant.issued'), [])
+  }
+
+  // A repository or a host the mask holds as secret (a value the broker
+  // registered after load): refused at the offer and before the gate, the
+  // field named by its place, never quoted, and at execution before any
+  // workspace is made.
+  t.after(() => SecretMask.clear())
+  const masked: readonly { field: string; secret: string; bindings: SandboxEgress['bindings'] }[] = [
+    {
+      field: 'repository routes\\[0\\]\\.repos\\[0\\]',
+      secret: 'fixture-7f3a9c2e',
+      bindings: { github: { ...GIT_BINDING, repos: ['op/fixture-7f3a9c2e'] }, 'github-api': { ...API_BINDING, repos: ['op/fixture-7f3a9c2e'] } },
+    },
+    { field: 'bound host routes\\[0\\]', secret: 'gitea-host-91c3', bindings: { github: { ...GIT_BINDING, host: 'gitea-host-91c3.example.org' }, 'github-api': API_BINDING } },
+    { field: 'bound host routes\\[1\\]', secret: 'api-host-4d1b8e0a', bindings: { github: GIT_BINDING, 'github-api': { ...API_BINDING, host: 'api-host-4d1b8e0a.example.org' } } },
+  ]
+  for (const c of masked) {
+    const d = direct(t, { files: { coder: PUBLISHER }, egress: egressOf({ bindings: c.bindings }).egress, exits: [{ hangs: true }] })
+    assert.equal(d.tools.egressRefusal(PUBLISH, 'coder', 'run_m'), undefined, `${c.field}: refused before the mask held the value`)
+    assert.ok(SecretMask.register(c.secret))
+    const refusal = new RegExp(`^the grant's ${c.field} is in the shape of a credential, or holds a value the kernel holds as secret`)
+    assert.match(d.tools.egressRefusal(PUBLISH, 'coder', 'run_m') ?? 'none', refusal, c.field)
+    assert.match(d.tools.egressRefusal(PUBLISH, 'coder') ?? 'none', refusal, `${c.field}, at the offer`)
+    const out = await d.tools.call(ticketFor('run_m', PUBLISH_ARGS, PUBLISH), PUBLISH_ARGS, context('run_m'))
+    assert.equal(out.ok, false)
+    assert.match(out.text, new RegExp(`^\\[refused\\] the grant's ${c.field} is in the shape of a credential`))
+    assert.equal(out.text.includes(c.secret), false, 'the refusal quoted the secret')
+    assert.equal(d.driver.specs.length, 0, 'a container started')
+    assert.deepEqual(payloads(d.store, 'proxy.grant.issued'), [])
+    assert.equal(existsSync(join(d.sandbox.domains.trusted.mountRoot, 'run_m')), false, `${c.field}: a workspace was made`)
+    SecretMask.clear()
+  }
+
+  // The offer: a manifest that lists it, on a kernel whose egress can serve
+  // its grant, is shown it with exec; with egress degraded, neither.
+  const ok = wire(t, { script: [done()], exits: [], files: { coder: PUBLISHER }, egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress })
+  await ok.loop.start({ runId: 'run_o', agent: ok.agent('coder'), prompt: 'look' })
+  assert.deepEqual(offered(ok.provider.requests[0]), ['sandbox__exec', 'sandbox__publish'])
+  const [schema] = (ok.provider.requests[0]?.body as { tools: { function: { name: string; description: string } }[] }).tools.filter((tool) => tool.function.name === 'sandbox__publish')
+  assert.equal(schema?.function.description, PUBLISH_DESCRIPTION)
+  const off = wire(t, { script: [done()], exits: [], files: { coder: PUBLISHER }, egress: egressOf({ bindings: PUBLISH_BINDINGS, state: DEGRADED }).egress })
+  await off.loop.start({ runId: 'run_f', agent: off.agent('coder'), prompt: 'look' })
+  assert.deepEqual(offered(off.provider.requests[0]), [])
+  // And a domain boot closed runs no publish either.
+  const closed = direct(t, { files: { coder: PUBLISHER }, egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress, closedDomains: { trusted: 'a boot canary showed a route out of the trusted domain' } })
+  assert.equal(closed.tools.domainRefusal(PUBLISH, 'coder'), 'a boot canary showed a route out of the trusted domain; no container was started')
+})
+
+test("a publisher's command the sandbox's audit refuses only whole, its fields and its target each passing apart, is refused at execution before any workspace, grant or container", async (t) => {
+  // The fields are held to the audit before the gate (argsRefusal), and the
+  // target too (egressRefusal), each on its own; #publish asks the audit of
+  // the whole command, as the driver will read it, once more. docker.ts's
+  // audit refuses no whole whose parts it passed, so this driver's is one
+  // that reads across elements: the mux and the publisher in one argv.
+  const fx = egressOf({ bindings: PUBLISH_BINDINGS })
+  const d = direct(t, { files: { coder: PUBLISHER }, egress: fx.egress, exits: [{ exitCode: 0 }] })
+  const said = 'docker args run the mux and the publisher in one container'
+  const whole = (command: readonly string[]): boolean => command.includes(MUX_ARGV[1] ?? '') && command.includes(PUBLISH_ARGV[1] ?? '')
+  const base = d.driver
+  const driver: SandboxDriver = {
+    name: base.name,
+    probe: () => base.probe(),
+    run: (spec) => base.run(spec),
+    kill: (name) => base.kill(name),
+    abandon: (name) => base.abandon(name),
+    commandRefusal: (command) => (whole(command) ? said : base.commandRefusal(command)),
+    everyRunRefusal: () => base.everyRunRefusal(),
+    sweepOrphans: (request) => base.sweepOrphans(request),
+  }
+  const tools = toolsOver(d, driver, { egress: fx.egress })
+  assert.equal(tools.argsRefusal(PUBLISH, PUBLISH_ARGS), undefined, 'the fields pass apart')
+  assert.equal(tools.egressRefusal(PUBLISH, 'coder', 'run_w'), undefined, 'the target passes apart')
+  assert.equal(tools.egressRefusal(PUBLISH, 'coder'), undefined, 'and at the offer')
+  const out = await tools.call(ticketFor('run_w', PUBLISH_ARGS, PUBLISH), PUBLISH_ARGS, context('run_w'))
+  assert.deepEqual(
+    [out.ok, out.taints, out.text],
+    [false, true, `[refused] the publisher's command is one the sandbox's audit refuses (${said}); no container was started`],
+  )
+  assert.equal(d.driver.specs.length, 0, 'a container was started')
+  assert.deepEqual(payloads(d.store, 'proxy.grant.issued'), [], 'a grant was issued')
+  assert.deepEqual(callRows(d.store), ['tool.call', 'tool.result'], 'a sandbox row was written')
+  assert.equal(existsSync(join(d.sandbox.domains.trusted.mountRoot, 'run_w')), false, 'a workspace was made')
+  assert.deepEqual(fx.up.seen, [])
+})
+
+test("publish's description names the bytes the approval preview counts: plain fields of that many bytes together are shown whole, one more, or a quote in their place, is refused; and the title's and the branch's own bounds", (t) => {
+  // The preview measures the redacted canonical JSON, {"body":..,"branch":..,"title":..}:
+  // 34 bytes of keys and quotes before any field's own.
+  assert.equal(PUBLISH_FIELDS_BYTES, APPROVAL_PREVIEW_BYTES - 34)
+  assert.ok(PUBLISH_DESCRIPTION.includes(`keep the three within ${String(PUBLISH_FIELDS_BYTES)} bytes together, in plain text, and fewer with quotes`))
+  assert.equal(PUBLISH_DESCRIPTION.includes(`within ${String(APPROVAL_PREVIEW_BYTES)} bytes`), false)
+  const d = direct(t, { files: { coder: PUBLISHER }, egress: egressOf({ bindings: PUBLISH_BINDINGS }).egress })
+  const fields = (body: string): Record<string, unknown> => ({ branch: 'fix/readme', title: 't'.repeat(200), body })
+  const room = PUBLISH_FIELDS_BYTES - 'fix/readme'.length - 200
+  assert.equal(d.tools.argsRefusal(PUBLISH, fields('b'.repeat(room))), undefined, 'exactly the budget, in plain text')
+  assert.equal(Buffer.byteLength(canonicalize(fields('b'.repeat(room)))), APPROVAL_PREVIEW_BYTES)
+  for (const [name, body] of [
+    ['one byte more', 'b'.repeat(room + 1)],
+    ['a quote in place of a plain byte', `${'b'.repeat(room - 1)}"`],
+    ['a line break in place of a plain byte', `${'b'.repeat(room - 1)}\n`],
+  ] as const) {
+    assert.match(String(d.tools.argsRefusal(PUBLISH, fields(body))), /^sandbox\.publish's arguments come to 50[0-9] bytes as a human approving the call is shown them/, name)
+  }
+
+  // Each field's own bound is narrower than the three's together, so the
+  // model is told it too, in the description and in the field's schema: a
+  // title or a branch past its own is refused however few bytes the three
+  // come to.
+  assert.ok(
+    PUBLISH_DESCRIPTION.includes(
+      `of those, the title takes at most ${String(MAX_PUBLISH_TITLE_BYTES)} bytes and the branch at most ${String(MAX_BRANCH_CHARS)} characters.`,
+    ),
+    PUBLISH_DESCRIPTION,
+  )
+  const schema = d.tools.schemas().find((s) => s.ref === PUBLISH)?.inputSchema as { properties: Record<string, { description: string }> } | undefined
+  assert.equal(schema?.properties['title']?.description, `The pull request's title; at most ${String(MAX_PUBLISH_TITLE_BYTES)} bytes.`)
+  assert.equal(schema?.properties['branch']?.description, `The branch, pushed as aos/<your run id>/<branch>; at most ${String(MAX_BRANCH_CHARS)} characters.`)
+  assert.ok(MAX_PUBLISH_TITLE_BYTES + 1 + 'x'.length < PUBLISH_FIELDS_BYTES && MAX_BRANCH_CHARS + 1 + 'y'.length < PUBLISH_FIELDS_BYTES)
+  const at = (branch: string, title: string): Record<string, unknown> => ({ branch, title, body: '' })
+  assert.equal(d.tools.argsRefusal(PUBLISH, at('x', 't'.repeat(MAX_PUBLISH_TITLE_BYTES))), undefined, 'a title at its bound')
+  assert.match(
+    String(d.tools.argsRefusal(PUBLISH, at('x', 't'.repeat(MAX_PUBLISH_TITLE_BYTES + 1)))),
+    new RegExp(`^sandbox\\.publish takes \\{branch, title, body\\}: title: a title is at most ${String(MAX_PUBLISH_TITLE_BYTES)} bytes$`),
+  )
+  assert.equal(d.tools.argsRefusal(PUBLISH, at('b'.repeat(MAX_BRANCH_CHARS), 'y')), undefined, 'a branch at its bound')
+  assert.match(
+    String(d.tools.argsRefusal(PUBLISH, at('b'.repeat(MAX_BRANCH_CHARS + 1), 'y'))),
+    new RegExp(`^sandbox\\.publish takes \\{branch, title, body\\}: branch: a branch name: .*at most ${String(MAX_BRANCH_CHARS)} characters$`),
+  )
+})
+
+test('a binding that both pushes and opens pull requests is one route of the publish grant, holding all three profiles, and the publisher is told so', { timeout: 10_000 }, async (t) => {
+  const fx = egressOf()
+  const d = direct(t, { files: { coder: manifest('coder', { tier: 3, allow: [PUBLISH], egress: { bind: ['github'] } }) }, egress: fx.egress, exits: [{ hangs: true }] })
+  assert.equal(d.tools.egressRefusal(PUBLISH, 'coder', 'run_s'), undefined)
+  const call = d.tools.call(ticketFor('run_s', PUBLISH_ARGS, PUBLISH), PUBLISH_ARGS, context('run_s'))
+  await until(() => d.driver.channels.length === 1, 'the publish channel')
+  assert.deepEqual(d.tools.liveGrants().map((g) => [g.purpose, g.grant.allow, g.grant.routes]), [
+    ['publish', [], [{ bindingId: 'github', host: 'github.com', profiles: ['git-fetch', 'git-push', 'github-pulls'], repos: ['op/fixture'] }]],
+  ])
+  assert.deepEqual(d.driver.specs[0]?.command, [...muxCommand(publishCommand({ gitHost: 'github.com', apiHost: 'github.com', repo: 'op/fixture' }, 'run_s', PUBLISH_ARGS))])
+  const mux = new FakeMux(d.driver.channels[0]!)
+  await mux.ready()
+  mux.exit(0)
+  d.driver.simulateExit(d.driver.channels[0]!.name)
+  const out = await call
+  assert.equal(out.ok, true, out.text)
+})
+
+test('a manifest below tier 3 may not hold sandbox.publish, which is irreversible', (t) => {
+  const store = withStore(t)
+  const agents = registry(store, SHIPPED_VIEWS, PUBLISH_BINDINGS)
+  assert.throws(
+    () => agents.load(agentsDir(t, { coder: manifest('coder', { tier: 2, allow: [PUBLISH], egress: { bind: ['github', 'github-api'] } }) })),
+    /tools\.allow names sandbox\.publish, which is irreversible risk, but tier 2 may hold read or write/,
+  )
 })

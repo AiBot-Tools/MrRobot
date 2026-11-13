@@ -448,10 +448,20 @@ test('a domain a canary closed stays closed across restarts until a boot whose c
     await one.shutdown()
     assert.deepEqual(closureRows(fx.dbPath), [[domain, reason]], domain)
 
-    /** A boot that keeps the domain closed, as the first one left it, and the other one open. */
-    const keeps = async (label: string, kernel: Kernel): Promise<void> => {
+    /**
+     * A boot that keeps the domain closed, as the first one left it, and the
+     * other one open: one closure row of its own (the count grows by exactly
+     * one, so a boot that held the domain closed in memory and wrote no row,
+     * which the next boot would read as open, is caught), naming the first
+     * canary's reason.
+     */
+    const keeps = async (label: string, boot: () => Promise<Kernel>): Promise<void> => {
       const at = `${domain}, ${label}`
-      assert.deepEqual(closureRows(fx.dbPath).at(-1), [domain, reason], `${at}: no closure row of its own`)
+      const before = closureRows(fx.dbPath).length
+      const kernel = await boot()
+      const after = closureRows(fx.dbPath)
+      assert.equal(after.length, before + 1, `${at}: no closure row of its own`)
+      assert.deepEqual(after.at(-1), [domain, reason], `${at}: its closure row is not the closing canary's`)
       assert.equal(kernel.status().subsystems.sandbox.state, 'degraded', at)
       assert.ok((kernel.status().subsystems.sandbox.reason ?? '').includes(reason), `${at}: ${kernel.status().subsystems.sandbox.reason ?? ''}`)
       assert.equal(kernel.sandboxTools.domainRefusal('sandbox.exec', `boxer-${domain}`), refusal, at)
@@ -462,30 +472,57 @@ test('a domain a canary closed stays closed across restarts until a boot whose c
     // Boot 2: egress disabled (the shipped default), so no canary runs.
     {
       const driver = driverWith()
-      await keeps('egress disabled', await bootOn(t, disabled, { sandboxDriver: driver, agentsDir }))
+      await keeps('egress disabled', () => bootOn(t, disabled, { sandboxDriver: driver, agentsDir }))
       assert.deepEqual(driver.specs, [], `${domain}: a canary ran with egress disabled`)
     }
     // Boot 3: a probe that failed (no daemon answers), so no canary runs.
     {
       const driver = fakeSandbox({ imageId: IMAGE, play: canaryPlayer() })
-      await keeps('a failed probe', await bootOn(t, fx, { sandboxDriver: driver, agentsDir }))
+      await keeps('a failed probe', () => bootOn(t, fx, { sandboxDriver: driver, agentsDir }))
       assert.deepEqual(driver.specs, [], domain)
     }
     // Boot 4: a sweep that did not finish (a VM it could not list), so no canary runs.
     {
       seedRunlessCanaries(t, fx, [`aos-run-canary-2-0000000000aa-${domain}`])
       const driver = driverWith({}, { sweepUnlisted: [domain] })
-      await keeps('a failed sweep', await bootOn(t, fx, { sandboxDriver: driver, agentsDir }))
+      await keeps('a failed sweep', () => bootOn(t, fx, { sandboxDriver: driver, agentsDir }))
       assert.deepEqual(driver.specs, [], domain)
     }
     // Boot 5: the domain's canary never ends, a failure that is no evidence
     // either way; the other one passes, and its domain stays open.
     {
       const driver = driverWith({ instead: { [domain]: 'hang' } })
-      const kernel = await bootOn(t, fx, { sandboxDriver: driver, agentsDir, canaryWaitMs: 200 })
-      assert.deepEqual(driver.specs.map((s) => s.domain).sort(), ['hostile', 'trusted'], domain)
-      assert.deepEqual(egressRows(fx.dbPath).at(-1)?.['domain'], domain)
-      await keeps('a canary that never ended', kernel)
+      await keeps('a canary that never ended', async () => {
+        const kernel = await bootOn(t, fx, { sandboxDriver: driver, agentsDir, canaryWaitMs: 200 })
+        assert.deepEqual(driver.specs.map((s) => s.domain).sort(), ['hostile', 'trusted'], domain)
+        assert.deepEqual(egressRows(fx.dbPath).at(-1)?.['domain'], domain)
+        return kernel
+      })
+    }
+    // Boot 5b: egress disabled once more, after the boot whose canary there
+    // failed for anything else. It reads the closure from that boot's rows,
+    // so a boot 5 that kept the domain closed only in memory would have it
+    // reopened here, with no canary of any boot having passed there.
+    {
+      const driver = driverWith()
+      await keeps('egress disabled after a canary that failed for anything else', () => bootOn(t, disabled, { sandboxDriver: driver, agentsDir }))
+      assert.deepEqual(driver.specs, [], domain)
+    }
+    // Boot 5c: the domain's canary is refused again, for another reason (its
+    // probe of 192.168.5.2:8766 timed out): the closure is this boot's, naming
+    // its own canary and its code, not the first canary's.
+    {
+      const driver = driverWith({ report: { [domain]: refusedReport('timed out') } })
+      const before = closureRows(fx.dbPath).length
+      const kernel = await bootOn(t, fx, { sandboxDriver: driver, agentsDir })
+      const again = closes(domain, canaryNames(driver)[domain], "the self-test's probe of 192.168.5.2:8766 met ETIMEDOUT, which does not say there is no route")
+      assert.notEqual(again, reason)
+      const after = closureRows(fx.dbPath)
+      assert.equal(after.length, before + 1, domain)
+      assert.deepEqual(after.at(-1), [domain, again], `${domain}: the closure kept the earlier canary's reason`)
+      assert.equal(kernel.sandboxTools.domainRefusal('sandbox.exec', `boxer-${domain}`), `${again}; no container was started`, domain)
+      assert.equal(kernel.sandboxTools.domainRefusal('sandbox.exec', `boxer-${other}`), undefined, domain)
+      await kernel.shutdown()
     }
     // Boot 6: both canaries pass, which reopens the domain: no closure
     // row, the sandbox ok, and an exec there runs again.
@@ -583,6 +620,40 @@ test('a canary whose probe timed out degrades egress, naming the probe and the c
   // The probe named is the kernel's own target for the probe of that kind.
   assert.equal(reportWith('address', 'ETIMEDOUT').target, '192.168.5.2:8766')
   assert.equal(reportWith('name', 'ETIMEDOUT').target, probeTarget(SELF_TEST.find((p) => probeKind(p) === 'name') ?? SELF_TEST[0]!))
+})
+
+test("a mountRoot whose canary workspace cannot be made degrades egress on each domain sharing it, naming each canary, and never refuses the boot", async (t) => {
+  // <mountRoot>/aos_canary is made by makeWorkspace, which refuses one that
+  // is there and is no directory of its own (and a mountRoot that does not
+  // exist). That is a canary that could not run, as any other failure to
+  // start one is: egress degraded, check `canary`, naming the domain; never
+  // the whole boot refused for a share the operator can fix. The fixture's
+  // two domains share one mountRoot, so both canaries fail so.
+  const driver = driverWith()
+  const { kernel, fx } = await withKernel(t, {
+    kernelYaml: yaml(true),
+    sandboxDriver: driver,
+    beforeBoot: (f) => {
+      writeFileSync(join(f.config.sandbox.domains.trusted.mountRoot, CANARY_WORKSPACE), 'no directory\n')
+    },
+  })
+  assert.equal(fx.config.sandbox.domains.trusted.mountRoot, fx.config.sandbox.domains.hostile.mountRoot)
+  assert.equal(kernel.status().subsystems.egress.state, 'degraded')
+  const rows = egressRows(fx.dbPath)
+  assert.deepEqual(rows.map((r) => [r['check'], r['domain']]), [
+    ['canary', 'trusted'],
+    ['canary', 'hostile'],
+  ])
+  for (const row of rows) {
+    const domain = String(row['domain'])
+    assert.match(String(row['reason']), new RegExp(`^the ${domain} domain's canary \\(aos-run-canary-[0-9]+-[0-9a-f]{12}-${domain}\\) did not pass: its workspace could not be made \\(`), domain)
+    assert.match(String(row['reason']), /is there and is no directory of its own\)\. So no run is given egress: check the domain's mountRoot/, domain)
+  }
+  // No canary container was started, and neither domain is closed: a
+  // workspace that could not be made is no evidence of a route.
+  assert.deepEqual(driver.specs, [])
+  assert.deepEqual(closureRows(fx.dbPath), [])
+  assert.equal(kernel.status().subsystems.sandbox.state, 'ok', kernel.status().subsystems.sandbox.reason ?? '')
 })
 
 test('an image id mismatch on either domain degrades sandbox and egress', async (t) => {

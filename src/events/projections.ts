@@ -392,6 +392,101 @@ export function sandboxRunIds(rows: readonly EventRow[]): string[] {
   return [...runs]
 }
 
+/**
+ * The docker CLI's own failure status (src/runtime/sandbox-tools.ts
+ * DOCKER_CLI_FAILED, held equal by test/egress-boot.test.ts): an exit that
+ * says nothing of the container, which may run on.
+ */
+const CLI_FAILED = 125
+
+/**
+ * Every container started under no run that the log never saw end on its
+ * own: the sandboxId of each `sandbox.started` row appended with no run
+ * whose name no later `sandbox.killed` row names as an exit the driver saw,
+ * in the order the log started them. A `sandbox.killed` row ends the name
+ * only when it carries an exit code and that code is not the docker CLI's
+ * own failure (125), and its reason is not `error`: a canary given up at
+ * boot's bound, one whose result rejected, one whose docker client exited
+ * 125 or with no status were each sent a kill by name that may never have
+ * landed (a paused VM), so the container may still run, as a run's container
+ * may after a live kernel's kill missed it, which the sweep names by its run
+ * whatever its end said. The kernel starts a container under no run only
+ * for boot's egress canaries (egress plan W3, src/runtime/canary.ts), one per
+ * domain, each named uniquely to its boot, and records every one's end; one
+ * with no such end is a canary a kernel that died during its boot left
+ * running, or one whose end it did not see, which the next boot's sweep
+ * kills by name (src/kernel.ts sweepTargets). The hostile domain's canary has
+ * no grant, so this row is the one that names it.
+ */
+export function openRunlessSandboxes(rows: readonly EventRow[]): string[] {
+  const open = new Set<string>()
+  for (const row of rows) {
+    if (row.runId !== null) continue
+    if (row.type !== 'sandbox.started' && row.type !== 'sandbox.killed') continue
+    const payload = parse(row.payload)
+    const name = stringAt(payload, 'sandboxId')
+    if (name === '') continue
+    if (row.type === 'sandbox.started') {
+      open.add(name)
+      continue
+    }
+    const exitCode = payload['exitCode']
+    const seen = stringAt(payload, 'reason') !== 'error' && typeof exitCode === 'number' && exitCode !== CLI_FAILED
+    if (seen) open.delete(name)
+  }
+  return [...open]
+}
+
+/** A sandbox domain, as a closure row names it. */
+export type ClosableDomain = 'trusted' | 'hostile'
+
+/**
+ * The domains the log holds closed to sandbox.exec, each with its closure
+ * row's reason, in domain order (egress plan W3's review, round 3): what a
+ * boot keeps closed unless a canary of its own passes there. A boot records
+ * every domain it leaves closed as one `sandbox.degraded` row with `closes`,
+ * before it marks its sandbox (its `subsystem.state` row of `sandbox`): a
+ * domain its canary closed, and each one the log already held closed that no
+ * canary of that boot's passed on (src/kernel.ts). So the last boot that
+ * marked its sandbox recorded the whole set, and its closure rows are the
+ * set it left: a domain it did not record, it reopened. A boot that ended
+ * before its mark (a crash among its canaries) cannot have reopened
+ * anything, so its closure rows only join the set before it. A boot that
+ * never runs a canary (egress disabled, a probe or a sweep that failed)
+ * therefore keeps every closure, and only a canary that passes on a domain
+ * reopens it.
+ */
+export function closedSandboxDomains(rows: readonly EventRow[]): Partial<Record<ClosableDomain, string>> {
+  let held = new Map<ClosableDomain, string>()
+  // This boot's closure rows so far, from its kernel.booted to its mark.
+  let boot: Map<ClosableDomain, string> | undefined
+  for (const row of rows) {
+    if (row.type === 'kernel.booted') {
+      boot = new Map()
+      continue
+    }
+    if (row.type === 'sandbox.degraded') {
+      const payload = parse(row.payload)
+      const domain = payload['closes']
+      if (domain !== 'trusted' && domain !== 'hostile') continue
+      const reason = stringAt(payload, 'reason', `${domain}: an earlier boot closed this domain to sandbox.exec, and its row gave no reason`)
+      boot?.set(domain, reason)
+      held.set(domain, reason)
+      continue
+    }
+    if (row.type === 'subsystem.state' && boot !== undefined && stringAt(parse(row.payload), 'subsystem') === 'sandbox') {
+      held = boot
+      boot = undefined
+    }
+  }
+  const closed: Partial<Record<ClosableDomain, string>> = {}
+  for (const domain of ['trusted', 'hostile'] as const) {
+    const reason = held.get(domain)
+    if (reason !== undefined) closed[domain] = reason
+  }
+  return closed
+}
+
 /** A child's terminal status, as a delegation result can state it. */
 function resultStatus(status: string): DanglingDelegation['status'] {
   return status === 'ok' || status === 'killed' || status === 'denied' ? status : 'error'

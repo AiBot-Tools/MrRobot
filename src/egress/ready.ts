@@ -16,15 +16,24 @@
 // container whose network is not what the kernel asked for never runs its
 // command. The report is the container's text and attacker-chosen: it is
 // parsed strictly and never echoed, and a clause here names a probe by the
-// target the kernel itself holds, never by what the report says.
+// target the kernel itself holds, never by what the report says (a reached
+// probe among them, so an operator reads what a container reached). The one
+// thing of the report's a clause repeats is a refused probe's error code,
+// and only one in the mux's code shape (an upper-case name of at most 32
+// characters) that the redaction pass leaves as it is, so an operator reads
+// which code a probe met (ETIMEDOUT, EHOSTUNREACH, EOTHER) and nothing else
+// the container wrote.
 //
 // SELF_TEST here is the kernel's copy of the mux's list, which the image
 // carries; test/egress-mux.test.ts holds the two equal, probe for probe, and
-// the mux's report format to this reading. The boot canary (egress plan W3)
-// will run the same judge on a container of its own.
+// the mux's report format to this reading. The boot canary (egress plan W3,
+// src/runtime/canary.ts) runs the same judge on a container of its own on
+// each domain.
 
 import { isIP } from 'node:net'
 import { z } from 'zod'
+
+import { redactString } from '../events/redact.js'
 
 /** One self-test probe, as the mux runs it and its report names it. */
 export interface ReadyProbe {
@@ -53,6 +62,19 @@ export const NO_ROUTE_CODES: Readonly<Record<'address' | 'name' | 'lookup', Read
   lookup: new Set(['EAI_AGAIN', 'ENOTFOUND']),
 })
 
+/** An error code as the mux spells one (mux.mjs ERROR_CODE): an upper-case name of at most 32 characters. */
+const ERROR_CODE = /^[A-Z][A-Z0-9_]{0,31}$/
+
+/**
+ * What a refused probe met, as a clause says it: the code, when it is one in
+ * the mux's shape that the redaction pass leaves as it is, and otherwise only
+ * that it was none or of no known shape, never the report's text.
+ */
+function metText(code: string | null): string {
+  if (code === null) return 'no error'
+  return ERROR_CODE.test(code) && redactString(code) === code ? code : 'an error code of no known shape'
+}
+
 /** How the report names a probe: host:port for a connect, the host for a lookup. */
 export function probeTarget(probe: ReadyProbe): string {
   return probe.probe === 'connect' ? `${probe.host}:${String(probe.port)}` : probe.host
@@ -73,10 +95,11 @@ const Report = z.strictObject({
 
 /**
  * Undefined to accept `report`, or a clause saying why not, which names a
- * probe by the kernel's own target, never by the report's text. Accepts only
- * ASCII JSON in the mux's shape naming every SELF_TEST probe in order, none
- * reached, the top-level count zero, and each error a code that says there
- * is no route for that kind of probe.
+ * probe by the kernel's own target, never by the report's text, and the
+ * code a refused probe met (metText). Accepts only ASCII JSON in the mux's
+ * shape naming every SELF_TEST probe in order, each as the kind of probe the
+ * kernel runs, none reached, the top-level count zero, and each error a code
+ * that says there is no route for that kind of probe.
  */
 export function acceptReady(report: Uint8Array): string | undefined {
   if (report.length === 0 || report.length > READY_MAX_BYTES) return 'the report is empty or longer than a ready report is'
@@ -94,16 +117,20 @@ export function acceptReady(report: Uint8Array): string | undefined {
   if (probes.length !== SELF_TEST.length || probes.some((p, i) => p.target !== probeTarget(SELF_TEST[i] ?? { probe: 'lookup', host: '' }))) {
     return 'the report does not name every self-test probe, in order'
   }
-  const reached = probes.filter((p) => p.reached).length
-  if (reached !== 0 || parsed.data.reached !== 0) {
-    return `the self-test reached ${String(Math.max(reached, parsed.data.reached))} of what it must not`
+  // Named by the kernel's own targets: the order is held to SELF_TEST's above.
+  const reached = SELF_TEST.filter((_, i) => probes[i]?.reached === true).map(probeTarget)
+  if (reached.length !== 0 || parsed.data.reached !== 0) {
+    const count = String(Math.max(reached.length, parsed.data.reached))
+    const which = reached.length === 0 ? 'its report names none of them' : reached.join(', ')
+    return `the self-test reached ${count} of what it must not (${which})`
   }
   for (const [i, p] of probes.entries()) {
     const probe = SELF_TEST[i]
     if (probe === undefined) return 'the report names a probe the kernel does not run'
+    if (p.probe !== probe.probe) return 'the report does not name every self-test probe, in order'
     const codes = probe.probe === 'lookup' ? NO_ROUTE_CODES.lookup : isIP(probe.host) === 0 ? NO_ROUTE_CODES.name : NO_ROUTE_CODES.address
-    if (p.probe !== probe.probe || p.error === null || !codes.has(p.error)) {
-      return `the self-test's probe of ${probeTarget(probe)} met no error that says there is no route`
+    if (p.error === null || !codes.has(p.error)) {
+      return `the self-test's probe of ${probeTarget(probe)} met ${metText(p.error)}, which does not say there is no route`
     }
   }
   return undefined

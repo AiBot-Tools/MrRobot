@@ -81,6 +81,27 @@
 // that went unanswered went somewhere, so there is a route (W3's judge; L1
 // confirms the codes in both VMs).
 //
+// The canary and the self-test (egress plan W3). Boot runs one container on
+// each domain to show its network is what the kernel asked for, before any
+// run is given egress (src/runtime/canary.ts):
+//
+//   docker run --init -i --network none ... <image id> node /opt/aos/mux.mjs --canary
+//   docker run --init --network none ... <image id> node /opt/aos/mux.mjs --self-test
+//
+// `--canary`, on the trusted domain, is the mux over its channel with one
+// request of its own in place of a command: the self-test and ready as
+// above, and once go has come and the listener is up, CANARY_REQUEST sent
+// through 127.0.0.1:3128 as a worker's would be, for an address the kernel
+// must deny; the exit frame then carries 0 when the kernel answered it 403
+// and CANARY_FAILED for any other answer or none within CANARY_TIMEOUT_MS,
+// and the mux ends as it ends after a command. It spawns nothing.
+// `--self-test`, on the hostile domain, which gets no channel, writes the
+// self-test's report as one line on stdout (the ready payload and a
+// newline), exits, and does nothing else: no listener, no frame, no read of
+// stdin. Its probes are bounded (PROBE_TIMEOUT_MS each, all at once) and so is
+// its one write (FLUSH_TIMEOUT_MS), so it ends on its own within seconds,
+// whatever the kernel does, or whether one still runs.
+//
 // Flows. A connection the listener accepts becomes the next flow (an open
 // frame), unless maxFlows flows are not yet retired: then it is held, paused,
 // until one retires (frame.ts: the mux holds a connection back rather than
@@ -849,9 +870,9 @@ export const EXIT_GRACE_MAX_MS = 20_000
 
 /** The mux's own exit codes: how its run ended, never the command's status (which is the exit frame's). */
 export const MUX_EXIT = Object.freeze({
-  /** The channel ended (stdin EOF), or the command exited and every flow retired. */
+  /** The channel ended (stdin EOF), or the command (or the canary's request) ended and every flow retired, or the self-test's line was written. */
   ok: 0,
-  /** The arguments were not `-- <command> [args...]`. */
+  /** The arguments were none of `-- <command> [args...]`, `--canary` and `--self-test` (parseArgs). */
   usage: 64,
   /** The mux would have sent a frame its own codec refuses: a bug here. */
   internal: 70,
@@ -862,6 +883,88 @@ export const MUX_EXIT = Object.freeze({
   /** The kernel sent a frame the mux refuses, or its stream ended inside one. */
   protocol: 76,
 })
+
+// ── the canary and the self-test (egress plan W3) ──
+
+/**
+ * The canary's one request: one the kernel must deny, for pmmcp on the Mac's
+ * loopback as a Colima VM reaches it, in the absolute form HTTP_PROXY gives
+ * every request. The kernel denies it before anything is resolved or dialled
+ * (an address is no egress host) and answers 403; the session records the
+ * deny as a proxy.decision row of the canary's grant.
+ */
+export const CANARY_REQUEST = 'GET http://192.168.5.2:8766/mcp HTTP/1.1\r\nHost: 192.168.5.2:8766\r\nConnection: close\r\n\r\n'
+/** The start of the answer the canary must read: the kernel's 403. */
+export const CANARY_DENIED = 'HTTP/1.1 403 '
+/** The most of the kernel's answer the canary reads: a 403's head and its short body. Past it the answer is no denial. */
+export const CANARY_ANSWER_MAX_BYTES = 16_384
+/** How long the canary's request may take, from its connect to the answer's end. */
+export const CANARY_TIMEOUT_MS = 10_000
+/** The canary's status when the kernel's answer was not its 403, or never came. */
+export const CANARY_FAILED = 1
+
+/**
+ * The canary's status from the answer it read: 0 when it begins with the
+ * kernel's 403 status line, CANARY_FAILED otherwise.
+ * @param {readonly Uint8Array[]} chunks
+ */
+export function canaryStatus(chunks) {
+  const want = new TextEncoder().encode(CANARY_DENIED)
+  let at = 0
+  for (const chunk of chunks) {
+    for (const byte of chunk) {
+      if (at === want.length) return 0
+      if (byte !== want.at(at)) return CANARY_FAILED
+      at++
+    }
+  }
+  return at === want.length ? 0 : CANARY_FAILED
+}
+
+/** @typedef {{ output: Writable, diagnostics?: Writable, connect?: ConnectProbe, lookup?: LookupProbe, probeTimeoutMs?: number, flushTimeoutMs?: number }} SelfTestOptions */
+
+/**
+ * The self-test alone, for a container with no channel (the hostile
+ * domain's canary, egress plan W3): run SELF_TEST, write its report to
+ * `output` as one line (the ready payload, then a newline: ASCII JSON, so
+ * the driver's text capture keeps it byte for byte), and resolve with
+ * MUX_EXIT.ok once it is written, or MUX_EXIT.io if it cannot be within
+ * flushTimeoutMs. It listens on nothing, reads nothing and runs nothing; the
+ * kernel judges the line as it judges a ready report.
+ * @param {SelfTestOptions} options
+ * @returns {Promise<number>}
+ */
+export async function runSelfTest(options) {
+  /** @type {Uint8Array} */
+  let report
+  try {
+    report = readyPayload(
+      await selfTest({
+        ...(options.connect === undefined ? {} : { connect: options.connect }),
+        ...(options.lookup === undefined ? {} : { lookup: options.lookup }),
+        ...(options.probeTimeoutMs === undefined ? {} : { timeoutMs: options.probeTimeoutMs }),
+      }),
+    )
+  } catch (e) {
+    options.diagnostics?.write(`aos-mux: the self-test failed: ${errorCode(e)}\n`)
+    return MUX_EXIT.internal
+  }
+  const line = new Uint8Array(report.length + 1)
+  line.set(report)
+  line.set([0x0a], report.length)
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(MUX_EXIT.io), options.flushTimeoutMs ?? FLUSH_TIMEOUT_MS)
+    try {
+      options.output.write(line, (e) => {
+        clearTimeout(timer)
+        resolve(e === undefined || e === null ? MUX_EXIT.ok : MUX_EXIT.io)
+      })
+    } catch {
+      clearTimeout(timer)
+      resolve(MUX_EXIT.io)
+    }
+  })
+}
 
 /** The address a listener is bound to, as the system reports it, and its close. @typedef {{ readonly host: string, readonly port: number, close(): void }} Listener */
 /** @typedef {(host: string, port: number, onConnection: (socket: Duplex) => void) => Promise<Listener>} Listen */
@@ -954,8 +1057,11 @@ export function spawnCommand(command, args, spawn = spawnProcess) {
  * @property {Readable} input the kernel's frames: docker -i stdin
  * @property {Writable} output the mux's frames: docker stdout
  * @property {Writable} [diagnostics] the mux's own complaints: docker stderr
- * @property {string} command
- * @property {readonly string[]} args
+ * @property {string} [command] the command, unless this is the canary
+ * @property {readonly string[]} [args]
+ * @property {boolean} [canary] run the canary's one request (runCanary) in place of a command
+ * @property {(host: string, port: number) => Duplex} [dial] how the canary connects to the mux's own listener
+ * @property {number} [canaryTimeoutMs]
  * @property {ConnectProbe} [connect]
  * @property {LookupProbe} [lookup]
  * @property {number} [probeTimeoutMs]
@@ -990,6 +1096,9 @@ class Mux {
   /** @type {Writable | undefined} */ #diagnostics
   /** @type {string} */ #command
   /** @type {readonly string[]} */ #args
+  /** @type {boolean} */ #canary
+  /** @type {(host: string, port: number) => Duplex} */ #dial
+  /** @type {number} */ #canaryTimeoutMs
   /** @type {ConnectProbe | undefined} */ #connect
   /** @type {LookupProbe | undefined} */ #lookup
   /** @type {number | undefined} */ #probeTimeoutMs
@@ -1037,8 +1146,11 @@ class Mux {
     this.#input = options.input
     this.#output = options.output
     this.#diagnostics = options.diagnostics
-    this.#command = options.command
-    this.#args = Object.freeze([...options.args])
+    this.#canary = options.canary === true
+    this.#command = options.command ?? ''
+    this.#args = Object.freeze([...(options.args ?? [])])
+    this.#dial = options.dial ?? dialTcp
+    this.#canaryTimeoutMs = options.canaryTimeoutMs ?? CANARY_TIMEOUT_MS
     this.#connect = options.connect
     this.#lookup = options.lookup
     this.#probeTimeoutMs = options.probeTimeoutMs
@@ -1194,6 +1306,10 @@ class Mux {
   }
 
   #run() {
+    if (this.#canary) {
+      this.#runCanary()
+      return
+    }
     /** @type {CommandChild} */
     let child
     try {
@@ -1223,6 +1339,52 @@ class Mux {
       this.#startGrace()
     })
     child.once('close', (code, signal) => this.#commandEnded(statusOf(code, signal, spawnError), spawnError))
+  }
+
+  /**
+   * The canary's command (egress plan W3), run in the mux itself: one
+   * request, CANARY_REQUEST, through the mux's own listener as a worker's
+   * request goes under HTTP_PROXY, so it crosses the channel as a flow and
+   * the kernel judges it. Its status, sent in the exit frame as a command's
+   * is: 0 when the kernel answered it 403 (denied, as it must deny the Mac's
+   * loopback), CANARY_FAILED for any other answer, none at all, or none
+   * within canaryTimeoutMs. Nothing is spawned.
+   */
+  #runCanary() {
+    /** @type {Duplex} */
+    let socket
+    try {
+      socket = this.#dial(MUX_HOST, MUX_PORT)
+    } catch {
+      this.#commandEnded(CANARY_FAILED, undefined)
+      return
+    }
+    /** @type {Uint8Array[]} */
+    const chunks = []
+    let held = 0
+    // An answer that took too long, or ran past CANARY_ANSWER_MAX_BYTES, is
+    // no denial, whatever it began with.
+    let failedAnswer = false
+    const timer = setTimeout(() => {
+      failedAnswer = true
+      socket.destroy()
+    }, this.#canaryTimeoutMs)
+    socket.on('error', () => {})
+    socket.on('data', (chunk) => {
+      const bytes = chunk instanceof Uint8Array ? chunk : new TextEncoder().encode(String(chunk))
+      if (held + bytes.length > CANARY_ANSWER_MAX_BYTES) {
+        failedAnswer = true
+        socket.destroy()
+        return
+      }
+      chunks.push(bytes)
+      held += bytes.length
+    })
+    socket.once('close', () => {
+      clearTimeout(timer)
+      this.#commandEnded(failedAnswer ? CANARY_FAILED : canaryStatus(chunks), undefined)
+    })
+    socket.write(new TextEncoder().encode(CANARY_REQUEST))
   }
 
   /**
@@ -1528,17 +1690,51 @@ export function statusOf(code, signal, spawnError) {
 
 // ── the entry point ─────────────────────────────────────────────────────────
 
-export const USAGE = 'usage: node mux.mjs -- <command> [args...]\n'
+export const USAGE = 'usage: node mux.mjs -- <command> [args...] | node mux.mjs --canary | node mux.mjs --self-test\n'
 
 /**
- * The command the mux runs: `-- <command> [args...]`, and nothing else.
+ * @typedef {{ readonly mode: 'run', readonly command: string, readonly args: readonly string[] }
+ *   | { readonly mode: 'canary' } | { readonly mode: 'self-test' }} Parsed
+ */
+
+/**
+ * What the mux is to do: `-- <command> [args...]`, the command over the
+ * channel; `--canary`, alone, the canary's one request over the channel in
+ * place of a command; `--self-test`, alone, the self-test's report as a line
+ * on stdout, for a container with no channel; and nothing else.
  * @param {readonly string[]} argv
- * @returns {{ readonly command: string, readonly args: readonly string[] } | undefined}
+ * @returns {Parsed | undefined}
  */
 export function parseArgs(argv) {
-  const [separator, command, ...args] = argv
-  if (separator !== '--' || command === undefined || command === '') return undefined
-  return Object.freeze({ command, args: Object.freeze(args) })
+  const [first, command, ...args] = argv
+  if (first === '--canary' && command === undefined) return Object.freeze({ mode: /** @type {const} */ ('canary') })
+  if (first === '--self-test' && command === undefined) return Object.freeze({ mode: /** @type {const} */ ('self-test') })
+  if (first !== '--' || command === undefined || command === '') return undefined
+  return Object.freeze({ mode: /** @type {const} */ ('run'), command, args: Object.freeze(args) })
+}
+
+/**
+ * @typedef {{ readonly runner: 'self-test', readonly options: SelfTestOptions }
+ *   | { readonly runner: 'mux', readonly options: MuxOptions }} Entry
+ */
+
+/**
+ * What main() runs for the arguments parseArgs read, over the process's own
+ * stdio: the runner and the options it is handed. Pure, and exported, so a
+ * test holds each mode's wiring (main() itself runs only as the program):
+ * `--self-test` runs runSelfTest on stdout and stderr alone (no channel, so
+ * it is handed no stdin), `--canary` runs the channel mux with the canary's
+ * own request in place of a command (and no command), and `-- <command>
+ * [args...]` runs the channel mux around the command.
+ * @param {Parsed} parsed
+ * @param {{ readonly input: Readable, readonly output: Writable, readonly diagnostics: Writable }} stdio
+ * @returns {Entry}
+ */
+export function entryOptions(parsed, stdio) {
+  const { input, output, diagnostics } = stdio
+  if (parsed.mode === 'self-test') return Object.freeze({ runner: 'self-test', options: { output, diagnostics } })
+  if (parsed.mode === 'canary') return Object.freeze({ runner: 'mux', options: { input, output, diagnostics, canary: true } })
+  return Object.freeze({ runner: 'mux', options: { input, output, diagnostics, command: parsed.command, args: parsed.args } })
 }
 
 async function main() {
@@ -1547,8 +1743,8 @@ async function main() {
     process.stderr.write(USAGE)
     process.exit(MUX_EXIT.usage)
   }
-  const code = await runMux({ input: process.stdin, output: process.stdout, diagnostics: process.stderr, ...parsed })
-  process.exit(code)
+  const entry = entryOptions(parsed, { input: process.stdin, output: process.stdout, diagnostics: process.stderr })
+  process.exit(entry.runner === 'self-test' ? await runSelfTest(entry.options) : await runMux(entry.options))
 }
 
 // Run only as the program node was started with (node >= 22.18 and 24.2 set

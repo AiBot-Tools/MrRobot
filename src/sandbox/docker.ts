@@ -1190,6 +1190,25 @@ interface Held {
   end(): void
 }
 
+/**
+ * Why `domain`'s VM does not hold the pinned image, from what its `docker
+ * image inspect --format {{.Id}} <imageId>` printed (trimmed), or undefined
+ * when it printed the pin itself. What docker says goes into the
+ * hash-chained log for good (sandbox.degraded.reason), so it is bounded:
+ * what it printed is shown only when it reads as an id, which is bounded,
+ * and otherwise only named. Exported so the tests' fake driver reports a
+ * mismatch in the probe's own words.
+ */
+export function imagePrintedProblem(domain: SandboxDomain, imageId: string, printed: string): string | undefined {
+  if (printed === imageId) return undefined
+  const what = printed === '' ? 'no id' : isImageId(printed) ? `the id ${printed}` : 'something that is no image id'
+  return (
+    `${domain}: docker image inspect ${imageId} printed ${what} on this domain's VM, not the pinned ` +
+    'sandbox.imageId: pin the id `docker image inspect --format {{.Id}}` prints for the worker image, the same ' +
+    'on both VMs'
+  )
+}
+
 export class DockerDriver implements SandboxDriver {
   readonly name = 'docker'
   readonly #options: DockerDriverOptions
@@ -1348,7 +1367,7 @@ export class DockerDriver implements SandboxDriver {
       // `image inspect` reads the VM's own store and never pulls.
       if (stopped()) return PROBE_STOPPED
       const missing = await this.#imageMissingOn(domain, imageId, signal)
-      if (missing !== undefined) return { ok: false, why: missing }
+      if (missing !== undefined) return { ok: false, why: missing, imageOn: domain }
     }
     return { ok: true, version }
   }
@@ -1377,17 +1396,7 @@ export class DockerDriver implements SandboxDriver {
         'that both VMs hold it under the one pinned id'
       )
     }
-    if (printed === imageId) return undefined
-    // What docker says goes into the hash-chained log for good
-    // (sandbox.degraded.reason), so it is bounded there: its refusal, above,
-    // cut by dockerSaid, and what it printed shown only when it reads as an
-    // id, which is bounded, and otherwise only named.
-    const what = printed === '' ? 'no id' : isImageId(printed) ? `the id ${printed}` : 'something that is no image id'
-    return (
-      `${domain}: docker image inspect ${imageId} printed ${what} on this domain's VM, not the pinned ` +
-      'sandbox.imageId: pin the id `docker image inspect --format {{.Id}}` prints for the worker image, the same ' +
-      'on both VMs'
-    )
+    return imagePrintedProblem(domain, imageId, printed)
   }
 
   run(given: SandboxSpec): RunningSandbox {

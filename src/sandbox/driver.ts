@@ -116,9 +116,12 @@ export interface SweepRequest {
    */
   readonly runIds: readonly string[]
   /**
-   * Containers the log names outright (an open grant's `sandbox`, a canary's
-   * included, which serves no run): a listed container of one of these
-   * names is killed.
+   * Containers the log names outright, apart from any run: an open grant's
+   * `sandbox` (the trusted boot canary's included, which serves no run), and
+   * each container started under no run whose end the log never saw (a boot
+   * canary of either domain: src/events/projections.ts
+   * openRunlessSandboxes). A listed container of one of these names is
+   * killed.
    */
   readonly names: readonly string[]
   /**
@@ -458,7 +461,19 @@ export interface RunningSandbox {
 
 export type ProbeResult =
   | { readonly ok: true; readonly version: string }
-  | { readonly ok: false; readonly why: string }
+  | {
+      readonly ok: false
+      readonly why: string
+      /**
+       * Set when the probe failed at the pinned image on one domain's VM: its
+       * `docker image inspect --format {{.Id}}` of sandbox.imageId, asked on
+       * that domain's own socket, failed or printed anything but the pin. So
+       * boot can say egress cannot run the image there (egress.degraded
+       * check `image`, naming the domain) apart from a runtime that does not
+       * answer at all. Unset for every other failure.
+       */
+      readonly imageOn?: SandboxDomain
+    }
 
 export interface SandboxDriver {
   readonly name: string

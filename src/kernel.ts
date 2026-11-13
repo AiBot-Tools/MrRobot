@@ -48,11 +48,12 @@ import { acceptReady } from './egress/ready.js'
 import type { CredentialInjector } from './egress/session.js'
 import { createUpstream, systemUpstreamDeps, type Upstream, type UpstreamDeps, type UpstreamLimits } from './egress/upstream.js'
 import { readAllRows, type EventRow } from './events/chain.js'
-import { isClean, projectRecovery, sandboxRunIds, type Recovery } from './events/projections.js'
+import { closedSandboxDomains, isClean, openRunlessSandboxes, projectRecovery, sandboxRunIds, type Recovery } from './events/projections.js'
 import { GoalTracker } from './goals/tracker.js'
 import { Delegation } from './runtime/delegate.js'
 import { KernelTools } from './runtime/kernel-tools.js'
-import { isSandboxRef, SandboxTools } from './runtime/sandbox-tools.js'
+import { isSandboxRef, makeWorkspace, SandboxTools } from './runtime/sandbox-tools.js'
+import { CANARY_WAIT_MS, CANARY_WORKSPACE, canaryName, canaryNonce, runCanary, type CanaryVerdict } from './runtime/canary.js'
 import { GoalWriter } from './goals/writer.js'
 import { goalToolsUnusable, watchGoalTools } from './goals/tools.js'
 
@@ -84,7 +85,8 @@ import type { BindingStatus, EgressState } from './runtime/egress.js'
 import { Scheduler } from './runtime/scheduler.js'
 import { AppleContainerDriver } from './sandbox/apple-container.js'
 import { DockerDriver, realDockerDriver, type DockerProcesses } from './sandbox/docker.js'
-import type { ProbeResult as SandboxProbe, SandboxDriver, SweepRequest, SweepResult } from './sandbox/driver.js'
+import type { ProbeResult as SandboxProbe, SandboxDomain, SandboxDriver, SweepRequest, SweepResult } from './sandbox/driver.js'
+import { memoryBytes } from './sandbox/limits.js'
 import { assertTokenUsable } from './control/auth.js'
 import { ControlServer, type ControlSurface } from './control/server.js'
 import type { HumanActor } from './control/actor.js'
@@ -192,7 +194,7 @@ export const PROBE_REASON_BYTES = 4_096
 
 const ProbeAnswer = z.union([
   z.object({ ok: z.literal(true), version: z.string() }),
-  z.object({ ok: z.literal(false), why: z.string() }),
+  z.object({ ok: z.literal(false), why: z.string(), imageOn: z.enum(['trusted', 'hostile']).optional() }),
 ])
 
 /**
@@ -215,7 +217,10 @@ function probeVerdict(driverName: string, answer: unknown): SandboxProbe {
     }
   }
   const probe = parsed.data
-  return probe.ok ? { ok: true, version: probe.version } : { ok: false, why: recordable(probe.why, PROBE_REASON_BYTES) }
+  if (probe.ok) return { ok: true, version: probe.version }
+  // The domain whose VM failed the image check, kept: boot names it in the
+  // egress.degraded row of check `image` (egress plan W3).
+  return { ok: false, why: recordable(probe.why, PROBE_REASON_BYTES), ...(probe.imageOn === undefined ? {} : { imageOn: probe.imageOn }) }
 }
 
 /**
@@ -250,14 +255,19 @@ export interface SweepTargets {
 /**
  * The boot sweep's targets, from the log as boot read it, before recovery
  * wrote anything: every run that may have had a container (sandboxRunIds),
- * and every grant left open's container by name (a canary's included, which
- * serves no run). Nothing else: a container with the prefix that this log
- * does not name may be a live kernel's, on another data directory.
+ * every grant left open's container by name (the trusted canary's included,
+ * which serves no run), and every container started under no run that the
+ * log never saw end (openRunlessSandboxes: a boot canary, on either domain,
+ * that a kernel which died during its boot left running, or whose end it did
+ * not see; the hostile one has no grant, so this is the row that names it).
+ * Nothing else: a container with the prefix that this log does not name may
+ * be a live kernel's, on another data directory.
  */
 export function sweepTargets(rows: readonly EventRow[], recovered: Recovery): SweepTargets {
   const runIds = new Set(sandboxRunIds(rows))
   for (const grant of recovered.openGrants) if (grant.runId !== null) runIds.add(grant.runId)
   const names = new Set(recovered.openGrants.map((g) => g.sandbox).filter((name) => name !== ''))
+  for (const name of openRunlessSandboxes(rows)) names.add(name)
   return { runIds: [...runIds], names: [...names] }
 }
 
@@ -436,6 +446,12 @@ export interface BootOptions {
    * bound without waiting 30 s.
    */
   readonly probeWaitMs?: number
+  /**
+   * Tests only: how long boot waits for each egress canary's container
+   * (src/runtime/canary.ts), in place of CANARY_WAIT_MS, so a test can hold
+   * a canary that never ends to its bound without waiting 30 s.
+   */
+  readonly canaryWaitMs?: number
   /** Injected by tests so no boot opens a socket to a real pmmcp. */
   readonly clientFactory?: ClientFactory
   /**
@@ -636,7 +652,9 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     const hash = configHash(config)
     // The first row of this boot, always. `degraded` is empty because nothing
     // has been built yet — see KernelBootedPayload.
-    store.append({
+    // Its seq names this boot's egress canaries (canaryName): no earlier boot
+    // of this log had it.
+    const booted = store.append({
       type: 'kernel.booted',
       payload: { schemaVersion: 1, version: VERSION, configHash: hash, degraded: [] },
     })
@@ -880,10 +898,11 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     // the mark: a kernel that died left its containers running with no
     // wallclock (the timers were the dead process's), on either VM, and
     // nothing else will ever end them. Only what this log names (sweepTargets:
-    // every run of its that may have had a container, every grant left open),
-    // so a live kernel's containers on the same VM, another data directory's,
-    // are never this boot's to kill; and none at all, with no runtime asked
-    // anything, for a log with no sandbox run. A sandbox is ok only once the
+    // every run of its that may have had a container, every grant left open,
+    // and every container started under no run whose end it never saw, a boot
+    // canary's), so a live kernel's containers on the same VM, another data
+    // directory's, are never this boot's to kill; and none at all, with no
+    // runtime asked anything, for a log with no sandbox run. A sandbox is ok only once the
     // sweep has done all it was asked, so that ok means no container of this
     // log's is left running that the sweep could reach. Bounded
     // (SWEEP_WAIT_MS): a VM that never answers degrades the sandbox rather
@@ -917,13 +936,120 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     // is made (a driver's probe reason, sweepProblem's SWEEP_REASON_BYTES).
     const sandboxWhys = [...(sandboxProbe.ok ? [] : [sandboxProbe.why]), ...(sweep.problem === undefined ? [] : [sweep.problem])]
     const sandboxWhy = sandboxWhys.length === 0 ? undefined : sandboxWhys.join('; ')
+
+    // The egress canaries (egress plan W3, src/runtime/canary.ts): one
+    // container on each domain, at once, run as any other is (the pinned
+    // image by id, --pull=never, --network none), which must fail every
+    // direct connect and the lookup of the mux's self-test, judged by
+    // acceptReady as every exec's ready is; the trusted one must also
+    // complete one framed round trip, which its session denies and records.
+    // Run only while egress is enabled and the sandbox is ok so far (the
+    // probe found the pinned image on both VMs, and the sweep finished),
+    // whatever the bindings say, so a failed binding does not hide a network
+    // that is not what the kernel asks for. Each is named uniquely to this
+    // boot (this boot's kernel.booted seq and a nonce), so no kill an earlier
+    // boot's sweep sent and a paused VM still holds can end one; and recorded
+    // as it starts (sandbox.started under no run, and the trusted one's
+    // proxy.grant.issued `sandbox`, issued before), so a next boot's sweep
+    // kills by name one this kernel dies leaving. Run here, before the
+    // sandbox's mark, because a canary whose self-test report was refused
+    // closes its domain to sandbox.exec (below); each failed one is egress's
+    // `canary` check (the egress section).
+    const canaries: { readonly domain: SandboxDomain; readonly verdict: CanaryVerdict }[] = []
+    if (config.egress.enabled && sandboxWhy === undefined) {
+      const nonce = canaryNonce()
+      const defaults = config.sandbox.defaults
+      const canaryOn = async (domain: SandboxDomain): Promise<CanaryVerdict> => {
+        const name = canaryName(booted.seq, nonce, domain)
+        // Pinned whenever the probe passed (DockerDriver.probe fails without
+        // one); said again here rather than handed to the driver as no id.
+        const imageId = config.sandbox.imageId
+        if (imageId === undefined) {
+          return { ok: false, why: `the ${domain} domain's canary (${name}) did not pass: no sandbox.imageId is pinned, so it has no image to run` }
+        }
+        let workspace: string
+        try {
+          workspace = makeWorkspace(domain, config.sandbox.domains[domain].mountRoot, CANARY_WORKSPACE)
+        } catch (e) {
+          return {
+            ok: false,
+            why:
+              `the ${domain} domain's canary (${name}) did not pass: its workspace could not be made ` +
+              `(${e instanceof Error ? e.message : String(e)}). So no run is given egress: check the domain's mountRoot ` +
+              '(scripts/colima-up.sh), then restart the kernel',
+          }
+        }
+        return runCanary({
+          driver,
+          store,
+          domain,
+          name,
+          imageId,
+          workspace,
+          limits: {
+            memoryMb: Math.ceil((memoryBytes(defaults.memory) ?? 0) / (1024 * 1024)),
+            cpus: defaults.cpus,
+            pids: defaults.pidsLimit,
+            wallclockMs: defaults.wallclockMs,
+          },
+          egressLimits: config.egress.limits,
+          acceptReady,
+          waitMs: options.canaryWaitMs ?? CANARY_WAIT_MS,
+        })
+      }
+      const domains = ['trusted', 'hostile'] as const
+      const verdicts = await Promise.all(domains.map(canaryOn))
+      for (const [i, verdict] of verdicts.entries()) {
+        const domain = domains[i]
+        if (domain !== undefined) canaries.push({ domain, verdict })
+      }
+    }
+    // A domain whose canary's self-test report was refused (a probe reached
+    // what --network none keeps out, or met a code that does not say there
+    // is no route) runs no sandbox.exec at all, not only none with egress: a
+    // run with no channel has no self-test of its own, so the canary is the
+    // only evidence of that domain's network the kernel has. And it stays
+    // closed, across boots, until a boot whose canary there passes: one the
+    // log holds closed (closedSandboxDomains, read before this boot wrote
+    // anything) is closed again by every boot that runs no canary there that
+    // passes (egress disabled, a probe or a sweep that failed, a canary that
+    // failed for anything else), with the reason its closure gave, which
+    // names the canary that found it. One sandbox.degraded row per closed
+    // domain, naming it (`closes`), before the sandbox's mark, so the next
+    // boot reads the whole set from this one's rows; the sandbox is
+    // degraded; SandboxTools refuses an exec there at the offer, before the
+    // gate and at execution (domainRefusal). The other domain runs as before.
+    const closedBefore = closedSandboxDomains(rowsAtBoot)
+    const closedDomains: Partial<Record<SandboxDomain, string>> = {}
+    for (const domain of ['trusted', 'hostile'] as const) {
+      const verdict = canaries.find((c) => c.domain === domain)?.verdict
+      // A canary of this boot's passed there: the domain is open, whatever
+      // an earlier boot found.
+      if (verdict?.ok === true) {
+        if (closedBefore[domain] !== undefined) log.warn({ domain }, 'a boot canary passed on a domain the log held closed: it runs sandbox.exec again')
+        continue
+      }
+      const found = verdict === undefined || verdict.ok ? undefined : verdict.closes
+      const kept = closedBefore[domain]
+      const reason = found ?? (kept === undefined ? undefined : recordable(kept, EGRESS_REASON_BYTES))
+      if (reason === undefined) continue
+      closedDomains[domain] = reason
+      store.append({ type: 'sandbox.degraded', payload: { schemaVersion: 1, driver: driver.name, reason, closes: domain } })
+      log.warn(
+        { domain, reason, kept: found === undefined },
+        found === undefined
+          ? 'a domain an earlier boot canary closed stays closed: no canary of this boot passed there'
+          : 'a boot canary showed a route out of a domain: it runs no sandbox.exec',
+      )
+    }
+    const sandboxReasons = [...sandboxWhys, ...(['trusted', 'hostile'] as const).flatMap((domain) => closedDomains[domain] ?? [])]
     const sweptNote = sweep.swept.length > 0 ? sweptReason(sweep.swept) : undefined
     mark(
       'sandbox',
-      sandboxWhy === undefined ? 'ok' : 'degraded',
-      sandboxWhy === undefined
+      sandboxReasons.length === 0 ? 'ok' : 'degraded',
+      sandboxReasons.length === 0
         ? sweptNote
-        : `${driver.name}: ${sandboxWhy}${sweptNote === undefined ? '' : `; ${sweptNote}`}`,
+        : `${driver.name}: ${sandboxReasons.join('; ')}${sweptNote === undefined ? '' : `; ${sweptNote}`}`,
     )
 
     // ── credentials: resolved ONCE, here, outside any run scope ───────────
@@ -1011,12 +1137,17 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     // failed check, each saying what failed and the key or command that fixes
     // it, as sandbox.degraded does, and the subsystem's reason joins them, as
     // many as fit EGRESS_REASON_BYTES (egressSummary). In
-    // order: the config (egress.enabled), the sandbox (egress serves only a
-    // container on the trusted domain, so a sandbox that cannot run one is
-    // egress that cannot), and each binding's value, resolved here, ONCE,
-    // outside any run scope, as the provider keys are above, and only while
-    // egress is enabled: a disabled egress uses no credential, and resolving
-    // one would record an access for nothing.
+    // order: the config (egress.enabled); the pinned image on each VM (the
+    // probe's `docker image inspect --format {{.Id}}` on that domain's own
+    // socket must print sandbox.imageId: one that does not degrades the
+    // sandbox and is egress's `image` check, naming the domain); the rest of
+    // the sandbox (egress serves only a container on the trusted domain, so a
+    // sandbox that cannot run one is egress that cannot); each binding's
+    // value, resolved here, ONCE, outside any run scope, as the provider keys
+    // are above, and only while egress is enabled: a disabled egress uses no
+    // credential, and resolving one would record an access for nothing; and
+    // a canary on each domain (egress plan W3), run above, before the
+    // sandbox's mark.
     const egressFailures: EgressFailure[] = []
     if (!config.egress.enabled) {
       egressFailures.push({
@@ -1026,11 +1157,27 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
           'once the worker image is built and pinned (sandbox.imageId), to serve the egress a trusted manifest names',
       })
     }
-    if (sandboxWhy !== undefined) {
+    const imageOn = sandboxProbe.ok ? undefined : sandboxProbe.imageOn
+    if (!sandboxProbe.ok && imageOn !== undefined) {
+      egressFailures.push({
+        check: 'image',
+        domain: imageOn,
+        // Not "does not hold": an inspect that failed (a daemon gone between
+        // the probe's calls among the ways) leaves the image unchecked, and
+        // the probe's own words say which it was.
+        reason:
+          `sandbox.imageId could not be confirmed on the ${imageOn} domain's VM by that id (${driver.name}: ${sandboxProbe.why}), ` +
+          "so neither a run's container nor a canary can run there: do as that says, then restart the kernel",
+      })
+    }
+    // The sandbox's other failures, the image's aside: a probe that failed
+    // anywhere else, and a sweep that did not finish.
+    const sandboxOthers = [...(sandboxProbe.ok || imageOn !== undefined ? [] : [sandboxProbe.why]), ...(sweep.problem === undefined ? [] : [sweep.problem])]
+    if (sandboxOthers.length > 0) {
       egressFailures.push({
         check: 'sandbox',
         reason:
-          `the sandbox is degraded (${driver.name}: ${sandboxWhy}), and egress serves only a container on the ` +
+          `the sandbox is degraded (${driver.name}: ${sandboxOthers.join('; ')}), and egress serves only a container on the ` +
           "trusted domain: fix the sandbox first, as the sandbox subsystem's reason says",
       })
     }
@@ -1052,14 +1199,14 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
         })
       }
     }
-    // W3's seam: the pinned image id as each VM holds it, and a canary on each
-    // domain (judged by src/egress/ready.ts's acceptReady), join these checks
-    // here, each a failure of its own naming its domain (check 'image' or
-    // 'canary'), and egress is ok only when they pass too. Each canary is to
-    // be named uniquely per boot, and that name recorded as its grant's
-    // `sandbox` (plan W3's note): the sweep's kills are left to finish once
-    // boot stops waiting, so one held by a paused VM could end a canary this
-    // boot started under a name an earlier boot's canary used.
+    // Each canary that failed (run above, before the sandbox's mark) is a
+    // check of its own naming its domain, and egress is ok only when both
+    // passed.
+    for (const { domain, verdict } of canaries) {
+      if (verdict.ok) continue
+      egressFailures.push({ check: 'canary', domain, reason: verdict.why })
+      log.warn({ domain, reason: verdict.why }, 'an egress canary did not pass')
+    }
     const egressReasons: string[] = []
     for (const failure of egressFailures) {
       // A binding id the log would store censored is recorded as no binding's.
@@ -1072,6 +1219,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
           schemaVersion: 1,
           check: failure.bindingId !== undefined && !named ? 'config' : failure.check,
           ...(named ? { bindingId: failure.bindingId } : {}),
+          ...(failure.domain === undefined ? {} : { domain: failure.domain }),
           reason,
         },
       })
@@ -1138,7 +1286,9 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     // --network none; one whose manifest has egress on the trusted domain is
     // issued a grant before its container starts and served over its channel
     // by the egress engine, while egress is ok (egressRefusal otherwise), and
-    // the hostile domain gets no channel and no grant. No shipped manifest
+    // the hostile domain gets no channel and no grant. A domain whose boot
+    // canary's self-test report was refused (closedDomains) runs no exec at
+    // all (domainRefusal), egress or none. No shipped manifest
     // lists a sandbox tool or holds egress.
     const sandboxTools = new SandboxTools({
       store,
@@ -1146,6 +1296,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       driver,
       agents,
       sandbox: config.sandbox,
+      closedDomains,
       egress: {
         state: egressState,
         bindings: config.egress.bindings,
@@ -1354,8 +1505,10 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
 
 /** One failed egress check, as boot records it (egress.degraded). */
 interface EgressFailure {
-  readonly check: 'config' | 'sandbox' | 'binding'
+  readonly check: 'config' | 'sandbox' | 'binding' | 'image' | 'canary'
   readonly bindingId?: string
+  /** The VM an image or a canary check failed on. */
+  readonly domain?: SandboxDomain
   readonly reason: string
 }
 

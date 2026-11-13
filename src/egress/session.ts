@@ -138,7 +138,10 @@
 // Built by the sandbox runner (src/runtime/sandbox-tools.ts) for each exec
 // grant, over that container's channel, once the grant is issued and before
 // anything is awaited, and ended by it with the driver's verdict on the
-// container (egress plan W1).
+// container (egress plan W1); and by the boot canary (src/runtime/canary.ts,
+// egress plan W3) for the trusted domain's canary grant, which serves no run
+// and reaches nothing, so its rows are appended under no run
+// (SessionOptions.canary).
 
 import {
   createServer,
@@ -278,6 +281,17 @@ export interface SessionOptions {
   readonly grant: EgressGrant
   /** The agent whose run the grant serves; every row is appended under it and the grant's run. */
   readonly agentId?: string
+  /**
+   * The boot's canary (egress plan W3, src/runtime/canary.ts): a grant that
+   * serves no run and no agent and reaches nothing, as its
+   * proxy.grant.issued row says (purpose `canary`). Its rows are appended
+   * under no run and no agent: the grant's runId is decide()'s alone (the
+   * push prefix it never reaches, since decide() denies every request under
+   * a grant with no host). A canary grant naming a host, a route or an
+   * agent is refused, so no session that records nothing of a run serves
+   * any reach.
+   */
+  readonly canary?: true
   readonly limits: SessionLimits
   /** The docker child's stdout, which the mux writes, and its stdin, which the mux reads. */
   readonly channel: { readonly input: Readable; readonly output: Writable }
@@ -437,9 +451,15 @@ const OptionsData = z
     grantId: z.string().regex(RUN_REF),
     grant: EgressGrant,
     agentId: z.string().regex(AGENT_SHAPE).optional(),
+    canary: z.literal(true).optional(),
     limits: SessionLimits,
   })
   .strip()
+  .superRefine((data, ctx) => {
+    if (data.canary !== true) return
+    if (data.grant.allow.length > 0 || data.grant.routes.length > 0) ctx.addIssue({ code: 'custom', message: 'a canary grant reaches nothing' })
+    if (data.agentId !== undefined) ctx.addIssue({ code: 'custom', message: 'a canary grant serves no agent' })
+  })
 
 /** The worker's head, read once into one record: decide() and the upstream head read only this. */
 type HeaderRecord = Readonly<Record<string, readonly string[]>>
@@ -713,7 +733,8 @@ class Session implements EgressSession {
   readonly #resolve: (outcome: SessionOutcome) => void
   readonly #grantId: string
   readonly #grant: EgressGrant
-  readonly #runId: string
+  /** The run every row is appended under: none for a canary's. */
+  readonly #runId: string | undefined
   readonly #agentId: string | undefined
   readonly #limits: SessionLimits
   readonly #input: Readable
@@ -758,7 +779,7 @@ class Session implements EgressSession {
   readonly #totals = { requests: 0, allowed: 0, denied: 0, refused: 0, failed: 0, sentBytes: 0, receivedBytes: 0 }
 
   constructor(options: SessionOptions) {
-    const data = OptionsData.parse({ grantId: options.grantId, grant: options.grant, agentId: options.agentId, limits: options.limits })
+    const data = OptionsData.parse({ grantId: options.grantId, grant: options.grant, agentId: options.agentId, canary: options.canary, limits: options.limits })
     for (const name of ['credential', 'acceptReady', 'kill'] as const) {
       if (typeof options[name] !== 'function') throw new TypeError(`egress session: ${name} must be a function`)
     }
@@ -784,7 +805,7 @@ class Session implements EgressSession {
     }
     this.#grantId = data.grantId
     this.#grant = data.grant
-    this.#runId = data.grant.runId
+    this.#runId = data.canary === true ? undefined : data.grant.runId
     this.#agentId = data.agentId
     this.#limits = Object.freeze(data.limits)
     this.#input = input
@@ -1467,15 +1488,20 @@ class Session implements EgressSession {
   // ── rows ─────────────────────────────────────────────────────────────────
 
   /**
-   * Append one row under the grant's run and agent, and say whether the
-   * store took it. A refused decision row is counted for the revocation's
+   * Append one row under the grant's run and agent (a canary's under
+   * neither), and say whether the store took it. A refused decision row is counted for the revocation's
    * detail, and the caller decides what else it ends: it ends the grant
    * (#unrecorded) once the request it judged is counted and answered; the
    * revocation's own is logged, and done resolves all the same.
    */
   #appendRow(type: 'proxy.decision' | 'proxy.grant.revoked', payload: Record<string, unknown>): boolean {
     try {
-      this.#store.append({ type, payload, runId: this.#runId, ...(this.#agentId === undefined ? {} : { agentId: this.#agentId }) })
+      this.#store.append({
+        type,
+        payload,
+        ...(this.#runId === undefined ? {} : { runId: this.#runId }),
+        ...(this.#agentId === undefined ? {} : { agentId: this.#agentId }),
+      })
       return true
     } catch (e) {
       log.error({ grantId: this.#grantId, type, code: e instanceof KernelError ? e.code : undefined }, 'egress session: a row could not be appended')

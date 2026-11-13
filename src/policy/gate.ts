@@ -79,11 +79,15 @@ export const GateInput = z
      * Why the tool's own runner refuses this call whatever a human says,
      * worked out by the kernel before the gate (sandbox tools', in the run
      * loop's #handleToolCall, from #sandboxHolderProblem,
-     * SandboxTools.configRefusal and SandboxTools.argsRefusal): its caller,
+     * SandboxTools.configRefusal, domainRefusal, egressRefusal and
+     * argsRefusal): its caller,
      * an agent whose manifest, read from the registry, may not hold the tool
      * (SandboxTools.holderProblem), or a kernel with no runner for it; the
      * kernel's own sandbox config, whose driver runs nothing or which pins
-     * no image id to run (SandboxTools.configRefusal); or its arguments, a
+     * no image id to run (SandboxTools.configRefusal); its manifest's
+     * domain, closed at boot by a canary that showed a route out
+     * (SandboxTools.domainRefusal); the egress its grant would need
+     * (SandboxTools.egressRefusal); or its arguments, a
      * command the approval preview would cut, redact or show unreadably, one
      * past the runner's bounds, or one the driver's audit refuses
      * (SandboxTools.argsRefusal).

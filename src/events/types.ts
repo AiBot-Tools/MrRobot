@@ -113,8 +113,15 @@ export const HubToolsClassifiedPayload = z
   })
   .strict()
 
+/**
+ * The sandbox cannot run as it should. `closes`, set only on a boot's row for
+ * a domain it leaves closed to sandbox.exec (egress plan W3: a boot canary's
+ * self-test report there was refused, at this boot or an earlier one no
+ * canary has since passed after), names that domain: the next boot reads the
+ * set from these rows (src/events/projections.ts closedSandboxDomains).
+ */
 export const SandboxDegradedPayload = z
-  .object({ ...V, driver: z.string(), reason: z.string() })
+  .object({ ...V, driver: z.string(), reason: z.string(), closes: z.enum(['trusted', 'hostile']).optional() })
   .strict()
 
 export const RouterDegradedPayload = z.object({ ...V, reason: z.string() }).strict()

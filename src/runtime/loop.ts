@@ -73,14 +73,17 @@
 // registry by its id, may hold the tool and lists it (SandboxTools.
 // holderProblem), whatever the RunAgent's own tool list says, on a kernel
 // whose sandbox config lets a call of it run (SandboxTools.configRefusal: a
-// driver that runs one, and an image id pinned), and, for a manifest with
+// driver that runs one, and an image id pinned), on a domain boot did not
+// close (SandboxTools.domainRefusal: one whose canary showed a container
+// there may have a route out runs no exec), and, for a manifest with
 // egress on the trusted domain, whose egress can serve its grant
 // (SandboxTools.egressRefusal: egress ok, and every binding it routes
 // resolved at boot): a run of any other, or on any other kernel, is never
 // shown one. Before the gate, the runner is asked whether it would refuse
 // the call whoever approved it, for its caller (that manifest again, or no
 // runner wired at all), for the kernel's sandbox config (configRefusal), for
-// its egress (egressRefusal, with the run's id) or for its arguments on
+// its domain (domainRefusal), for its egress (egressRefusal, with the run's
+// id) or for its arguments on
 // their own, and the gate denies such a call (its rule 3c) rather than ask a
 // human to approve a command that would then never run. A caller the
 // registry stops admitting while a human is asked (archived, or reloaded
@@ -562,8 +565,8 @@ export class RunLoop {
    * from the RunAgent, may hold one and lists it (holderProblem): a RunAgent
    * whose toolAllow names sandbox.exec is not shown it otherwise, nor is any
    * run on a kernel whose sandbox config refuses every call of it
-   * (configRefusal), nor one whose egress the kernel cannot serve
-   * (egressRefusal).
+   * (configRefusal), nor one on a domain boot closed (domainRefusal), nor one
+   * whose egress the kernel cannot serve (egressRefusal).
    */
   #toolsFor(agent: RunAgent): ToolSchema[] {
     const allowed = new Set(agent.toolAllow)
@@ -573,6 +576,8 @@ export class RunLoop {
         : []
     // Nor on a kernel whose sandbox config lets no call of the tool run (a
     // driver that runs nothing, or no image id pinned: configRefusal), nor to
+    // a run on a domain boot closed (its canary showed a route out:
+    // domainRefusal), nor to
     // a run whose manifest has egress the kernel cannot serve (egress not ok,
     // or a binding it routes unresolved: egressRefusal): the gate would deny
     // every call, and a model shown the tool would spend its model calls
@@ -587,6 +592,7 @@ export class RunLoop {
               (t) =>
                 sandbox.holderProblem(t.ref, agent.agentId) === undefined &&
                 sandbox.configRefusal(t.ref) === undefined &&
+                sandbox.domainRefusal(t.ref, agent.agentId) === undefined &&
                 sandbox.egressRefusal(t.ref, agent.agentId) === undefined,
             )
     return [...this.#o.agentView().tools, ...kernel, ...boxed].filter((t) => allowed.has(t.ref))
@@ -611,7 +617,8 @@ export class RunLoop {
 
     // Before the gate, so that the gate denies (its rule 3c) a sandbox call
     // the runner would refuse whoever approved it, for its caller, for the
-    // kernel's own sandbox config or for its arguments, rather than ask a
+    // kernel's own sandbox config, its domain, its egress or for its
+    // arguments, rather than ask a
     // human to approve a command that then never runs. The most fundamental
     // first: who may hold the tool, then whether any call of it can run.
     const sandboxTools = this.#o.sandboxTools
@@ -619,6 +626,7 @@ export class RunLoop {
     const runnerRefusal = isSandbox
       ? (this.#sandboxHolderProblem(call.ref, agent.agentId) ??
         sandboxTools?.configRefusal(call.ref) ??
+        sandboxTools?.domainRefusal(call.ref, agent.agentId) ??
         sandboxTools?.egressRefusal(call.ref, agent.agentId, runId) ??
         sandboxTools?.argsRefusal(call.ref, context.args))
       : undefined

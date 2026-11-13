@@ -395,8 +395,8 @@ and outside this rule (decision D36, the last row).
 | Path | What |
 |---|---|
 | `.aos/events.db`, `.aos/events.head` | the event log and its anchor |
-| `.aos/kernel.lock`, `.aos/kernel.lock-journal` | the running kernel's hold on its data directory (an empty SQLite file, locked while a kernel runs, its lock dropped by the OS when that kernel ends), and the rollback journal SQLite keeps beside it while the hold lasts, holding only SQLite's journal header, and removes when the hold is released (one a killed kernel left stays until the next kernel's hold takes it over and removes it in turn); both 0600, the lock made so before SQLite opens it, so the journal takes its mode: one kernel per event log |
-| `.aos/workspaces/{trusted,hostile}` | sandbox mount roots, one per Colima VM |
+| `.aos/kernel.lock`, `.aos/kernel.lock-journal` | the running kernel's hold on its data directory (an empty SQLite file, locked while a kernel runs, its lock dropped by the OS when that kernel ends), and the rollback journal SQLite keeps beside it while the hold lasts, holding only SQLite's journal header, and removes when the hold is released (one a killed kernel left stays until the next kernel's hold takes it over and removes it in turn); both 0600, the lock made so before SQLite opens it, so the journal takes its mode: one kernel per event log. `kernel.lock` is never stale, so never remove it: a boot refused with `another kernel holds` means a kernel holds it now (perhaps a launchd job or another terminal), and one removed while its kernel runs lets a second kernel onto the same log, which closes the live kernel's runs, revokes its grants and kills its containers; stop the other kernel instead |
+| `.aos/workspaces/{trusted,hostile}` | sandbox mount roots, one per Colima VM: a run's workspace is `<runId>/` in its domain's, and `aos_canary/` the boot canaries' (egress plan W3), mounted and never written |
 | `.aos/docker` | `DOCKER_CONFIG` for the kernel's docker calls, `colima-up.sh` and `build-worker-image.sh`, never `~/.docker` |
 | `.env` | your credentials (`AOS_CONTROL_TOKEN`, `AOS_PMMCP_TOKEN`, `ANTHROPIC_API_KEY`): written by you, or created at 0600 and appended to by `npm run aos-install`, which generates the two tokens, never writes `ANTHROPIC_API_KEY` and never changes a line; mode 0600, git-ignored; read, never written, by the other npm entry scripts; deleted by `git clean -fdx` like `.aos/` |
 | `.aos/install/`, `.aos/install.lock` | the installer's logs: a 0700 folder per run, `<UTC stamp>/`, holding each program's `<step>.out` and `<step>.err` (0600), `installer.out` (what it said, when its own output went away mid-run), `force-quit.log` (0600, a typed force-quit's record), and `active.json` while a step it started in a session of its own runs; its lock, held while it runs and removed at its exit (one left by a killed run is taken over, even after a reboot gave its pid to another process) |
@@ -577,14 +577,51 @@ grant, whatever its manifest says.
 
 Boot reports egress `ok` or `degraded`, never absent: degraded appends one
 `egress.degraded` row per failed check, naming what failed and the key or
-command that fixes it (`egress.enabled: false`, which kernel.yaml ships; a
-sandbox that cannot run a container; a binding whose value did not resolve,
-named with its envVar, never its value). While it is degraded no run is offered
-`sandbox.exec` for a manifest with egress, and a call of it is refused with the
-egress reason before any human is asked. That reason, which `status` shows and
-each refusal quotes, names the failed checks while they fit 2 KiB and counts the
-rest, each named in its own row. Each binding's value is resolved once,
-at boot, outside any run, through the broker (`secret.accessed` with purpose
+command that fixes it (`egress.enabled: false`, which kernel.yaml ships; a VM
+whose `docker image inspect --format {{.Id}}` of `sandbox.imageId`, asked on
+that domain's own socket, does not print the pin or cannot be asked, check
+`image`, naming the domain, which degrades the sandbox too; a sandbox that
+cannot run a container for any other reason; a binding whose value did not
+resolve, named with its envVar, never its value; a canary that did not pass,
+check `canary`, naming the domain). The canaries (egress plan W3,
+`src/runtime/canary.ts`) run at every boot while egress is enabled and the
+sandbox probe and the orphan sweep have passed, whatever the bindings say:
+one container on each domain, run as any other is (the pinned image by id,
+`--pull=never`, `--network none`, a wallclock of 20 s or
+`sandbox.defaults.wallclockMs` if that is lower, and none run under a cap
+below 15 s), named uniquely to the boot
+(`aos-run-canary-<seq>-<nonce>-<domain>`, `<seq>` that boot's
+`kernel.booted` row) and recorded under no run. Each runs the worker image's
+mux, whose self-test must fail every direct connect (192.168.5.2:8766 and
+:7777, `host.lima.internal` and `host.docker.internal` on 8766, 1.1.1.1:443)
+and the lookup of `example.com`, each with a code that says there is no
+route, judged by the same `acceptReady` every exec's ready is (a probe that
+timed out went somewhere, and is refused). The trusted one (`--canary`) also
+sends one request over its channel, for `http://192.168.5.2:8766/mcp`, which
+its session, under a `canary` grant that reaches nothing, denies and records
+as a `proxy.decision` row the log must hold; its exit frame must say it read
+the 403. The hostile one (`--self-test`), which gets no channel, writes its
+report as one line on stdout. Egress is ok only when both pass; a failed one
+is named with the probe and the code it met, or what else failed, and what
+fixes it (a rebuilt image, a VM that honours `--network none`). A canary
+whose self-test report is refused also closes its domain to `sandbox.exec`,
+egress or none, since a run with no channel has no self-test of its own: one
+`sandbox.degraded` row names the domain (`closes`), the sandbox is degraded,
+and no run on that domain is offered the tool or has a call of it run
+(refused before any human is asked); the other domain runs as before (W3's
+review, round 2: put to the operator to keep or narrow). The closure lasts
+across restarts, until a boot whose canary on that domain passes: every
+boot that runs none there that passes (egress disabled, a probe or a sweep
+that failed, a canary that failed for any other reason) records the domain
+closed again, with the reason the closing canary gave, and the next boot
+reads the set from the last boot that marked its sandbox
+(`closedSandboxDomains`). So reopening one takes a boot with egress enabled
+whose canary there passes. While egress is degraded no run is offered
+`sandbox.exec` for a manifest with egress, and a call of it is refused with
+the egress reason before any human is asked. That reason, which `status`
+shows and each refusal quotes, names the failed checks while they fit 2 KiB
+and counts the rest, each named in its own row. Each binding's value is
+resolved once, at boot, outside any run, through the broker (`secret.accessed` with purpose
 `egress credential for <host>`), checked as a bearer, and, for a Basic
 binding, its derived value (base64 of `<basicUser>:<value>`) masked before
 anything can quote it; a binding whose envVar is a provider's key refuses the
@@ -690,8 +727,15 @@ prefix, then `docker kill` on the VM that listed each), whatever the sandbox
 probe said, since a dead kernel's wallclock timers died with it. Only those
 the log names: a container of every run that called a sandbox tool, started a
 container or was issued a grant (a finished run's included, so a container a
-live kernel's kill missed is reaped at the next boot), and each open grant's
-container. A VM is shared by every kernel on the Mac, and a container with the
+live kernel's kill missed is reaped at the next boot), each open grant's
+container, and each container started under no run whose end the log never
+saw as an exit the driver reported (a boot canary of either domain whose
+kernel died during its boot, or one given up, whose result was lost or whose
+docker client exited 125 or with no status, each sent a kill by name that may
+not have landed; the hostile one has no grant, so its `sandbox.started` row is
+what names it; a canary ends on its own besides, its probes, its one request
+and its one write each bounded, and the trusted one's mux at its channel's
+end). A VM is shared by every kernel on the Mac, and a container with the
 prefix that this log does not name may be another data directory's live
 kernel's. A log with no sandbox run asks no VM anything. The sandbox's reason
 names what the sweep killed. Boot waits 30 s for it at most, then tells it to
@@ -712,10 +756,11 @@ All of that assumes the log has no live kernel, so boot first takes
 `<dataDir>/kernel.lock` (`src/data-lock.ts`), before it opens the log: SQLite's
 own exclusive lock on an empty file, held until shutdown has closed the log,
 and dropped by the OS when the process ends however it ends, so no stale lock
-is ever left to judge. A second kernel on the same data directory is refused
-there, before it writes anything, instead of closing the live kernel's runs as
-orphans, revoking their grants and killing their containers, and only then
-failing on the control port.
+is ever left to judge, and the file is never one to remove (the `.aos/` table
+says why). A second kernel on the same data directory is refused there, before
+it writes anything, instead of closing the live kernel's runs as orphans,
+revoking their grants and killing their containers, and only then failing on
+the control port.
 
 `test/projections.test.ts` boots on such a log twice and checks that the first
 boot closes each grant once, a canary's under no run and no agent, and the

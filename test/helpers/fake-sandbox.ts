@@ -73,7 +73,16 @@
 // not ok (or none scripted): the scripted (or default) reason here, where the
 // real driver names sandbox.imageId before asking any daemon anything.
 // Degraded on both. A probe scripted ok or not stands for everything the real
-// driver asks the daemons, the pinned image's presence on each VM among it.
+// driver asks the daemons but the pinned image's id on each VM, which a test
+// gives as each VM's daemon prints it (`vmImageIds`): a probe scripted ok
+// fails, as the real one does, at the first VM, trusted's first, that prints
+// anything but the pin, in the real driver's words, naming that domain
+// (ProbeResult.imageOn).
+//
+// A container may be played rather than scripted (`play`): the test's
+// program for it, which decides its exit and, on a channel run, speaks over
+// its channel as its mux would (test/helpers/fake-egress.ts canaryPlayer
+// plays boot's egress canaries so), and spends no scripted exit.
 //
 // And a script may not describe a result the real driver cannot return.
 // assertDriverShaped refuses a stream longer than its capture keeps, a cut
@@ -145,7 +154,7 @@ import {
   type SweepRequest,
   type SweepResult,
 } from '../../src/sandbox/driver.js'
-import { commandAuditRefusal } from '../../src/sandbox/docker.js'
+import { commandAuditRefusal, imagePrintedProblem } from '../../src/sandbox/docker.js'
 import { imageIdProblem, imageRefusal } from '../../src/sandbox/limits.js'
 
 export interface ScriptedExit {
@@ -202,6 +211,27 @@ export interface FakeSandboxOptions {
   readonly orphans?: readonly string[] | Readonly<Partial<Record<SandboxDomain, readonly string[]>>>
   /** sweepOrphans() never settles: a daemon that accepts and never answers. */
   readonly sweepHangs?: boolean
+  /**
+   * What each VM's `docker image inspect --format {{.Id}} <imageId>` prints,
+   * on that domain's own socket, as the real probe asks it of each domain in
+   * turn, trusted's first: a VM listed here with anything but the pinned id
+   * fails a probe scripted ok, as the real driver's does, in its words
+   * (imagePrintedProblem) and naming that domain (ProbeResult.imageOn).
+   * Unset, or a domain left out, prints the pin.
+   */
+  readonly vmImageIds?: Readonly<Partial<Record<SandboxDomain, string>>>
+  /**
+   * A container a test plays as a program, not from the script: called with
+   * every spec run() admits and, on a channel run, the container's ends. A
+   * promise is that run: it runs until its kill or overrun, or until the
+   * promise resolves, when it exits with the ScriptedExit given (on a channel
+   * run its pipes then close as Node closes a child's), and it spends no
+   * scripted exit. Undefined leaves the run to the script. What a played
+   * container exits with is held to the shapes the real driver returns, as a
+   * script is. test/helpers/fake-egress.ts canaryPlayer plays boot's egress
+   * canaries this way.
+   */
+  readonly play?: (spec: SandboxSpec, container: FakeChannel | undefined) => Promise<ScriptedExit> | undefined
   /** VMs the sweep cannot list, as a daemon that refuses `docker ps` (SweepResult.unlisted). */
   readonly sweepUnlisted?: readonly SandboxDomain[]
   /** Names whose kill by name the daemon refuses (SweepResult.failed): listed, never swept. */
@@ -374,7 +404,8 @@ function ownExit(spec: SandboxSpec, scripted: ScriptedExit, overran: boolean): S
 /** A run that hangs, and what has been sent to end it. */
 interface Hung {
   readonly spec: SandboxSpec
-  readonly scripted: ScriptedExit
+  /** What it exits with on its own: a played run's is set once its play resolves. */
+  scripted: ScriptedExit
   readonly resolve: (result: SandboxResult) => void
   /** Who sent the kill that ends it: the real driver's killSentBy. */
   killedBy?: 'requested' | 'wallclock'
@@ -559,6 +590,15 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
       // would say.
       const unpinned = imageIdProblem(options.imageId)
       if (probe.ok && unpinned !== undefined) return { ok: false, why: unpinned }
+      // As the real driver: the pinned id, as each VM's daemon prints it,
+      // trusted's first.
+      if (probe.ok && options.imageId !== undefined) {
+        for (const domain of ['trusted', 'hostile'] as const) {
+          const printed = options.vmImageIds?.[domain] ?? options.imageId
+          const why = imagePrintedProblem(domain, options.imageId, printed)
+          if (why !== undefined) return { ok: false, why, imageOn: domain }
+        }
+      }
       return probe
     },
 
@@ -599,15 +639,21 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
             'a second one under that name could not be killed by name',
         )
       }
-      const scripted = script[index]
-      index++
+      const channel = spec.channel === true
+      // The channel's input is the container's stdout, and its output the
+      // container's stdin.
+      const pipes = channel ? fakePipes(spec.name) : undefined
+      // A container the test plays (FakeSandboxOptions.play) spends no
+      // scripted exit: it runs until its play resolves, or its kill.
+      const played = options.play?.(spec, pipes?.container)
+      const scripted: ScriptedExit | undefined = played === undefined ? script[index] : { hangs: true }
+      if (played === undefined) index++
       if (scripted === undefined) {
         throw new Error(
           `unscripted run: the fake sandbox has ${String(script.length)} scripted exit(s) and run ` +
             `${String(index)} (${spec.name}) was requested. Extend the script or fix the caller.`,
         )
       }
-      const channel = spec.channel === true
       if (channel && (scripted.stdout ?? '') !== '') {
         throw new Error(
           `scripted exit ${String(index - 1)}: stdout on a channel run (${spec.name}), whose stdout the real driver ` +
@@ -617,10 +663,6 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
       }
       started.set(spec.name, spec)
       running.add(spec.name)
-
-      // The channel's input is the container's stdout, and its output the
-      // container's stdin.
-      const pipes = channel ? fakePipes(spec.name) : undefined
       if (pipes !== undefined) channels.push(pipes.container)
 
       const result = new Promise<SandboxResult>((resolve) => {
@@ -629,7 +671,20 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
           else pipes.exit(() => resolve({ ...ended, stderr: ended.stderr + pipes.heard() }))
         }
         if (scripted.hangs === true) {
-          pending.set(spec.name, { spec, scripted, resolve: settle, overran: false, ending: false })
+          const hung: Hung = { spec, scripted, resolve: settle, overran: false, ending: false }
+          pending.set(spec.name, hung)
+          // A played container exits with what its play resolves to, unless
+          // a kill, an overrun or an abandon ended it first. A play that
+          // rejects, or resolves to a shape the real driver never returns,
+          // is the test's mistake, and is thrown where it surfaces.
+          void played?.then((exit) => {
+            if (pending.get(spec.name) !== hung || hung.ending) return
+            assertDriverShaped(exit, -1)
+            if (exit.hangs === true || exit.ignoresKill === true) throw new Error(`a played container's exit (${spec.name}) is its exit: no hangs, no ignoresKill`)
+            if (channel && (exit.stdout ?? '') !== '') throw new Error(`a played channel run (${spec.name}) wrote stdout, which the real driver never reads`)
+            hung.scripted = exit
+            end(hung)
+          })
           return
         }
         settle(ownExit(spec, scripted, false))

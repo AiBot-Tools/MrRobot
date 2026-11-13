@@ -12,9 +12,10 @@
 // manifest's credential-free hosts and, of each binding it binds, git-fetch
 // alone, never git-push or github-pulls, which only a human-approved
 // sandbox.publish may hold), its container gets the driver's channel (docker
-// -i), and an egress session (src/egress/session.ts) serves that channel
-// under the grant, every request a proxy.decision of the run before any
-// dial. The grant is entered in an in-memory table and revoked
+// -i) and runs the worker image's mux around its command (muxCommand: the
+// image's entrypoint is empty), and an egress session (src/egress/session.ts)
+// serves that channel under the grant, every request a proxy.decision of the
+// run before any dial. The grant is entered in an in-memory table and revoked
 // (proxy.grant.revoked, with its totals) once the driver has a verdict on the
 // container: its exit, its wallclock, the run's stop, or the session's own
 // revocation for a violation or a limit, which kills the container by name on
@@ -35,7 +36,11 @@
 // PROXY_GRANT_MAX_REPOS repositories across its bindings, which the registry
 // refuses in a manifest at load). A hostile-domain run gets no channel and no
 // grant, whatever its manifest says: only the trusted domain is granted, by
-// code.
+// code. And a domain boot closed runs no exec at all, egress or none
+// (closedDomains, domainRefusal): a canary's self-test report there was
+// refused, at this boot or an earlier one no canary there has passed since,
+// so a container there may have a route the kernel did not give it, and a
+// run with no channel has no self-test of its own (src/runtime/canary.ts).
 //
 // It meets the contract every agent tool meets, as kernel-tools.ts reproduces
 // the hub's execute half for tools that have no server:
@@ -335,6 +340,16 @@ export interface SandboxToolsOptions {
    * trusted domain is refused: there is nothing to serve its grant.
    */
   readonly egress?: SandboxEgress
+  /**
+   * The domains boot closed to sandbox.exec, each with the sandbox's reason:
+   * one whose boot canary's self-test report was refused (src/runtime/
+   * canary.ts routed), at this boot or at an earlier one after which no
+   * canary there has passed (src/kernel.ts, closedSandboxDomains), so a
+   * container there may have a route the kernel did not give it. Every exec
+   * on such a domain is refused, egress or none (domainRefusal). Unset, or a
+   * domain left out, runs as before.
+   */
+  readonly closedDomains?: Readonly<Partial<Record<SandboxDomain, string>>>
 }
 
 /**
@@ -357,6 +372,24 @@ export interface SandboxEgress {
   readonly acceptReady: ReadyJudge
   /** Unset, real timers. A test's clock, for the session's deny window, idle bound and end drain. */
   readonly clock?: SessionClock
+}
+
+/**
+ * The worker image's mux, as a container runs it: images/worker/Dockerfile
+ * copies it to /opt/aos/mux.mjs, and the image has `ENTRYPOINT []`, so
+ * docker runs a spec's command as given, after the image. A channel run's
+ * command is therefore the mux's `--` mode wrapping the agent's argv
+ * (muxCommand; mux.mjs parseArgs): the mux reads the kernel's frames on
+ * stdin, sends its ready report, waits for go, runs the command and frames
+ * its flows and its exit on stdout. A run with no channel runs the agent's
+ * argv itself. Boot's canary runs the mux's other two modes
+ * (src/runtime/canary.ts CANARY_COMMANDS), from this same constant.
+ */
+export const MUX_ARGV: readonly string[] = Object.freeze(['node', '/opt/aos/mux.mjs'])
+
+/** A channel run's container command: the mux, `--`, then the agent's argv as given (mux.mjs parseArgs). */
+export function muxCommand(command: readonly string[]): readonly string[] {
+  return Object.freeze([...MUX_ARGV, '--', ...command])
 }
 
 /** The profiles an exec grant may hold of a binding: git-fetch alone. git-push and github-pulls are sandbox.publish's (S4). */
@@ -701,6 +734,33 @@ export class SandboxTools {
 
   /**
    * Why the runner would refuse every exec of the agent `agentId` for its
+   * manifest's domain, whatever its arguments, its egress and whoever
+   * approved it, or undefined: boot closed that domain to sandbox.exec, its
+   * canary having shown a container there may have a route the kernel did
+   * not give it (SandboxToolsOptions.closedDomains). The run loop asks it of
+   * every sandbox schema it would offer, so no run on that domain is shown
+   * the tool, and before the gate, handing the answer to it
+   * (GateInput.runnerRefusal), so no human is asked to approve an exec that
+   * would be refused; #exec asks it again. Undefined for an agent the
+   * registry does not admit (holderProblem says why).
+   */
+  domainRefusal(ref: string, agentId: string): string | undefined {
+    if (ref !== `${SANDBOX_SERVER}.exec`) return undefined
+    const held = this.#holderOf(ref, agentId)
+    if ('problem' in held) return undefined
+    const domain = held.manifest.sandbox?.domain
+    return domain === undefined ? undefined : this.#closedRefusal(domain)
+  }
+
+  /** Why `domain` runs no exec (closedDomains), as a refusal says it, or undefined. */
+  #closedRefusal(domain: SandboxDomain): string | undefined {
+    const closed = this.#o.closedDomains
+    const reason = closed !== undefined && Object.hasOwn(closed, domain) ? closed[domain] : undefined
+    return reason === undefined ? undefined : `${reason}; no container was started`
+  }
+
+  /**
+   * Why the runner would refuse every exec of the agent `agentId` for its
    * egress, whatever its arguments and whoever approved it, or undefined:
    * its manifest, read from the registry now, has egress on the trusted
    * domain and egress is not ok (boot's verdict), a binding it routes did not
@@ -866,6 +926,11 @@ export class SandboxTools {
     if (box === undefined) throw new Error(`[refused] ${manifest.id} declares no sandbox: block`)
     const domain = box.domain
 
+    // A domain boot closed (its canary showed a route out): asked of the
+    // loop before the gate too (domainRefusal), and again here.
+    const closed = this.#closedRefusal(domain)
+    if (closed !== undefined) throw new Error(`[refused] ${closed}`)
+
     // The grant this exec would be issued, or why none can be: asked of the
     // loop before the gate too (egressRefusal), and again here. Undefined for
     // a manifest with no egress, and for every hostile-domain run, whatever
@@ -892,7 +957,11 @@ export class SandboxTools {
       agentId: ctx.agentId,
       domain,
       image: imageId,
-      command,
+      // A channel run's container runs the worker image's mux around the
+      // command (muxCommand): with no mux, the session would read the
+      // command's own stdout as frames, no ready report would come, and the
+      // run would fail closed every time.
+      command: planned === undefined ? command : muxCommand(command),
       workspace,
       limits: { memoryMb, cpus: defaults.cpus, pids: defaults.pidsLimit, wallclockMs },
       // A channel only for a grant, which only a trusted run with egress is
@@ -1389,40 +1458,49 @@ export class SandboxTools {
     }
   }
 
-  /**
-   * The run's workspace, <mountRoot>/<runId>: made if it is not there, as a
-   * directory only the operator reads, and refused unless it is one, and no
-   * link. The mountRoot itself is the VM's share (scripts/colima-up.sh makes
-   * it), never made here: a missing one is a VM that shares nothing. The
-   * driver then confines the path again (confine.ts) before it mounts it.
-   */
+  /** The run's workspace, <mountRoot>/<runId> (makeWorkspace). */
   #workspace(domain: SandboxDomain, mountRoot: string, runId: string): string {
-    if (!WORKSPACE_RUN_ID.test(runId)) {
+    return makeWorkspace(domain, mountRoot, runId)
+  }
+}
+
+/**
+ * A container's workspace, <mountRoot>/<name>: made if it is not there, as a
+ * directory only the operator reads, and refused unless it is one, and no
+ * link. `name` is a run's id, or the boot canary's own (src/runtime/canary.ts
+ * CANARY_WORKSPACE), and must be one directory name (WORKSPACE_RUN_ID). The
+ * mountRoot itself is the VM's share (scripts/colima-up.sh makes it), never
+ * made here: a missing one is a VM that shares nothing. The driver then
+ * confines the path again (confine.ts) before it mounts it. The one
+ * directory any sandbox code makes: test/hygiene.test.ts holds this file to
+ * this one mkdirSync.
+ */
+export function makeWorkspace(domain: SandboxDomain, mountRoot: string, runId: string): string {
+  if (!WORKSPACE_RUN_ID.test(runId)) {
+    throw new Error(
+      '[refused] the run id is not one directory name and one container prefix (a letter or digit, then letters, ' +
+        'digits or _, at most 64), so it names no workspace',
+    )
+  }
+  const workspace = join(mountRoot, runId)
+  try {
+    mkdirSync(workspace, { mode: 0o700 })
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') {
       throw new Error(
-        '[refused] the run id is not one directory name and one container prefix (a letter or digit, then letters, ' +
-          'digits or _, at most 64), so it names no workspace',
+        `[refused] the ${domain} domain's mountRoot ${mountRoot} does not exist: it is the VM's share, which ` +
+          'scripts/colima-up.sh makes with the VM',
       )
     }
-    const workspace = join(mountRoot, runId)
-    try {
-      mkdirSync(workspace, { mode: 0o700 })
-    } catch (e) {
-      const code = (e as NodeJS.ErrnoException).code
-      if (code === 'ENOENT') {
-        throw new Error(
-          `[refused] the ${domain} domain's mountRoot ${mountRoot} does not exist: it is the VM's share, which ` +
-            'scripts/colima-up.sh makes with the VM',
-        )
-      }
-      if (code !== 'EEXIST') throw new Error(`[refused] the workspace ${workspace} cannot be made: ${String(code)}`)
-    }
-    // lstat, so a link is no directory, wherever it points: another run's
-    // workspace inside the same mountRoot among the places.
-    if (!lstatSync(workspace).isDirectory()) {
-      throw new Error(`[refused] the workspace ${workspace} is there and is no directory of its own`)
-    }
-    return workspace
+    if (code !== 'EEXIST') throw new Error(`[refused] the workspace ${workspace} cannot be made: ${String(code)}`)
   }
+  // lstat, so a link is no directory, wherever it points: another run's
+  // workspace inside the same mountRoot among the places.
+  if (!lstatSync(workspace).isDirectory()) {
+    throw new Error(`[refused] the workspace ${workspace} is there and is no directory of its own`)
+  }
+  return workspace
 }
 
 /** sandbox.killed's reason, from the driver's verdict. */
@@ -1444,7 +1522,7 @@ export function endReason(result: SandboxResult): 'wallclock' | 'requested' | 'e
  * SIGKILL from outside), or a spawn that started nothing. 125 with no kill
  * credited: the CLI's own failure (DOCKER_CLI_FAILED).
  */
-function mayRunOn(result: SandboxResult): string | undefined {
+export function mayRunOn(result: SandboxResult): string | undefined {
   if (result.exitCode === null) return 'as a docker client with no exit status may leave its container running'
   if (result.killedBy === undefined && result.exitCode === DOCKER_CLI_FAILED) {
     return (

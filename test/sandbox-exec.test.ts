@@ -111,6 +111,8 @@ import {
   SANDBOX_SERVER,
   STREAM_WINDOW_BYTES,
   SandboxTools,
+  MUX_ARGV,
+  muxCommand,
   endReason,
   jwtRunStarts,
   pemEndHolds,
@@ -127,7 +129,7 @@ import { readAllRows } from '../src/events/chain.js'
 import { FakeMux, fakeUpstream, refusedReport, until, type FakeUpstream } from './helpers/fake-egress.js'
 import { AppleContainerDriver } from '../src/sandbox/apple-container.js'
 import { DockerDriver, type ChildLike } from '../src/sandbox/docker.js'
-import { CAPTURE_MAX_BYTES, CONTAINER_PREFIX, type SandboxDriver, type SandboxResult, type SandboxSpec } from '../src/sandbox/driver.js'
+import { CAPTURE_MAX_BYTES, CONTAINER_PREFIX, type SandboxDomain, type SandboxDriver, type SandboxResult, type SandboxSpec } from '../src/sandbox/driver.js'
 import { fakeProvider, http, FAKE_PRICING, type RecordedRequest, type ScriptEntry, type ScriptedResponse } from './helpers/fake-provider.js'
 import { fakeSandbox, type FakeSandbox, type ScriptedExit } from './helpers/fake-sandbox.js'
 import { freshProbe } from './helpers/probe.js'
@@ -320,6 +322,8 @@ function wire(
     driver?: (fake: FakeSandbox) => SandboxDriver
     /** The egress engine the runner is handed (SandboxToolsOptions.egress). */
     egress?: SandboxEgress
+    /** The domains boot closed (SandboxToolsOptions.closedDomains): read at each ask, so a test may close one after the offer. */
+    closedDomains?: Partial<Record<SandboxDomain, string>>
   },
 ): Wired {
   const store = withStore(t)
@@ -339,6 +343,7 @@ function wire(
     sandbox,
     ...(options.resultGraceMs === undefined ? {} : { resultGraceMs: options.resultGraceMs }),
     ...(options.egress === undefined ? {} : { egress: options.egress }),
+    ...(options.closedDomains === undefined ? {} : { closedDomains: options.closedDomains }),
   })
 
   const provider = fakeProvider(options.script)
@@ -938,6 +943,8 @@ function direct(
     sandboxAgents?: (registry: AgentRegistry) => SandboxToolsOptions['agents']
     /** How long a container may outlive its command's exit frame (SandboxToolsOptions.exitKillGraceMs). */
     exitKillGraceMs?: number
+    /** The domains boot closed (SandboxToolsOptions.closedDomains). */
+    closedDomains?: Partial<Record<SandboxDomain, string>>
   } = {},
 ): Direct {
   const store = withStore(t)
@@ -954,6 +961,7 @@ function direct(
     sandbox,
     ...(options.egress === undefined ? {} : { egress: options.egress }),
     ...(options.exitKillGraceMs === undefined ? {} : { exitKillGraceMs: options.exitKillGraceMs }),
+    ...(options.closedDomains === undefined ? {} : { closedDomains: options.closedDomains }),
   })
   return { store, driver, tools, sandbox, agents }
 }
@@ -978,6 +986,63 @@ test('a hostile-domain worker runs on the hostile domain, in its mountRoot, with
   assert.equal(spec?.workspace, join(d.sandbox.domains.hostile.mountRoot, 'run_h'))
   assert.equal(spec !== undefined && 'channel' in spec, false)
   assert.deepEqual(payloads(d.store, 'sandbox.killed').map((p) => [p.reason, p.exitCode]), [['exited', 3]])
+})
+
+test('a domain boot closed runs no exec: never offered, denied before the gate asks anyone, refused at execution with no workspace, and the other domain runs as before', async (t) => {
+  // SandboxToolsOptions.closedDomains: boot's canary on that domain showed a
+  // container there may have a route out (src/runtime/canary.ts routed), so
+  // every exec there is refused, egress or none.
+  const reason = 'hostile: the boot canary (aos-run-canary-1-000000000000-hostile) found that a container on this domain may have a route'
+  const refusal = `${reason}; no container was started`
+  const files = { coder: manifest('coder'), boxer: manifest('boxer', { sandbox: 'hostile' }) }
+
+  // The runner itself: the agent on the closed domain is refused, the other is not.
+  const d = direct(t, { files, closedDomains: { hostile: reason }, exits: [{ stdout: 'v24\n' }] })
+  assert.equal(d.tools.domainRefusal(EXEC, 'boxer'), refusal)
+  assert.equal(d.tools.domainRefusal(EXEC, 'coder'), undefined)
+  assert.equal(d.tools.domainRefusal('sandbox.other', 'boxer'), undefined)
+  assert.equal(d.tools.domainRefusal(EXEC, 'nobody'), undefined, 'holderProblem says why an unknown agent is refused')
+  const args = { command: ['node', '--version'] }
+  const refused = await d.tools.call(ticketFor('run_c', args), args, context('run_c', { agentId: 'boxer' }))
+  assert.deepEqual([refused.ok, refused.text, refused.taints], [false, `[refused] ${refusal}`, true])
+  assert.equal(existsSync(join(d.sandbox.domains.hostile.mountRoot, 'run_c')), false, 'a workspace was made on a closed domain')
+  assert.deepEqual(payloads(d.store, 'sandbox.started'), [])
+  const ran = await d.tools.call(ticketFor('run_o', args), args, context('run_o'))
+  assert.equal(ran.ok, true, ran.text)
+  assert.deepEqual(d.driver.specs.map((spec) => spec.domain), ['trusted'])
+
+  // Through the loop: a run on the closed domain is shown no sandbox tool.
+  {
+    const w = wire(t, { script: [done()], exits: [], files, closedDomains: { hostile: reason } })
+    const out = await w.loop.start({ runId: 'run_l', agent: w.agent('boxer'), prompt: 'go' })
+    assert.equal(out.status, 'ok', String(out.reason))
+    assert.deepEqual(offered(w.provider.requests[0]), [])
+  }
+  // A domain closed after the offer: the call is denied before the gate
+  // asks anyone, on a clean run or a tainted one, and nothing runs.
+  for (const taint of ['clean', 'tainted'] as const) {
+    const closed: Partial<Record<SandboxDomain, string>> = {}
+    const w: Wired = wire(t, {
+      script: [
+        () => {
+          closed.hostile = reason
+          return exec(['node', '--version'])
+        },
+        done(),
+      ],
+      exits: [],
+      files,
+      closedDomains: closed,
+    })
+    const asked = denyEveryApproval(w)
+    const out = await w.loop.start({ runId: `run_${taint}`, agent: w.agent('boxer'), prompt: 'go', taint })
+    assert.equal(out.status, 'ok', `${taint}: ${String(out.reason)}`)
+    assert.equal(asked(), 0, `${taint}: a human was asked`)
+    assert.deepEqual(payloads(w.store, 'tool.gate').map((g) => [g.decision, g.reason]), [['deny', refusal]], taint)
+    assert.deepEqual(toolMessages(w.provider.requests[1]), [`[denied] ${refusal}`], taint)
+    assert.deepEqual(callRows(w.store), ['tool.gate'], `${taint}: no tool.call or tool.result`)
+    assert.equal(w.driver.specs.length, 0, taint)
+  }
 })
 
 test('a run whose budget has elapsed starts no container, and a refusal before the container writes no sandbox row', async (t) => {
@@ -4029,6 +4094,44 @@ test('grant issued before spawn, revoked on finish and on wallclock', async (t) 
   assert.equal(new Set(grants).size, 2)
 })
 
+test("a channel run's container runs the worker image's mux around the command, and a run with no channel runs the command itself, in the docker run the real driver builds", async (t) => {
+  // The image's entrypoint is empty and docker appends the spec's command
+  // after the image, so a channel run whose command were the agent's argv
+  // would run no mux: the session would read the command's own stdout as
+  // frames, no ready report would come, and every egress exec would fail.
+  // The fakes play the mux, so only the real driver's argv shows it.
+  const fx = egressOf()
+  const files = { coder: EGRESS_CODER, plain: manifest('plain'), boxer: manifest('boxer', { sandbox: 'hostile' }) }
+  const d = direct(t, { files, egress: fx.egress })
+  const spawned: (readonly string[])[] = []
+  const real = realDriver(d.sandbox, tmpdir(t), {
+    spawn: (_cmd, args) => {
+      spawned.push(args)
+      throw new Error('test: nothing is spawned here')
+    },
+    execFile: () => Promise.resolve({ stdout: '', stderr: '' }),
+  })
+  const tools = toolsOver(d, real, { egress: fx.egress })
+  const command = ['git', 'fetch', '--depth', '1']
+  const cases: readonly (readonly [string, boolean])[] = [
+    ['coder', true],
+    ['plain', false],
+    ['boxer', false],
+  ]
+  for (const [agentId, channel] of cases) {
+    spawned.length = 0
+    const runId = `run_${agentId}`
+    await tools.call(ticketFor(runId, { command }), { command }, context(runId, { agentId }))
+    assert.equal(spawned.length, 1, agentId)
+    const args = spawned[0] ?? []
+    const image = args.indexOf(IMAGE)
+    assert.ok(image > 0, `${agentId}: no image in ${JSON.stringify(args)}`)
+    assert.deepEqual(args.slice(image + 1), channel ? [...MUX_ARGV, '--', ...command] : command, agentId)
+    assert.deepEqual(args.slice(image + 1), channel ? [...muxCommand(command)] : command, agentId)
+    assert.equal(args.slice(0, image).includes('-i'), channel, `${agentId}: -i`)
+  }
+})
+
 test('an exec grant never includes git-push or github-pulls', async (t) => {
   assert.deepEqual([...EXEC_PROFILES], ['git-fetch'])
   // github holds every profile; api holds only github-pulls, so an exec
@@ -4484,8 +4587,8 @@ test("a container whose ready report says its self-test reached what --network n
     assert.match(out.text, /was killed by name when its egress grant was revoked/, how)
     const why =
       how === 'reached'
-        ? 'the self-test reached 1 of what it must not'
-        : "the self-test's probe of 192.168.5.2:8766 met no error that says there is no route"
+        ? 'the self-test reached 1 of what it must not (192.168.5.2:8766)'
+        : "the self-test's probe of 192.168.5.2:8766 met ETIMEDOUT, which does not say there is no route"
     const [revoked] = payloads(d.store, 'proxy.grant.revoked')
     assert.equal(revoked?.['reason'], 'violation', how)
     assert.equal(revoked?.['detail'], `the mux's ready report was refused: ${why}`, how)

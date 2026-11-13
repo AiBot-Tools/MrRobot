@@ -74,11 +74,12 @@ import {
   type KernelFixture,
 } from './helpers/kernel.js'
 import { tmpdir } from './helpers/tmpdir.js'
-import { DATA_LOCK_FILE, DATA_LOCK_JOURNAL, holdDataDir } from '../src/data-lock.js'
+import { DATA_LOCK_FILE, DATA_LOCK_JOURNAL, holdDataDir, lockHeldRefusal } from '../src/data-lock.js'
 import { closeVerified, withStore } from './helpers/store.js'
 import { SANDBOX_SERVER } from '../src/runtime/sandbox-tools.js'
 import { join } from 'node:path'
-import { fakeSandbox } from './helpers/fake-sandbox.js'
+import { fakeSandbox, type FakeChannel } from './helpers/fake-sandbox.js'
+import { CANARY_PREFIX } from '../src/runtime/canary.js'
 import type { SandboxDriver } from '../src/sandbox/driver.js'
 import { anthropicEndTurn, anthropicToolUse, fakeProvider } from './helpers/fake-provider.js'
 import { mintHumanActor } from '../src/control/actor.js'
@@ -86,7 +87,7 @@ import { freshProbe } from './helpers/probe.js'
 import { writeProbeRecord } from '../src/models/probe.js'
 import { mockMcp } from './helpers/mock-mcp.js'
 import { MIN_MASK_LENGTH, redactString, SecretMask } from '../src/events/redact.js'
-import { FakeMux, fakeUpstream, fakeUpstreamDeps, refusedReport, until } from './helpers/fake-egress.js'
+import { canaryPlayer, FakeMux, fakeUpstream, fakeUpstreamDeps, refusedReport, until } from './helpers/fake-egress.js'
 import { connectControl } from '../src/cli/client.js'
 
 
@@ -1055,6 +1056,39 @@ test('holdDataDir is exclusive within a process, and free again once released', 
   one.release()
   const two = holdDataDir(dataDir)
   two.release()
+})
+
+test('the refusal of a held data directory says the lock is never stale and must never be removed, and tells the operator to stop the other kernel, never to remove the file', (t) => {
+  // An operator who meets a lock file that looks stale (a launchd daemon
+  // running unseen, say) and removes it lets the next hold make a new
+  // kernel.lock on a new inode and lock that one, beside the live kernel's
+  // lock on the unlinked file: a second kernel on the same log. The kernel
+  // cannot see a removal made after its hold was taken, so the refusal is
+  // where this is said.
+  const dataDir = tmpdir(t)
+  const one = holdDataDir(dataDir)
+  t.after(() => one.release())
+  let message = ''
+  try {
+    holdDataDir(dataDir)
+  } catch (e) {
+    assert.ok(e instanceof ConfigError, String(e))
+    message = e.message
+  }
+  assert.equal(message, lockHeldRefusal(dataDir, join(dataDir, DATA_LOCK_FILE)))
+  assert.match(message, /The lock is never stale: the OS drops it when the kernel holding it ends, however it ends, so a kernel holds it now/)
+  assert.match(message, /Never remove kernel\.lock: one removed while its kernel runs lets a second kernel onto the same log\./)
+  assert.match(message, /Stop the other kernel \(Ctrl-C in the terminal running its `npm run dev`, or stop its launchd job\), or give this one its own dataDir$/)
+  // Every sentence that names the file's removal forbids it: none tells the
+  // operator to remove, delete or rm it, as the stale-lock reflex would.
+  const sentences = message.split(/(?<=\.) /)
+  const naming = sentences.filter((s) => /remov|delet|\brm\b|unlink/i.test(s))
+  assert.deepEqual(naming, ['Never remove kernel.lock: one removed while its kernel runs lets a second kernel onto the same log.'])
+  // README's .aos row says the same where the operator reads the layout.
+  const row = readFileSync(join(REPO_ROOT, 'README.md'), 'utf8').split('\n').find((l) => l.startsWith('| `.aos/kernel.lock`')) ?? ''
+  assert.match(row, /`kernel\.lock` is never stale, so never remove it: a boot refused with `another kernel holds` means a kernel holds it now/)
+  assert.match(row, /one removed while its kernel runs lets a second kernel onto the same log/)
+  assert.match(row, /stop the other kernel instead \|$/)
 })
 
 test("the lock's journal holds SQLite's journal header while the hold lasts and goes at release, and one a killed kernel left is taken over by the next hold and goes at its release", (t) => {
@@ -2515,9 +2549,26 @@ const EGRESS_IMAGE = `sha256:${'ef'.repeat(32)}`
 const pinned = (extra = '') => (base: string): string =>
   `${base.replace('  image: aos-worker:test\n', `  image: aos-worker:test\n  imageId: "${EGRESS_IMAGE}"\n`)}${extra}`
 
-/** A driver whose daemon answers, holding the pinned image. */
+/** The payloads of `type` under runs' grants, boot's canary grant's aside (its issued row's purpose is `canary`). */
+function runPayloads(dbPath: string, type: string): Record<string, unknown>[] {
+  const all = rows(dbPath).map((r) => ({ type: r.type, payload: JSON.parse(r.payload) as Record<string, unknown> }))
+  const canaries = new Set(all.filter((r) => r.type === 'proxy.grant.issued' && r.payload['purpose'] === 'canary').map((r) => r.payload['grantId']))
+  return all.filter((r) => r.type === type && !canaries.has(r.payload['grantId'])).map((r) => r.payload)
+}
+
+/** The proxy.grant.revoked payloads of runs' grants, boot's canary grant's aside. */
+const runRevocations = (dbPath: string): Record<string, unknown>[] => runPayloads(dbPath, 'proxy.grant.revoked')
+
+/** The channels of runs' containers, boot's egress canaries' aside. */
+const runChannels = (driver: ReturnType<typeof fakeSandbox>): FakeChannel[] => driver.channels.filter((c) => !c.name.startsWith(CANARY_PREFIX))
+
+/**
+ * A driver whose daemon answers, holding the pinned image on both VMs, whose
+ * containers run boot's egress canaries as the worker image's mux does, so
+ * both pass (canaryPlayer; test/egress-boot.test.ts holds them).
+ */
 const answering = (script: Parameters<typeof fakeSandbox>[0] = {}): ReturnType<typeof fakeSandbox> =>
-  fakeSandbox({ imageId: EGRESS_IMAGE, probe: { ok: true, version: 'fake 1' }, ...script })
+  fakeSandbox({ imageId: EGRESS_IMAGE, probe: { ok: true, version: 'fake 1' }, play: canaryPlayer(), ...script })
 
 const GITHUB_BINDING = `
 egress:
@@ -2791,7 +2842,7 @@ test("many unresolved bindings boot degraded: each named in its own row, and egr
   const finished = await runThroughControl(kernel, 'install', 'reacher')
   assert.equal(finished['status'], 'ok', String(finished['reason']))
   assert.deepEqual(offeredNames(provider.requests[0]?.body), [], 'the tool was offered')
-  assert.equal(rows(fx.dbPath).filter((r) => r.type === 'tool.call' || r.type === 'sandbox.started').length, 0)
+  assert.equal(rows(fx.dbPath).filter((r) => r.type === 'tool.call' || (r.type === 'sandbox.started' && !r.payload.includes(CANARY_PREFIX))).length, 0)
   assert.deepEqual(kernel.sandboxTools.liveGrants(), [])
 })
 
@@ -2885,13 +2936,13 @@ test("a booted kernel serves a trusted worker's exec over its channel: the grant
     if (row.type === 'proxy.decision' || row.type.startsWith('proxy.grant.') || row.type.startsWith('sandbox.')) order.push(row.type)
   })
   const finished = runThroughControl(kernel, 'fetch the fixture', 'fetcher')
-  await until(() => driver.channels.length === 1, 'the channel', 20_000)
-  const mux = new FakeMux(driver.channels[0]!)
+  await until(() => runChannels(driver).length === 1, 'the channel', 20_000)
+  const mux = new FakeMux(runChannels(driver)[0]!)
   await mux.ready()
   const answer = await mux.request('GET http://github.com/op/fixture.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: github.com\r\n\r\n')
   assert.match(answer, /^HTTP\/1\.1 200 /)
   mux.exit(0)
-  driver.simulateExit(driver.channels[0]!.name)
+  driver.simulateExit(runChannels(driver)[0]!.name)
   const done = await finished
   assert.equal(done['status'], 'ok', String(done['reason']))
 
@@ -3002,8 +3053,8 @@ egress:
   })
   assert.equal(kernel.status().subsystems.egress.state, 'ok', kernel.status().subsystems.egress.reason ?? '')
   const finished = runThroughControl(kernel, 'fetch both', 'fetcher')
-  await until(() => driver.channels.length === 1, 'the channel', 20_000)
-  const mux = new FakeMux(driver.channels[0]!)
+  await until(() => runChannels(driver).length === 1, 'the channel', 20_000)
+  const mux = new FakeMux(runChannels(driver)[0]!)
   await mux.ready()
   const answers: string[] = []
   for (const [host, repo] of [
@@ -3019,7 +3070,7 @@ egress:
     mux.stdout(`${answer}\n`)
   }
   mux.exit(0)
-  driver.simulateExit(driver.channels[0]!.name)
+  driver.simulateExit(runChannels(driver)[0]!.name)
   const done = await finished
   assert.equal(done['status'], 'ok', String(done['reason']))
 
@@ -3082,9 +3133,9 @@ test("a booted kernel refuses a mux whose ready report says its self-test reache
   })
   assert.equal(kernel.status().subsystems.egress.state, 'ok', kernel.status().subsystems.egress.reason ?? '')
   const finished = runThroughControl(kernel, 'fetch the fixture', 'fetcher')
-  await until(() => driver.channels.length === 1, 'the channel', 20_000)
-  const name = driver.channels[0]!.name
-  const mux = new FakeMux(driver.channels[0]!)
+  await until(() => runChannels(driver).length === 1, 'the channel', 20_000)
+  const name = runChannels(driver)[0]!.name
+  const mux = new FakeMux(runChannels(driver)[0]!)
   mux.send({ type: 'ready', flow: 0, payload: refusedReport('reached') })
   const done = await finished
   assert.equal(done['status'], 'ok', String(done['reason']))
@@ -3093,12 +3144,12 @@ test("a booted kernel refuses a mux whose ready report says its self-test reache
   assert.deepEqual(driver.kills, [name], 'the container was not killed by name, once')
   const payloadsOf = (type: string): Record<string, unknown>[] =>
     rows(fx.dbPath).filter((r) => r.type === type).map((r) => JSON.parse(r.payload) as Record<string, unknown>)
-  const revoked = payloadsOf('proxy.grant.revoked')
+  const revoked = runRevocations(fx.dbPath)
   assert.deepEqual(revoked.map((r) => [r['reason'], r['detail']]), [
-    ['violation', "the mux's ready report was refused: the self-test reached 1 of what it must not"],
+    ['violation', "the mux's ready report was refused: the self-test reached 1 of what it must not (192.168.5.2:8766)"],
   ])
   assert.deepEqual(payloadsOf('tool.result').map((r) => r['ok']), [false])
-  assert.deepEqual(payloadsOf('proxy.decision'), [], 'a request was judged under a refused grant')
+  assert.deepEqual(runPayloads(fx.dbPath, 'proxy.decision'), [], 'a request was judged under a refused grant')
   assert.equal(up.seen.length, 0, 'an upstream was sent a request')
   assert.deepEqual(kernel.sandboxTools.liveGrants(), [])
 })
@@ -3134,9 +3185,9 @@ test("boot hands each session kernel.yaml's egress.limits: the go frame carries 
   )
   assert.equal(kernel.status().subsystems.egress.state, 'ok', kernel.status().subsystems.egress.reason ?? '')
   const finished = runThroughControl(kernel, 'fetch the fixture', 'fetcher')
-  await until(() => driver.channels.length === 1, 'the channel', 20_000)
-  const name = driver.channels[0]!.name
-  const mux = new FakeMux(driver.channels[0]!)
+  await until(() => runChannels(driver).length === 1, 'the channel', 20_000)
+  const name = runChannels(driver)[0]!.name
+  const mux = new FakeMux(runChannels(driver)[0]!)
   await mux.ready()
   assert.deepEqual(mux.limits, { frameMaxBytes: 4096, maxFlows: 2 })
   const first = await mux.request('GET http://github.com/op/fixture.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: github.com\r\n\r\n')
@@ -3145,9 +3196,7 @@ test("boot hands each session kernel.yaml's egress.limits: the go frame carries 
   mux.send({ type: 'open', flow: 2, payload: new Uint8Array(0) })
   const done = await finished
   assert.equal(done['status'], 'ok', String(done['reason']))
-  const revoked = rows(fx.dbPath)
-    .filter((r) => r.type === 'proxy.grant.revoked')
-    .map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+  const revoked = runRevocations(fx.dbPath)
   assert.deepEqual(revoked.map((r) => [r['reason'], r['limit']]), [['limit', 'maxRequests']])
   assert.deepEqual(driver.kills, [name], 'the container was not killed by name, once')
   assert.equal(up.seen.length, 1, 'the request past maxRequests was sent')
@@ -3225,13 +3274,13 @@ test("with no upstream injected, boot builds its own from egressUpstreamOptions(
   assert.deepEqual(up.limits, [{ connectTimeoutMs: EGRESS_CONNECT_TIMEOUT_MS, idleTimeoutMs: 12_345 }])
   assert.equal(kernel.status().subsystems.egress.state, 'ok', kernel.status().subsystems.egress.reason ?? '')
   const finished = runThroughControl(kernel, 'fetch the fixture', 'fetcher')
-  await until(() => driver.channels.length === 1, 'the channel', 20_000)
-  const mux = new FakeMux(driver.channels[0]!)
+  await until(() => runChannels(driver).length === 1, 'the channel', 20_000)
+  const mux = new FakeMux(runChannels(driver)[0]!)
   await mux.ready()
   const answer = await mux.request('GET http://github.com/op/fixture.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: github.com\r\n\r\n')
   assert.match(answer, /^HTTP\/1\.1 200 /)
   mux.exit(0)
-  driver.simulateExit(driver.channels[0]!.name)
+  driver.simulateExit(runChannels(driver)[0]!.name)
   const done = await finished
   assert.equal(done['status'], 'ok', String(done['reason']))
   assert.deepEqual(up.steps, ['resolve4 github.com', 'dial 140.82.112.3'])

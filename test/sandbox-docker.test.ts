@@ -2382,10 +2382,19 @@ test('probe asks each VM for the pinned image by id, and is degraded naming the 
   // What each VM's daemon prints for `image inspect`, by socket; an Error is
   // docker's refusal for an image it does not hold.
   let printed: Record<string, string | Error> = {}
+  // What each VM's daemon answers for `network inspect`, by socket, in place
+  // of a healthy daemon's `true`; and for `version`, everywhere.
+  let networks: Record<string, string | Error> = {}
+  let version: Error | undefined
   const asked: string[] = []
   d.setExec((args, env) => {
-    if (args[0] !== 'image') return healthyDaemon('29.5.2')(args, env)
     const host = env['DOCKER_HOST'] ?? ''
+    if (args[0] === 'version' && version !== undefined) return Promise.reject(version)
+    const network = networks[host]
+    if (args[0] === 'network' && network !== undefined) {
+      return network instanceof Error ? Promise.reject(network) : Promise.resolve({ stdout: network, stderr: '' })
+    }
+    if (args[0] !== 'image') return healthyDaemon('29.5.2')(args, env)
     asked.push(`${host} ${args.join(' ')}`)
     const answer = printed[host] ?? `${IMAGE_ID}\n`
     return answer instanceof Error ? Promise.reject(answer) : Promise.resolve({ stdout: answer, stderr: '' })
@@ -2455,6 +2464,43 @@ test('probe asks each VM for the pinned image by id, and is degraded naming the 
       JSON.stringify(answer),
     )
   }
+
+  // Each failure at the image names its domain (ProbeResult.imageOn), so
+  // boot records egress's `image` check on that domain (egress plan W3);
+  // a failure anywhere else names none.
+  for (const [host, domain, answer] of [
+    [TRUSTED_HOST, 'trusted', `${other}\n`],
+    [HOSTILE_HOST, 'hostile', `${other}\n`],
+    [HOSTILE_HOST, 'hostile', new Error(`Error response from daemon: No such image: ${IMAGE_ID}`)],
+  ] as const) {
+    printed = { [host]: answer }
+    const probe = await d.driver.probe()
+    assert.equal(probe.ok ? undefined : probe.imageOn, domain, `${domain} ${String(answer)}`)
+  }
+  printed = {}
+  const held = await d.driver.probe()
+  assert.equal('imageOn' in held, false, 'a probe that passed names a domain')
+  // A failure before the image names no domain, whatever the image would
+  // have said: a network that could not be inspected, one that is not
+  // internal, or a daemon that does not answer at all. Boot then records
+  // egress's `sandbox` check, never `image`.
+  for (const host of [TRUSTED_HOST, HOSTILE_HOST]) {
+    for (const answer of [new Error('Error response from daemon: network aos-x not found'), 'false\n']) {
+      // That VM's image would fail too, were it asked: the network is asked first.
+      printed = { [host]: `${other}\n` }
+      networks = { [host]: answer }
+      const probe = await d.driver.probe()
+      assert.equal(probe.ok, false, `${host} ${String(answer)}`)
+      assert.match(probe.ok ? '' : probe.why, /network aos-\w+ (could not be inspected|is not internal)/, `${host} ${String(answer)}`)
+      assert.equal('imageOn' in probe, false, `${host} ${String(answer)}: a network failure names the image's domain`)
+    }
+  }
+  networks = {}
+  version = new Error('Cannot connect to the Docker daemon')
+  const down = await d.driver.probe()
+  assert.deepEqual([down.ok, 'imageOn' in down], [false, false])
+  version = undefined
+  printed = {}
 
   // At no point was anything pulled, or asked of docker but the probe's
   // three questions.

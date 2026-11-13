@@ -131,6 +131,8 @@ export interface WithKernelOptions extends FixtureOptions {
   readonly sweepWaitMs?: BootOptions['sweepWaitMs']
   /** In place of PROBE_WAIT_MS, so a probe that never settles is given up in a test's time. */
   readonly probeWaitMs?: BootOptions['probeWaitMs']
+  /** In place of CANARY_WAIT_MS, so a canary that never ends is given up in a test's time. */
+  readonly canaryWaitMs?: BootOptions['canaryWaitMs']
   readonly now?: () => number
   /**
    * Runs after the fixture exists and before the kernel boots, for state boot
@@ -178,6 +180,7 @@ export async function withKernel(
     ...(options.egressUpstreamDeps === undefined ? {} : { egressUpstreamDeps: options.egressUpstreamDeps }),
     ...(options.sweepWaitMs === undefined ? {} : { sweepWaitMs: options.sweepWaitMs }),
     ...(options.probeWaitMs === undefined ? {} : { probeWaitMs: options.probeWaitMs }),
+    ...(options.canaryWaitMs === undefined ? {} : { canaryWaitMs: options.canaryWaitMs }),
   })
 
   registerVerify(t, fx.dbPath, async () => {
@@ -216,6 +219,7 @@ export async function bootOn(
     ...(options.egressUpstreamDeps === undefined ? {} : { egressUpstreamDeps: options.egressUpstreamDeps }),
     ...(options.sweepWaitMs === undefined ? {} : { sweepWaitMs: options.sweepWaitMs }),
     ...(options.probeWaitMs === undefined ? {} : { probeWaitMs: options.probeWaitMs }),
+    ...(options.canaryWaitMs === undefined ? {} : { canaryWaitMs: options.canaryWaitMs }),
   })
   registerVerify(t, fx.dbPath, async () => {
     await kernel.shutdown()
@@ -255,6 +259,7 @@ export async function bootCrashable(
     ...(options.egressUpstreamDeps === undefined ? {} : { egressUpstreamDeps: options.egressUpstreamDeps }),
     ...(options.sweepWaitMs === undefined ? {} : { sweepWaitMs: options.sweepWaitMs }),
     ...(options.probeWaitMs === undefined ? {} : { probeWaitMs: options.probeWaitMs }),
+    ...(options.canaryWaitMs === undefined ? {} : { canaryWaitMs: options.canaryWaitMs }),
   })
   let crashed = false
   const crash = async (): Promise<void> => {

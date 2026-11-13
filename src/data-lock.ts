@@ -22,6 +22,17 @@
 //   in another process is. release() rolls back and closes; a test that
 //   simulates a SIGKILL releases it as the OS would.
 //
+//   So kernel.lock is never stale, and must never be removed. A refusal
+//   means a kernel holds it now (one the operator may not see, a launchd
+//   daemon in Phase 3). Removed while that kernel runs, the next hold makes
+//   a new kernel.lock on a new inode and locks that one, while the live
+//   kernel still holds its lock on the unlinked file, so a second kernel is
+//   let onto the same log: it closes the live kernel's runs as orphans,
+//   revokes its grants `recovered`, kills its containers in the sweep, and
+//   both append to one events.db. Nothing here can see a removal made after
+//   a hold was taken, so the refusal says so where the operator reads it:
+//   the lock is never stale, never remove it, stop the other kernel.
+//
 //   Refused, as a ConfigError naming the path: a hold another kernel has; a
 //   lock path, or a journal path beside it, that is a link or anything but a
 //   regular file; a file SQLite cannot lock for another reason; one whose
@@ -111,6 +122,24 @@ function keepLockFile(path: string, create: boolean): void {
 }
 
 /**
+ * Why a boot is refused while another kernel holds `dataDir`: what a second
+ * kernel would do, that the lock is never stale (so a kernel holds it now),
+ * that removing it while that kernel runs lets a second one onto the same
+ * log, and what to do instead. It never tells the operator to remove the
+ * file: the one sentence that names its removal forbids it.
+ */
+export function lockHeldRefusal(dataDir: string, path: string): string {
+  return (
+    `another kernel holds ${dataDir} (${path} is locked): one kernel per event log. A second one would close the ` +
+    "live kernel's runs as orphans, revoke its egress grants and kill its containers. The lock is never stale: the " +
+    'OS drops it when the kernel holding it ends, however it ends, so a kernel holds it now, perhaps one you do not ' +
+    `see (a launchd job, another terminal). Never remove ${DATA_LOCK_FILE}: one removed while its kernel runs lets ` +
+    'a second kernel onto the same log. Stop the other kernel (Ctrl-C in the terminal running its `npm run dev`, ' +
+    'or stop its launchd job), or give this one its own dataDir'
+  )
+}
+
+/**
  * Take the hold on `dataDir`, or throw a ConfigError saying why it cannot be
  * taken. See the contract above.
  */
@@ -132,11 +161,7 @@ export function holdDataDir(dataDir: string): DataLock {
   } catch (e) {
     db.close()
     if (busy(e)) {
-      throw new ConfigError(
-        `another kernel holds ${dataDir} (${path} is locked): one kernel per event log. A second one would close the ` +
-          "live kernel's runs as orphans, revoke its egress grants and kill its containers. Stop the other kernel, " +
-          'or give this one its own dataDir',
-      )
+      throw new ConfigError(lockHeldRefusal(dataDir, path))
     }
     throw new ConfigError(`${path} cannot be locked: ${e instanceof Error ? e.message : String(e)}`)
   }

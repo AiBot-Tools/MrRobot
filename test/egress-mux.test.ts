@@ -34,7 +34,7 @@ import './helpers/guard.js'
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { readFileSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import net from 'node:net'
 import { Duplex, PassThrough, Writable } from 'node:stream'
 import ts from 'typescript'
@@ -68,6 +68,9 @@ import { EgressGrant } from '../src/egress/policy.js'
 import { acceptReady, NO_ROUTE_CODES as KERNEL_NO_ROUTE_CODES, probeTarget, READY_MAX_BYTES as KERNEL_READY_MAX_BYTES, SELF_TEST as KERNEL_SELF_TEST } from '../src/egress/ready.js'
 import { createEgressSession, type SessionLimits } from '../src/egress/session.js'
 import { createUpstream } from '../src/egress/upstream.js'
+import { CANARY_COMMANDS, CANARY_MIN_WALLCLOCK_MS, CANARY_WAIT_MS, CANARY_WALLCLOCK_MS, MUX_USAGE_EXIT } from '../src/runtime/canary.js'
+import { KILL_WAIT_MS, muxCommand, MUX_ARGV } from '../src/runtime/sandbox-tools.js'
+import { CANARY_REQUEST, probeKind, REFUSED_PROBE_ERRORS, type ProbeKind } from './helpers/fake-egress.js'
 import { differential, type WalkMove } from './helpers/frame-order.js'
 import { withStore } from './helpers/store.js'
 
@@ -1921,17 +1924,29 @@ test('the minimal judge accepts only a report naming every probe in order, none 
   const lookup = mux.SELF_TEST.findIndex((p) => p.probe === 'lookup')
   assert.ok(address !== -1 && name !== -1 && lookup !== -1)
   assert.equal(judge(changed(name, { error: 'ENETUNREACH' })), undefined, 'a name the container resolved and could not route to')
-  for (const [at, error] of [
-    [address, 'ETIMEDOUT'],
-    [address, 'EHOSTUNREACH'],
-    [address, 'EOTHER'],
-    [address, 'EAI_AGAIN'],
-    [name, 'ETIMEDOUT'],
-    [lookup, 'ETIMEDOUT'],
-    [lookup, 'ENETUNREACH'],
-    [lookup, null],
-  ] as const) {
-    assert.match(judge(changed(at, { error })) ?? 'accepted', /which does not say there is no route$/, `${results[at]?.target ?? ''} ${String(error)}`)
+  // The list W3's boot canary is held to as well (test/egress-boot.test.ts),
+  // from one place: test/helpers/fake-egress.ts REFUSED_PROBE_ERRORS.
+  const at: Record<ProbeKind, number> = { address, name, lookup }
+  assert.deepEqual(
+    [address, name, lookup].map((i) => probeKind(mux.SELF_TEST[i] ?? { probe: 'lookup', host: '' })),
+    ['address', 'name', 'lookup'],
+    "the helper reads a probe's kind as this judge does",
+  )
+  assert.deepEqual(
+    REFUSED_PROBE_ERRORS.map((e) => [e.kind, e.error]),
+    [
+      ['address', 'ETIMEDOUT'],
+      ['address', 'EHOSTUNREACH'],
+      ['address', 'EOTHER'],
+      ['address', 'EAI_AGAIN'],
+      ['name', 'ETIMEDOUT'],
+      ['lookup', 'ETIMEDOUT'],
+      ['lookup', 'ENETUNREACH'],
+      ['lookup', null],
+    ],
+  )
+  for (const { kind, error } of REFUSED_PROBE_ERRORS) {
+    assert.match(judge(changed(at[kind], { error })) ?? 'accepted', /which does not say there is no route$/, `${results[at[kind]]?.target ?? ''} ${String(error)}`)
   }
   assert.match(judge(changed(address, { reached: true, error: 'ECONNREFUSED' })) ?? 'accepted', /reached 1 of what it must not/)
   assert.match(judge(mux.readyPayload(results.slice(1))) ?? 'accepted', /does not name every probe/)
@@ -1965,6 +1980,8 @@ test("the kernel's own judge (src/egress/ready.ts) holds the mux's self-test pro
   }
   // A report that names another target in a probe's place, met by the right code.
   rows.push(mux.readyPayload(results.map((r, i) => (i === 0 ? { ...r, target: '10.0.0.1:8766' } : r))))
+  // One that names a connect's target as a lookup, met by a lookup's code.
+  rows.push(mux.readyPayload(results.map((r, i) => (i === 0 ? { ...r, probe: 'lookup' as const, error: 'ENOTFOUND' } : r))))
   rows.push(new Uint8Array(0), Buffer.from('not json', 'ascii'), Buffer.from('{"mux":2,"probes":[],"reached":0}', 'ascii'))
   for (const row of rows) {
     const text = Buffer.from(row).toString('latin1')
@@ -1978,8 +1995,37 @@ test("the kernel's own judge (src/egress/ready.ts) holds the mux's self-test pro
   }
   // The kernel's clause names a probe by its own target, never the report's text.
   const forged = results.map((r, i) => (i === 0 ? { ...r, error: 'ETIMEDOUT' } : r))
-  assert.equal(acceptReady(mux.readyPayload(forged)), "the self-test's probe of 192.168.5.2:8766 met no error that says there is no route")
-  assert.equal(acceptReady(mux.readyPayload(results.map((r, i) => (i === 4 ? { ...r, reached: true, error: 'ECONNREFUSED' } : r)))), 'the self-test reached 1 of what it must not')
+  assert.equal(acceptReady(mux.readyPayload(forged)), "the self-test's probe of 192.168.5.2:8766 met ETIMEDOUT, which does not say there is no route")
+  assert.equal(acceptReady(mux.readyPayload(results.map((r, i) => (i === 4 ? { ...r, reached: true, error: 'ECONNREFUSED' } : r)))), 'the self-test reached 1 of what it must not (1.1.1.1:443)')
+  assert.equal(
+    acceptReady(mux.readyPayload(results.map((r, i) => (i === 0 || i === 3 ? { ...r, reached: true, error: null } : r)))),
+    'the self-test reached 2 of what it must not (192.168.5.2:8766, host.docker.internal:8766)',
+  )
+  // A count that names no probe is refused all the same, saying so.
+  const counted = JSON.parse(Buffer.from(mux.readyPayload(results)).toString('ascii')) as Record<string, unknown>
+  assert.equal(acceptReady(Buffer.from(JSON.stringify({ ...counted, reached: 3 }), 'ascii')), 'the self-test reached 3 of what it must not (its report names none of them)')
+  // A probe swapped for another kind at its target is no probe the kernel ran.
+  assert.equal(
+    acceptReady(mux.readyPayload(results.map((r, i) => (i === 0 ? { ...r, probe: 'lookup' as const, error: 'ENOTFOUND' } : r)))),
+    'the report does not name every self-test probe, in order',
+  )
+  // The code a refused probe met is said only in the mux's shape, and only
+  // as the redaction pass leaves it: anything else of the report's is
+  // named, never quoted.
+  for (const [error, met] of [
+    ['EHOSTUNREACH', 'EHOSTUNREACH'],
+    ['etimedout', 'an error code of no known shape'],
+    ['ETIMEDOUT; see http://x', 'an error code of no known shape'],
+    [`E${'X'.repeat(32)}`, 'an error code of no known shape'],
+    ['AKIAIOSFODNN7EXAMPLE', 'an error code of no known shape'],
+  ] as const) {
+    assert.equal(
+      acceptReady(mux.readyPayload(results.map((r, i) => (i === 0 ? { ...r, error } : r)))),
+      `the self-test's probe of 192.168.5.2:8766 met ${met}, which does not say there is no route`,
+      error,
+    )
+  }
+  assert.equal(acceptReady(mux.readyPayload(results.map((r, i) => (i === 5 ? { ...r, error: null } : r)))), "the self-test's probe of example.com met no error, which does not say there is no route")
 })
 
 function sessionOver(t: TestContext, toKernel: PassThrough, toMux: PassThrough, kills: number[]): ReturnType<typeof createEgressSession> {
@@ -2090,17 +2136,413 @@ test("against the kernel's own session: a self-test that reached something gets 
   assert.deepEqual(spawned, [])
 })
 
+// ── the canary and the self-test (egress plan W3) ─────────────────────────────
+
+/** A listener on a real loopback port of the system's choosing in 3128's place, and a dial that reaches it: the canary's own request on real sockets. */
+function loopbackCanary(t: TestContext): { listen: mux.Listen; dial: (host: string, port: number) => Duplex; asked: { host: string; port: number }[]; dialled: { host: string; port: number }[] } {
+  let bound = 0
+  const asked: { host: string; port: number }[] = []
+  const dialled: { host: string; port: number }[] = []
+  return {
+    asked,
+    dialled,
+    listen: async (host, port, onConnection) => {
+      asked.push({ host, port })
+      const listener = await mux.listenTcp(host, 0, onConnection)
+      t.after(() => listener.close())
+      bound = listener.port
+      return listener
+    },
+    dial: (host, port) => {
+      dialled.push({ host, port })
+      return net.connect({ host, port: bound, autoSelectFamily: false })
+    },
+  }
+}
+
+test("against the kernel's own canary session, on real loopback sockets: the canary's one request crosses the channel as a flow, is denied and recorded under no run, and its exit frame says 0", async (t) => {
+  const store = withStore(t)
+  const toKernel = new PassThrough()
+  const toMux = new PassThrough()
+  const kills: number[] = []
+  const touched: string[] = []
+  const session = createEgressSession({
+    grantId: 'grant_1762700000000_c1',
+    grant: EgressGrant.parse({ runId: 'canary', allow: [], routes: [] }),
+    canary: true,
+    limits: SESSION_LIMITS,
+    channel: { input: toKernel, output: toMux },
+    store,
+    upstream: createUpstream({
+      resolver: () => {
+        touched.push('resolver')
+        throw new Error('nothing is resolved here')
+      },
+      dial: () => {
+        touched.push('dial')
+        throw new Error('nothing is dialled here')
+      },
+      interfaces: () => ({}),
+      connectTimeoutMs: 1_000,
+      idleTimeoutMs: 1_000,
+    }),
+    credential: () => {
+      throw new Error('no credential is injected here')
+    },
+    acceptReady,
+    kill: () => kills.push(1),
+  })
+  const sockets = loopbackCanary(t)
+  const done = mux.runMux({
+    input: toMux,
+    output: toKernel,
+    canary: true,
+    connect: NO_ROUTE,
+    lookup: NO_DNS,
+    listen: sockets.listen,
+    dial: sockets.dial,
+    spawn: () => {
+      throw new Error('the canary spawns nothing')
+    },
+  })
+  assert.equal(await exits(done), mux.MUX_EXIT.ok, 'the mux exits once its request is answered and its flow retired')
+  toKernel.end()
+  const outcome = await exits(session.end('exited'), 'the session to end')
+  assert.equal(outcome.reason, 'exited')
+  assert.equal(outcome.exitStatus, 0, 'the mux read no 403')
+  assert.deepEqual([outcome.totals.flows, outcome.totals.requests, outcome.totals.denied, outcome.totals.allowed], [1, 1, 1, 0])
+  assert.deepEqual(sockets.asked, [{ host: '127.0.0.1', port: 3128 }], 'the canary listens where a worker would')
+  assert.deepEqual(sockets.dialled, [{ host: '127.0.0.1', port: 3128 }], 'the canary dials its own listener, as HTTP_PROXY does')
+  assert.deepEqual(touched, [], 'an address was resolved or dialled')
+  assert.deepEqual(kills, [])
+  const decided = store.query({ type: 'proxy.decision' })
+  assert.equal(decided.length, 1)
+  assert.deepEqual([decided[0]?.runId, decided[0]?.agentId], [null, null], 'a canary row was appended under a run')
+  const decision = JSON.parse(decided[0]?.payload ?? '{}') as Record<string, unknown>
+  assert.deepEqual([decision['verdict'], decision['reason'], decision['hostRefusal'], decision['method']], ['deny', 'not-a-host', 'ip-literal', 'GET'])
+  const revoked = store.query({ type: 'proxy.grant.revoked' })
+  assert.deepEqual(revoked.map((r) => [r.runId, (JSON.parse(r.payload) as Record<string, unknown>)['reason']]), [[null, 'exited']])
+  // The request is the one test/helpers/fake-egress.ts plays the canary with.
+  assert.equal(mux.CANARY_REQUEST, CANARY_REQUEST)
+  assert.match(mux.CANARY_REQUEST, /^GET http:\/\/192\.168\.5\.2:8766\/mcp HTTP\/1\.1\r\n/)
+  // The image's usage exit is the one the kernel reads as a mux that predates the canary.
+  assert.equal(mux.MUX_EXIT.usage, MUX_USAGE_EXIT)
+})
+
+test("a canary session refuses a grant that reaches anything or serves an agent", (t) => {
+  const store = withStore(t)
+  const base = {
+    grantId: 'grant_1762700000000_c2',
+    canary: true as const,
+    limits: SESSION_LIMITS,
+    channel: { input: new PassThrough(), output: new PassThrough() },
+    store,
+    upstream: { request: () => Promise.reject(new Error('never')) },
+    credential: () => undefined,
+    acceptReady,
+    kill: () => undefined,
+  }
+  assert.throws(() => createEgressSession({ ...base, grant: EgressGrant.parse({ runId: 'canary', allow: ['registry.npmjs.org'], routes: [] }) }), /a canary grant reaches nothing/)
+  assert.throws(() => createEgressSession({ ...base, grant: GRANT }), /a canary grant reaches nothing/)
+  assert.throws(() => createEgressSession({ ...base, grant: EgressGrant.parse({ runId: 'canary', allow: [], routes: [] }), agentId: 'coder' }), /a canary grant serves no agent/)
+})
+
+test("the canary's status is 0 only for an answer that begins with the kernel's 403 status line", () => {
+  const bytes = (s: string): Uint8Array => Uint8Array.from(Buffer.from(s, 'latin1'))
+  const deny = 'HTTP/1.1 403 Forbidden\r\nconnection: close\r\n\r\n'
+  assert.equal(mux.canaryStatus([bytes(deny)]), 0)
+  assert.equal(mux.canaryStatus([...deny].map(bytes)), 0, 'byte by byte')
+  assert.equal(mux.canaryStatus([bytes(''), bytes('HTTP/1.1 403 ')]), 0)
+  for (const answer of ['', 'HTTP/1.1 403', 'HTTP/1.1 200 OK\r\n\r\n', 'HTTP/1.1 502 Bad Gateway\r\n\r\n', 'HTTP/1.0 403 Forbidden\r\n\r\n', ' HTTP/1.1 403 ', 'http/1.1 403 ']) {
+    assert.equal(mux.canaryStatus([bytes(answer)]), mux.CANARY_FAILED, JSON.stringify(answer))
+  }
+  assert.notEqual(mux.CANARY_FAILED, 0)
+})
+
+/** A canary mux run against a hand-driven kernel end, on real loopback sockets. */
+async function canaryAgainst(t: TestContext, answer: (kernel: KernelEnd, flow: number) => void, canaryTimeoutMs = 2_000): Promise<{ status: number | undefined; kernel: KernelEnd }> {
+  const kernel = new KernelEnd({ frameMaxBytes: 4_096, maxFlows: 2 })
+  const sockets = loopbackCanary(t)
+  const done = mux.runMux({
+    input: kernel.toMux,
+    output: kernel.fromMux,
+    canary: true,
+    canaryTimeoutMs,
+    connect: NO_ROUTE,
+    lookup: NO_DNS,
+    listen: sockets.listen,
+    dial: sockets.dial,
+    flushTimeoutMs: 1_000,
+  })
+  await until(() => kernel.of('ready').length === 1, 'ready')
+  kernel.go()
+  await until(() => kernel.of('open').length === 1 && kernel.dataOn(1).endsWith('\r\n\r\n'), 'the canary request on its flow')
+  assert.equal(kernel.dataOn(1), mux.CANARY_REQUEST)
+  answer(kernel, 1)
+  await until(() => kernel.of('exit').length === 1, 'the exit frame', canaryTimeoutMs + 3_000)
+  kernel.toMux.end()
+  assert.equal(await exits(done, 'the mux to exit', canaryTimeoutMs + 3_000), mux.MUX_EXIT.ok)
+  return { status: kernel.of('exit')[0]?.payload[0], kernel }
+}
+
+test("the canary sends CANARY_FAILED for an answer that is no 403, for one that never comes within its bound, and for one past CANARY_ANSWER_MAX_BYTES, and 0 for the kernel's deny", async (t) => {
+  const answered = (text: string) => (kernel: KernelEnd, flow: number) => {
+    kernel.sendData(flow, text)
+    kernel.send(frame('end', flow))
+    kernel.send(frame('close', flow))
+  }
+  assert.equal((await canaryAgainst(t, answered('HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n'))).status, 0)
+  assert.equal((await canaryAgainst(t, answered('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'))).status, mux.CANARY_FAILED)
+  // A kernel that cuts the flow with no answer: a close and no end.
+  assert.equal(
+    (
+      await canaryAgainst(t, (kernel, flow) => {
+        kernel.send(frame('close', flow))
+      })
+    ).status,
+    mux.CANARY_FAILED,
+  )
+  // A kernel that never answers: the canary gives its request up at its bound.
+  const started = Date.now()
+  assert.equal((await canaryAgainst(t, () => undefined, 300)).status, mux.CANARY_FAILED)
+  assert.ok(Date.now() - started >= 250, 'the canary gave up before its bound')
+  // Nor one that begins a 403 and never ends it: what arrived by the bound is no denial.
+  assert.equal(
+    (
+      await canaryAgainst(
+        t,
+        (kernel, flow) => {
+          kernel.sendData(flow, 'HTTP/1.1 403 Forbidden\r\n')
+        },
+        300,
+      )
+    ).status,
+    mux.CANARY_FAILED,
+  )
+  // A 403 that does not end within CANARY_ANSWER_MAX_BYTES is no denial,
+  // its head read first (so the canary holds a 403's start) and the rest
+  // after it, past the bound.
+  const head = `HTTP/1.1 403 Forbidden\r\ncontent-length: ${String(mux.CANARY_ANSWER_MAX_BYTES)}\r\n\r\n`
+  assert.equal(
+    (
+      await canaryAgainst(t, (kernel, flow) => {
+        kernel.sendData(flow, head)
+        setTimeout(() => answered('x'.repeat(mux.CANARY_ANSWER_MAX_BYTES))(kernel, flow), 100)
+      })
+    ).status,
+    mux.CANARY_FAILED,
+  )
+  // Its bounds are the plan's.
+  assert.deepEqual([mux.CANARY_TIMEOUT_MS, mux.CANARY_ANSWER_MAX_BYTES], [10_000, 16_384])
+})
+
+test('a canary whose self-test reached something gets no go: it never listens and never sends its request', async () => {
+  const kernel = new KernelEnd({ frameMaxBytes: 4_096, maxFlows: 2 })
+  const listens: string[] = []
+  const dials: string[] = []
+  const done = mux.runMux({
+    input: kernel.toMux,
+    output: kernel.fromMux,
+    canary: true,
+    connect: (host, port) => Promise.resolve(host === '192.168.5.2' && port === 8766 ? { reached: true, error: null } : { reached: false, error: 'ENETUNREACH' }),
+    lookup: NO_DNS,
+    listen: (host) => {
+      listens.push(host)
+      return Promise.reject(new Error('never listened'))
+    },
+    dial: (host) => {
+      dials.push(host)
+      throw new Error('never dialled')
+    },
+  })
+  await until(() => kernel.of('ready').length === 1, 'ready')
+  assert.match(acceptReady(kernel.of('ready')[0]?.payload ?? new Uint8Array(0)) ?? 'accepted', /reached 1 of what it must not \(192\.168\.5\.2:8766\)/)
+  // The kernel sends no go; it ends the channel.
+  kernel.toMux.end()
+  assert.equal(await exits(done), mux.MUX_EXIT.ok)
+  assert.deepEqual([listens, dials], [[], []])
+  assert.deepEqual(kernel.of('open'), [])
+})
+
+/** A writable that keeps what it is given, or fails or holds every write. */
+function lineSink(how: 'keep' | 'fail' | 'hold' = 'keep'): { sink: Writable; text: () => string } {
+  const chunks: Buffer[] = []
+  const sink = new Writable({
+    write(chunk: Buffer, _encoding, callback) {
+      if (how === 'fail') {
+        callback(new Error('EPIPE'))
+        return
+      }
+      if (how === 'hold') return
+      chunks.push(chunk)
+      callback()
+    },
+  })
+  sink.on('error', () => undefined)
+  return { sink, text: () => Buffer.concat(chunks).toString('latin1') }
+}
+
+test('--self-test writes the self-test report as one line on stdout and exits 0, reading nothing, listening on nothing, running nothing', async () => {
+  const probed: string[] = []
+  const quiet = lineSink()
+  const code = await exits(
+    mux.runSelfTest({
+      output: quiet.sink,
+      connect: (host, port) => {
+        probed.push(`${host}:${String(port)}`)
+        return NO_ROUTE(host, port, 1_000)
+      },
+      lookup: (host) => {
+        probed.push(host)
+        return NO_DNS(host, 1_000)
+      },
+    }),
+  )
+  assert.equal(code, mux.MUX_EXIT.ok)
+  assert.deepEqual(probed.sort(), mux.SELF_TEST.map(targetOf).sort(), 'it ran every probe, once')
+  const line = quiet.text()
+  assert.ok(line.endsWith('\n') && line.indexOf('\n') === line.length - 1, JSON.stringify(line))
+  const report = Buffer.from(line.slice(0, -1), 'latin1')
+  assert.equal(acceptReady(report), undefined, 'the kernel refused the line a quiet self-test writes')
+  assert.equal(judge(report), undefined)
+  // A probe that reached something is in the line, for the kernel to refuse.
+  const loud = lineSink()
+  await exits(mux.runSelfTest({ output: loud.sink, connect: (host) => Promise.resolve(host === '1.1.1.1' ? { reached: true, error: null } : { reached: false, error: 'ENETUNREACH' }), lookup: NO_DNS }))
+  assert.equal(acceptReady(Buffer.from(loud.text().trimEnd(), 'latin1')), 'the self-test reached 1 of what it must not (1.1.1.1:443)')
+  // A stdout that fails, or never takes the line within its bound, is the mux's io failure.
+  assert.equal(await exits(mux.runSelfTest({ output: lineSink('fail').sink, connect: NO_ROUTE, lookup: NO_DNS })), mux.MUX_EXIT.io)
+  assert.equal(await exits(mux.runSelfTest({ output: lineSink('hold').sink, connect: NO_ROUTE, lookup: NO_DNS, flushTimeoutMs: 100 })), mux.MUX_EXIT.io)
+  // Its options name no input, listener or spawn: the source says so too.
+  const body = MUX_SOURCE.slice(MUX_SOURCE.indexOf('export async function runSelfTest'), MUX_SOURCE.indexOf('/** The address a listener is bound to'))
+  assert.ok(body.length > 0)
+  for (const word of ['input', 'listen', 'spawn', 'createServer', 'netConnect']) assert.equal(new RegExp(`\\b${word}\\b`).test(body), false, word)
+})
+
 // ── what the mux is ──────────────────────────────────────────────────────────
 
-test('parseArgs takes -- and a command with its arguments, and nothing else', () => {
+test('parseArgs takes -- and a command with its arguments, --canary alone or --self-test alone, and nothing else', () => {
   assert.deepEqual(mux.parseArgs(['--', 'git', 'clone', '--depth', '1', 'http://github.com/op/fixture.git']), {
+    mode: 'run',
     command: 'git',
     args: ['clone', '--depth', '1', 'http://github.com/op/fixture.git'],
   })
-  assert.deepEqual(mux.parseArgs(['--', 'node']), { command: 'node', args: [] })
-  for (const argv of [[], ['--'], ['--', ''], ['git', 'clone'], ['--canary'], ['-', 'git']]) {
+  assert.deepEqual(mux.parseArgs(['--', 'node']), { mode: 'run', command: 'node', args: [] })
+  // A command named --canary is a command, after --.
+  assert.deepEqual(mux.parseArgs(['--', '--canary']), { mode: 'run', command: '--canary', args: [] })
+  assert.deepEqual(mux.parseArgs(['--canary']), { mode: 'canary' })
+  assert.deepEqual(mux.parseArgs(['--self-test']), { mode: 'self-test' })
+  for (const argv of [
+    [],
+    ['--'],
+    ['--', ''],
+    ['git', 'clone'],
+    ['-', 'git'],
+    ['--canary', 'git'],
+    ['--canary', '--'],
+    ['--canary', '--self-test'],
+    ['--self-test', '--canary'],
+    ['--self-test', '--', 'git'],
+    ['--canary='],
+    ['--CANARY'],
+  ]) {
     assert.equal(mux.parseArgs(argv), undefined, JSON.stringify(argv))
   }
+  // What the kernel runs on each domain is what parseArgs reads as that mode.
+  assert.deepEqual(mux.parseArgs(CANARY_COMMANDS.trusted.slice(2)), { mode: 'canary' })
+  assert.deepEqual(mux.parseArgs(CANARY_COMMANDS.hostile.slice(2)), { mode: 'self-test' })
+  assert.deepEqual(CANARY_COMMANDS.trusted.slice(0, 2), ['node', '/opt/aos/mux.mjs'])
+  assert.deepEqual(CANARY_COMMANDS.hostile.slice(0, 2), ['node', '/opt/aos/mux.mjs'])
+  // And a channel exec's command (sandbox-tools.ts muxCommand) is what
+  // parseArgs reads as the run mode, the agent's argv whole, from the one
+  // constant the canaries' commands start with: the path the worker image
+  // copies the mux to, run as given, since the image's entrypoint is empty.
+  assert.deepEqual(MUX_ARGV, ['node', '/opt/aos/mux.mjs'])
+  assert.deepEqual(CANARY_COMMANDS.trusted.slice(0, 2), [...MUX_ARGV])
+  for (const command of [['git', 'fetch', '--depth', '1'], ['node', '--test'], ['--canary'], ['sh', '-c', 'exit 3']]) {
+    const argv = muxCommand(command)
+    assert.deepEqual(argv.slice(0, 3), [...MUX_ARGV, '--'], command.join(' '))
+    assert.deepEqual(mux.parseArgs(argv.slice(2)), { mode: 'run', command: command[0], args: command.slice(1) }, command.join(' '))
+  }
+  const dockerfile = readFileSync(new URL('../images/worker/Dockerfile', import.meta.url), 'utf8')
+  assert.match(dockerfile, new RegExp(`^COPY mux\\.mjs ${String(MUX_ARGV[1]).replaceAll('.', '\\.')}$`, 'm'))
+  assert.match(dockerfile, /^ENTRYPOINT \[\]$/m)
+  assert.match(mux.USAGE, /--canary/)
+  assert.match(mux.USAGE, /--self-test/)
+})
+
+test("the boot canary's bounds hold to the mux's own: boot waits past the wallclock, and no wallclock a canary runs under is shorter than its probes, its round trip and a container's start", () => {
+  // A wait below the wallclock gives up a healthy canary on a slow VM, its
+  // end recorded as an error and egress degraded; a minimum below the mux's
+  // own bounds lets a canary run that its wallclock kills before its round
+  // trip's bound, a failure read as the VM's (src/runtime/canary.ts).
+  /** A docker run's start and its mux's exit: a second or two. */
+  const START_MS = 2_000
+  assert.ok(CANARY_WAIT_MS > CANARY_WALLCLOCK_MS, `wait ${String(CANARY_WAIT_MS)} <= wallclock ${String(CANARY_WALLCLOCK_MS)}`)
+  assert.ok(CANARY_WAIT_MS - CANARY_WALLCLOCK_MS >= KILL_WAIT_MS, 'the kill at the wallclock has less time to land than a kill by name is given')
+  assert.ok(CANARY_WALLCLOCK_MS >= CANARY_MIN_WALLCLOCK_MS, `wallclock ${String(CANARY_WALLCLOCK_MS)} < minimum ${String(CANARY_MIN_WALLCLOCK_MS)}`)
+  // The trusted canary: its probes, at once, then its one request's bound.
+  assert.ok(CANARY_MIN_WALLCLOCK_MS >= mux.PROBE_TIMEOUT_MS + mux.CANARY_TIMEOUT_MS + START_MS, `minimum ${String(CANARY_MIN_WALLCLOCK_MS)}`)
+  // The hostile canary: its probes, then its one write's bound.
+  assert.ok(CANARY_MIN_WALLCLOCK_MS >= mux.PROBE_TIMEOUT_MS + mux.FLUSH_TIMEOUT_MS + START_MS, `minimum ${String(CANARY_MIN_WALLCLOCK_MS)}`)
+})
+
+test("main() runs what entryOptions says for each of the three modes, over the process's own stdio, and nothing else", () => {
+  // main() runs only as the program (import.meta.main), so its wiring is
+  // held here: entryOptions, pure, for each mode, and main()'s own body,
+  // pinned whole, which does no more than read argv, refuse with USAGE, and
+  // run what entryOptions says.
+  const stdio = { input: new PassThrough(), output: new PassThrough(), diagnostics: new PassThrough() }
+  const io = { input: stdio.input, output: stdio.output, diagnostics: stdio.diagnostics }
+  // --self-test: the self-test alone, on stdout and stderr; no stdin, since it has no channel.
+  const selfTest = mux.entryOptions({ mode: 'self-test' }, stdio)
+  assert.deepEqual(selfTest, { runner: 'self-test', options: { output: stdio.output, diagnostics: stdio.diagnostics } })
+  // --canary: the channel mux with the canary's request, and no command.
+  const canary = mux.entryOptions({ mode: 'canary' }, stdio)
+  assert.deepEqual(canary, { runner: 'mux', options: { ...io, canary: true } })
+  // -- <command>: the channel mux around the command, as given.
+  const run = mux.entryOptions({ mode: 'run', command: 'git', args: ['fetch', '--depth', '1'] }, stdio)
+  assert.deepEqual(run, { runner: 'mux', options: { ...io, command: 'git', args: ['fetch', '--depth', '1'] } })
+  assert.equal('canary' in run.options, false)
+  for (const entry of [selfTest, canary, run]) assert.equal(Object.isFrozen(entry), true)
+  // What the kernel runs on each domain, read as main() reads argv.
+  const entryFor = (argv: readonly string[]) => {
+    const parsed = mux.parseArgs(argv.slice(2))
+    assert.ok(parsed !== undefined, argv.join(' '))
+    return mux.entryOptions(parsed, stdio)
+  }
+  assert.deepEqual(entryFor(CANARY_COMMANDS.trusted), canary)
+  assert.deepEqual(entryFor(CANARY_COMMANDS.hostile), selfTest)
+  assert.deepEqual(entryFor(muxCommand(['git', 'fetch', '--depth', '1'])), run)
+  // main() itself, whole.
+  const start = MUX_SOURCE.indexOf('async function main() {')
+  const end = MUX_SOURCE.indexOf('\n}\n', start)
+  assert.ok(start !== -1 && end !== -1)
+  assert.equal(
+    MUX_SOURCE.slice(start, end + 2),
+    [
+      'async function main() {',
+      '  const parsed = parseArgs(process.argv.slice(2))',
+      '  if (parsed === undefined) {',
+      '    process.stderr.write(USAGE)',
+      '    process.exit(MUX_EXIT.usage)',
+      '  }',
+      '  const entry = entryOptions(parsed, { input: process.stdin, output: process.stdout, diagnostics: process.stderr })',
+      "  process.exit(entry.runner === 'self-test' ? await runSelfTest(entry.options) : await runMux(entry.options))",
+      '}',
+    ].join('\n'),
+  )
+  assert.equal(MUX_SOURCE.split('async function main() {').length, 2, 'one main()')
+  assert.match(MUX_SOURCE, /\nif \(import\.meta\.main\) await main\(\)\n$/)
+})
+
+test("every repository file the mux's own text names is there, under that name", () => {
+  // Its header and doc comments point the reader at the kernel's side of
+  // each contract (the session, the frame codec, the boot canary): a path
+  // that names no file sends them nowhere.
+  const text = readFileSync(new URL('../images/worker/mux.mjs', import.meta.url), 'utf8')
+  const named = [...new Set([...text.matchAll(/\b(?:src|test|images|scripts|config|docs)\/[A-Za-z0-9_./-]+\.(?:ts|mjs|sh|md|yaml|json)\b/g)].map((m) => m[0]))]
+  assert.ok(named.includes('src/runtime/canary.ts'), named.join(', '))
+  for (const path of named) assert.equal(existsSync(new URL(`../${path}`, import.meta.url)), true, `${path} is named by the mux and is not there`)
 })
 
 /** What the mux may use of process: its stdio, its argv, exit, and kill (of the command's group). */

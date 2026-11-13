@@ -34,10 +34,24 @@
 // a result row, from what the log says the child did — and an orphaned parent's
 // bill counts every child it paid for, exactly as its live `run.finished` would.
 //
+// Egress adds another (egress plan W2). A grant is issued before its
+// container starts and revoked once the kernel has a verdict on the container,
+// and both rows are the kernel's: the grant table, like the session that
+// serves it, lives in memory. A kernel that died between the two left a grant
+// issued and never revoked, which reads as a reach the log never closed.
+// Nothing can be served under it any more (the egress engine was in the dead
+// process, and so was the container's one channel), so recovery closes it:
+// `proxy.grant.revoked` with reason `recovered`, and no totals, since the
+// counts died with the kernel that kept them (events/types.ts). A grant whose
+// live revocation the store refused (src/egress/session.ts logs the failed
+// append and ends the session all the same) reads the same, and is closed the
+// same way at the next boot, by words that cover both (GRANT_RECOVERED_DETAIL).
+//
 // Idempotence is structural rather than bolted on: a run is open because it has
 // no `run.finished` row, so once recovery writes one it is no longer open. The
 // second restart finds nothing to do because the first one recorded what it
-// did, in the same log, under the same rules.
+// did, in the same log, under the same rules. A grant likewise: it is open
+// because it has no `proxy.grant.revoked` row.
 
 import type { EventRow } from './chain.js'
 
@@ -100,11 +114,26 @@ export interface DanglingDelegation {
   readonly seq: number
 }
 
+/**
+ * An egress grant issued and never revoked: its `proxy.grant.issued` row has no
+ * `proxy.grant.revoked` row naming its id. Its run and agent are the issued
+ * row's own columns (null for a canary grant, which serves no run).
+ */
+export interface OpenGrant {
+  readonly grantId: string
+  readonly runId: string | null
+  readonly agentId: string | null
+  /** The container the grant served, as its issued row names it: the boot sweep kills it by name. */
+  readonly sandbox: string
+  readonly seq: number
+}
+
 export interface Recovery {
   readonly orphanRuns: readonly OrphanRun[]
   readonly unresolvedApprovals: readonly UnresolvedApproval[]
   readonly unreleasedHolds: readonly UnreleasedHold[]
   readonly danglingDelegations: readonly DanglingDelegation[]
+  readonly openGrants: readonly OpenGrant[]
 }
 
 /** True when a recovery has nothing to do. */
@@ -113,7 +142,8 @@ export function isClean(recovery: Recovery): boolean {
     recovery.orphanRuns.length === 0 &&
     recovery.unresolvedApprovals.length === 0 &&
     recovery.unreleasedHolds.length === 0 &&
-    recovery.danglingDelegations.length === 0
+    recovery.danglingDelegations.length === 0 &&
+    recovery.openGrants.length === 0
   )
 }
 
@@ -162,6 +192,7 @@ export function projectRecovery(rows: readonly EventRow[]): Recovery {
   const open = new Map<string, OpenRun>()
   const approvals = new Map<string, UnresolvedApproval>()
   const holds = new Map<string, UnreleasedHold>()
+  const grants = new Map<string, OpenGrant>()
   // Keyed by child run id. An admission leaves this map only on its result.
   const admitted = new Map<string, { parentRunId: string; seq: number }>()
   const finished = new Map<string, { status: string; costMicroUsd: number }>()
@@ -285,6 +316,18 @@ export function projectRecovery(rows: readonly EventRow[]): Recovery {
         holds.delete(stringAt(payload, 'holdId'))
         break
       }
+      case 'proxy.grant.issued': {
+        const grantId = stringAt(payload, 'grantId')
+        if (grantId === '') break
+        grants.set(grantId, { grantId, runId: row.runId, agentId: row.agentId, sandbox: stringAt(payload, 'sandbox'), seq: row.seq })
+        break
+      }
+      case 'proxy.grant.revoked': {
+        // Any reason closes it, a recovered one included: that is what makes
+        // the second boot find nothing.
+        grants.delete(stringAt(payload, 'grantId'))
+        break
+      }
       default:
         break
     }
@@ -319,7 +362,34 @@ export function projectRecovery(rows: readonly EventRow[]): Recovery {
     unresolvedApprovals: [...approvals.values()].sort((a, b) => a.seq - b.seq),
     unreleasedHolds: [...holds.values()].sort((a, b) => a.seq - b.seq),
     danglingDelegations: dangling.sort((a, b) => a.seq - b.seq),
+    openGrants: [...grants.values()].sort((a, b) => a.seq - b.seq),
   }
+}
+
+/**
+ * Every run the log shows may have had a container: the run of each
+ * `tool.call` to a sandbox tool (`sandbox.<name>`, which the runner appends
+ * before it asks the driver for a container), of each `sandbox.started`, and
+ * of each `proxy.grant.issued` that names one, in the order the log first
+ * names them. Finished runs included, and that is the point: what the boot
+ * sweep (egress plan W2) is to kill is a container of THIS log's that a VM
+ * still runs, whichever kernel lost it (one that died, or one whose kill by
+ * name no daemon answered), and a run's container is `aos-run-<runId>-<n>`.
+ * A run another log names (another data directory's kernel, on the same VM)
+ * is not here, so its containers are never this boot's to kill; nor is a
+ * run started after these rows were read.
+ */
+export function sandboxRunIds(rows: readonly EventRow[]): string[] {
+  const runs = new Set<string>()
+  for (const row of rows) {
+    if (row.runId === null) continue
+    if (row.type === 'sandbox.started' || row.type === 'proxy.grant.issued') {
+      runs.add(row.runId)
+    } else if (row.type === 'tool.call' && stringAt(parse(row.payload), 'toolRef').startsWith('sandbox.')) {
+      runs.add(row.runId)
+    }
+  }
+  return [...runs]
 }
 
 /** A child's terminal status, as a delegation result can state it. */

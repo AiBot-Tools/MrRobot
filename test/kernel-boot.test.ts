@@ -21,9 +21,9 @@
 
 import './helpers/guard.js'
 
-import { test } from 'node:test'
+import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { parse as parseYaml } from 'yaml'
 import { WebSocket } from 'ws'
 import { createServer, type IncomingHttpHeaders } from 'node:http'
@@ -36,10 +36,19 @@ import {
   defaultDriver,
   EGRESS_CONNECT_TIMEOUT_MS,
   egressUpstreamOptions,
+  PROBE_REASON_BYTES,
+  PROBE_WAIT_MS,
+  probeAtBoot,
   project,
   STUBS,
   SUBSYSTEM_ORDER,
+  SWEEP_REASON_BYTES,
+  SWEEP_WAIT_MS,
+  sweepAtBoot,
+  sweepTargets,
+  sweptReason,
 } from '../src/kernel.js'
+import { AppleContainerDriver } from '../src/sandbox/apple-container.js'
 import { parseToolViews } from '../src/mcp/tool-views.js'
 import { isClean, projectRecovery } from '../src/events/projections.js'
 import { rebuildFromLog as rebuildApprovals } from '../src/policy/approvals.js'
@@ -53,6 +62,7 @@ import { readAnchor } from '../src/events/anchor.js'
 import { CONTROL_PATH } from '../src/control/auth.js'
 import { VERSION } from '../src/version.js'
 import {
+  bootCrashable,
   bootOn,
   fixture,
   REPO_ROOT,
@@ -64,6 +74,9 @@ import {
   type KernelFixture,
 } from './helpers/kernel.js'
 import { tmpdir } from './helpers/tmpdir.js'
+import { DATA_LOCK_FILE, DATA_LOCK_JOURNAL, holdDataDir } from '../src/data-lock.js'
+import { closeVerified, withStore } from './helpers/store.js'
+import { SANDBOX_SERVER } from '../src/runtime/sandbox-tools.js'
 import { join } from 'node:path'
 import { fakeSandbox } from './helpers/fake-sandbox.js'
 import type { SandboxDriver } from '../src/sandbox/driver.js'
@@ -73,7 +86,7 @@ import { freshProbe } from './helpers/probe.js'
 import { writeProbeRecord } from '../src/models/probe.js'
 import { mockMcp } from './helpers/mock-mcp.js'
 import { MIN_MASK_LENGTH, redactString, SecretMask } from '../src/events/redact.js'
-import { FakeMux, fakeUpstream, fakeUpstreamDeps, until } from './helpers/fake-egress.js'
+import { FakeMux, fakeUpstream, fakeUpstreamDeps, refusedReport, until } from './helpers/fake-egress.js'
 import { connectControl } from '../src/cli/client.js'
 
 
@@ -126,6 +139,9 @@ async function expectBootRefusal(
 
 /** The one non-placeholder ref in the shipped providers.yaml. */
 const REAL_REF = 'anthropic/claude-sonnet-5'
+
+/** The orphan sweep's listing, as the docker driver asks each VM for it (docker.ts #sweepOn). */
+const SWEEP_PS = ['ps', '--filter', 'name=aos-run-', '--format', '{{.Names}}']
 
 test('boots DEGRADED with hub, sandbox and router degraded, each with a reason, secrets and control ok, over a real WS connection', async (t) => {
   const { kernel, fx } = await withKernel(t)
@@ -197,7 +213,9 @@ test('with sandbox.imageId unset, boot marks the sandbox degraded, naming the ke
   // built yet. The driver boot builds from kernel.yaml (defaultDriver), with
   // only the docker CLI's two process functions swapped for ones that answer
   // as a healthy daemon would, is what reports it: the verdict is the id's
-  // alone, and nothing is asked of a daemon, let alone pulled.
+  // alone, and nothing is asked of a daemon, let alone pulled. The orphan
+  // sweep (egress plan W2) asks nothing either on a log with no sandbox run:
+  // it kills only what the log names.
   const driverFor = (fx: KernelFixture, calls: string[][]): SandboxDriver =>
     defaultDriver(fx.config, REPO_ROOT, {
       spawn: (_command, args) => {
@@ -229,6 +247,18 @@ test('with sandbox.imageId unset, boot marks the sandbox degraded, naming the ke
   assert.equal(degraded['driver'], 'docker')
   assert.equal(`docker: ${String(degraded['reason'])}`, reason)
 
+  // A log that holds a sandbox run, under an id since unpinned: the sweep
+  // lists each VM, whatever the probe says, since such a kernel may have
+  // left its containers running and only the sweep ends them. Nothing else
+  // is asked.
+  const unpinned = fixture(t)
+  seedSandboxRuns(t, unpinned, ['run_unpinned'])
+  const swept: string[][] = []
+  const again = await bootOn(t, unpinned, { sandboxDriver: driverFor(unpinned, swept) })
+  assert.equal(again.status().subsystems.sandbox.state, 'degraded')
+  await again.shutdown()
+  assert.deepEqual(swept, [SWEEP_PS, SWEEP_PS], 'boot asked docker something besides the sweep')
+
   // Pinned, the same driver goes on to the daemons, and the sandbox is ok.
   const id = `sha256:${'0123456789abcdef'.repeat(4)}`
   const pinned = fixture(t, { kernelYaml: (base) => base.replace('  image: aos-worker:test\n', `  image: aos-worker:test\n  imageId: ${id}\n`) })
@@ -244,6 +274,825 @@ test('with sandbox.imageId unset, boot marks the sandbox degraded, naming the ke
   ])
   await ok.shutdown()
   assert.equal(rows(pinned.dbPath).some((r) => r.type === 'sandbox.degraded'), false)
+})
+
+// ── the orphan sweep (egress plan W2) ──────────────────────────────────────
+//
+// A kernel that died left its containers running with no wallclock: the
+// timers were the dead process's. Boot kills them by name, on every VM,
+// before it says the sandbox is ok, and only those its own log names.
+
+const PINNED_ID = `sha256:${'0123456789abcdef'.repeat(4)}`
+const pinnedYaml = (base: string): string => base.replace('  image: aos-worker:test\n', `  image: aos-worker:test\n  imageId: ${PINNED_ID}\n`)
+
+/**
+ * The log a kernel that died mid-exec leaves: each run started, with its
+ * sandbox.exec tool call (which the runner appends before it asks the driver
+ * for a container), and never finished, unless `finished` names it.
+ */
+function seedSandboxRuns(t: TestContext, fx: KernelFixture, runIds: readonly string[], finished: readonly string[] = []): void {
+  const store = withStore(t, { path: fx.dbPath, headFile: fx.headFile })
+  for (const runId of runIds) {
+    store.append({
+      type: 'run.started',
+      runId,
+      agentId: 'coder',
+      payload: { schemaVersion: 1, runId, agentId: 'coder', lane: 'main', tier: 2, taint: 'clean' },
+    })
+    store.append({
+      type: 'tool.call',
+      runId,
+      agentId: 'coder',
+      payload: { schemaVersion: 1, ticketId: `ticket_${runId}`, toolRef: 'sandbox.exec', argsHash: 'h', quarantine: false },
+    })
+    if (finished.includes(runId)) {
+      store.append({
+        type: 'run.finished',
+        runId,
+        payload: { schemaVersion: 1, runId, status: 'ok', costMicroUsd: 0, llmCalls: 0, toolCalls: 1, durationMs: 1 },
+      })
+    }
+  }
+  closeVerified(store)
+}
+
+test('boot sweeps orphans on both domains before marking sandbox', async (t) => {
+  // The driver boot builds from kernel.yaml (defaultDriver), over docker CLI
+  // functions that answer as two healthy daemons would, each listing what a
+  // dead kernel left on its VM beside a live kernel's container (a run of
+  // another data directory's log, on the same VM) and one that is no one's
+  // of ours.
+  const fx = fixture(t, { kernelYaml: pinnedYaml })
+  seedSandboxRuns(t, fx, ['run_a', 'run_b', 'run_c'])
+  const DOMAIN_OF: Readonly<Record<string, string>> = { 'unix:///tmp/t.sock': 'trusted', 'unix:///tmp/h.sock': 'hostile' }
+  const LISTED: Readonly<Record<string, string>> = {
+    trusted: 'aos-run-run_a-1\nsomeone-elses\naos-run-run_b-2\naos-run-run_live-1\n',
+    hostile: '\naos-run-run_c-1\n',
+  }
+  const sandboxMarked = (): boolean =>
+    rows(fx.dbPath).some((r) => r.type === 'subsystem.state' && (JSON.parse(r.payload) as { subsystem?: string }).subsystem === 'sandbox')
+  const booted = (): boolean => rows(fx.dbPath).some((r) => r.type === 'kernel.booted')
+  const swept: { domain: string; args: string[]; marked: boolean; booted: boolean }[] = []
+  const driver = defaultDriver(fx.config, REPO_ROOT, {
+    spawn: () => {
+      throw new Error('no run starts at boot')
+    },
+    execFile: (_command, args, options) => {
+      const domain = DOMAIN_OF[options.env['DOCKER_HOST'] ?? ''] ?? '?'
+      if (args[0] === 'ps' || args[0] === 'kill') swept.push({ domain, args: [...args], marked: sandboxMarked(), booted: booted() })
+      const answer =
+        args[0] === 'ps'
+          ? (LISTED[domain] ?? '')
+          : args[0] === 'kill'
+            ? `${args[args.length - 1] ?? ''}\n`
+            : args[0] === 'network'
+              ? 'true\n'
+              : args[0] === 'image'
+                ? `${args[args.length - 1] ?? ''}\n`
+                : '29.5.2\n'
+      return Promise.resolve({ stdout: answer, stderr: '' })
+    },
+  })
+  const kernel = await bootOn(t, fx, { sandboxDriver: driver })
+  const sandbox = kernel.status().subsystems.sandbox
+  await kernel.shutdown()
+
+  // Each VM listed once, by name, and each orphan killed by name on the VM
+  // that listed it; the live kernel's container and the one that is not the
+  // kernel's left alone.
+  assert.deepEqual(
+    swept.filter((s) => s.args[0] === 'ps').map((s) => [s.domain, s.args.join(' ')]),
+    [
+      ['trusted', SWEEP_PS.join(' ')],
+      ['hostile', SWEEP_PS.join(' ')],
+    ],
+  )
+  assert.deepEqual(
+    swept.filter((s) => s.args[0] === 'kill').map((s) => [s.domain, s.args.join(' ')]).sort(),
+    [
+      ['hostile', 'kill --signal=KILL aos-run-run_c-1'],
+      ['trusted', 'kill --signal=KILL aos-run-run_a-1'],
+      ['trusted', 'kill --signal=KILL aos-run-run_b-2'],
+    ],
+  )
+  // All of it after this boot's kernel.booted and before the sandbox's mark.
+  for (const call of swept) {
+    assert.equal(call.booted, true, `${call.args.join(' ')} came before kernel.booted`)
+    assert.equal(call.marked, false, `${call.args.join(' ')} came after the sandbox was marked`)
+  }
+  // The sandbox is ok, its reason naming what the sweep killed, in the
+  // order the VMs listed them.
+  assert.equal(sandbox.state, 'ok', sandbox.reason ?? '')
+  assert.equal(sandbox.reason, sweptReason(['aos-run-run_a-1', 'aos-run-run_b-2', 'aos-run-run_c-1']))
+  assert.equal(
+    sandbox.reason,
+    'the orphan sweep killed by name 3 containers a previous kernel left running: aos-run-run_a-1, aos-run-run_b-2, aos-run-run_c-1',
+  )
+  const mark = rows(fx.dbPath)
+    .filter((r) => r.type === 'subsystem.state')
+    .map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+    .find((p) => p['subsystem'] === 'sandbox')
+  assert.deepEqual(mark, { schemaVersion: 1, subsystem: 'sandbox', state: 'ok', reason: sandbox.reason })
+  assert.equal(rows(fx.dbPath).some((r) => r.type === 'sandbox.degraded'), false)
+})
+
+test("boot asks the sweep for every run its log shows may have had a container, a finished one's included, and every open grant's container, and nothing for a log with none", async (t) => {
+  // A fresh log: the driver is not asked to sweep at all.
+  const fresh = fixture(t, { kernelYaml: pinnedYaml })
+  const idle = fakeSandbox({ probe: { ok: true, version: '29.5.2' }, imageId: PINNED_ID, orphans: ['aos-run-run_x-1'] })
+  const first = await bootOn(t, fresh, { sandboxDriver: idle })
+  assert.deepEqual(first.status().subsystems.sandbox, { state: 'ok' })
+  await first.shutdown()
+  assert.deepEqual(idle.sweepRequests, [])
+
+  // A finished run's container a live kernel failed to kill is swept too; a
+  // run that never called a sandbox tool is not asked for; an open grant's
+  // container is named outright (a canary's, which serves no run, as well).
+  const fx = fixture(t, { kernelYaml: pinnedYaml })
+  seedSandboxRuns(t, fx, ['run_done', 'run_open'], ['run_done'])
+  const extra = withStore(t, { path: fx.dbPath, headFile: fx.headFile })
+  extra.append({
+    type: 'run.started',
+    runId: 'run_chat',
+    agentId: 'ceo',
+    payload: { schemaVersion: 1, runId: 'run_chat', agentId: 'ceo', lane: 'main', tier: 2, taint: 'clean' },
+  })
+  extra.append({
+    type: 'proxy.grant.issued',
+    payload: { schemaVersion: 1, grantId: 'grant_canary', purpose: 'canary', sandbox: 'aos-run-canary-trusted', domain: 'trusted', allow: [], routes: [] },
+  })
+  closeVerified(extra)
+  const driver = fakeSandbox({
+    probe: { ok: true, version: '29.5.2' },
+    imageId: PINNED_ID,
+    orphans: { trusted: ['aos-run-run_done-1', 'aos-run-canary-trusted', 'aos-run-run_chat-1'], hostile: ['aos-run-run_open-2'] },
+  })
+  const kernel = await bootOn(t, fx, { sandboxDriver: driver })
+  const sandbox = kernel.status().subsystems.sandbox
+  await kernel.shutdown()
+  assert.equal(driver.sweepRequests.length, 1)
+  assert.deepEqual([...(driver.sweepRequests[0]?.runIds ?? [])].sort(), ['run_done', 'run_open'])
+  assert.deepEqual(driver.sweepRequests[0]?.names, ['aos-run-canary-trusted'])
+  assert.deepEqual(driver.sweeps, [['aos-run-run_done-1', 'aos-run-canary-trusted', 'aos-run-run_open-2']])
+  assert.deepEqual(sandbox, { state: 'ok', reason: sweptReason(['aos-run-run_done-1', 'aos-run-canary-trusted', 'aos-run-run_open-2']) })
+})
+
+test('a boot whose sweep killed nothing marks the sandbox ok with no reason, and every boot of a log with a sandbox run sweeps once', async (t) => {
+  const fx = fixture(t, { kernelYaml: pinnedYaml })
+  seedSandboxRuns(t, fx, ['run_gone'])
+  const driver = fakeSandbox({ probe: { ok: true, version: '29.5.2' }, imageId: PINNED_ID, orphans: ['someone-elses'] })
+  const kernel = await bootOn(t, fx, { sandboxDriver: driver })
+  const sandbox = kernel.status().subsystems.sandbox
+  await kernel.shutdown()
+  assert.deepEqual(driver.sweeps, [[]])
+  assert.deepEqual(sandbox, { state: 'ok' })
+  // The run is closed now, and still the log's: the next boot sweeps for it again.
+  const next = fakeSandbox({ probe: { ok: true, version: '29.5.2' }, imageId: PINNED_ID })
+  const again = await bootOn(t, fx, { sandboxDriver: next })
+  await again.shutdown()
+  assert.deepEqual(next.sweepRequests.map((r) => r.runIds), [['run_gone']])
+})
+
+test("a sandbox degraded by its probe still sweeps, and its reason names what the sweep killed after the probe's", async (t) => {
+  // No runtime answers the probe here, but the VMs still list what a dead
+  // kernel left: the sweep runs whatever the probe said, and the reason
+  // keeps both.
+  const fx = fixture(t)
+  seedSandboxRuns(t, fx, ['run_old'])
+  const driver = fakeSandbox({ orphans: ['aos-run-run_old-3'] })
+  const kernel = await bootOn(t, fx, { sandboxDriver: driver })
+  const sandbox = kernel.status().subsystems.sandbox
+  await kernel.shutdown()
+  assert.deepEqual(driver.sweeps, [['aos-run-run_old-3']])
+  assert.equal(sandbox.state, 'degraded')
+  assert.equal(
+    sandbox.reason,
+    'fake: fake driver: no container runtime configured for this test; ' +
+      'the orphan sweep killed by name 1 container a previous kernel left running: aos-run-run_old-3',
+  )
+  // The row for the probe's failure says the probe's reason alone.
+  assert.deepEqual(
+    rows(fx.dbPath).filter((r) => r.type === 'sandbox.degraded').map((r) => (JSON.parse(r.payload) as { reason?: string }).reason),
+    ['fake driver: no container runtime configured for this test'],
+  )
+})
+
+/** What every sweep problem ends with: a container may still run, and what to do. */
+const SWEEP_LEFT_TEXT =
+  'so a container a previous kernel left may still be running, past its wallclock. Check that each VM answers ' +
+  '(scripts/colima-up.sh), then restart the kernel to sweep again'
+
+test('a sweep that throws degrades a sandbox whose probe passed, naming the sweep, and egress with it; a probe failure keeps its own reason', async (t) => {
+  // A driver that breaks the contract (sweepOrphans never rejects) or the
+  // apple-container stub (which throws): boot completes, and the sandbox is
+  // not ok while what a dead kernel left may still run.
+  const fx = fixture(t, { kernelYaml: pinnedYaml })
+  seedSandboxRuns(t, fx, ['run_lost'])
+  const base = fakeSandbox({ probe: { ok: true, version: '29.5.2' }, imageId: PINNED_ID })
+  const throwing: SandboxDriver = {
+    name: base.name,
+    probe: () => base.probe(),
+    run: (spec) => base.run(spec),
+    kill: (name) => base.kill(name),
+    abandon: (name) => base.abandon(name),
+    commandRefusal: (command) => base.commandRefusal(command),
+    everyRunRefusal: () => base.everyRunRefusal(),
+    sweepOrphans: () => {
+      throw new Error('the VM went away mid-listing')
+    },
+  }
+  const kernel = await bootOn(t, fx, { sandboxDriver: throwing })
+  const status = kernel.status()
+  await kernel.shutdown()
+  const problem = `the orphan sweep failed: the VM went away mid-listing, ${SWEEP_LEFT_TEXT}`
+  assert.equal(status.subsystems.sandbox.state, 'degraded')
+  assert.equal(status.subsystems.sandbox.reason, `fake: ${problem}`)
+  assert.ok(kernel.degraded.includes('sandbox'))
+  assert.deepEqual(
+    rows(fx.dbPath).filter((r) => r.type === 'sandbox.degraded').map((r) => JSON.parse(r.payload) as Record<string, unknown>),
+    [{ schemaVersion: 1, driver: 'fake', reason: problem }],
+  )
+  // Egress serves only a container on a sandbox that is ok.
+  assert.ok((status.subsystems.egress.reason ?? '').includes(`the sandbox is degraded (fake: ${problem})`), status.subsystems.egress.reason ?? '')
+
+  // The apple-container stub: its probe failed and the sweep it cannot run
+  // did too. Each is a row of its own, and the sandbox's reason names both,
+  // the probe's first: the probe's alone would never tell an operator
+  // reading status that a container this log names may still be running.
+  const stubbed = fixture(t)
+  seedSandboxRuns(t, stubbed, ['run_stubbed'])
+  const stub = await bootOn(t, stubbed, { sandboxDriver: new AppleContainerDriver() })
+  const stubStatus = stub.status()
+  const stubSandbox = stubStatus.subsystems.sandbox
+  await stub.shutdown()
+  const stubRows = rows(stubbed.dbPath).filter((r) => r.type === 'sandbox.degraded').map((r) => String((JSON.parse(r.payload) as { reason?: string }).reason))
+  assert.equal(stubRows.length, 2)
+  assert.match(stubRows[0] ?? '', /^the apple-container driver is not implemented/)
+  assert.match(stubRows[1] ?? '', /^the orphan sweep failed: not implemented/)
+  assert.ok((stubRows[1] ?? '').endsWith(SWEEP_LEFT_TEXT))
+  assert.deepEqual(stubSandbox, { state: 'degraded', reason: `apple-container: ${stubRows[0] ?? ''}; ${stubRows[1] ?? ''}` })
+  // Egress names both as well, as the sandbox's reason.
+  assert.ok(
+    (stubStatus.subsystems.egress.reason ?? '').includes(`the sandbox is degraded (apple-container: ${stubRows[0] ?? ''}; the orphan sweep failed`),
+    stubStatus.subsystems.egress.reason ?? '',
+  )
+})
+
+test('a driver whose probe and sweep answer with no result of their shape boots degraded, naming both, never refused', async (t) => {
+  // The driver contract types what probe() and sweepOrphans() resolve with,
+  // and a driver that breaks it (a null probe, a `{}` sweep) must not refuse
+  // the boot: reading `.ok` of null or iterating a missing `swept` would
+  // throw out of the Promise.all boot waits on.
+  const fx = fixture(t, { kernelYaml: pinnedYaml })
+  seedSandboxRuns(t, fx, ['run_shape'])
+  const base = fakeSandbox({ probe: { ok: true, version: '29.5.2' }, imageId: PINNED_ID })
+  const broken: SandboxDriver = {
+    name: base.name,
+    probe: () => Promise.resolve(null as unknown as Awaited<ReturnType<SandboxDriver['probe']>>),
+    run: (spec) => base.run(spec),
+    kill: (name) => base.kill(name),
+    abandon: (name) => base.abandon(name),
+    commandRefusal: (command) => base.commandRefusal(command),
+    everyRunRefusal: () => base.everyRunRefusal(),
+    sweepOrphans: () => Promise.resolve({} as unknown as Awaited<ReturnType<SandboxDriver['sweepOrphans']>>),
+  }
+  const kernel = await bootOn(t, fx, { sandboxDriver: broken })
+  const status = kernel.status()
+  await kernel.shutdown()
+  const probeWhy =
+    'fake probe answered with no probe result (ok true with a version, or ok false with a why), so the sandbox is not known to work'
+  const sweepWhy =
+    'the orphan sweep failed: the driver answered with no sweep result (swept, unlisted and failed, each a list of ' +
+    `its own shape), ${SWEEP_LEFT_TEXT}`
+  assert.deepEqual(status.subsystems.sandbox, { state: 'degraded', reason: `fake: ${probeWhy}; ${sweepWhy}` })
+  assert.ok(kernel.degraded.includes('sandbox'))
+  assert.deepEqual(
+    rows(fx.dbPath).filter((r) => r.type === 'sandbox.degraded').map((r) => (JSON.parse(r.payload) as { reason?: string }).reason),
+    [probeWhy, sweepWhy],
+  )
+  // A probe that answers `ok` with no boolean is no working runtime either.
+  const truthy = fixture(t, { kernelYaml: pinnedYaml })
+  const yes: SandboxDriver = {
+    ...broken,
+    probe: () => Promise.resolve({ ok: 'yes' } as unknown as Awaited<ReturnType<SandboxDriver['probe']>>),
+  }
+  const again = await bootOn(t, truthy, { sandboxDriver: yes })
+  const truthySandbox = again.status().subsystems.sandbox
+  await again.shutdown()
+  assert.deepEqual(truthySandbox, { state: 'degraded', reason: `fake: ${probeWhy}` })
+})
+
+test('a sweep that could not list a VM, or whose kill a daemon refused, degrades the sandbox naming each, and egress with it', async (t) => {
+  // The production driver turns neither into a throw: a VM that cannot be
+  // listed and a refused kill are in its result, and either may leave a
+  // container of this log's running.
+  const fx = fixture(t, { kernelYaml: pinnedYaml })
+  seedSandboxRuns(t, fx, ['run_a'])
+  const driver = fakeSandbox({
+    probe: { ok: true, version: '29.5.2' },
+    imageId: PINNED_ID,
+    orphans: { trusted: ['aos-run-run_a-1', 'aos-run-run_a-2'] },
+    sweepUnlisted: ['hostile'],
+    sweepKillRefused: ['aos-run-run_a-2'],
+  })
+  const kernel = await bootOn(t, fx, { sandboxDriver: driver })
+  const status = kernel.status()
+  await kernel.shutdown()
+  const problem =
+    'the orphan sweep did not finish: the hostile VM could not be listed (Cannot connect to the Docker daemon); ' +
+    `aos-run-run_a-2 could not be killed on the trusted VM (Error response from daemon: refused), ${SWEEP_LEFT_TEXT}`
+  assert.deepEqual(status.subsystems.sandbox, {
+    state: 'degraded',
+    reason: `fake: ${problem}; ${sweptReason(['aos-run-run_a-1'])}`,
+  })
+  assert.deepEqual(
+    rows(fx.dbPath).filter((r) => r.type === 'sandbox.degraded').map((r) => (JSON.parse(r.payload) as { reason?: string }).reason),
+    [problem],
+  )
+  assert.ok((status.subsystems.egress.reason ?? '').includes(`the sandbox is degraded (fake: ${problem}`), status.subsystems.egress.reason ?? '')
+})
+
+test("a sweep that never settles is given up at boot's bound: the boot completes, the sandbox degraded saying so, egress naming it, and the sweep told to stop", { timeout: 60_000 }, async (t) => {
+  // A paused VM accepts the connection and never answers. Boot waits its
+  // bound (SWEEP_WAIT_MS, here the test's) and goes on, so the operator can
+  // read why from the booted kernel; the sweep's signal is aborted, so a
+  // listing the VM answers later kills nothing.
+  const fx = fixture(t, { kernelYaml: pinnedYaml })
+  seedSandboxRuns(t, fx, ['run_paused'])
+  const driver = fakeSandbox({ probe: { ok: true, version: '29.5.2' }, imageId: PINNED_ID, sweepHangs: true })
+  const started = Date.now()
+  const kernel = await bootOn(t, fx, { sandboxDriver: driver, sweepWaitMs: 50 })
+  const elapsed = Date.now() - started
+  const status = kernel.status()
+  await kernel.shutdown()
+  // The bound boot was handed, and no other: waited for, and well short of
+  // SWEEP_WAIT_MS (a boot that waited its own 30 s for a test's sweep, as
+  // one ignoring the bound it is handed would, fails here, and the test's
+  // timeout stays over it so the kernel is still shut down).
+  assert.ok(elapsed >= 45, 'the bound was not waited for')
+  assert.ok(elapsed < 10_000, `boot waited ${String(elapsed)} ms, not the 50 ms it was handed`)
+  const problem = `the orphan sweep did not finish within 50 ms: a runtime accepted and never answered, and the sweep was told to stop, ${SWEEP_LEFT_TEXT}`
+  assert.deepEqual(status.subsystems.sandbox, { state: 'degraded', reason: `fake: ${problem}` })
+  assert.deepEqual(
+    rows(fx.dbPath).filter((r) => r.type === 'sandbox.degraded').map((r) => (JSON.parse(r.payload) as { reason?: string }).reason),
+    [problem],
+  )
+  assert.ok((status.subsystems.egress.reason ?? '').includes(`the sandbox is degraded (fake: ${problem})`), status.subsystems.egress.reason ?? '')
+  assert.equal(driver.sweepRequests.length, 1)
+  assert.equal(driver.sweepRequests[0]?.signal.aborted, true, 'the sweep given up was not told to stop')
+})
+
+/** What a sandbox probe given up at boot's bound says. */
+const probeLate = (ms: number): string =>
+  `the probe did not finish within ${String(ms)} ms: a runtime accepted and never answered, and the probe was told to stop, ` +
+  'so the sandbox is not known to work. Check that each VM answers (scripts/colima-up.sh), then restart the kernel'
+
+test("a probe that never settles is given up at boot's bound: the boot completes with the sandbox degraded, egress naming it, and the probe told to stop", { timeout: 60_000 }, async (t) => {
+  // A paused trusted VM accepts the connection and never answers `docker
+  // version`. Once sandbox.imageId is pinned the probe asks it, and boot
+  // waits its bound (PROBE_WAIT_MS, here the test's) and goes on, so the
+  // operator can read why from the booted kernel.
+  const fx = fixture(t, { kernelYaml: pinnedYaml })
+  const driver = fakeSandbox({ probeHangs: true, imageId: PINNED_ID })
+  const started = Date.now()
+  const kernel = await bootOn(t, fx, { sandboxDriver: driver, probeWaitMs: 50 })
+  const elapsed = Date.now() - started
+  const status = kernel.status()
+  await kernel.shutdown()
+  // The bound boot was handed, and no other (a boot that waited its own 30 s
+  // fails here, and the test's timeout stays over it so the kernel is still
+  // shut down).
+  assert.ok(elapsed >= 45, 'the bound was not waited for')
+  assert.ok(elapsed < 10_000, `boot waited ${String(elapsed)} ms, not the 50 ms it was handed`)
+  const why = probeLate(50)
+  assert.deepEqual(status.subsystems.sandbox, { state: 'degraded', reason: `fake: ${why}` })
+  assert.deepEqual(
+    rows(fx.dbPath).filter((r) => r.type === 'sandbox.degraded').map((r) => JSON.parse(r.payload) as Record<string, unknown>),
+    [{ schemaVersion: 1, driver: 'fake', reason: why }],
+  )
+  assert.ok((status.subsystems.egress.reason ?? '').includes(`the sandbox is degraded (fake: ${why})`), status.subsystems.egress.reason ?? '')
+  assert.equal(driver.probeSignals.length, 1)
+  assert.equal(driver.probeSignals[0]?.aborted, true, 'the probe given up was not told to stop')
+
+  // The driver boot builds from kernel.yaml (defaultDriver), on a log with a
+  // sandbox run: a trusted VM that accepts and never answers holds both the
+  // probe's `docker version` and the sweep's listings, and each call ends
+  // only once boot stops waiting (rejecting then, as Node's execFile does
+  // once its child is ended). The probe and the sweep go out together, so the
+  // boot is held one bound, not two; each call is handed a signal that ends
+  // its CLI by SIGKILL, and every one is aborted by the time boot completes.
+  const paused = fixture(t, { kernelYaml: pinnedYaml })
+  seedSandboxRuns(t, paused, ['run_paused'])
+  const calls: { args: string[]; signal: AbortSignal | undefined; killSignal: string | undefined; earlierStopped: boolean }[] = []
+  const held = defaultDriver(paused.config, REPO_ROOT, {
+    spawn: () => {
+      throw new Error('no run starts at boot')
+    },
+    execFile: (_command, args, options) => {
+      calls.push({
+        args: [...args],
+        signal: options.signal,
+        killSignal: options.killSignal,
+        earlierStopped: calls.some((c) => c.signal?.aborted === true),
+      })
+      return new Promise((_resolve, reject) => {
+        options.signal?.addEventListener('abort', () => {
+          reject(new Error('The operation was aborted'))
+        })
+      })
+    },
+  })
+  const heldStart = Date.now()
+  const again = await bootOn(t, paused, { sandboxDriver: held, probeWaitMs: 50, sweepWaitMs: 50 })
+  const heldElapsed = Date.now() - heldStart
+  const heldStatus = again.status()
+  await again.shutdown()
+  assert.ok(heldElapsed < 10_000, `boot waited ${String(heldElapsed)} ms on a paused VM`)
+  assert.deepEqual(calls.map((c) => c.args.join(' ')), [
+    'version --format {{.Server.Version}}',
+    SWEEP_PS.join(' '),
+    SWEEP_PS.join(' '),
+  ])
+  for (const call of calls) {
+    assert.equal(call.earlierStopped, false, `${call.args.join(' ')} went out only once another call had been given up`)
+    assert.equal(call.signal?.aborted, true, `${call.args.join(' ')} was never told to stop`)
+    assert.equal(call.killSignal, 'SIGKILL', `${call.args.join(' ')} would end its CLI by a signal a held CLI may ignore`)
+  }
+  const sweepWhy = `the orphan sweep did not finish within 50 ms: a runtime accepted and never answered, and the sweep was told to stop, ${SWEEP_LEFT_TEXT}`
+  assert.deepEqual(heldStatus.subsystems.sandbox, { state: 'degraded', reason: `docker: ${why}; ${sweepWhy}` })
+  assert.deepEqual(
+    rows(paused.dbPath).filter((r) => r.type === 'sandbox.degraded').map((r) => (JSON.parse(r.payload) as { reason?: string }).reason),
+    [why, sweepWhy],
+  )
+})
+
+test('probeAtBoot gives a probe that never settles up at its bound and tells it to stop, reads a throw or a rejection as a failed probe, and passes a settled one through', async () => {
+  // Raced against the test's own clock: a probeAtBoot that waited for the
+  // probe itself would never return, and this fails in 5 s rather than at
+  // the file's timeout.
+  const within = <T>(p: Promise<T>, ms: number): Promise<T | 'unsettled'> =>
+    Promise.race([p, new Promise<'unsettled'>((resolve) => setTimeout(() => resolve('unsettled'), ms).unref())])
+  const started = Date.now()
+  const hanging = fakeSandbox({ probeHangs: true })
+  const hung = await within(probeAtBoot(hanging, 50), 5_000)
+  assert.notEqual(hung, 'unsettled', 'probeAtBoot waited for a probe that never settles')
+  assert.ok(Date.now() - started >= 45, 'the bound was not waited for')
+  assert.deepEqual(hung, { ok: false, why: probeLate(50) })
+  assert.equal(hanging.probeSignals[0]?.aborted, true, 'the probe given up was not told to stop')
+  // A probe that settles in time is passed through, and its signal is never aborted.
+  const ok = fakeSandbox({ probe: { ok: true, version: '29.5.2' }, imageId: PINNED_ID })
+  assert.deepEqual(await probeAtBoot(ok, 10_000), { ok: true, version: '29.5.2' })
+  assert.equal(ok.probeSignals[0]?.aborted, false)
+  const down = fakeSandbox()
+  assert.deepEqual(await probeAtBoot(down, 10_000), { ok: false, why: 'fake driver: no container runtime configured for this test' })
+  // A driver that breaks the contract, by rejecting or by throwing.
+  const over = (probe: SandboxDriver['probe']): SandboxDriver => ({ ...fakeSandbox(), probe })
+  assert.deepEqual(await probeAtBoot(over(() => Promise.reject(new Error('lost'))), 10_000), { ok: false, why: 'fake probe threw: lost' })
+  assert.deepEqual(
+    await probeAtBoot(over(() => {
+      throw new Error('sync')
+    }), 10_000),
+    { ok: false, why: 'fake probe threw: sync' },
+  )
+  // A driver that breaks the contract by what it answers: no ProbeResult is a
+  // failed probe, never a refused boot (`.ok` of null) and never a working
+  // runtime (a truthy `ok` that is no `true`).
+  const noResult =
+    'fake probe answered with no probe result (ok true with a version, or ok false with a why), so the sandbox is not known to work'
+  const answers: readonly unknown[] = [
+    null,
+    undefined,
+    'ok',
+    {},
+    { ok: 'yes', version: '29.5.2' },
+    { ok: 1, version: '29.5.2' },
+    { ok: true },
+    { ok: true, version: 29 },
+    { ok: false },
+    { ok: false, why: 7 },
+  ]
+  for (const answer of answers) {
+    assert.deepEqual(
+      await probeAtBoot(over(() => Promise.resolve(answer as Awaited<ReturnType<SandboxDriver['probe']>>)), 10_000),
+      { ok: false, why: noResult },
+      `answer ${JSON.stringify(answer) ?? 'undefined'}`,
+    )
+  }
+  // An answer whose reading throws is a throw, named as one.
+  const getter = { get ok(): boolean { throw new Error('getter') } }
+  assert.deepEqual(
+    await probeAtBoot(over(() => Promise.resolve(getter as unknown as Awaited<ReturnType<SandboxDriver['probe']>>)), 10_000),
+    { ok: false, why: 'fake probe threw: getter' },
+  )
+  // A well-formed answer is taken field by field, nothing else of it kept.
+  const extra = { ok: true, version: '29.5.2', why: 'ignored' } as unknown as Awaited<ReturnType<SandboxDriver['probe']>>
+  assert.deepEqual(await probeAtBoot(over(() => Promise.resolve(extra)), 10_000), { ok: true, version: '29.5.2' })
+  // A failure's reason of any size, answered or thrown, is redacted and
+  // bounded for the sandbox.degraded row boot appends.
+  const token = `ghp_${'Q7xK'.repeat(9)}`
+  const loud = `${token} ${'w'.repeat(100_000)}`
+  for (const verdict of [
+    await probeAtBoot(over(() => Promise.resolve({ ok: false, why: loud })), 10_000),
+    await probeAtBoot(over(() => Promise.reject(new Error(loud))), 10_000),
+  ]) {
+    assert.equal(verdict.ok, false)
+    const why = verdict.ok ? '' : verdict.why
+    assert.ok(!why.includes(token), 'a credential in the reason was kept')
+    assert.ok(Buffer.byteLength(why) <= PROBE_REASON_BYTES, `${String(Buffer.byteLength(why))} bytes`)
+    assert.ok(Buffer.byteLength(why) > PROBE_REASON_BYTES - 8, 'the reason was cut further than its bound')
+  }
+  assert.equal(PROBE_REASON_BYTES, 4_096)
+  // The default bound is PROBE_WAIT_MS.
+  assert.equal(PROBE_WAIT_MS, 30_000)
+})
+
+test('sweepAtBoot asks nothing of empty targets, gives a sweep that never settles up at its bound and tells it to stop, and reads a throw or a rejection as a problem, never as nothing swept', async () => {
+  const targets = { runIds: ['run_x'], names: [] }
+  const quiet = fakeSandbox({ sweepHangs: true })
+  assert.deepEqual(await sweepAtBoot(quiet, { runIds: [], names: [] }, 10), { swept: [] })
+  assert.deepEqual(quiet.sweepRequests, [], 'empty targets asked the driver')
+
+  const started = Date.now()
+  const hanging = fakeSandbox({ sweepHangs: true })
+  const hung = await sweepAtBoot(hanging, targets, 50)
+  assert.ok(Date.now() - started >= 45, 'the bound was not waited for')
+  assert.match(hung.problem ?? '', /^the orphan sweep did not finish within 50 ms: a runtime accepted and never answered/)
+  assert.ok((hung.problem ?? '').endsWith(SWEEP_LEFT_TEXT))
+  assert.deepEqual(hung.swept, [])
+  assert.equal(hanging.sweepRequests[0]?.signal.aborted, true)
+  // A sweep that settles in time is not raced against the bound, and its signal is never aborted.
+  const settles = fakeSandbox({ orphans: ['aos-run-run_x-1', 'other', 'aos-run-run_y-1'] })
+  assert.deepEqual(await sweepAtBoot(settles, targets, 10_000), { swept: ['aos-run-run_x-1'] })
+  assert.equal(settles.sweepRequests[0]?.signal.aborted, false)
+  assert.deepEqual(settles.sweepRequests[0]?.runIds, ['run_x'])
+  const over = (sweepOrphans: SandboxDriver['sweepOrphans']): SandboxDriver => ({ ...fakeSandbox(), sweepOrphans })
+  assert.deepEqual(await sweepAtBoot(over(() => Promise.reject(new Error('lost'))), targets, 10_000), {
+    swept: [],
+    problem: `the orphan sweep failed: lost, ${SWEEP_LEFT_TEXT}`,
+  })
+  assert.deepEqual(
+    await sweepAtBoot(over(() => {
+      throw new Error('sync')
+    }), targets, 10_000),
+    { swept: [], problem: `the orphan sweep failed: sync, ${SWEEP_LEFT_TEXT}` },
+  )
+  // A driver that breaks the contract by what it answers: no SweepResult is
+  // the sweep's failure, named, never a rejection that refuses the boot, and
+  // never a sweep read from a shape it lacks (a `swept` that is a string
+  // read as its characters).
+  const noSweep =
+    'the orphan sweep failed: the driver answered with no sweep result (swept, unlisted and failed, each a list of ' +
+    `its own shape), ${SWEEP_LEFT_TEXT}`
+  const answers: readonly unknown[] = [
+    {},
+    undefined,
+    null,
+    { swept: 'aos-run-run_x-1', unlisted: [], failed: [] },
+    { swept: [1], unlisted: [], failed: [] },
+    { swept: [], failed: [] },
+    { swept: [], unlisted: [{ domain: 'default', why: 'x' }], failed: [] },
+    { swept: [], unlisted: [{ domain: 'trusted' }], failed: [] },
+    { swept: [], unlisted: [], failed: [{ name: 'aos-run-run_x-1', domain: 'trusted' }] },
+    { swept: [], unlisted: [], failed: [{ domain: 'trusted', why: 'refused' }] },
+  ]
+  for (const answer of answers) {
+    assert.deepEqual(
+      await sweepAtBoot(over(() => Promise.resolve(answer as Awaited<ReturnType<SandboxDriver['sweepOrphans']>>)), targets, 10_000),
+      { swept: [], problem: noSweep },
+      `answer ${JSON.stringify(answer) ?? 'undefined'}`,
+    )
+  }
+  // What a failing driver says is redacted and bounded before boot records
+  // it, and what to do still follows it whole.
+  const token = `ghp_${'Q7xK'.repeat(9)}`
+  const loud = await sweepAtBoot(over(() => Promise.reject(new Error(`${token} ${'x'.repeat(5_000)}`))), targets, 10_000)
+  assert.ok(!(loud.problem ?? '').includes(token), 'a credential in the error reached the reason')
+  assert.ok(Buffer.byteLength(loud.problem ?? '') <= SWEEP_REASON_BYTES)
+  assert.ok((loud.problem ?? '').endsWith(`, ${SWEEP_LEFT_TEXT}`))
+  // So is what a runtime said of a VM it could not list.
+  const said = await sweepAtBoot(
+    over(() => Promise.resolve({ swept: [], unlisted: [{ domain: 'trusted', why: `${token} ${'y'.repeat(5_000)}` }], failed: [] })),
+    targets,
+    10_000,
+  )
+  assert.ok(!(said.problem ?? '').includes(token))
+  assert.ok(Buffer.byteLength(said.problem ?? '') <= SWEEP_REASON_BYTES)
+  assert.ok((said.problem ?? '').endsWith(`, ${SWEEP_LEFT_TEXT}`))
+  // The default bound is SWEEP_WAIT_MS.
+  assert.equal(SWEEP_WAIT_MS, 30_000)
+})
+
+test('sweepTargets names every run of the log that called a sandbox tool, started a container or was issued a grant, and every open grant\'s container, and nothing else', (t) => {
+  const store = withStore(t)
+  const append = store.append.bind(store)
+  const started = (runId: string): unknown =>
+    append({ type: 'run.started', runId, agentId: 'coder', payload: { schemaVersion: 1, runId, agentId: 'coder', lane: 'main', tier: 2, taint: 'clean' } })
+  const call = (runId: string, toolRef: string): unknown =>
+    append({ type: 'tool.call', runId, agentId: 'coder', payload: { schemaVersion: 1, ticketId: `t_${runId}_${toolRef}`, toolRef, argsHash: 'h', quarantine: false } })
+  started('run_exec')
+  call('run_exec', 'sandbox.exec')
+  started('run_mcp')
+  call('run_mcp', 'pmmcp.recall')
+  started('run_box')
+  append({
+    type: 'sandbox.started',
+    runId: 'run_box',
+    agentId: 'coder',
+    payload: { schemaVersion: 1, sandboxId: 'aos-run-run_box-1', driver: 'fake', domain: 'trusted', image: 'i', memoryMb: 1, pids: 1, wallclockMs: 1 },
+  })
+  started('run_grant')
+  append({
+    type: 'proxy.grant.issued',
+    runId: 'run_grant',
+    agentId: 'coder',
+    payload: { schemaVersion: 1, grantId: 'grant_g', purpose: 'exec', runId: 'run_grant', agentId: 'coder', sandbox: 'aos-run-run_grant-1', domain: 'trusted', allow: [], routes: [] },
+  })
+  append({
+    type: 'proxy.grant.issued',
+    payload: { schemaVersion: 1, grantId: 'grant_c', purpose: 'canary', sandbox: 'aos-run-canary-trusted', domain: 'trusted', allow: [], routes: [] },
+  })
+  const all = readAllRows(store.db)
+  const targets = sweepTargets(all, projectRecovery(all))
+  assert.deepEqual(targets, {
+    runIds: ['run_exec', 'run_box', 'run_grant'],
+    names: ['aos-run-run_grant-1', 'aos-run-canary-trusted'],
+  })
+  // The literal the projection reads a sandbox tool by is the runner's server id.
+  assert.equal(SANDBOX_SERVER, 'sandbox')
+})
+
+// ── one kernel per log (src/data-lock.ts) ─────────────────────────────────
+
+test('a second kernel on the same data directory is refused before it writes anything, and one boots once the first has shut down or died', async (t) => {
+  // Without the hold, a second kernel would read the live one's open runs as
+  // a dead kernel's: close them as orphans, revoke their grants `recovered`
+  // and kill their containers in the sweep, and only then fail on its port.
+  const fx = fixture(t)
+  seedSandboxRuns(t, fx, ['run_live'])
+  const first = await bootOn(t, fx)
+  // Every file in the data directory is the operator's alone while the
+  // kernel runs: the lock, and the journal SQLite keeps beside it while the
+  // hold lasts (made with the lock file's mode, so the lock is made 0600
+  // before SQLite opens it), as much as the log. Read before the second
+  // kernel below, whose own hold tightens what it finds.
+  assertPrivate(fx.dataDir, [DATA_LOCK_FILE, DATA_LOCK_JOURNAL, 'events.db'])
+  const before = rows(fx.dbPath)
+  const second = fakeSandbox({ orphans: ['aos-run-run_live-1'] })
+  // A second kernel that boots after all is shut down before the test fails,
+  // so a broken hold fails here rather than hanging the file on its socket.
+  let refusal: unknown
+  try {
+    const booted = await bootKernel({
+      config: fx.config,
+      repoRoot: REPO_ROOT,
+      providers: fx.providers,
+      toolViews: fx.toolViews,
+      env: { AOS_CONTROL_TOKEN: TEST_TOKEN },
+      sandboxDriver: second,
+    })
+    await booted.shutdown()
+  } catch (e) {
+    refusal = e
+  }
+  assert.ok(
+    refusal instanceof ConfigError &&
+      refusal.message.startsWith(`another kernel holds ${fx.dataDir} (${join(fx.dataDir, DATA_LOCK_FILE)} is locked): one kernel per event log`),
+    `a second kernel on a live data directory was not refused: ${String(refusal)}`,
+  )
+  // Nothing written, nothing swept, nothing asked.
+  assert.deepEqual(rows(fx.dbPath), before)
+  assert.deepEqual(second.sweepRequests, [])
+  await first.shutdown()
+  // Released, the journal is gone with the hold.
+  assert.equal(existsSync(join(fx.dataDir, DATA_LOCK_JOURNAL)), false)
+
+  // A lock file left looser than 0600 (by a kernel before this rule, or by
+  // hand) is tightened before SQLite opens it, so its journal is made 0600
+  // too.
+  chmodSync(join(fx.dataDir, DATA_LOCK_FILE), 0o644)
+  const loose = await bootOn(t, fx)
+  assertPrivate(fx.dataDir, [DATA_LOCK_FILE, DATA_LOCK_JOURNAL])
+  await loose.shutdown()
+
+  // Shut down, the directory is free.
+  const { kernel: next, crash } = await bootCrashable(t, fx)
+  // Dead (the OS drops a dead process's lock; crash() drops it as the OS
+  // would), free again.
+  await crash()
+  // Released twice is released once.
+  next.lock.release()
+  const after = await bootOn(t, fx)
+  await after.shutdown()
+})
+
+test('a boot refused after it took the data directory leaves it free, and a lock path that is not a regular file is refused by name', async (t) => {
+  const fx = fixture(t)
+  // An agents tree with a directory and no agent.yaml: refused while agents
+  // load, long after the lock was taken and the log opened.
+  const agentsDir = join(tmpdir(t), 'agents')
+  mkdirSync(join(agentsDir, 'broken'), { recursive: true })
+  await assert.rejects(
+    bootKernel({
+      config: fx.config,
+      repoRoot: REPO_ROOT,
+      agentsDir,
+      providers: fx.providers,
+      toolViews: fx.toolViews,
+      env: { AOS_CONTROL_TOKEN: TEST_TOKEN },
+      sandboxDriver: fakeSandbox(),
+    }),
+    /ENOENT/,
+  )
+  const kernel = await bootOn(t, fx)
+  await kernel.shutdown()
+
+  // A link at the lock's path is no lock of the kernel's, and nothing is written.
+  const linked = fixture(t)
+  mkdirSync(linked.dataDir, { recursive: true })
+  symlinkSync(join(tmpdir(t), 'elsewhere'), join(linked.dataDir, DATA_LOCK_FILE))
+  await expectBootRefusal(linked, { AOS_CONTROL_TOKEN: TEST_TOKEN }, /kernel\.lock is not a regular file \(a link is not one\)/)
+  assert.equal(existsSync(linked.dbPath), false, 'a refused boot opened the log')
+  const dir = fixture(t)
+  mkdirSync(join(dir.dataDir, DATA_LOCK_FILE), { recursive: true })
+  await expectBootRefusal(dir, { AOS_CONTROL_TOKEN: TEST_TOKEN }, /kernel\.lock is not a regular file/)
+  // So is a link at the journal's path, before SQLite opens anything and
+  // would follow it to make the journal wherever it points.
+  const journal = fixture(t)
+  mkdirSync(journal.dataDir, { recursive: true })
+  const target = join(tmpdir(t), 'journal-target')
+  symlinkSync(target, join(journal.dataDir, DATA_LOCK_JOURNAL))
+  await expectBootRefusal(journal, { AOS_CONTROL_TOKEN: TEST_TOKEN }, /kernel\.lock-journal is not a regular file \(a link is not one\)/)
+  assert.equal(existsSync(target), false, 'the journal link was followed')
+  assert.equal(existsSync(journal.dbPath), false, 'a refused boot opened the log')
+
+  // A log that is no database, refused as the store opens it, before the
+  // boot's own try: the data directory is free again, so once the file is put
+  // right the next boot in this process takes it, rather than being refused
+  // as a second kernel.
+  const damaged = fixture(t)
+  mkdirSync(damaged.dataDir, { recursive: true })
+  writeFileSync(damaged.dbPath, 'no kernel wrote this, and it is no SQLite database\n'.repeat(64), { mode: 0o600 })
+  await expectBootRefusal(damaged, { AOS_CONTROL_TOKEN: TEST_TOKEN }, /not a database/)
+  rmSync(damaged.dbPath)
+  const repaired = await bootOn(t, damaged)
+  await repaired.shutdown()
+})
+
+/** Every file in `dir` is 0600, and those `expected` name are among them. */
+function assertPrivate(dir: string, expected: readonly string[]): void {
+  const files = readdirSync(dir).filter((name) => lstatSync(join(dir, name)).isFile())
+  for (const name of expected) assert.ok(files.includes(name), `${name} is not in ${dir}: ${files.join(', ')}`)
+  for (const name of files) {
+    const mode = lstatSync(join(dir, name)).mode & 0o777
+    assert.equal(mode, 0o600, `${name} is 0${mode.toString(8)}`)
+  }
+}
+
+test('holdDataDir is exclusive within a process, and free again once released', (t) => {
+  const dataDir = tmpdir(t)
+  const one = holdDataDir(dataDir)
+  assert.throws(() => holdDataDir(dataDir), (e: unknown) => e instanceof ConfigError && /another kernel holds/.test(e.message))
+  one.release()
+  const two = holdDataDir(dataDir)
+  two.release()
+})
+
+test("the lock's journal holds SQLite's journal header while the hold lasts and goes at release, and one a killed kernel left is taken over by the next hold and goes at its release", (t) => {
+  // README's .aos table and data-lock.ts's header say what this holds: the
+  // journal is no empty file, and the OS drops a dead kernel's lock but not
+  // its journal, which the next kernel's hold takes over.
+  const dataDir = tmpdir(t)
+  const journal = join(dataDir, DATA_LOCK_JOURNAL)
+  const one = holdDataDir(dataDir)
+  assert.ok(existsSync(journal), 'no journal while the hold lasts')
+  const header = readFileSync(journal)
+  assert.ok(header.length >= 28, 'the journal is empty while the hold lasts')
+  // SQLite's journal header and nothing else: no page journaled (a record
+  // count of 0, of a database of 0 pages), and the file is one header, its
+  // own sector size long (512 bytes here).
+  assert.equal(header.readUInt32BE(8), 0, 'the journal records a page')
+  assert.equal(header.readUInt32BE(16), 0)
+  assert.equal(header.readUInt32BE(20), header.length, 'the journal holds more than its header')
+  assertPrivate(dataDir, [DATA_LOCK_FILE, DATA_LOCK_JOURNAL])
+  one.release()
+  assert.equal(existsSync(journal), false, 'the journal outlived the hold')
+  // A SIGKILL leaves the journal as it was while the hold lasted (the OS
+  // drops the lock, not the file); laid back as such a kernel left it.
+  writeFileSync(journal, header, { mode: 0o600 })
+  const next = holdDataDir(dataDir)
+  assert.ok(existsSync(journal), "the next hold keeps no journal of its own")
+  assertPrivate(dataDir, [DATA_LOCK_FILE, DATA_LOCK_JOURNAL])
+  next.release()
+  assert.equal(existsSync(journal), false, 'a journal a killed kernel left outlived the next hold')
+})
+
+test('sweptReason names every container that fits and is cut, never over its bound', () => {
+  assert.equal(sweptReason(['aos-run-a-1']), 'the orphan sweep killed by name 1 container a previous kernel left running: aos-run-a-1')
+  const many = Array.from({ length: 200 }, (_, i) => `aos-run-run_${String(i)}-1`)
+  const text = sweptReason(many)
+  assert.ok(text.startsWith('the orphan sweep killed by name 200 containers a previous kernel left running: aos-run-run_0-1, '))
+  assert.ok(Buffer.byteLength(text) <= SWEEP_REASON_BYTES)
+  assert.ok(text.endsWith('…'))
 })
 
 test('kernel.booted is the first event of this boot (seq = tail+1 at boot start) and carries configHash', async (t) => {
@@ -496,6 +1345,7 @@ test('boot succeeds after an unclean exit where the log is ahead of events.head,
   // this — the fd simply goes away.
   await first.server.close()
   first.store.db.close()
+  first.lock.release()
 
   // This is the case a tail-equality check would refuse — and refusing it
   // would mean every crash needs manual intervention before the kernel starts.
@@ -875,6 +1725,7 @@ test('a restart mid-run orphans nothing: every run reaches a terminal state and 
   // and no anchor write. (store.close() would anchor — see the unclean-exit test.)
   await first.server.close()
   first.store.db.close()
+  first.lock.release()
 
   // Everything is open at this point, per the projection.
   const open = projectRecovery(allRows(fx.dbPath))
@@ -985,6 +1836,7 @@ test('recovery is idempotent: a second restart writes no further recovery rows',
   })
   await first.server.close()
   first.store.db.close()
+  first.lock.release()
 
   // Captured, then shut down, THEN asserted. Asserting first leaks a running
   // kernel on failure and turns a clear assertion error into a hung test file.
@@ -2201,6 +3053,104 @@ egress:
     }
   }
   assert.equal(kernel.store.verifyChain(kernel.store.readAnchor()).ok, true)
+})
+
+test("a booted kernel refuses a mux whose ready report says its self-test reached the Mac's loopback: no go, the container killed by name, the grant revoked as a violation, and nothing served", async (t) => {
+  // The judge boot hands every session (src/egress/ready.ts acceptReady) is
+  // the kernel's one check, before the command runs, that the container's
+  // network is the --network none it asked for. One that accepted every
+  // report would send go to a container that reached 192.168.5.2:8766.
+  SecretMask.clear()
+  t.after(() => SecretMask.clear())
+  const dir = testFleet(t, { fetcher: egressWorker('fetcher', ['  bind: [github-git]']) })
+  const up = fakeUpstream(() => undefined)
+  const driver = answering({ script: [{ hangs: true }] })
+  const provider = fakeProvider([
+    anthropicToolUse({ name: 'sandbox__exec', input: { command: ['git', 'fetch'] } }),
+    anthropicEndTurn({ text: 'the exec was refused' }),
+  ])
+  const { kernel, fx } = await withKernel(t, {
+    kernelYaml: pinned(GITHUB_BINDING),
+    agentsDir: dir,
+    sandboxDriver: driver,
+    egressUpstream: up.upstream,
+    env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-9c1f0b', AOS_GITHUB_TOKEN: GITHUB_VALUE },
+    fetch: provider.fetch,
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+  assert.equal(kernel.status().subsystems.egress.state, 'ok', kernel.status().subsystems.egress.reason ?? '')
+  const finished = runThroughControl(kernel, 'fetch the fixture', 'fetcher')
+  await until(() => driver.channels.length === 1, 'the channel', 20_000)
+  const name = driver.channels[0]!.name
+  const mux = new FakeMux(driver.channels[0]!)
+  mux.send({ type: 'ready', flow: 0, payload: refusedReport('reached') })
+  const done = await finished
+  assert.equal(done['status'], 'ok', String(done['reason']))
+
+  assert.equal(mux.kernelFrames.includes('go'), false, 'the container was sent go, so its command ran')
+  assert.deepEqual(driver.kills, [name], 'the container was not killed by name, once')
+  const payloadsOf = (type: string): Record<string, unknown>[] =>
+    rows(fx.dbPath).filter((r) => r.type === type).map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+  const revoked = payloadsOf('proxy.grant.revoked')
+  assert.deepEqual(revoked.map((r) => [r['reason'], r['detail']]), [
+    ['violation', "the mux's ready report was refused: the self-test reached 1 of what it must not"],
+  ])
+  assert.deepEqual(payloadsOf('tool.result').map((r) => r['ok']), [false])
+  assert.deepEqual(payloadsOf('proxy.decision'), [], 'a request was judged under a refused grant')
+  assert.equal(up.seen.length, 0, 'an upstream was sent a request')
+  assert.deepEqual(kernel.sandboxTools.liveGrants(), [])
+})
+
+test("boot hands each session kernel.yaml's egress.limits: the go frame carries its frameMaxBytes and maxFlows, and a request past its maxRequests ends the grant", async (t) => {
+  // Every other boot row runs on the defaults, which a wiring that dropped
+  // the operator's bounds would keep: small ones, held from the go frame the
+  // mux reads and from the revocation a second request earns.
+  SecretMask.clear()
+  t.after(() => SecretMask.clear())
+  const dir = testFleet(t, { fetcher: egressWorker('fetcher', ['  bind: [github-git]']) })
+  const up = fakeUpstream(() => undefined)
+  const driver = answering({ script: [{ hangs: true }] })
+  const provider = fakeProvider([
+    anthropicToolUse({ name: 'sandbox__exec', input: { command: ['git', 'fetch'] } }),
+    anthropicEndTurn({ text: 'fetched once' }),
+  ])
+  const limited = `${GITHUB_BINDING}  limits:\n    frameMaxBytes: 4096\n    maxFlows: 2\n    maxRequests: 1\n`
+  const { kernel, fx } = await withKernel(t, {
+    kernelYaml: pinned(limited),
+    agentsDir: dir,
+    sandboxDriver: driver,
+    egressUpstream: up.upstream,
+    env: { ANTHROPIC_API_KEY: 'offline-fixture-credential-9c1f0b', AOS_GITHUB_TOKEN: GITHUB_VALUE },
+    fetch: provider.fetch,
+    beforeBoot: (f) => {
+      writeProbeRecord(f.dataDir, freshProbe(REAL_REF))
+    },
+  })
+  assert.deepEqual(
+    { frameMaxBytes: fx.config.egress.limits.frameMaxBytes, maxFlows: fx.config.egress.limits.maxFlows, maxRequests: fx.config.egress.limits.maxRequests },
+    { frameMaxBytes: 4096, maxFlows: 2, maxRequests: 1 },
+  )
+  assert.equal(kernel.status().subsystems.egress.state, 'ok', kernel.status().subsystems.egress.reason ?? '')
+  const finished = runThroughControl(kernel, 'fetch the fixture', 'fetcher')
+  await until(() => driver.channels.length === 1, 'the channel', 20_000)
+  const name = driver.channels[0]!.name
+  const mux = new FakeMux(driver.channels[0]!)
+  await mux.ready()
+  assert.deepEqual(mux.limits, { frameMaxBytes: 4096, maxFlows: 2 })
+  const first = await mux.request('GET http://github.com/op/fixture.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: github.com\r\n\r\n')
+  assert.match(first, /^HTTP\/1\.1 200 /)
+  // A second flow, one past maxRequests: the grant ends at its open.
+  mux.send({ type: 'open', flow: 2, payload: new Uint8Array(0) })
+  const done = await finished
+  assert.equal(done['status'], 'ok', String(done['reason']))
+  const revoked = rows(fx.dbPath)
+    .filter((r) => r.type === 'proxy.grant.revoked')
+    .map((r) => JSON.parse(r.payload) as Record<string, unknown>)
+  assert.deepEqual(revoked.map((r) => [r['reason'], r['limit']]), [['limit', 'maxRequests']])
+  assert.deepEqual(driver.kills, [name], 'the container was not killed by name, once')
+  assert.equal(up.seen.length, 1, 'the request past maxRequests was sent')
 })
 
 test('egressUpstreamOptions reads its idle bound from kernel.yaml and its connect deadline from EGRESS_CONNECT_TIMEOUT_MS', () => {

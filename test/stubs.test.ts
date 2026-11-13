@@ -59,6 +59,8 @@ test('every STUBS entry throws NotImplementedError or reports unavailable with a
   const table: { id: string; call: () => unknown }[] = [
     { id: 'apple-container-driver', call: () => new AppleContainerDriver().run({} as never) },
     { id: 'apple-container-driver', call: () => new AppleContainerDriver().kill('x') },
+    { id: 'apple-container-driver', call: () => new AppleContainerDriver().abandon('x') },
+    { id: 'apple-container-driver', call: () => new AppleContainerDriver().sweepOrphans({ runIds: ['run_x'], names: [], signal: new AbortController().signal }) },
   ]
 
   for (const row of table) {
@@ -84,6 +86,29 @@ test('every STUBS entry throws NotImplementedError or reports unavailable with a
   assert.equal(probe.ok, false)
   assert.ok(!probe.ok && probe.why.length > 20, 'the probe reports unavailable with no reason')
   assert.match(!probe.ok ? probe.why : '', /not implemented|no `container` binary/)
+
+  // STUBS.how names every method of the stub that throws, and no other: each
+  // method on its prototype is called, and one that throws must be named
+  // `name()` in the how text, one that answers must not be said to throw.
+  const how = STUBS.find((stub) => stub.id === 'apple-container-driver')?.how ?? ''
+  const throwsPart = /; (.*) throws? NotImplementedError/.exec(how)?.[1] ?? ''
+  const stub = new AppleContainerDriver()
+  const methods = Object.getOwnPropertyNames(AppleContainerDriver.prototype).filter((name) => name !== 'constructor')
+  const throwing: string[] = []
+  for (const name of methods) {
+    const method = (stub as unknown as Record<string, (...args: unknown[]) => unknown>)[name]
+    if (typeof method !== 'function') continue
+    try {
+      const out = method.call(stub, { runIds: ['run_x'], names: [], signal: new AbortController().signal })
+      if (out instanceof Promise) await out.catch(() => undefined)
+    } catch (e) {
+      if (e instanceof NotImplementedError) throwing.push(name)
+    }
+  }
+  assert.deepEqual(throwing.sort(), ['abandon', 'kill', 'run', 'sweepOrphans'])
+  for (const name of methods) {
+    assert.equal(throwsPart.includes(`${name}()`), throwing.includes(name), `STUBS.how and ${name}() disagree on whether it throws: ${how}`)
+  }
 
   // Every id in the list was actually exercised above. Without this, adding a
   // seventh stub and no row would leave it untested and still "covered".

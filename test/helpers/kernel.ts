@@ -127,6 +127,10 @@ export interface WithKernelOptions extends FixtureOptions {
    * (productionUpstream), so a test holds the options boot hands it.
    */
   readonly egressUpstreamDeps?: BootOptions['egressUpstreamDeps']
+  /** In place of SWEEP_WAIT_MS, so a sweep that never settles is given up in a test's time. */
+  readonly sweepWaitMs?: BootOptions['sweepWaitMs']
+  /** In place of PROBE_WAIT_MS, so a probe that never settles is given up in a test's time. */
+  readonly probeWaitMs?: BootOptions['probeWaitMs']
   readonly now?: () => number
   /**
    * Runs after the fixture exists and before the kernel boots, for state boot
@@ -172,6 +176,8 @@ export async function withKernel(
     ...(options.agentsDir === undefined ? {} : { agentsDir: options.agentsDir }),
     ...(options.egressUpstream === undefined ? {} : { egressUpstream: options.egressUpstream }),
     ...(options.egressUpstreamDeps === undefined ? {} : { egressUpstreamDeps: options.egressUpstreamDeps }),
+    ...(options.sweepWaitMs === undefined ? {} : { sweepWaitMs: options.sweepWaitMs }),
+    ...(options.probeWaitMs === undefined ? {} : { probeWaitMs: options.probeWaitMs }),
   })
 
   registerVerify(t, fx.dbPath, async () => {
@@ -208,6 +214,8 @@ export async function bootOn(
     ...(options.agentsDir === undefined ? {} : { agentsDir: options.agentsDir }),
     ...(options.egressUpstream === undefined ? {} : { egressUpstream: options.egressUpstream }),
     ...(options.egressUpstreamDeps === undefined ? {} : { egressUpstreamDeps: options.egressUpstreamDeps }),
+    ...(options.sweepWaitMs === undefined ? {} : { sweepWaitMs: options.sweepWaitMs }),
+    ...(options.probeWaitMs === undefined ? {} : { probeWaitMs: options.probeWaitMs }),
   })
   registerVerify(t, fx.dbPath, async () => {
     await kernel.shutdown()
@@ -221,8 +229,9 @@ export async function bootOn(
  * `shutdown()` is the clean path: it aborts live runs, which then finish as
  * `killed`, drains the goal queue and anchors the tail. A crash does none of
  * that, and a restart test driven through `shutdown()` would prove recovery of
- * a log that never needed it. `crash()` releases the socket and drops the raw
- * database handle — the SIGKILL shape kernel-boot.test.ts uses — leaving every
+ * a log that never needed it. `crash()` releases the socket, drops the raw
+ * database handle and the data directory's lock, as the OS would — the
+ * SIGKILL shape kernel-boot.test.ts uses — leaving every
  * in-flight run open in the log. Teardown then verifies the chain without
  * calling `shutdown()`, which would write to the closed handle.
  */
@@ -244,6 +253,8 @@ export async function bootCrashable(
     ...(options.agentsDir === undefined ? {} : { agentsDir: options.agentsDir }),
     ...(options.egressUpstream === undefined ? {} : { egressUpstream: options.egressUpstream }),
     ...(options.egressUpstreamDeps === undefined ? {} : { egressUpstreamDeps: options.egressUpstreamDeps }),
+    ...(options.sweepWaitMs === undefined ? {} : { sweepWaitMs: options.sweepWaitMs }),
+    ...(options.probeWaitMs === undefined ? {} : { probeWaitMs: options.probeWaitMs }),
   })
   let crashed = false
   const crash = async (): Promise<void> => {
@@ -252,6 +263,8 @@ export async function bootCrashable(
     kernel.scheduler.stop()
     await kernel.server.close()
     kernel.store.db.close()
+    // The OS drops a dead process's lock on its data directory.
+    kernel.lock.release()
   }
   registerVerify(t, fx.dbPath, async () => {
     if (!crashed) await kernel.shutdown()

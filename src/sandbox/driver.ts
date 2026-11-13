@@ -23,7 +23,9 @@
 // Never privileged, never the docker socket, never the home directory.
 //
 // `probe()` reports availability rather than throwing, because a kernel with
-// no container runtime must still boot degraded and say why.
+// no container runtime must still boot degraded and say why; and it stops
+// when its caller does (its AbortSignal), because one that never answers must
+// not hold the boot either.
 //
 // What a run writes is bounded too. A container is untrusted, and one that
 // writes without end would otherwise grow the kernel's memory until the
@@ -56,7 +58,8 @@ import { MAX_LOGGED_OUTPUT } from '../events/bound.js'
 export const CAPTURE_MAX_BYTES = 16 * MAX_LOGGED_OUTPUT
 
 /**
- * Prefix for every container the kernel creates, so orphans are findable, and
+ * Prefix for every container the kernel creates, so orphans are findable (the
+ * boot sweep, SandboxDriver.sweepOrphans), and
  * so that a name without it is someone else's container, which no driver
  * starts or kills (SandboxDriver.run, kill). Here rather than in a driver's
  * module so that whatever codes against this interface, the fake driver
@@ -65,10 +68,82 @@ export const CAPTURE_MAX_BYTES = 16 * MAX_LOGGED_OUTPUT
 export const CONTAINER_PREFIX = 'aos-run-'
 
 /**
+ * The name of a run's nth container, `aos-run-<runId>-<n>`: how the sandbox
+ * runner names each exec's container, and how the boot sweep tells a
+ * container of a run its log names (containerRunId), a finished run's as
+ * much as one left open. A run id never holds a `-` (sandbox-tools.ts
+ * WORKSPACE_RUN_ID), so the last `-` ends it.
+ */
+export function containerName(runId: string, n: number): string {
+  return `${CONTAINER_PREFIX}${runId}-${String(n)}`
+}
+
+/**
+ * The run id a container name of containerName's shape names, or undefined
+ * for any other name: one without CONTAINER_PREFIX, an empty run id, or a
+ * last part that is not a number from 1. Read from the last `-`, so a name
+ * names one run only (`aos-run-a-b-1` is run `a-b`'s, never run `a`'s).
+ */
+export function containerRunId(name: string): string | undefined {
+  if (!name.startsWith(CONTAINER_PREFIX)) return undefined
+  const rest = name.slice(CONTAINER_PREFIX.length)
+  const dash = rest.lastIndexOf('-')
+  if (dash <= 0 || !/^[1-9][0-9]*$/.test(rest.slice(dash + 1))) return undefined
+  return rest.slice(0, dash)
+}
+
+/**
  * Isolation domain. Each maps to its own VM; its internal network is kept and
  * probed as defence in depth, and no run is put on it.
  */
 export type SandboxDomain = 'trusted' | 'hostile'
+
+/**
+ * What the boot sweep is to kill: only containers this kernel's own log
+ * names (egress plan W2; src/kernel.ts sweepTargets), never every container
+ * with the prefix, which on a VM two kernels share (another data
+ * directory's, a second checkout's) is also a live kernel's. No other kernel
+ * holds this log (the data directory's lock), so any container of its runs
+ * that a VM still runs is one no live kernel will end.
+ */
+export interface SweepRequest {
+  /**
+   * Every run of the log that may have had a container: each that called a
+   * sandbox tool, started a container or was issued a grant, finished runs
+   * included (a live kernel's kill by name can fail, and a container it
+   * missed outlives the run), and each open grant's run. A listed container
+   * named for one of them (containerRunId) is killed.
+   */
+  readonly runIds: readonly string[]
+  /**
+   * Containers the log names outright (an open grant's `sandbox`, a canary's
+   * included, which serves no run): a listed container of one of these
+   * names is killed.
+   */
+  readonly names: readonly string[]
+  /**
+   * Aborted once the caller stops waiting (boot: SWEEP_WAIT_MS). From then
+   * on the sweep lists nothing more and sends no kill it has not sent, so a
+   * listing a VM answers late, which may by then hold a container a run of
+   * the new kernel started, kills nothing.
+   */
+  readonly signal: AbortSignal
+}
+
+/** What a sweep came to, every part of it, so a caller can say what it could not do. */
+export interface SweepResult {
+  /**
+   * Each container killed by name, on the domain that listed it, in the
+   * order the domains are listed (trusted, then hostile): its daemon
+   * answered the kill, or said the container no longer ran (it had exited
+   * between the listing and the kill).
+   */
+  readonly swept: readonly string[]
+  /** Each domain whose runtime could not be listed, and what its runtime said (cut short). */
+  readonly unlisted: readonly { readonly domain: SandboxDomain; readonly why: string }[]
+  /** Each kill by name the daemon refused, and what it said (cut short): the container may still run. */
+  readonly failed: readonly { readonly name: string; readonly domain: SandboxDomain; readonly why: string }[]
+}
 
 export interface SandboxLimits {
   readonly memoryMb: number
@@ -387,8 +462,17 @@ export type ProbeResult =
 
 export interface SandboxDriver {
   readonly name: string
-  /** Availability, never a throw: a missing runtime is a degraded boot. */
-  probe(): Promise<ProbeResult>
+  /**
+   * Availability, never a throw: a missing runtime is a degraded boot.
+   *
+   * A runtime that accepts a connection and never answers (a paused VM)
+   * leaves this unsettled, so a caller bounds the wait (boot: PROBE_WAIT_MS)
+   * and aborts `signal` when it stops waiting. Once it is aborted a driver
+   * asks the runtime nothing more and ends what it is waiting on
+   * (DockerDriver: the docker CLI child, by SIGKILL, the one process it may
+   * signal).
+   */
+  probe(signal?: AbortSignal): Promise<ProbeResult>
   /**
    * Throws a ConfigError, before starting anything, for a `spec.name` that
    * does not start with CONTAINER_PREFIX: such a name is no container of the
@@ -457,4 +541,23 @@ export interface SandboxDriver {
    * nothing more from it, and records the container's end itself.
    */
   abandon(name: string): Promise<void>
+  /**
+   * Kill every container `request` names (a run's, by containerRunId, or
+   * one named outright) that a domain's runtime still runs, by name, on the
+   * domain that lists it, every domain at once. For boot, before the sandbox
+   * subsystem is marked and before any run starts: a kernel that died left
+   * its containers running past their wallclock, whose timer was the dead
+   * process's, and nothing else will ever end them. Any other container is
+   * left alone: a name without CONTAINER_PREFIX is someone else's, and one
+   * with it that the request does not name may be a live kernel's on the
+   * same VM. A request that names nothing asks no runtime anything.
+   *
+   * Never rejects: a domain that cannot be listed is in the result's
+   * `unlisted`, and a kill its daemon refused in `failed`. Resolves once
+   * every kill it sent has been answered, which a daemon that never answers
+   * never does, so a caller bounds the wait (boot: SWEEP_WAIT_MS) and aborts
+   * request.signal when it stops waiting. A driver that runs nothing (the
+   * apple-container stub) throws instead, as its kill does.
+   */
+  sweepOrphans(request: SweepRequest): Promise<SweepResult>
 }

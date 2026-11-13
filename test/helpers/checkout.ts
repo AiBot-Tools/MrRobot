@@ -19,10 +19,10 @@
 import './guard.js'
 
 import { spawn, spawnSync, type ChildProcessByStdio, type SpawnOptions, type SpawnSyncOptionsWithStringEncoding, type SpawnSyncReturns } from 'node:child_process'
-import { appendFileSync, chmodSync, cpSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { appendFileSync, chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import type { Readable } from 'node:stream'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const REPO = fileURLToPath(new URL('../..', import.meta.url)).replace(/\/$/, '')
@@ -52,6 +52,80 @@ function noCwd(opts: object): void {
   if ('cwd' in opts) throw new Error('an entry point runs from the shadow checkout only; drop the cwd option')
 }
 
+/** The line fakeDocker's `docker` carries, by which daemonRefusal knows it. */
+export const FAKE_DOCKER_MARK = '# aos-test: a fake docker that logs its argv and reaches no daemon'
+
+/**
+ * A `docker` that appends each call's argv, one line per call, to `log` and
+ * exits 1, reaching no daemon, in a bin directory of its own under `dir`;
+ * `path` is a PATH that starts with it. A test daemon runs with that PATH,
+ * so whatever its boot asks of docker (the probe, the orphan sweep's `ps`
+ * and `kill`) reaches no VM of the operator's, and the test can read what
+ * was asked.
+ */
+export function fakeDocker(dir: string): { readonly bin: string; readonly log: string; readonly path: string } {
+  const bin = join(dir, 'fake-docker-bin')
+  const log = join(dir, 'fake-docker.log')
+  if (log.includes("'")) throw new Error(`a fake docker's log path may hold no quote: ${log}`)
+  mkdirSync(bin, { recursive: true })
+  const docker = join(bin, 'docker')
+  writeFileSync(docker, `#!/bin/sh\n${FAKE_DOCKER_MARK}\nprintf '%s\\n' "$*" >> '${log}'\nexit 1\n`, { mode: 0o755 })
+  chmodSync(docker, 0o755)
+  return { bin, log, path: `${bin}${delimiter}${process.env['PATH'] ?? '/usr/bin:/bin'}` }
+}
+
+/**
+ * Why a spawn of the daemon (src/main.ts) could reach the operator's docker
+ * VMs, or undefined. The daemon builds the real docker driver from its
+ * config, and the shipped kernel.yaml names ~/.colima/{trusted,hostile}: a
+ * daemon booted from it with the real docker on its PATH asks those VMs
+ * whatever boot asks, the orphan sweep's kills by name included. So every
+ * spawn of it is held to two things: its PATH starts with fakeDocker()'s bin,
+ * and it is given a --config none of whose dockerHost sockets is under the
+ * home directory or a `.colima` directory. runEntry and spawnEntry refuse one
+ * that is not, before anything starts.
+ */
+export function daemonRefusal(args: readonly string[], env: NodeJS.ProcessEnv | undefined): string | undefined {
+  if (env === undefined) return "the daemon is spawned with this process's env, whose PATH reaches the real docker: give it fakeDocker()'s PATH"
+  const first = (env['PATH'] ?? '').split(delimiter)[0] ?? ''
+  let docker = ''
+  try {
+    docker = readFileSync(join(first, 'docker'), 'utf8')
+  } catch {
+    // Read as no fake below.
+  }
+  if (first === '' || !docker.split('\n').includes(FAKE_DOCKER_MARK)) {
+    return `the daemon's PATH does not start with a fake docker (it starts with ${JSON.stringify(first)}): give it fakeDocker()'s PATH`
+  }
+  const at = args.indexOf('--config')
+  const configPath = at === -1 ? undefined : args[at + 1]
+  if (configPath === undefined) return 'the daemon is spawned with no --config, so it boots from the shipped kernel.yaml, which names the operator\'s VMs'
+  let text: string
+  try {
+    text = readFileSync(configPath, 'utf8')
+  } catch (e) {
+    return `the daemon's --config ${configPath} cannot be read: ${e instanceof Error ? e.message : String(e)}`
+  }
+  const hosts = [...text.matchAll(/dockerHost:\s*(\S+)/g)].map((m) => m[1] ?? '')
+  if (hosts.length === 0) return `the daemon's --config ${configPath} names no dockerHost`
+  const homes = [homedir(), env['HOME'], process.env['HOME']].filter((h): h is string => h !== undefined && h !== '')
+  for (const host of hosts) {
+    const path = host.replace(/^unix:\/\//, '')
+    const underHome = path.startsWith('~') || homes.some((h) => path === h || path.startsWith(`${h}/`))
+    if (!host.startsWith('unix://') || underHome || path.includes('/.colima/')) {
+      return `the daemon's --config ${configPath} names dockerHost ${host}, which may be a VM of the operator's: point it at a socket under the test's temp directory`
+    }
+  }
+  return undefined
+}
+
+/** Throws daemonRefusal's reason for a spawn of the daemon that could reach the operator's VMs. */
+function assertOffVms(entry: EntryPoint, args: readonly string[], env: NodeJS.ProcessEnv | undefined): void {
+  if (entry !== 'src/main.ts') return
+  const why = daemonRefusal(args, env)
+  if (why !== undefined) throw new Error(why)
+}
+
 /** Run an entry point to completion from the copy: `node --import tsx <entry> ...args`, cwd = the copy. */
 export function runEntry(
   checkout: ShadowCheckout,
@@ -60,6 +134,7 @@ export function runEntry(
   opts: Omit<SpawnSyncOptionsWithStringEncoding, 'cwd' | 'encoding'> = {},
 ): SpawnSyncReturns<string> {
   noCwd(opts)
+  assertOffVms(entry, args, opts.env)
   return spawnSync(process.execPath, ['--import', 'tsx', entry, ...args], { ...opts, cwd: checkout.root, encoding: 'utf8' })
 }
 
@@ -143,6 +218,7 @@ export function spawnEntry(
   opts: Omit<SpawnOptions, 'cwd' | 'stdio'> & { readonly eofAfter?: string; readonly typed?: readonly PtyStep[] } = {},
 ): ChildProcessByStdio<null, Readable, Readable> {
   noCwd(opts)
+  assertOffVms(entry, args, opts.env)
   const { eofAfter, typed, ...options } = opts
   const node = [process.execPath, '--import', 'tsx', entry, ...args]
   const steps: readonly PtyStep[] | undefined = typed ?? (eofAfter === undefined ? undefined : [{ cue: eofAfter, send: '\x04' }])

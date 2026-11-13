@@ -79,6 +79,7 @@ import { canonicalize, sha256Hex } from '../src/events/canonical.js'
 import { projectRecovery } from '../src/events/projections.js'
 import { redactString, SecretMask, TOKEN_PATTERNS } from '../src/events/redact.js'
 import type { EventStore } from '../src/events/store.js'
+import { PROXY_GRANT_MAX_REPOS } from '../src/events/types.js'
 import type { AgentView } from '../src/mcp/hub.js'
 import { parseToolViews, type ToolViewsFile } from '../src/mcp/tool-views.js'
 import type { ModelCard } from '../src/models/registry.js'
@@ -93,6 +94,7 @@ import { RunLoop, type RunAgent } from '../src/runtime/loop.js'
 import {
   AWS_KEY_ID,
   CAPTURE_EDGE_BYTES,
+  EXEC_DESCRIPTION,
   EXEC_PROFILES,
   DESCRIBE_RESERVE,
   DOCKER_CLI_FAILED,
@@ -122,7 +124,7 @@ import type { EgressHost } from '../src/egress/host.js'
 import { acceptReady } from '../src/egress/ready.js'
 import type { CredentialInjector } from '../src/egress/session.js'
 import { readAllRows } from '../src/events/chain.js'
-import { FakeMux, fakeUpstream, until, type FakeUpstream } from './helpers/fake-egress.js'
+import { FakeMux, fakeUpstream, refusedReport, until, type FakeUpstream } from './helpers/fake-egress.js'
 import { AppleContainerDriver } from '../src/sandbox/apple-container.js'
 import { DockerDriver, type ChildLike } from '../src/sandbox/docker.js'
 import { CAPTURE_MAX_BYTES, CONTAINER_PREFIX, type SandboxDriver, type SandboxResult, type SandboxSpec } from '../src/sandbox/driver.js'
@@ -1343,6 +1345,7 @@ test('a driver whose result rejects has its container killed by name, and its en
     abandon: (name) => d.driver.abandon(name),
     commandRefusal: (command) => d.driver.commandRefusal(command),
     everyRunRefusal: () => d.driver.everyRunRefusal(),
+    sweepOrphans: (request) => d.driver.sweepOrphans(request),
   }
   const tools = new SandboxTools({ store: d.store, views: SHIPPED_VIEWS, driver: lossy, agents: d.agents, sandbox: d.sandbox })
   const name = `${CONTAINER_PREFIX}run_j-1`
@@ -1928,6 +1931,7 @@ function switching(base: FakeSandbox): SandboxDriver & { stub(): void } {
     abandon: (name) => now.abandon(name),
     commandRefusal: (command) => now.commandRefusal(command),
     everyRunRefusal: () => now.everyRunRefusal(),
+    sweepOrphans: (request) => now.sweepOrphans(request),
     stub: () => {
       now = stub
     },
@@ -2151,6 +2155,7 @@ function withKill(base: FakeSandbox, answer: (name: string) => Promise<void>): S
     abandon: (name) => base.abandon(name),
     commandRefusal: (command) => base.commandRefusal(command),
     everyRunRefusal: () => base.everyRunRefusal(),
+    sweepOrphans: (request) => base.sweepOrphans(request),
     kills,
   }
 }
@@ -2569,6 +2574,7 @@ test('a container the log cannot record fails the call only once it has ended', 
     abandon: (name) => d.driver.abandon(name),
     commandRefusal: (command) => d.driver.commandRefusal(command),
     everyRunRefusal: () => d.driver.everyRunRefusal(),
+    sweepOrphans: (request) => d.driver.sweepOrphans(request),
   }
   const append = d.store.append.bind(d.store)
   d.store.append = ((event: Parameters<EventStore['append']>[0]) => {
@@ -3576,6 +3582,7 @@ test('a driver whose kill refuses with a long text of quotes still gets its tool
         abandon: (name) => base.abandon(name),
         commandRefusal: (command) => base.commandRefusal(command),
         everyRunRefusal: () => base.everyRunRefusal(),
+        sweepOrphans: (request) => base.sweepOrphans(request),
       }),
     ],
   ]
@@ -3624,6 +3631,7 @@ test("a driver's text of exactly DRIVER_TEXT_BYTES payload bytes is shown whole,
     abandon: (name) => base.abandon(name),
     commandRefusal: (command) => base.commandRefusal(command),
     everyRunRefusal: () => base.everyRunRefusal(),
+    sweepOrphans: (request) => base.sweepOrphans(request),
   })
   // Counted in the bytes it takes in the log's JSON: 256 quotes are 512.
   const rows: readonly [string, string, string][] = [
@@ -3780,6 +3788,7 @@ test('a refusal never quotes a key the model sent, and a failure text past what 
       abandon: (name) => d.driver.abandon(name),
       commandRefusal: (command) => d.driver.commandRefusal(command),
       everyRunRefusal: () => d.driver.everyRunRefusal(),
+      sweepOrphans: (request) => d.driver.sweepOrphans(request),
     }
     const tools = toolsOver(d, refusing)
     const args = { command: ['true'] }
@@ -4184,6 +4193,7 @@ test('a run the driver gives no channel, though its spec asked for one, is kille
     abandon: (name) => base.abandon(name),
     commandRefusal: (command) => base.commandRefusal(command),
     everyRunRefusal: () => base.everyRunRefusal(),
+    sweepOrphans: (request) => base.sweepOrphans(request),
   }
   // A short wallclock and grace, so a runner that sent no kill gives the
   // container up in well under the test's timeout, by abandon, not by kill.
@@ -4449,6 +4459,169 @@ test("a grant is revoked on a violation and on the run's stop, and its container
   }
 })
 
+test("a container whose ready report says its self-test reached what --network none keeps out is never sent go: killed by name, its grant revoked as a violation, and nothing served", { timeout: 10_000 }, async (t) => {
+  // The kernel's judge (src/egress/ready.ts acceptReady) is its one check,
+  // before the command runs, that the container's network is the --network
+  // none the kernel asked for: a probe of 192.168.5.2:8766 that reached it,
+  // or that timed out (a SYN that went somewhere), is refused. The run's
+  // budget and a short grace bound the call well inside the test's timeout,
+  // so a judge that accepts every report fails here within a second, not
+  // after the default 120 s wallclock and its grace.
+  for (const how of ['reached', 'timed out'] as const) {
+    const fx = egressOf()
+    const d = direct(t, { files: { coder: EGRESS_CODER }, egress: fx.egress, exits: [{ hangs: true }] })
+    const tools = toolsOver(d, d.driver, { egress: fx.egress, resultGraceMs: 100 })
+    const args = { command: ['git', 'fetch'] }
+    const call = tools.call(ticketFor('run_y', args), args, context('run_y', { budget: { remainingMs: () => 400 } }))
+    await until(() => d.driver.channels.length === 1, 'the channel')
+    const name = d.driver.channels[0]!.name
+    const mux = new FakeMux(d.driver.channels[0]!)
+    mux.send({ type: 'ready', flow: 0, payload: refusedReport(how) })
+    const out = await call
+    assert.equal(out.ok, false, how)
+    assert.equal(mux.kernelFrames.includes('go'), false, `${how}: the container was sent go, so its command ran`)
+    assert.deepEqual(d.driver.kills, [name], `${how}: the container was not killed by name, once`)
+    assert.match(out.text, /was killed by name when its egress grant was revoked/, how)
+    const why =
+      how === 'reached'
+        ? 'the self-test reached 1 of what it must not'
+        : "the self-test's probe of 192.168.5.2:8766 met no error that says there is no route"
+    const [revoked] = payloads(d.store, 'proxy.grant.revoked')
+    assert.equal(revoked?.['reason'], 'violation', how)
+    assert.equal(revoked?.['detail'], `the mux's ready report was refused: ${why}`, how)
+    const [result] = payloads(d.store, 'tool.result')
+    assert.equal(result?.['ok'], false, how)
+    assert.deepEqual(payloads(d.store, 'proxy.decision'), [], `${how}: a request was judged`)
+    assert.equal(fx.up.seen.length, 0, `${how}: an upstream was sent a request`)
+    assert.deepEqual(tools.liveGrants(), [], how)
+  }
+})
+
+test('a grant the session revokes on its own leaves the grant table once its revocation is appended, while its container still runs', { timeout: 10_000 }, async (t) => {
+  // A container that breaks the protocol, on a daemon that never answers
+  // the kill by name: the container runs on until its wallclock and the
+  // grace, and the call with it. The table (liveGrants) is every grant
+  // issued whose revocation has not yet been attempted, so the revoked grant
+  // is not in it then.
+  const never = (): Promise<void> => new Promise<void>(() => undefined)
+  const fx = egressOf()
+  const d = direct(t, { files: { coder: EGRESS_CODER }, egress: fx.egress, exits: [{ hangs: true }] })
+  const driver = withKill(d.driver, never)
+  const tools = toolsOver(d, driver, { egress: fx.egress, killWaitMs: 25, resultGraceMs: 100 })
+  const args = { command: ['true'] }
+  let settled = false
+  const call = tools.call(ticketFor('run_q', args), args, context('run_q', { budget: { remainingMs: () => 400 } }))
+  void call.then(() => {
+    settled = true
+  })
+  await until(() => d.driver.channels.length === 1, 'the channel')
+  const name = d.driver.channels[0]!.name
+  const mux = new FakeMux(d.driver.channels[0]!)
+  await mux.ready()
+  assert.equal(tools.liveGrants().length, 1)
+  mux.raw(Buffer.from([0, 0, 0, 0, 0x7f, 0, 0, 0, 1]))
+  await until(() => payloads(d.store, 'proxy.grant.revoked').length === 1, "the session's revocation")
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(payloads(d.store, 'proxy.grant.revoked')[0]?.['reason'], 'violation')
+  assert.deepEqual(driver.kills, [name], 'the session did not have the container killed by name')
+  assert.equal(settled, false, 'the call ended before the container did')
+  assert.equal(payloads(d.store, 'sandbox.killed').length, 0, 'the container was recorded ended')
+  assert.deepEqual(tools.liveGrants(), [], 'a revoked grant is still listed live')
+  // The call ends at the container's wallclock and the grace, by abandon.
+  const out = await call
+  assert.equal(out.ok, false)
+  assert.deepEqual(d.driver.abandons, [name])
+  assert.deepEqual(tools.liveGrants(), [])
+  assert.equal(payloads(d.store, 'proxy.grant.revoked').length, 1, 'the grant was revoked twice')
+})
+
+test("a grant whose session's revocation the store refuses leaves the grant table all the same, and stays open in the log for the next boot to close", { timeout: 10_000 }, async (t) => {
+  // The session ends whether or not its proxy.grant.revoked row was taken
+  // (EgressSession.done: the revocation attempted). The table drops the
+  // grant then, as it does a revoked one, so liveGrants lists no grant the
+  // kernel no longer serves; the log, which holds no revocation, shows it
+  // open, and projectRecovery hands it to the next boot (GRANT_RECOVERED_DETAIL).
+  const never = (): Promise<void> => new Promise<void>(() => undefined)
+  const fx = egressOf()
+  const d = direct(t, { files: { coder: EGRESS_CODER }, egress: fx.egress, exits: [{ hangs: true }] })
+  let refused = 0
+  const append = d.store.append.bind(d.store)
+  d.store.append = ((event: Parameters<EventStore['append']>[0]) => {
+    if (event.type === 'proxy.grant.revoked') {
+      refused += 1
+      throw new Error('the log refused the row')
+    }
+    return append(event)
+  }) as EventStore['append']
+  const driver = withKill(d.driver, never)
+  const tools = toolsOver(d, driver, { egress: fx.egress, killWaitMs: 25, resultGraceMs: 100 })
+  const args = { command: ['true'] }
+  let settled = false
+  const call = tools.call(ticketFor('run_r', args), args, context('run_r', { budget: { remainingMs: () => 400 } }))
+  void call.then(() => {
+    settled = true
+  })
+  await until(() => d.driver.channels.length === 1, 'the channel')
+  const mux = new FakeMux(d.driver.channels[0]!)
+  await mux.ready()
+  const [live] = tools.liveGrants()
+  assert.ok(live !== undefined, 'no grant was live while the channel was served')
+  mux.raw(Buffer.from([0, 0, 0, 0, 0x7f, 0, 0, 0, 1]))
+  await until(() => refused === 1, "the session's revocation")
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(settled, false, 'the call ended before the container did')
+  assert.deepEqual(tools.liveGrants(), [], 'a grant the session no longer serves is still listed live')
+  await call
+  assert.deepEqual(tools.liveGrants(), [])
+  assert.deepEqual(payloads(d.store, 'proxy.grant.revoked'), [], 'a revocation the store refused is in the log')
+  const open = projectRecovery(readAllRows(d.store.db)).openGrants
+  assert.deepEqual(open.map((g) => g.grantId), [live.grantId], 'the grant left open is not handed to the next boot')
+})
+
+test("sandbox.exec's description says a container reaches only what its manifest's egress grants, through the kernel, and nothing without it", (t) => {
+  // One description for every run: a model whose manifest grants egress must
+  // not be told its container has no network, nor one without egress that it
+  // has some.
+  const d = direct(t)
+  const [schema] = d.tools.schemas()
+  assert.equal(schema?.description, EXEC_DESCRIPTION)
+  assert.match(EXEC_DESCRIPTION, /^Run one command in a fresh container of your sandbox\. The container has no network of its own: if your manifest grants egress, it reaches the hosts that grant names, and nothing else, through the kernel, over the HTTP_PROXY its image sets; otherwise it reaches nothing\. /)
+  assert.doesNotMatch(EXEC_DESCRIPTION, /with no network\./)
+  // How to reach a granted host, as the engine routes it: an http:// URL in
+  // absolute form, which the kernel sends on over TLS; never an https:// URL
+  // through the proxy, which is a CONNECT the engine denies, whatever it names.
+  assert.match(EXEC_DESCRIPTION, /Name such a host with an http:\/\/ URL and no port \(http:\/\/<host>\/<path>\): the kernel makes the TLS connection to it itself\. /)
+  assert.match(EXEC_DESCRIPTION, /An https:\/\/ URL sent through the proxy asks it for a tunnel \(CONNECT\), which is always refused; /)
+  assert.doesNotMatch(EXEC_DESCRIPTION, /HTTPS_PROXY/)
+})
+
+test('a grant whose bindings name exactly PROXY_GRANT_MAX_REPOS repositories between them is issued, its row naming each one', async (t) => {
+  // The row's bound, at the bound: two bindings of 64 each, 128 in all, is
+  // a grant proxy.grant.issued records (the 192 row in 'exec with egress
+  // refuses with the egress reason when the state is not ok' is one past).
+  const wide = Object.fromEntries(
+    [0, 1].map((b) => [`gh-${String(b)}`, { host: 'github.com', profiles: ['git-fetch'], repos: Array.from({ length: 64 }, (_, i) => `op/b${String(b)}-r${String(i)}`) }]),
+  ) as SandboxEgress['bindings']
+  assert.equal(PROXY_GRANT_MAX_REPOS, 128)
+  const fx = egressOf({ bindings: wide })
+  const d = direct(t, { files: { coder: manifest('coder', { egress: { bind: ['gh-0', 'gh-1'] } }) }, egress: fx.egress, registryBindings: wide, exits: [{ hangs: true }] })
+  assert.equal(d.tools.egressRefusal(EXEC, 'coder'), undefined)
+  assert.equal(d.tools.egressRefusal(EXEC, 'coder', 'run_m'), undefined)
+  const args = { command: ['git', 'fetch', '--all'] }
+  const call = d.tools.call(ticketFor('run_m', args), args, context('run_m'))
+  await until(() => d.driver.channels.length === 1, 'the channel')
+  const mux = new FakeMux(d.driver.channels[0]!)
+  await mux.ready()
+  mux.exit(0)
+  d.driver.simulateExit(d.driver.channels[0]!.name)
+  const out = await call
+  assert.equal(out.ok, true, out.text)
+  const [issued] = payloads(d.store, 'proxy.grant.issued')
+  const routes = (issued?.['routes'] ?? []) as { bindingId: string; repos: string[] }[]
+  assert.deepEqual(routes.map((r) => [r.bindingId, r.repos.length]), [['gh-0', 64], ['gh-1', 64]])
+  assert.equal(routes.reduce((n, r) => n + r.repos.length, 0), PROXY_GRANT_MAX_REPOS)
+})
+
 test('a container whose command exited while a flow stays open is killed by name and its grant revoked', { timeout: 10_000 }, async (t) => {
   // The mux sends the command's exit frame once the command and its group
   // are gone, and exits once its last flow retires; a descendant that left
@@ -4676,6 +4849,7 @@ test('every error path of a channel run revokes its grant, and leaves the grant 
       abandon: (name) => d.driver.abandon(name),
       commandRefusal: (command) => d.driver.commandRefusal(command),
       everyRunRefusal: () => d.driver.everyRunRefusal(),
+      sweepOrphans: (request) => d.driver.sweepOrphans(request),
     }
     const tools = toolsOver(d, lossy, { egress: fx.egress })
     const call = tools.call(ticketFor('run_j', args), args, context('run_j'))

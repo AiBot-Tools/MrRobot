@@ -21,7 +21,11 @@ import assert from 'node:assert/strict'
 
 import { readAllRows } from '../src/events/chain.js'
 import { isClean, projectRecovery } from '../src/events/projections.js'
-import { withStore } from './helpers/store.js'
+import { EventStore } from '../src/events/store.js'
+import { EGRESS_DETAIL_BYTES, ProxyGrantRevokedPayload } from '../src/events/types.js'
+import { GRANT_RECOVERED_DETAIL } from '../src/kernel.js'
+import { bootOn, fixture, rows } from './helpers/kernel.js'
+import { closeVerified, withStore } from './helpers/store.js'
 
 const BOOT = { schemaVersion: 1 as const, version: '0.0.1', configHash: 'h', degraded: [] }
 
@@ -407,4 +411,169 @@ test('recovery’s own rows close every delegation-shaped orphan, so a second re
     payload: { schemaVersion: 1, runId: 'run_parent', status: 'error', reason: 'orphaned by a kernel restart', costMicroUsd: 17, llmCalls: 1, toolCalls: 0, durationMs: 1 },
   })
   assert.equal(isClean(projectRecovery(readAllRows(store.db))), true)
+})
+
+// ── egress grants (egress plan W2) ─────────────────────────────────────────
+//
+// A grant is issued before its container starts and revoked once the kernel
+// has a verdict on the container, both by the kernel, from a table in memory.
+// A crash between the two leaves a reach the log never closed. Recovery
+// closes it once: a second boot that closed it again would be a revocation of
+// a grant already revoked, and one that never closed it would leave the log
+// saying a run could still reach a host.
+
+/** A proxy.grant.issued row as the runner appends it (sandbox-tools.ts issuedRow), under its run and agent. */
+function issued(store: Store, grantId: string, runId: string, agentId = 'coder'): void {
+  store.append({
+    type: 'proxy.grant.issued',
+    runId,
+    agentId,
+    payload: {
+      schemaVersion: 1, grantId, purpose: 'exec', runId, agentId, sandbox: `aos-run-${runId}-1`, domain: 'trusted',
+      allow: ['registry.npmjs.org'],
+      routes: [{ bindingId: 'github', host: 'github.com', profiles: ['git-fetch'], repos: ['op/fixture'] }],
+    },
+  })
+}
+
+const TOTALS = { flows: 1, requests: 1, allowed: 1, denied: 0, refused: 0, failed: 0, sentBytes: 0, receivedBytes: 10, durationMs: 5 }
+
+test('a grant issued and never revoked is open, a revocation of any reason closes it, and a canary grant serves no run', (t) => {
+  const store = withStore(t)
+  started(store, 'run_g', 'coder')
+  issued(store, 'grant_done', 'run_g')
+  store.append({ type: 'proxy.grant.revoked', runId: 'run_g', agentId: 'coder', payload: { schemaVersion: 1, grantId: 'grant_done', reason: 'exited', totals: TOTALS } })
+  issued(store, 'grant_open', 'run_g')
+  // A canary grant (egress plan W3) is issued under no run and no agent.
+  store.append({
+    type: 'proxy.grant.issued',
+    payload: { schemaVersion: 1, grantId: 'grant_canary', purpose: 'canary', sandbox: 'aos-run-canary-trusted', domain: 'trusted', allow: [], routes: [] },
+  })
+  issued(store, 'grant_recovered', 'run_g')
+  // What a previous boot wrote for it: a recovered revocation closes it as any other does.
+  store.append({ type: 'proxy.grant.revoked', runId: 'run_g', agentId: 'coder', payload: { schemaVersion: 1, grantId: 'grant_recovered', reason: 'recovered' } })
+
+  const recovery = projectRecovery(readAllRows(store.db))
+  assert.deepEqual(
+    recovery.openGrants.map(({ grantId, runId, agentId }) => ({ grantId, runId, agentId })),
+    [
+      { grantId: 'grant_open', runId: 'run_g', agentId: 'coder' },
+      { grantId: 'grant_canary', runId: null, agentId: null },
+    ],
+  )
+  // Each with the container its issued row names, which the boot sweep kills by name.
+  assert.deepEqual(recovery.openGrants.map((g) => g.sandbox), ['aos-run-run_g-1', 'aos-run-canary-trusted'])
+  // In the order they were issued.
+  assert.ok((recovery.openGrants[0]?.seq ?? 0) < (recovery.openGrants[1]?.seq ?? 0))
+  assert.equal(isClean(recovery), false)
+  // An open grant alone makes a recovery unclean: its run closed, the grant did not.
+  finished(store, 'run_g')
+  const runClosed = projectRecovery(readAllRows(store.db))
+  assert.deepEqual(runClosed.orphanRuns, [])
+  assert.equal(isClean(runClosed), false, 'an open grant read as nothing to do')
+  // A revocation whose payload will not parse names no grant, and closes none.
+  const all = readAllRows(store.db)
+  const damaged = [...all, { ...all[0]!, seq: 999, type: 'proxy.grant.revoked', payload: 'not json' }]
+  assert.deepEqual(projectRecovery(damaged).openGrants.map((g) => g.grantId), ['grant_open', 'grant_canary'])
+})
+
+test('an issued grant with no revoked row is closed at boot exactly once; a second boot appends nothing', async (t) => {
+  const fx = fixture(t)
+  // The log a crash leaves: an exec's grant issued under a run that never
+  // finished, beside one revoked before the crash.
+  const crashed = withStore(t, { path: fx.dbPath, headFile: fx.headFile })
+  started(crashed, 'run_crashed', 'coder')
+  issued(crashed, 'grant_closed', 'run_crashed')
+  crashed.append({
+    type: 'proxy.grant.revoked',
+    runId: 'run_crashed',
+    agentId: 'coder',
+    payload: { schemaVersion: 1, grantId: 'grant_closed', reason: 'exited', totals: TOTALS },
+  })
+  issued(crashed, 'grant_left_open', 'run_crashed')
+  // A canary grant (egress plan W3's boot check) a kernel died serving: no
+  // run and no agent, in its row's columns or its payload.
+  crashed.append({
+    type: 'proxy.grant.issued',
+    payload: { schemaVersion: 1, grantId: 'grant_canary_open', purpose: 'canary', sandbox: 'aos-run-canary-trusted', domain: 'trusted', allow: [], routes: [] },
+  })
+  closeVerified(crashed)
+  assert.deepEqual(projectRecovery(readOnlyRows(fx.dbPath)).openGrants.map((g) => g.grantId), ['grant_left_open', 'grant_canary_open'])
+
+  const first = await bootOn(t, fx)
+  assert.deepEqual(first.recovered.openGrants.map((g) => g.grantId), ['grant_left_open', 'grant_canary_open'])
+  await first.shutdown()
+
+  const revokedRows = (): { seq: number; runId: string | null; agentId: string | null; payload: Record<string, unknown> }[] =>
+    readOnlyRows(fx.dbPath)
+      .filter((r) => r.type === 'proxy.grant.revoked')
+      .map((r) => ({ seq: r.seq, runId: r.runId, agentId: r.agentId, payload: JSON.parse(r.payload) as Record<string, unknown> }))
+  const afterFirst = revokedRows()
+  const recovered = afterFirst.filter((r) => r.payload['grantId'] === 'grant_left_open')
+  assert.equal(recovered.length, 1, 'the open grant was not closed exactly once')
+  // Under the grant's own run and agent, as the live revocation is; reason
+  // recovered, with no totals (the counts died with the kernel that kept
+  // them), and the boot's fixed words.
+  assert.deepEqual(recovered[0], {
+    seq: recovered[0]?.seq,
+    runId: 'run_crashed',
+    agentId: 'coder',
+    payload: { schemaVersion: 1, grantId: 'grant_left_open', reason: 'recovered', detail: GRANT_RECOVERED_DETAIL },
+  })
+  // The canary's, once, under no run and no agent: both columns null, as its issued row's are.
+  const canary = afterFirst.filter((r) => r.payload['grantId'] === 'grant_canary_open')
+  assert.deepEqual(canary, [
+    {
+      seq: canary[0]?.seq,
+      runId: null,
+      agentId: null,
+      payload: { schemaVersion: 1, grantId: 'grant_canary_open', reason: 'recovered', detail: GRANT_RECOVERED_DETAIL },
+    },
+  ])
+  // The grant revoked before the crash is left as it was.
+  assert.equal(afterFirst.filter((r) => r.payload['grantId'] === 'grant_closed').length, 1)
+  // After this boot's kernel.booted, and before the run it served is closed,
+  // the order the live kernel writes them in.
+  const log = rows(fx.dbPath)
+  const booted = log.filter((r) => r.type === 'kernel.booted').map((r) => r.seq)
+  assert.equal(booted.length, 1)
+  const runClosed = log.find((r) => r.type === 'run.finished' && (JSON.parse(r.payload) as { runId?: string }).runId === 'run_crashed')
+  assert.ok(runClosed, 'the crashed run was not closed')
+  assert.ok((booted[0] ?? Infinity) < (recovered[0]?.seq ?? 0), 'the revocation came before kernel.booted')
+  assert.ok((recovered[0]?.seq ?? Infinity) < runClosed.seq, 'the grant was revoked after the run it served was closed')
+  assert.equal(isClean(projectRecovery(readOnlyRows(fx.dbPath))), true)
+
+  const before = readOnlyRows(fx.dbPath).length
+  const second = await bootOn(t, fx)
+  assert.deepEqual(second.recovered.openGrants, [])
+  await second.shutdown()
+  assert.deepEqual(revokedRows(), afterFirst, 'the second boot revoked a grant again')
+  // Only the second boot's own bookkeeping: no recovery row of any kind.
+  const RECOVERY_TYPES = ['proxy.grant.revoked', 'run.finished', 'delegation.result', 'approval.resolved', 'quarantine.abandoned']
+  const added = readOnlyRows(fx.dbPath).slice(before).map((r) => r.type)
+  assert.ok(added.includes('kernel.booted'), 'the second boot wrote nothing at all')
+  assert.deepEqual(added.filter((type) => RECOVERY_TYPES.includes(type)), [])
+})
+
+/** Every row of a kernel's log, read back read-only, with its run and agent columns. */
+function readOnlyRows(dbPath: string): ReturnType<typeof readAllRows> {
+  const store = new EventStore(dbPath, { readOnly: true })
+  try {
+    return readAllRows(store.db)
+  } finally {
+    store.close()
+  }
+}
+
+test("a recovered grant's detail names both ways a grant is left open, quotes nothing from the log, and is a revocation the schema keeps whole", () => {
+  // A boot cannot tell a grant whose kernel died from one whose live
+  // revocation the store refused (src/egress/session.ts logs that and ends
+  // the session all the same, while the kernel runs on): the words cover
+  // both, and claim no kernel stopped where none did.
+  assert.match(GRANT_RECOVERED_DETAIL, /^no revocation of this grant was recorded: /)
+  assert.match(GRANT_RECOVERED_DETAIL, /the kernel that issued it stopped first, or its revocation could not be appended/)
+  assert.match(GRANT_RECOVERED_DETAIL, /nothing is served under it now/)
+  assert.ok(Buffer.byteLength(GRANT_RECOVERED_DETAIL) <= EGRESS_DETAIL_BYTES)
+  const row = { schemaVersion: 1, grantId: 'grant_left_open', reason: 'recovered', detail: GRANT_RECOVERED_DETAIL }
+  assert.deepEqual(ProxyGrantRevokedPayload.parse(row), row)
 })

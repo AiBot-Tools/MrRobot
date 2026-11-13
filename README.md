@@ -395,6 +395,7 @@ and outside this rule (decision D36, the last row).
 | Path | What |
 |---|---|
 | `.aos/events.db`, `.aos/events.head` | the event log and its anchor |
+| `.aos/kernel.lock`, `.aos/kernel.lock-journal` | the running kernel's hold on its data directory (an empty SQLite file, locked while a kernel runs, its lock dropped by the OS when that kernel ends), and the rollback journal SQLite keeps beside it while the hold lasts, holding only SQLite's journal header, and removes when the hold is released (one a killed kernel left stays until the next kernel's hold takes it over and removes it in turn); both 0600, the lock made so before SQLite opens it, so the journal takes its mode: one kernel per event log |
 | `.aos/workspaces/{trusted,hostile}` | sandbox mount roots, one per Colima VM |
 | `.aos/docker` | `DOCKER_CONFIG` for the kernel's docker calls, `colima-up.sh` and `build-worker-image.sh`, never `~/.docker` |
 | `.env` | your credentials (`AOS_CONTROL_TOKEN`, `AOS_PMMCP_TOKEN`, `ANTHROPIC_API_KEY`): written by you, or created at 0600 and appended to by `npm run aos-install`, which generates the two tokens, never writes `ANTHROPIC_API_KEY` and never changes a line; mode 0600, git-ignored; read, never written, by the other npm entry scripts; deleted by `git clean -fdx` like `.aos/` |
@@ -405,10 +406,12 @@ and outside this rule (decision D36, the last row).
 
 `dataDir` is `./.aos`, relative to the repo root, and is kept `0700`: created
 so on first boot, or tightened at boot when npm made `.aos` first for its cache
-(at your umask's 0755); `events.db` and its `-wal`/`-shm` are made `0600`. `AOS_DATA_DIR` overrides it, relative to your shell's directory. Inside the
-repo, `config.ts` accepts a data dir or mount root only under `.aos/`, and only
-while `.gitignore` ignores `/.aos/`. Whatever `kernel.yaml` or `AOS_DATA_DIR`
-names, `<repo>/.aos` itself must be a real directory spelled exactly so on disk:
+(at your umask's 0755); `events.db` and its `-wal`/`-shm`, and `kernel.lock`
+and its `-journal`, are made `0600`. `AOS_DATA_DIR` overrides it, relative to
+your shell's directory. Inside the repo, `config.ts` accepts a data dir or
+mount root only under `.aos/`, and only while `.gitignore` ignores `/.aos/`.
+Whatever `kernel.yaml` or `AOS_DATA_DIR` names, `<repo>/.aos` itself must be a
+real directory spelled exactly so on disk:
 a symlinked `.aos`, which git does not ignore and would commit with the path it
 names, or one stored as `.AOS`, is refused by name at boot. What sits beneath a
 real `.aos`, a linked `workspaces` included, is ignored with it.
@@ -538,7 +541,7 @@ the CLI, and kernel boot.
 
 | Stub | Where | How it refuses |
 |---|---|---|
-| `apple-container-driver` | `src/sandbox/apple-container.ts` | `probe()` reports unavailable with a reason so boot degrades; `run()` and `kill()` throw `NotImplementedError`. macOS 15 has no `container` binary |
+| `apple-container-driver` | `src/sandbox/apple-container.ts` | `probe()` reports unavailable with a reason so boot degrades; `run()`, `kill()`, `abandon()` and `sweepOrphans()` throw `NotImplementedError`. macOS 15 has no `container` binary |
 
 **Egress: built, and never yet run live.** The kernel's own egress engine
 (`src/egress/`) is the one way a container reaches anything (egress plan W1,
@@ -671,6 +674,55 @@ uses. An orphaned parent's recovered cost counts every child it paid for, as its
 live `run.finished` would have. `test/delegation-restart.test.ts` crashes a real
 kernel with a child mid-call and checks all of it, plus that a second restart
 finds nothing left.
+
+Egress adds a fifth (egress plan W2): a `proxy.grant.issued` with no
+`proxy.grant.revoked`, a grant whose kernel died while its container ran (or,
+rarely, one whose live revocation the store refused to append, which a boot
+cannot tell apart; its detail names both).
+Nothing can be served under it any more (the egress engine and the container's
+one channel were in the dead process), so boot writes the revocation, reason
+`recovered`, under the grant's run and agent (none, for a canary's), before
+that run's terminal row, and with no totals: the counts died with the kernel
+that kept them, and zeros would claim nothing crossed. Then, before it marks
+the sandbox subsystem, boot kills by name, on both VMs, the containers its log
+names that a VM still runs (the orphan sweep: `docker ps` for the `aos-run-`
+prefix, then `docker kill` on the VM that listed each), whatever the sandbox
+probe said, since a dead kernel's wallclock timers died with it. Only those
+the log names: a container of every run that called a sandbox tool, started a
+container or was issued a grant (a finished run's included, so a container a
+live kernel's kill missed is reaped at the next boot), and each open grant's
+container. A VM is shared by every kernel on the Mac, and a container with the
+prefix that this log does not name may be another data directory's live
+kernel's. A log with no sandbox run asks no VM anything. The sandbox's reason
+names what the sweep killed. Boot waits 30 s for it at most, then tells it to
+stop, so a listing a VM answers late kills nothing. A sweep that did not
+finish, that could not list a VM, or whose kill a daemon refused degrades the
+sandbox (and so egress), naming each, saying a container a previous kernel
+left may still be running, and the boot completes; the next boot sweeps for
+the same runs again. The sweep runs beside the sandbox probe, which boot also
+waits 30 s for at most (`PROBE_WAIT_MS` in `src/kernel.ts`), so a paused VM
+holds the boot one bound and degrades the sandbox rather than holding it for
+good; once boot stops waiting, the docker CLI of each probe call and each
+sweep listing still held is ended by SIGKILL, while a `docker kill` the sweep
+already sent is left to finish on its own. When both fail, the sandbox's
+reason names the probe's failure and then the sweep's, each also in a
+`sandbox.degraded` row of its own.
+
+All of that assumes the log has no live kernel, so boot first takes
+`<dataDir>/kernel.lock` (`src/data-lock.ts`), before it opens the log: SQLite's
+own exclusive lock on an empty file, held until shutdown has closed the log,
+and dropped by the OS when the process ends however it ends, so no stale lock
+is ever left to judge. A second kernel on the same data directory is refused
+there, before it writes anything, instead of closing the live kernel's runs as
+orphans, revoking their grants and killing their containers, and only then
+failing on the control port.
+
+`test/projections.test.ts` boots on such a log twice and checks that the first
+boot closes each grant once, a canary's under no run and no agent, and the
+second appends nothing; `test/kernel-boot.test.ts` checks the sweep reaches
+both VMs before the mark and kills only what the log names, and that a second
+kernel on the same data directory is refused; `test/entrypoints.test.ts`
+checks the same of a second `npm run dev`.
 
 It does **not** resume them, and that is a design decision rather than a gap:
 
@@ -1259,9 +1311,10 @@ kernel enforces or will enforce:
   route at all, so no container has a route there. Each domain's internal
   network stays, and the sandbox probe still refuses a domain whose docker
   network is not `--internal`, as defence in depth: no run is put on it.
-- **The kernel's egress engine denies it** (`src/egress`, wired since egress plan W1, never yet run live): a
-  worker's one way out is that engine, over its run's `docker -i` channel, and
-  it refuses `192.168.5.2`, `host.lima.internal` and `host.docker.internal`.
+- **The kernel's egress engine denies it** (`src/egress`, wired since egress
+  plan W1, never yet run live): a worker's one way out is that engine, over
+  its run's `docker -i` channel, and it refuses `192.168.5.2`,
+  `host.lima.internal` and `host.docker.internal`.
 
 pmmcp's other keys (Qdrant's `service.api_key`, the dashboard token, the curator
 secret) live in 0600 files under `~/.persistent-memory-mcp`, made by pmmcp's own
@@ -1381,7 +1434,7 @@ checks on the Mac" above.
 | pmmcp: Streamable HTTP interop with SDK 1.32.1 (same-origin redirects only, from 1.32.0), idle timeout vs the 240 s heartbeat (the 64 tool names, their input schemas and their output schemas, every one FastMCP's `{result: string}`, are captured in `test/fixtures/pmmcp-listtools.json`, re-taken 2026-10-19) | boot with pmmcp up: `hub.connected` and `hub.tools.classified` list what is really there; checklist line 2 |
 | An Anthropic API key accepted as `Authorization: Bearer` (D20's alternative) | one `npm run cli -- probe anthropic/claude-sonnet-5` with `auth.header: Authorization` |
 | Whether SIGKILL of the docker client leaves its container running, which is why the driver kills by name | Phase 2 live Docker driver tests |
-| What `docker run -i` gives a channel run through Colima's forwarded socket (a spec's `channel`, on the trusted domain only: `buildRunArgs` and `DockerDriver.run` in `src/sandbox/docker.ts`, which add `-i` beside `--init`, never `-t`, and hand the CLI's own stdin and stdout to the caller unread): the bytes carried both ways as they are, the CLI's stdin ending as the container's end of file, and the CLI exiting once its container has, its stdin still open; and what the CLI does when the reader of its stdout goes away (the kernel destroys the channel's input): its next copy of container output is expected to fail with EPIPE rather than kill it by SIGPIPE, as it catches every signal to relay it, and it is expected to exit while its `--rm` container runs on unattached, past its wallclock, which the CLI's exit clears. Check whether the container outlives the CLI, and for how long. Whatever it shows, a caller ends a channel run with `kill(name)`, never by destroying its input (`SandboxChannel` in `src/sandbox/driver.ts`), and the deadline is to stay armed until a kill by name succeeds (the wallclock note in `DockerDriver.run`; plan W1, W2) | Phase 2 live Docker driver tests (egress plan L1), on each VM |
+| What `docker run -i` gives a channel run through Colima's forwarded socket (a spec's `channel`, on the trusted domain only: `buildRunArgs` and `DockerDriver.run` in `src/sandbox/docker.ts`, which add `-i` beside `--init`, never `-t`, and hand the CLI's own stdin and stdout to the caller unread): the bytes carried both ways as they are, the CLI's stdin ending as the container's end of file, and the CLI exiting once its container has, its stdin still open; and what the CLI does when the reader of its stdout goes away (the kernel destroys the channel's input): its next copy of container output is expected to fail with EPIPE rather than kill it by SIGPIPE, as it catches every signal to relay it, and it is expected to exit while its `--rm` container runs on unattached, past its wallclock, which the CLI's exit clears. Check whether the container outlives the CLI, and for how long. Whatever it shows, a caller ends a channel run with `kill(name)`, never by destroying its input (`SandboxChannel` in `src/sandbox/driver.ts`), and the deadline is to stay armed until a kill by name succeeds (the wallclock note in `DockerDriver.run`: open, and owned by no plan task yet; until it is, only the next boot's orphan sweep, plan W2, reaps a container such a kill missed) | Phase 2 live Docker driver tests (egress plan L1), on each VM |
 | That docker 29.5.2 runs `docker run --pull=never sha256:<64 hex>` from the image of that id on the VM, under whichever image store the VM uses, and fails with no such image rather than pulling when the VM lacks it; and that `docker save` on the trusted VM and `docker load` on the hostile one keep the id the same, so one `sandbox.imageId` names the image on both; and that `docker image inspect --format {{.Id}} sha256:<64 hex>` prints that same id on a VM that holds the image and fails on one that lacks it, which the probe asks of each VM (`buildRunArgs`, `assertTheImage` and `#imageMissingOn` in `src/sandbox/docker.ts`; kernel.yaml ships no id, so the sandbox is degraded until the image is built, pinned and held by both VMs) | Phase 2 live Docker driver tests (egress plan L1), on each VM, once `scripts/build-worker-image.sh` (plan I1) has built the image |
 | `scripts/build-worker-image.sh` and `images/worker/Dockerfile`, each marked NEEDS VALIDATION on its line 2: that the docker CLI, given only `DOCKER_CONFIG`, `DOCKER_HOST` and `PATH` as the kernel's own calls are, builds through the trusted VM's daemon with whichever builder it finds (the Dockerfile keeps to the classic builder's syntax: no syntax directive, heredoc or `--chmod`); that the base, `node:24-bookworm-slim` by the digest of its index, gives the VMs its arm64 image; that `ENTRYPOINT []` leaves the image with no entrypoint, which the script checks as `{{json .Config.Entrypoint}}` printing `null` or `[]`; and that bookworm's git (2.39), matching `safe.directory = /workspace` exactly, admits a repository cloned into `/workspace` itself and refuses one in a directory under it, which virtiofs shows as the operator's `501:20`; and what the image's `NODE_USE_ENV_PROXY=1` does on its Node (24.22.2): on Node 22.22 every node process started with it, the mux included, every `node --test` child and any Node command an agent runs, prints `[UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental` to stderr, so check whether 24.22.2 still does; and, with `NO_PROXY` empty, a request to a server the run itself listens on at `127.0.0.1` goes to the mux like any other (seen on Node 22.22, on loopback), which the kernel denies, so the Phase 2 exit's fixture repository (egress plan L2) keeps its tests off loopback HTTP; and, before the first build, what `ls -l ~/.colima/docker.sock` shows: nothing there, or a link to `~/.colima/default/docker.sock`, is expected. The build's plan refuses a `dockerHost` that is the same file as that name (`defaultSockets` in `scripts/worker-image.ts`), on the understanding, not checked against Colima 0.10.3, that Colima keeps it for the default profile alone; if it links to the trusted or hostile VM's socket instead, the plan refuses the shipped kernel.yaml as the default profile's, and that check needs changing before the image can be built | the operator runs the script once on the Mac and pins the id it prints as `sandbox.imageId`; then the Phase 2 live Docker driver tests (egress plan L1) |
 | The docker CLI's exit code once its container is killed by name from another client (`docker kill --signal=KILL aos-run-<id>`), with the driver's `--init` and `--rm`: 137 is expected, and the driver credits a kill (`killedBy`, SIGKILL) only on a 137 (`finish()` in `DockerDriver.run`). Any other code would make every kernel kill read as a run that ended on its own, leaving only `overran` to show a wallclock breach | Phase 2 live Docker driver tests, on each VM |

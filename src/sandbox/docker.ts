@@ -93,6 +93,7 @@ import {
   CAPTURE_MAX_BYTES,
   CONTAINER_PREFIX,
   channelRefusal,
+  containerRunId,
   readSpecOnce,
   type ProbeResult,
   type RunningSandbox,
@@ -101,6 +102,8 @@ import {
   type SandboxDriver,
   type SandboxResult,
   type SandboxSpec,
+  type SweepRequest,
+  type SweepResult,
 } from './driver.js'
 
 // The prefix every kernel container's name carries: the interface's rule
@@ -992,10 +995,19 @@ export type SpawnFn = (
   options: { env: Record<string, string> },
 ) => ChildLike
 
+/**
+ * Node's promisified execFile, as far as the driver uses it. `signal`, when
+ * given, ends the child once aborted, by `killSignal` (the probe's calls and
+ * the sweep's listings name SIGKILL: a docker CLI held by a daemon that
+ * never answers is the driver's own child, and only its end frees it), and
+ * the call then rejects. realDockerProcesses hears the signal itself, since
+ * Node's own `signal` option ends a child by SIGTERM whatever `killSignal`
+ * says.
+ */
 export type ExecFileFn = (
   command: string,
   args: readonly string[],
-  options: { env: Record<string, string> },
+  options: { env: Record<string, string>; signal?: AbortSignal; killSignal?: 'SIGKILL' },
 ) => Promise<{ stdout: string; stderr: string }>
 
 export interface DockerDriverOptions {
@@ -1147,6 +1159,16 @@ function channelOf(child: ChildLike, stderr: Capture): SandboxChannel | undefine
  */
 export const PROBE_ERROR_BYTES = 1_024
 
+/**
+ * What probe() says once its caller has stopped waiting (its signal
+ * aborted): nothing more was asked, and no answer that came late is read.
+ * Boot records its own reason then, naming its bound, and never this.
+ */
+export const PROBE_STOPPED: ProbeResult = Object.freeze({
+  ok: false,
+  why: 'the probe was told to stop before every runtime answered, so the sandbox is not known to work',
+})
+
 /** What docker said when one of probe()'s calls failed: redacted, and cut to PROBE_ERROR_BYTES (recordable). */
 function dockerSaid(e: unknown): string {
   return recordable(e instanceof Error ? e.message : String(e), PROBE_ERROR_BYTES)
@@ -1202,7 +1224,26 @@ export class DockerDriver implements SandboxDriver {
     }
   }
 
-  async probe(): Promise<ProbeResult> {
+  /**
+   * The options of one of probe()'s calls: its domain's environment, and the
+   * caller's signal, which ends the docker CLI by SIGKILL once aborted.
+   */
+  #probeCall(
+    domain: SandboxDomain,
+    signal: AbortSignal | undefined,
+  ): { env: Record<string, string>; signal?: AbortSignal; killSignal?: 'SIGKILL' } {
+    return { env: this.#env(domain), ...(signal === undefined ? {} : { signal, killSignal: 'SIGKILL' as const }) }
+  }
+
+  /**
+   * Whether the pinned image runs on each domain: the id pinned, a daemon
+   * that answers, each domain's network internal, and the image on each VM
+   * by that id (SandboxDriver.probe). Each call goes out only while `signal`
+   * is not aborted, and an abort ends the one in flight (its CLI, by
+   * SIGKILL): boot stops waiting at PROBE_WAIT_MS, and a CLI a paused VM
+   * holds is not left running behind it.
+   */
+  async probe(signal?: AbortSignal): Promise<ProbeResult> {
     // No run can be built without a pinned image, whatever the daemons say,
     // so none is asked anything: degraded, saying which key to set and how to
     // get its value, and nothing pulled now or at a run.
@@ -1211,12 +1252,24 @@ export class DockerDriver implements SandboxDriver {
     // imageIdProblem has passed it, so it is an id, sha256:<64 hex>.
     const imageId = String(this.#options.imageId)
 
+    // A function, so that each read is of the signal as it is now.
+    const stopped = (): boolean => signal?.aborted === true
+    if (stopped()) return PROBE_STOPPED
+    const found = await this.#probeDaemons(imageId, stopped, signal)
+    // A late answer is no answer, an ok or a failure alike: its caller has
+    // stopped waiting, and recorded its own reason, and what docker said once
+    // its CLI was ended is only that it was ended.
+    return stopped() ? PROBE_STOPPED : found
+  }
+
+  /** probe()'s calls to the daemons, each sent only while `stopped` says no. */
+  async #probeDaemons(imageId: string, stopped: () => boolean, signal: AbortSignal | undefined): Promise<ProbeResult> {
     let version: string
     try {
       const { stdout } = await this.#options.execFile(
         this.#binary,
         ['version', '--format', '{{.Server.Version}}'],
-        { env: this.#env('trusted') },
+        this.#probeCall('trusted', signal),
       )
       version = stdout.trim()
       if (version === '') return { ok: false, why: 'docker version reported no server version' }
@@ -1255,12 +1308,13 @@ export class DockerDriver implements SandboxDriver {
             `(docker network create --internal aos-${domain})`,
         }
       }
+      if (stopped()) return PROBE_STOPPED
       let internal: string
       try {
         const { stdout } = await this.#options.execFile(
           this.#binary,
           ['network', 'inspect', '--format', '{{.Internal}}', network],
-          { env: this.#env(domain) },
+          this.#probeCall(domain, signal),
         )
         internal = stdout.trim()
       } catch (e) {
@@ -1292,7 +1346,8 @@ export class DockerDriver implements SandboxDriver {
       // print the pin itself as the image's id: the pin is what it prints
       // (isImageId), and an id it prints differently is not the one pinned.
       // `image inspect` reads the VM's own store and never pulls.
-      const missing = await this.#imageMissingOn(domain, imageId)
+      if (stopped()) return PROBE_STOPPED
+      const missing = await this.#imageMissingOn(domain, imageId, signal)
       if (missing !== undefined) return { ok: false, why: missing }
     }
     return { ok: true, version }
@@ -1302,13 +1357,13 @@ export class DockerDriver implements SandboxDriver {
    * Why the pinned image cannot run on `domain`'s VM, or undefined when that
    * VM's daemon has it and prints the pin as its id.
    */
-  async #imageMissingOn(domain: SandboxDomain, imageId: string): Promise<string | undefined> {
+  async #imageMissingOn(domain: SandboxDomain, imageId: string, signal: AbortSignal | undefined): Promise<string | undefined> {
     let printed: string
     try {
       const { stdout } = await this.#options.execFile(
         this.#binary,
         ['image', 'inspect', '--format', '{{.Id}}', imageId],
-        { env: this.#env(domain) },
+        this.#probeCall(domain, signal),
       )
       printed = stdout.trim()
     } catch (e) {
@@ -1425,8 +1480,11 @@ export class DockerDriver implements SandboxDriver {
       // longer trusts without negotiating. On the spec's own domain, which the
       // timer knows without asking anyone.
       //
-      // Not yet hard enough, and still open now that runs start containers
-      // (sandbox.exec, egress plan W1a; plan W2 closes it): this is one
+      // Not yet hard enough, still open now that runs start containers
+      // (sandbox.exec, egress plan W1a), and owned by no plan task: under a
+      // live kernel nothing else reaps a container this kill missed, and the
+      // boot sweep (plan W2) reaps it only at the next boot, as a container
+      // of a run its log names. This is one
       // `docker kill` that nothing waits on, #killOn swallows
       // every failure (a transient "Cannot connect to the Docker daemon" too,
       // with no retry and no log line), and the timer is cleared when the
@@ -1633,26 +1691,49 @@ export class DockerDriver implements SandboxDriver {
   }
 
   /**
-   * Kill every container the kernel left behind.
+   * Kill every container the request names that a VM still runs
+   * (SandboxDriver.sweepOrphans).
    *
-   * Meant for boot: a kernel that crashed mid-run leaves a container holding
-   * a workspace and a CPU, and nothing else will ever reap it. Nothing calls
-   * it yet: runs start containers (sandbox.exec, wired since egress plan
-   * W1a), so a kernel that crashes mid-exec leaves one running, to its
-   * wallclock at most, until the boot sweep lands (plan W2).
+   * For boot: a kernel that crashed mid-run leaves a container holding a
+   * workspace and a CPU, past its wallclock, whose timer died with that
+   * kernel, and nothing else will ever reap it. Boot calls it (egress plan
+   * W2) before it marks the sandbox subsystem, with what src/kernel.ts
+   * sweepTargets reads from its own log: every run of that log that called
+   * a sandbox tool, started a container or was issued a grant, finished runs
+   * included (a live kernel's kill by name can fail too), and each open
+   * grant's container by name; and waits for it SWEEP_WAIT_MS at most
+   * (sweepAtBoot). Only those: a VM is shared by every kernel on the Mac (a
+   * second checkout, another data directory), and a container with the
+   * prefix the log does not name may be a live kernel's. A request that
+   * names nothing asks no daemon anything.
    *
    * Every domain is listed at once, as kill() asks every domain at once: a
    * daemon that accepts the connection and never answers `ps` (no execFile
-   * timeout stands behind it) must not stop the other VM being listed and
-   * swept. The names are those of the trusted VM, then the hostile one's.
+   * timeout stands behind it, only the caller's signal) must not stop the
+   * other VM being listed and swept. The names are those of the trusted VM,
+   * then the hostile one's.
    */
-  async sweepOrphans(): Promise<string[]> {
-    const swept = await Promise.all(DOMAINS.map((domain) => this.#sweepOn(domain)))
-    return swept.flat()
+  async sweepOrphans(request: SweepRequest): Promise<SweepResult> {
+    const runIds = new Set(request.runIds)
+    const names = new Set(request.names)
+    if (runIds.size === 0 && names.size === 0) return { swept: [], unlisted: [], failed: [] }
+    const named = (name: string): boolean => {
+      if (!name.startsWith(CONTAINER_PREFIX)) return false
+      if (names.has(name)) return true
+      const runId = containerRunId(name)
+      return runId !== undefined && runIds.has(runId)
+    }
+    const per = await Promise.all(DOMAINS.map((domain) => this.#sweepOn(domain, named, request.signal)))
+    return {
+      swept: per.flatMap((p) => p.swept),
+      unlisted: per.flatMap((p) => (p.unlisted === undefined ? [] : [{ domain: p.domain, why: p.unlisted }])),
+      failed: per.flatMap((p) => p.failed),
+    }
   }
 
   /**
-   * List one domain's orphans, then kill them all on it at once.
+   * List one domain's containers of the kernel's, then kill on it, all at
+   * once, those the request names.
    *
    * By name, so never with `--quiet`: the docker CLI ignores a custom
    * `--format` when `--quiet` is set ("WARNING: Ignoring custom format,
@@ -1661,30 +1742,89 @@ export class DockerDriver implements SandboxDriver {
    * kill nothing. Nor `--no-trunc`: it is for IDs and commands, and a name is
    * never cut short without it; on names it only adds a linked container's
    * legacy `--link` aliases, comma-joined, to the one name wanted.
+   *
+   * Nothing is listed once the caller has stopped waiting, and nothing is
+   * killed after it: a late listing is read as no listing, and a listing in
+   * flight then is ended (its CLI, by SIGKILL).
    */
-  async #sweepOn(domain: SandboxDomain): Promise<string[]> {
+  async #sweepOn(
+    domain: SandboxDomain,
+    named: (name: string) => boolean,
+    signal: AbortSignal,
+  ): Promise<{
+    readonly domain: SandboxDomain
+    readonly swept: string[]
+    readonly unlisted?: string
+    readonly failed: { name: string; domain: SandboxDomain; why: string }[]
+  }> {
+    const stopped = { domain, swept: [], unlisted: 'the sweep was given up before this VM answered', failed: [] }
+    if (signal.aborted) return stopped
     let stdout: string
     try {
+      // The caller's signal ends a listing a paused VM holds (its CLI, by
+      // SIGKILL), as it ends the probe's calls.
       ;({ stdout } = await this.#options.execFile(
         this.#binary,
         ['ps', '--filter', `name=${CONTAINER_PREFIX}`, '--format', '{{.Names}}'],
-        { env: this.#env(domain) },
+        { env: this.#env(domain), signal, killSignal: 'SIGKILL' },
       ))
-    } catch {
-      return []
+    } catch (e) {
+      if (signal.aborted) return stopped
+      return { domain, swept: [], unlisted: sweepSaid(e), failed: [] }
     }
-    // Only ours. A filter is a request, not a guarantee.
-    const names = stdout.split('\n').map((s) => s.trim()).filter((s) => s.startsWith(CONTAINER_PREFIX))
+    if (signal.aborted) return stopped
+    // Only ours, and only those the log names. A filter is a request, not a guarantee.
+    const listed = stdout.split('\n').map((s) => s.trim()).filter(named)
     // On the daemon that listed each, which is the one that holds it, and all
     // at once, so that one kill which never returns holds up no other.
-    await Promise.all(names.map((name) => this.#killOn(name, domain)))
-    return names
+    const ends = await Promise.all(listed.map(async (name) => ({ name, why: await this.#sweepKill(name, domain) })))
+    return {
+      domain,
+      swept: ends.filter((end) => end.why === undefined).map((end) => end.name),
+      failed: ends.flatMap((end) => (end.why === undefined ? [] : [{ name: end.name, domain, why: end.why }])),
+    }
   }
+
+  /**
+   * The sweep's `docker kill`: undefined once the daemon has answered that
+   * it killed the container, or that the container no longer runs (it
+   * exited between the listing and the kill), else what the daemon said.
+   * Unlike #killOn, a refusal is reported: the container may still run, and
+   * boot says so.
+   */
+  async #sweepKill(name: string, domain: SandboxDomain): Promise<string | undefined> {
+    try {
+      await this.#options.execFile(this.#binary, ['kill', '--signal=KILL', name], { env: this.#env(domain) })
+      return undefined
+    } catch (e) {
+      const said = sweepSaid(e)
+      return /no such container|is not running/i.test(said) ? undefined : said
+    }
+  }
+}
+
+/** The most of what docker said that a sweep's result keeps, per domain or kill. */
+export const SWEEP_SAID_CHARS = 200
+
+/**
+ * What docker said when one of the sweep's calls failed: the first line of
+ * its stderr, else of the error's message, cut to SWEEP_SAID_CHARS. Not
+ * redacted here: the kernel records the whole sweep's reason through
+ * recordable.
+ */
+function sweepSaid(e: unknown): string {
+  const stderr = typeof e === 'object' && e !== null && 'stderr' in e ? String((e as { stderr: unknown }).stderr) : ''
+  const text = stderr.trim() !== '' ? stderr : e instanceof Error ? e.message : String(e)
+  const line = text.trim().split('\n')[0]?.trim() ?? ''
+  // By code point, so a cut never splits a surrogate pair.
+  const points = [...line]
+  const cut = points.length > SWEEP_SAID_CHARS ? `${points.slice(0, SWEEP_SAID_CHARS).join('')}…` : line
+  return cut === '' ? 'it failed and said nothing' : cut
 }
 
 /**
  * The two functions through which the driver reaches the docker CLI. Only
- * realDockerDriver binds them to node:child_process; a test hands its own.
+ * realDockerProcesses binds them to node:child_process; a test hands its own.
  */
 export type DockerProcesses = Pick<DockerDriverOptions, 'spawn' | 'execFile'>
 
@@ -1703,9 +1843,47 @@ export type DockerProcesses = Pick<DockerDriverOptions, 'spawn' | 'execFile'>
 export function realDockerDriver(
   options: Omit<DockerDriverOptions, 'spawn' | 'execFile'>,
 ): DockerDriver {
-  return new DockerDriver({
-    ...options,
+  // By name, never spread last: a value handed as `options` is not checked
+  // for excess properties, and one carrying process functions of its own
+  // must not stand in for these.
+  const processes = realDockerProcesses()
+  return new DockerDriver({ ...options, spawn: processes.spawn, execFile: processes.execFile })
+}
+
+/**
+ * realDockerDriver's two process functions, bound to node:child_process.
+ * Exported only so that test/sandbox-docker.test.ts can hand the bound
+ * execFile a signal the driver itself never sends, one already aborted:
+ * test/hygiene.test.ts holds every other module, src and test, to naming it
+ * in no line of code, so the kernel reaches a process only through a
+ * DockerDriver.
+ */
+export function realDockerProcesses(): DockerProcesses {
+  return {
     spawn: (command, args, opts) => spawn(command, [...args], opts),
-    execFile: (command, args, opts) => execFileAsync(command, [...args], opts),
-  })
+    execFile: (command, args, opts) => {
+      const { signal, killSignal, ...rest } = opts
+      const call = execFileAsync(command, [...args], rest)
+      // The signal is heard here, not handed to Node: Node's execFile ends
+      // a child its signal aborts by SIGTERM whatever killSignal says
+      // (killSignal is its timeout's), and a docker CLI a paused VM holds is
+      // ended for sure only by SIGKILL. The call then rejects once the child
+      // has exited, which a SIGKILL makes at once. A signal already aborted
+      // fires no abort event again, so its child is ended here, at once.
+      if (signal !== undefined) {
+        const end = (): void => {
+          call.child.kill(killSignal ?? 'SIGTERM')
+        }
+        if (signal.aborted) end()
+        else {
+          signal.addEventListener('abort', end, { once: true })
+          const unhear = (): void => {
+            signal.removeEventListener('abort', end)
+          }
+          call.then(unhear, unhear)
+        }
+      }
+      return call
+    },
+  }
 }

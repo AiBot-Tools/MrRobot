@@ -298,6 +298,12 @@ test('node:child_process is imported only by src/sandbox/docker.ts and five test
   ])
   // The composer asks for a driver and does not wire processes itself.
   assert.equal(importersOf(SRC, 'node:child_process').includes('src/kernel.ts'), false)
+  // docker.ts's bound process functions, exported only so one test can hand
+  // the bound execFile a signal already aborted, which no driver call sends:
+  // anything else that named them would run a process with no DockerDriver
+  // around it, whatever argv it chose. In code, so a comment naming the rule
+  // does not break it.
+  assert.deepEqual(pathsOf(hits([...SRC, ...TEST], /\brealDockerProcesses\b/)), ['src/sandbox/docker.ts', 'test/sandbox-docker.test.ts'])
 
   // Inside the worker image, the one spawner is images/worker/mux.mjs, which
   // runs the agent's command in the container as docker.ts runs the container
@@ -760,13 +766,16 @@ test('no source file writes to souls/ or AGENTS.md', () => {
   // put a model's persona one bug away from being editable by the model.
   const WRITE = /\b(writeFileSync|writeFile|appendFileSync|appendFile|createWriteStream|writeSync|rmSync|unlinkSync|renameSync|mkdirSync|chmodSync|fchmodSync|copyFileSync|truncateSync)\s*\(/
 
-  // Only five modules in src/ write to the filesystem at all. Three write
-  // under the data directory; one is the .env writer, which writes
-  // <repo>/.env and nothing else (its own rules below); and sandbox.exec makes
-  // a run's workspace, one directory <mountRoot>/<runId> under a sandbox
-  // domain's mountRoot, and nothing else (egress plan S3). A sixth is a new
-  // writer and must be looked at.
+  // Only six modules in src/ write to the filesystem at all. Four write
+  // under the data directory, the kernel's lock among them (src/data-lock.ts,
+  // which only creates <dataDir>/kernel.lock, empty, and makes it and its
+  // journal 0600); one is the
+  // .env writer, which writes <repo>/.env and nothing else (its own rules
+  // below); and sandbox.exec makes a run's workspace, one directory
+  // <mountRoot>/<runId> under a sandbox domain's mountRoot, and nothing else
+  // (egress plan S3). A seventh is a new writer and must be looked at.
   assert.deepEqual(pathsOf(hits(SRC, WRITE)), [
+    'src/data-lock.ts',
     'src/events/anchor.ts',
     'src/kernel.ts',
     'src/models/probe.ts',
@@ -779,6 +788,39 @@ test('no source file writes to souls/ or AGENTS.md', () => {
     ['mkdirSync(workspace, { mode: 0o700 })'],
     'sandbox-tools.ts writes only the run workspace it names',
   )
+  const lockWrites = hits(SRC.filter((f) => f.path === 'src/data-lock.ts'), WRITE)
+  assert.deepEqual(
+    lockWrites.map((h) => h.replace(/^[^ ]+ +/, '')),
+    ['chmodSync(path, 0o600)'],
+    'data-lock.ts writes only the mode of the lock file and its journal',
+  )
+  // And it creates the lock by one open, exclusive and 0600, and opens
+  // nothing else: an openSync writes as soon as its flags say so, which WRITE
+  // does not read. Read from the syntax tree, so a call however it is laid
+  // out or nested counts, and its fs functions by their own names only, so
+  // none comes in under another.
+  const lockFile = SRC.find((f) => f.path === 'src/data-lock.ts')
+  assert.ok(lockFile)
+  const lockTree = ts.createSourceFile(lockFile.path, lockFile.text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const lockOpens: string[] = []
+  const lockFs: string[] = []
+  const visitLock = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const callee = node.expression
+      const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : undefined
+      if (name !== undefined && /^open(?:Sync)?$/.test(name)) lockOpens.push(node.getText(lockTree).replace(/\s+/g, ' '))
+    }
+    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && /^(?:node:)?fs(?:\/promises)?$/.test(node.moduleSpecifier.text)) {
+      const clause = node.importClause
+      const bindings = clause?.namedBindings
+      if (clause?.name !== undefined || bindings === undefined || !ts.isNamedImports(bindings)) lockFs.push(node.getText(lockTree))
+      else for (const el of bindings.elements) lockFs.push(el.propertyName === undefined ? el.name.text : `${el.propertyName.text} as ${el.name.text}`)
+    }
+    ts.forEachChild(node, visitLock)
+  }
+  visitLock(lockTree)
+  assert.deepEqual(lockOpens, ["openSync(path, 'wx', 0o600)"], 'data-lock.ts opens a file other than by the exclusive 0600 create of its lock')
+  assert.deepEqual(lockFs, ['chmodSync', 'closeSync', 'lstatSync', 'openSync'], "data-lock.ts takes fs functions this pin does not read")
 
   // No write call site anywhere mentions a protected path.
   const suspicious = hits(SRC, WRITE).filter((h) => /soul|AGENTS|agent\.yaml/i.test(h))

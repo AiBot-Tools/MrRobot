@@ -115,7 +115,7 @@ import './helpers/guard.js'
 
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { userInfo } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough, Readable, Writable } from 'node:stream'
@@ -135,14 +135,19 @@ import {
   CONTAINER_PREFIX,
   DockerDriver,
   PROBE_ERROR_BYTES,
+  PROBE_STOPPED,
+  realDockerDriver,
+  realDockerProcesses,
+  SWEEP_SAID_CHARS,
   WORKSPACE_TARGET,
   type ChildLike,
   type DockerDefaults,
   type DomainConfig,
 } from '../src/sandbox/docker.js'
 import { AppleContainerDriver } from '../src/sandbox/apple-container.js'
-import { CAPTURE_MAX_BYTES, readSpecOnce, type SandboxDriver, type SandboxResult, type SandboxSpec } from '../src/sandbox/driver.js'
+import { CAPTURE_MAX_BYTES, containerName, containerRunId, readSpecOnce, type SandboxDriver, type SandboxResult, type SandboxSpec, type SweepRequest } from '../src/sandbox/driver.js'
 import { fakeSandbox } from './helpers/fake-sandbox.js'
+import { until } from './helpers/fake-egress.js'
 
 const DEFAULTS: DockerDefaults = { user: '65534:65534', pidsLimit: 256, memory: '2g', cpus: 2 }
 
@@ -1293,6 +1298,8 @@ interface Spied {
   readonly driver: DockerDriver
   readonly spawns: { args: readonly string[]; env: Record<string, string> }[]
   readonly execs: { args: readonly string[]; env: Record<string, string> }[]
+  /** Each execFile call's signal and killSignal, beside its argv, in call order. */
+  readonly execOptions: { args: readonly string[]; signal: AbortSignal | undefined; killSignal: string | undefined }[]
   readonly child: FakeChild
   setExec(fn: ScriptedExec): void
   /** The next spawn throws this, as Node's spawn does for an argument it refuses. */
@@ -1323,6 +1330,7 @@ const HOSTILE_HOST = 'unix:///tmp/colima-hostile.sock'
 function driverFor(f: Fixture, streams?: ChildStreams, pinned: { readonly imageId: string | undefined } = { imageId: IMAGE_ID }): Spied {
   const spawns: Spied['spawns'] = []
   const execs: Spied['execs'] = []
+  const execOptions: Spied['execOptions'] = []
   const child = fakeChild(streams)
   let exec: ScriptedExec = () => Promise.resolve({ stdout: '', stderr: '' })
   let spawnFailure: Error | undefined
@@ -1337,6 +1345,7 @@ function driverFor(f: Fixture, streams?: ChildStreams, pinned: { readonly imageI
     },
     execFile: (_cmd, args, options) => {
       execs.push({ args, env: options.env })
+      execOptions.push({ args, signal: options.signal, killSignal: options.killSignal })
       return exec(args, options.env)
     },
     domains: { trusted: f.domain, hostile: f.hostile },
@@ -1352,6 +1361,7 @@ function driverFor(f: Fixture, streams?: ChildStreams, pinned: { readonly imageI
     driver,
     spawns,
     execs,
+    execOptions,
     child,
     setExec(fn) {
       exec = fn
@@ -2613,6 +2623,213 @@ test('the fake and the real driver agree: only the pinned image id runs, a tag o
   }
 })
 
+// ── a probe told to stop (boot's PROBE_WAIT_MS) ────────────────────────────
+//
+// A paused VM accepts the connection and never answers. Boot stops waiting
+// at its bound and aborts the probe's signal: the probe asks nothing more,
+// reads no answer that comes after, and ends the docker CLI it waits on.
+
+/** An exec whose every call waits until the test answers it, or rejects as Node's execFile does once its signal is aborted. */
+function heldDaemon(d: Spied): { readonly answers: ((stdout: string) => void)[] } {
+  const answers: ((stdout: string) => void)[] = []
+  d.setExec(() => {
+    const signal = d.execOptions[d.execOptions.length - 1]?.signal
+    return new Promise((resolve, reject) => {
+      answers.push((stdout) => {
+        resolve({ stdout, stderr: '' })
+      })
+      signal?.addEventListener('abort', () => {
+        reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' }))
+      })
+    })
+  })
+  return { answers }
+}
+
+test("probe hands each of its calls the caller's signal with SIGKILL, asks nothing once it is aborted, and reads no answer that comes after", async (t) => {
+  // Healthy and handed a signal: every call carries it, to be ended by SIGKILL.
+  const f = fixture(t)
+  const d = driverFor(f)
+  d.setExec(healthyDaemon('29.5.2'))
+  const stop = new AbortController()
+  assert.deepEqual(await d.driver.probe(stop.signal), { ok: true, version: '29.5.2' })
+  assert.deepEqual(d.execOptions.map((o) => o.args[0]), ['version', 'network', 'image', 'network', 'image'])
+  for (const o of d.execOptions) {
+    assert.equal(o.signal, stop.signal, `${o.args.join(' ')} was not handed the probe's signal`)
+    assert.equal(o.killSignal, 'SIGKILL', `${o.args.join(' ')} would end its CLI by a signal a held CLI may ignore`)
+  }
+  // Handed none, as a caller that bounds nothing: no signal, and no killSignal.
+  const bare = driverFor(fixture(t))
+  bare.setExec(healthyDaemon('29.5.2'))
+  assert.deepEqual(await bare.driver.probe(), { ok: true, version: '29.5.2' })
+  for (const o of bare.execOptions) assert.deepEqual([o.signal, o.killSignal], [undefined, undefined])
+
+  // Stopped while `docker version` is held: it rejects as Node's execFile
+  // does, and the probe says it was stopped, never what the abort said.
+  const held = driverFor(fixture(t))
+  heldDaemon(held)
+  const first = new AbortController()
+  const probing = held.driver.probe(first.signal)
+  await new Promise((resolve) => setImmediate(resolve))
+  first.abort()
+  assert.deepEqual(await probing, PROBE_STOPPED)
+  assert.deepEqual(held.execOptions.map((o) => o.args[0]), ['version'])
+
+  // Stopped while `docker version` is held, which then answers anyway (a
+  // fake that ignores the signal): nothing more is asked, though every
+  // other call would be answered at once.
+  const late = driverFor(fixture(t))
+  const lateAnswers: ((stdout: string) => void)[] = []
+  const answersAtOnce = healthyDaemon('29.5.2')
+  late.setExec((args, env) =>
+    args[0] === 'version' ? new Promise((resolve) => lateAnswers.push((stdout) => resolve({ stdout, stderr: '' }))) : answersAtOnce(args, env),
+  )
+  const second = new AbortController()
+  const lateProbe = late.driver.probe(second.signal)
+  await new Promise((resolve) => setImmediate(resolve))
+  second.abort()
+  lateAnswers[0]?.('29.5.2\n')
+  assert.deepEqual(await lateProbe, PROBE_STOPPED)
+  assert.deepEqual(late.execOptions.map((o) => o.args[0]), ['version'], 'a probe told to stop asked a daemon something more')
+
+  // Stopped while the trusted VM's `network inspect` is held, which then
+  // answers that the network is internal: the image on that VM is not asked
+  // about, though its daemon would answer at once. The stop is read again
+  // before each call, not only before each domain's first.
+  const mid = driverFor(fixture(t))
+  const midAnswers: ((stdout: string) => void)[] = []
+  const answersRest = healthyDaemon('29.5.2')
+  mid.setExec((args, env) =>
+    args[0] === 'network' && env['DOCKER_HOST'] === TRUSTED_HOST
+      ? new Promise((resolve) => midAnswers.push((stdout) => resolve({ stdout, stderr: '' })))
+      : answersRest(args, env),
+  )
+  const fourth = new AbortController()
+  const midProbe = mid.driver.probe(fourth.signal)
+  await until(() => midAnswers.length === 1, "the trusted VM's network inspect")
+  fourth.abort()
+  midAnswers[0]?.('true\n')
+  assert.deepEqual(await midProbe, PROBE_STOPPED)
+  assert.deepEqual(mid.execOptions.map((o) => o.args[0]), ['version', 'network'], "a probe told to stop asked about the trusted VM's image")
+
+  // Stopped while the last call (the hostile VM's image) is held, which then
+  // answers the pinned id: no ok is given after the stop.
+  const last = driverFor(fixture(t))
+  const lastAnswers: ((stdout: string) => void)[] = []
+  const healthy = healthyDaemon('29.5.2')
+  last.setExec((args, env) =>
+    args[0] === 'image' && env['DOCKER_HOST'] === HOSTILE_HOST
+      ? new Promise((resolve) => lastAnswers.push((stdout) => resolve({ stdout, stderr: '' })))
+      : healthy(args, env),
+  )
+  const third = new AbortController()
+  const lastProbe = last.driver.probe(third.signal)
+  await until(() => lastAnswers.length === 1, "the hostile VM's image inspect")
+  third.abort()
+  lastAnswers[0]?.(`${IMAGE_ID}\n`)
+  assert.deepEqual(await lastProbe, PROBE_STOPPED, 'an answer that came after the stop was read as ok')
+
+  // Already stopped: nothing is asked at all.
+  const gone = driverFor(fixture(t))
+  gone.setExec(healthyDaemon('29.5.2'))
+  const aborted = new AbortController()
+  aborted.abort()
+  assert.deepEqual(await gone.driver.probe(aborted.signal), PROBE_STOPPED)
+  assert.deepEqual(gone.execs, [])
+})
+
+test('a probe told to stop ends the docker CLI it waits on by SIGKILL, through the real process functions', { timeout: 30_000 }, async (t) => {
+  // realDockerDriver binds Node's execFile, so this is the production path,
+  // with a stand-in CLI in place of docker: one a paused VM holds, which
+  // never answers and ignores SIGTERM (an ignored signal stays ignored across
+  // exec), so only SIGKILL ends it. No docker is run.
+  const f = fixture(t)
+  const pidFile = join(f.root, 'cli.pid')
+  const cli = join(f.root, 'held-docker')
+  writeFileSync(cli, `#!/bin/sh\ntrap '' TERM\necho $$ > '${pidFile}'\nexec sleep 60\n`, { mode: 0o755 })
+  let pid: number | undefined
+  t.after(() => {
+    if (pid === undefined) return
+    try {
+      process.kill(pid, 'SIGKILL')
+    } catch {
+      // Already gone, as it should be.
+    }
+  })
+  const alive = (p: number): boolean => {
+    try {
+      process.kill(p, 0)
+      return true
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ESRCH') return false
+      throw e
+    }
+  }
+  const driver = realDockerDriver({
+    binary: cli,
+    domains: { trusted: f.domain, hostile: f.hostile },
+    defaults: DEFAULTS,
+    repoRoot: f.repoRoot,
+    imageId: IMAGE_ID,
+    path: '/usr/bin:/bin',
+    home: join(f.root, 'home'),
+    dockerConfig: join(f.root, 'data', 'docker'),
+  })
+  const stop = new AbortController()
+  const probing = driver.probe(stop.signal)
+  await until(() => existsSync(pidFile) && /^\d+\n$/.test(readFileSync(pidFile, 'utf8')), 'the stand-in CLI to start', 10_000)
+  pid = Number(readFileSync(pidFile, 'utf8').trim())
+  // Held, as a paused VM holds it.
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  assert.equal(alive(pid), true, 'the stand-in CLI did not wait')
+  stop.abort()
+  // Ended first, then the probe's answer: a CLI that heeds no signal it is
+  // sent would hold the probe for its whole minute.
+  const ended = pid
+  await until(() => !alive(ended), 'the held CLI to be ended', 10_000)
+  assert.deepEqual(await probing, PROBE_STOPPED)
+})
+
+test('the real execFile ends at once, by SIGKILL, a CLI whose signal was aborted before the call', { timeout: 30_000 }, async (t) => {
+  // The driver sends no call once its signal is aborted (the probe and the
+  // sweep read it first), so only the bound execFile itself can be handed one
+  // that is: an abort event fires once, and a signal aborted before the call
+  // fires none it could hear. A call that waited for one would leave the CLI
+  // running unended. The same stand-in CLI as above, which never answers and
+  // ignores SIGTERM, so that only SIGKILL ends it. No docker is run.
+  const f = fixture(t)
+  const pidFile = join(f.root, 'cli.pid')
+  const cli = join(f.root, 'held-docker')
+  writeFileSync(cli, `#!/bin/sh\ntrap '' TERM\necho $$ > '${pidFile}'\nexec sleep 60\n`, { mode: 0o755 })
+  t.after(() => {
+    // Only a CLI left running wrote its pid: one ended at its spawn may not
+    // have.
+    if (!existsSync(pidFile)) return
+    try {
+      process.kill(Number(readFileSync(pidFile, 'utf8').trim()), 'SIGKILL')
+    } catch {
+      // Already gone, as it should be.
+    }
+  })
+  const gone = new AbortController()
+  gone.abort()
+  const call = realDockerProcesses().execFile(cli, [], { env: { PATH: '/usr/bin:/bin' }, signal: gone.signal, killSignal: 'SIGKILL' })
+  // Bounded well inside the stand-in's minute, so a call that is not ended
+  // fails here rather than at the test's timeout.
+  const settled = await Promise.race([
+    call.then(
+      () => 'answered',
+      (e: unknown) => e,
+    ),
+    new Promise((resolve) => setTimeout(() => resolve('held'), 5_000)),
+  ])
+  assert.notEqual(settled, 'held', 'a CLI handed a signal already aborted was left running')
+  assert.notEqual(settled, 'answered')
+  // Rejected once the child exited, which it did by the signal it was told to
+  // send, never by SIGTERM, which a held CLI may ignore.
+  assert.equal((settled as { signal?: unknown }).signal, 'SIGKILL', `ended by ${String((settled as { signal?: unknown }).signal)}`)
+})
+
 test('kill is idempotent and sweepOrphans reaps only our containers', async (t) => {
   const f = fixture(t)
   const d = driverFor(f)
@@ -2626,16 +2843,23 @@ test('kill is idempotent and sweepOrphans reaps only our containers', async (t) 
   // A kill that races a container's own exit is the normal case, not an error.
   await d.driver.kill(`${CONTAINER_PREFIX}gone`)
 
-  const killed = await d.driver.sweepOrphans()
-  // A --filter is a request, not a guarantee; the prefix is re-checked.
-  assert.deepEqual(killed, [
-    `${CONTAINER_PREFIX}aaa`,
-    `${CONTAINER_PREFIX}bbb`,
-    `${CONTAINER_PREFIX}aaa`,
-    `${CONTAINER_PREFIX}bbb`,
-  ])
-  assert.equal(killed.includes('someone-elses-container'), false)
+  // Named outright, and someone else's too: a name without the prefix is
+  // never killed, whatever a request says.
+  const killed = await d.driver.sweepOrphans(sweepOf({ names: [`${CONTAINER_PREFIX}aaa`, `${CONTAINER_PREFIX}bbb`, 'someone-elses-container'] }))
+  // A --filter is a request, not a guarantee; the prefix is re-checked. A
+  // kill answered "No such container" (it exited after the listing) is swept.
+  assert.deepEqual(killed, {
+    swept: [`${CONTAINER_PREFIX}aaa`, `${CONTAINER_PREFIX}bbb`, `${CONTAINER_PREFIX}aaa`, `${CONTAINER_PREFIX}bbb`],
+    unlisted: [],
+    failed: [],
+  })
+  assert.equal(killsSent(d).some((k) => k.endsWith('someone-elses-container')), false)
 })
+
+/** A sweep request: nothing named unless given, and a signal no one aborts unless given. */
+function sweepOf(o: { runIds?: readonly string[]; names?: readonly string[]; signal?: AbortSignal } = {}): SweepRequest {
+  return { runIds: o.runIds ?? [], names: o.names ?? [], signal: o.signal ?? new AbortController().signal }
+}
 
 /**
  * A sweep's listing, known by what it asks for (the kernel's containers, by
@@ -2669,7 +2893,8 @@ test('sweepOrphans asks each VM for names, never with --quiet, under which docke
     return Promise.resolve({ stdout: `${CONTAINER_PREFIX}${vm}1\n`, stderr: '' })
   })
 
-  assert.deepEqual(await d.driver.sweepOrphans(), [`${CONTAINER_PREFIX}t1`, `${CONTAINER_PREFIX}h1`])
+  const swept = await d.driver.sweepOrphans(sweepOf({ names: [`${CONTAINER_PREFIX}t1`, `${CONTAINER_PREFIX}h1`] }))
+  assert.deepEqual(swept.swept, [`${CONTAINER_PREFIX}t1`, `${CONTAINER_PREFIX}h1`])
   const listed = d.execs.filter((e) => listsOrphans(e.args))
   assert.deepEqual(
     listed.map((e) => e.env['DOCKER_HOST']),
@@ -2739,8 +2964,8 @@ test('sweepOrphans kills each orphan on the domain that listed it', async (t) =>
       : Promise.resolve({ stdout: '', stderr: '' }),
   )
 
-  const killed = await d.driver.sweepOrphans()
-  assert.deepEqual(killed, [`${CONTAINER_PREFIX}t1`, `${CONTAINER_PREFIX}h1`, `${CONTAINER_PREFIX}h2`])
+  const killed = await d.driver.sweepOrphans(sweepOf({ names: ['t1', 'h1', 'h2'].map((n) => `${CONTAINER_PREFIX}${n}`) }))
+  assert.deepEqual(killed.swept, [`${CONTAINER_PREFIX}t1`, `${CONTAINER_PREFIX}h1`, `${CONTAINER_PREFIX}h2`])
   // One kill per orphan, each on its own VM: none sent twice, none sent wide.
   assert.deepEqual(killsSent(d), [
     `${TRUSTED_HOST} ${CONTAINER_PREFIX}t1`,
@@ -2849,7 +3074,7 @@ test('sweepOrphans lists every VM at once and kills each orphan at once, so a da
       // The first orphan's kill never returns either.
       return args[2] === `${CONTAINER_PREFIX}${first}` ? hang : Promise.resolve({ stdout: '', stderr: '' })
     })
-    void d.driver.sweepOrphans()
+    void d.driver.sweepOrphans(sweepOf({ names: ['t1', 't2', 'h1', 'h2'].map((n) => `${CONTAINER_PREFIX}${n}`) }))
     await new Promise((resolve) => setImmediate(resolve))
     assert.deepEqual(
       d.execs.filter((e) => listsOrphans(e.args)).map((e) => e.env['DOCKER_HOST']).sort(),
@@ -2886,8 +3111,13 @@ test('sweepOrphans still sweeps one VM when the other cannot be listed', async (
       }
       return Promise.resolve({ stdout: names.map((n) => `${CONTAINER_PREFIX}${n}\n`).join(''), stderr: '' })
     })
-    const killed = await d.driver.sweepOrphans()
-    assert.deepEqual(killed, names.map((n) => `${CONTAINER_PREFIX}${n}`), `${down} down`)
+    const killed = await d.driver.sweepOrphans(sweepOf({ names: ['t1', 'h1', 'h2'].map((n) => `${CONTAINER_PREFIX}${n}`) }))
+    assert.deepEqual(killed.swept, names.map((n) => `${CONTAINER_PREFIX}${n}`), `${down} down`)
+    // The VM that could not be listed is reported, with what its runtime said, never read as one with nothing on it.
+    assert.deepEqual(killed.unlisted, [
+      { domain: down === TRUSTED_HOST ? 'trusted' : 'hostile', why: `Cannot connect to the Docker daemon at ${down}. Is the docker daemon running?` },
+    ], `${down} down`)
+    assert.deepEqual(killed.failed, [], `${down} down`)
     assert.deepEqual(killsSent(d), names.map((n) => `${up} ${CONTAINER_PREFIX}${n}`), `${down} down`)
     assert.deepEqual(
       d.execs.filter((e) => listsOrphans(e.args)).map((e) => e.env['DOCKER_HOST']).sort(),
@@ -2924,7 +3154,7 @@ test('sweepOrphans resolves only once every kill it sent has returned, and kill(
     return () => settled
   }
 
-  const sweep = d.driver.sweepOrphans()
+  const sweep = d.driver.sweepOrphans(sweepOf({ names: [`${CONTAINER_PREFIX}h1`] }))
   const swept = settledYet(sweep)
   const kill = d.driver.kill(`${CONTAINER_PREFIX}stranger`)
   const killed = settledYet(kill)
@@ -2938,8 +3168,178 @@ test('sweepOrphans resolves only once every kill it sent has returned, and kill(
   assert.equal(killed(), false, 'kill() resolved while its docker kills were in flight')
 
   release()
-  assert.deepEqual(await sweep, [`${CONTAINER_PREFIX}h1`])
+  assert.deepEqual((await sweep).swept, [`${CONTAINER_PREFIX}h1`])
   await kill
+})
+
+test("a run's container name is aos-run-<runId>-<n>, and containerRunId reads the run back from the last dash, nothing else", () => {
+  assert.equal(containerName('run_1_abc', 3), `${CONTAINER_PREFIX}run_1_abc-3`)
+  assert.equal(containerRunId(containerName('run_1_abc', 3)), 'run_1_abc')
+  assert.equal(containerRunId(`${CONTAINER_PREFIX}run_a-12`), 'run_a')
+  // The last dash ends the run id, so a name names one run only.
+  assert.equal(containerRunId(`${CONTAINER_PREFIX}a-b-1`), 'a-b')
+  for (const name of [
+    'run_a-1', // no prefix
+    `${CONTAINER_PREFIX}run_a`, // no number
+    `${CONTAINER_PREFIX}run_a-`, // an empty number
+    `${CONTAINER_PREFIX}run_a-0`, // the runner counts from 1
+    `${CONTAINER_PREFIX}run_a-01`,
+    `${CONTAINER_PREFIX}run_a-1x`,
+    `${CONTAINER_PREFIX}-1`, // an empty run id
+    `x${CONTAINER_PREFIX}run_a-1`,
+  ]) {
+    assert.equal(containerRunId(name), undefined, name)
+  }
+})
+
+test("sweepOrphans kills only what the request names: a named run's containers and a container named outright, never another run's, a live kernel's or anyone else's", async (t) => {
+  // A VM is shared by every kernel on the Mac. The boot sweep names the runs
+  // its own log holds and the containers its open grants name; a container
+  // with the prefix that it does not name may be a live kernel's, on another
+  // data directory, and is left to run.
+  const f = fixture(t)
+  const d = driverFor(f)
+  const listed: Record<string, string> = {
+    [TRUSTED_HOST]: [
+      `${CONTAINER_PREFIX}run_dead-1`,
+      `${CONTAINER_PREFIX}run_live-1`, // another log's run
+      `${CONTAINER_PREFIX}run_dead_2-1`, // a run whose id starts with the dead one's
+      `${CONTAINER_PREFIX}run_dead`, // no number: no run's container
+      `${CONTAINER_PREFIX}canary-trusted`,
+      'run_dead-1', // no prefix
+      '',
+    ].join('\n'),
+    [HOSTILE_HOST]: `${CONTAINER_PREFIX}run_dead-12\n${CONTAINER_PREFIX}run_other-2\n`,
+  }
+  d.setExec((args, env) =>
+    listsOrphans(args)
+      ? Promise.resolve({ stdout: listed[env['DOCKER_HOST'] ?? ''] ?? '', stderr: '' })
+      : Promise.resolve({ stdout: '', stderr: '' }),
+  )
+  const result = await d.driver.sweepOrphans(sweepOf({ runIds: ['run_dead'], names: [`${CONTAINER_PREFIX}canary-trusted`, 'run_dead-1'] }))
+  assert.deepEqual(result, {
+    swept: [`${CONTAINER_PREFIX}run_dead-1`, `${CONTAINER_PREFIX}canary-trusted`, `${CONTAINER_PREFIX}run_dead-12`],
+    unlisted: [],
+    failed: [],
+  })
+  assert.deepEqual(killsSent(d), [
+    `${TRUSTED_HOST} ${CONTAINER_PREFIX}run_dead-1`,
+    `${TRUSTED_HOST} ${CONTAINER_PREFIX}canary-trusted`,
+    `${HOSTILE_HOST} ${CONTAINER_PREFIX}run_dead-12`,
+  ])
+})
+
+test('a sweep request that names nothing asks no VM anything', async (t) => {
+  // A log with no sandbox run has no container to sweep: its boot asks no
+  // runtime anything, so a test daemon on a fresh log reaches no VM.
+  const f = fixture(t)
+  const d = driverFor(f)
+  d.setExec(() => Promise.reject(new Error('asked')))
+  assert.deepEqual(await d.driver.sweepOrphans(sweepOf()), { swept: [], unlisted: [], failed: [] })
+  assert.deepEqual(d.execs, [])
+})
+
+test('a sweep told to stop lists nothing more, and kills nothing a listing answered late names', async (t) => {
+  // Boot stops waiting at SWEEP_WAIT_MS and aborts the request's signal. A
+  // paused VM that answers its `ps` after that may list a container a run of
+  // the new kernel has started meanwhile: nothing is killed from it.
+  const f = fixture(t)
+  const d = driverFor(f)
+  let answer: (stdout: string) => void = () => undefined
+  const late = new Promise<{ stdout: string; stderr: string }>((resolve) => {
+    answer = (stdout) => {
+      resolve({ stdout, stderr: '' })
+    }
+  })
+  d.setExec((args) => (listsOrphans(args) ? late : Promise.resolve({ stdout: '', stderr: '' })))
+  const stop = new AbortController()
+  const sweep = d.driver.sweepOrphans(sweepOf({ runIds: ['run_dead'], signal: stop.signal }))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(d.execs.filter((e) => listsOrphans(e.args)).length, 2, 'both VMs were not asked')
+  stop.abort()
+  answer(`${CONTAINER_PREFIX}run_dead-1\n`)
+  const result = await sweep
+  assert.deepEqual(killsSent(d), [], 'a listing answered after the sweep was given up killed something')
+  assert.deepEqual(result.swept, [])
+  assert.deepEqual(result.unlisted.map((u) => u.domain), ['trusted', 'hostile'])
+  // A sweep already stopped asks nothing at all.
+  const g = driverFor(fixture(t))
+  const stopped = new AbortController()
+  stopped.abort()
+  await g.driver.sweepOrphans(sweepOf({ runIds: ['run_dead'], signal: stopped.signal }))
+  assert.deepEqual(g.execs, [])
+})
+
+test("a sweep's listing is handed its signal with SIGKILL, and one the stop ended reads as given up, never as what the abort said", async (t) => {
+  // A paused VM holds `docker ps`: the stop ends that CLI, as it ends the
+  // probe's, and Node's execFile then rejects with its AbortError.
+  const f = fixture(t)
+  const d = driverFor(f)
+  heldDaemon(d)
+  const stop = new AbortController()
+  const sweep = d.driver.sweepOrphans(sweepOf({ runIds: ['run_dead'], signal: stop.signal }))
+  await new Promise((resolve) => setImmediate(resolve))
+  const listings = d.execOptions.filter((o) => listsOrphans(o.args))
+  assert.equal(listings.length, 2, 'both VMs were not asked')
+  for (const o of listings) {
+    assert.equal(o.signal, stop.signal, "a listing was not handed the sweep's signal")
+    assert.equal(o.killSignal, 'SIGKILL')
+  }
+  stop.abort()
+  const result = await sweep
+  const given = 'the sweep was given up before this VM answered'
+  assert.deepEqual(result, {
+    swept: [],
+    unlisted: [
+      { domain: 'trusted', why: given },
+      { domain: 'hostile', why: given },
+    ],
+    failed: [],
+  })
+  assert.deepEqual(killsSent(d), [])
+})
+
+test("a sweep reports each kill its daemon refused, with what it said, and counts a container already gone as swept", async (t) => {
+  // A refused kill leaves a container that may still run: boot degrades the
+  // sandbox naming it. One that exited between the listing and the kill
+  // ("No such container", "is not running") is not left running.
+  const f = fixture(t)
+  const d = driverFor(f)
+  const stderrOf = (name: string): string | undefined =>
+    name.endsWith('-1')
+      ? 'Error response from daemon: Cannot kill container: x: permission denied\nmore'
+      : name.endsWith('-2')
+        ? 'Error response from daemon: No such container: x'
+        : name.endsWith('-3')
+          ? 'Error response from daemon: Cannot kill container: x: container 3 is not running'
+          : undefined
+  d.setExec((args) => {
+    if (listsOrphans(args)) return Promise.resolve({ stdout: [1, 2, 3, 4].map((n) => containerName('run_dead', n)).join('\n'), stderr: '' })
+    const said = stderrOf(args[2] ?? '')
+    return said === undefined ? Promise.resolve({ stdout: '', stderr: '' }) : Promise.reject(Object.assign(new Error(`Command failed: docker kill\n${said}`), { stderr: said }))
+  })
+  // Both VMs list all four, so each refusal and each swept name comes once per VM.
+  const result = await d.driver.sweepOrphans(sweepOf({ runIds: ['run_dead'] }))
+  assert.deepEqual(result.swept, [2, 3, 4, 2, 3, 4].map((n) => containerName('run_dead', n)))
+  assert.deepEqual(result.failed, [
+    { name: containerName('run_dead', 1), domain: 'trusted', why: 'Error response from daemon: Cannot kill container: x: permission denied' },
+    { name: containerName('run_dead', 1), domain: 'hostile', why: 'Error response from daemon: Cannot kill container: x: permission denied' },
+  ])
+  assert.deepEqual(result.unlisted, [])
+  // What docker said is cut to SWEEP_SAID_CHARS, by code point.
+  const e = driverFor(fixture(t))
+  e.setExec((args) =>
+    listsOrphans(args) ? Promise.reject(Object.assign(new Error('x'), { stderr: `${'\u{1F600}'.repeat(SWEEP_SAID_CHARS + 5)}\n` })) : Promise.resolve({ stdout: '', stderr: '' }),
+  )
+  const cut = await e.driver.sweepOrphans(sweepOf({ runIds: ['run_dead'] }))
+  assert.equal(cut.unlisted[0]?.why, `${'\u{1F600}'.repeat(SWEEP_SAID_CHARS)}…`)
+  // An error with no stderr is read by its message's first line.
+  const m = driverFor(fixture(t))
+  m.setExec((args) => (listsOrphans(args) ? Promise.reject(new Error('spawn docker ENOENT\nstack')) : Promise.resolve({ stdout: '', stderr: '' })))
+  assert.deepEqual((await m.driver.sweepOrphans(sweepOf({ runIds: ['run_dead'] }))).unlisted, [
+    { domain: 'trusted', why: 'spawn docker ENOENT' },
+    { domain: 'hostile', why: 'spawn docker ENOENT' },
+  ])
 })
 
 test('abandon SIGKILLs the docker CLI the driver spawned, while it runs, and kills the container by name on its own domain; the fake agrees on the result', async (t) => {
@@ -3920,7 +4320,7 @@ function dockerCommand(args: readonly string[]): string {
  * literal led by its command's words, a binary other than this.#binary, a
  * spawn of anything but buildRunArgs' argv, this.#options or one of its
  * process functions taken as a value, or node:child_process called anywhere
- * but realDockerDriver's forwarding of the argv it was handed. A command this
+ * but realDockerProcesses' forwarding of the argv it was handed. A command this
  * cannot read is one the header's list cannot be held to.
  */
 function dockerCommandsInSource(text: string): { readonly commands: readonly string[]; readonly unread: readonly string[] } {
@@ -3975,8 +4375,8 @@ function dockerCommandsInSource(text: string): { readonly commands: readonly str
   }
 
   const PROCESS = new Set(['spawn', 'execFile', 'execFileAsync'])
-  const realDriver = source.statements.find(
-    (s): s is ts.FunctionDeclaration => ts.isFunctionDeclaration(s) && s.name?.text === 'realDockerDriver',
+  const realProcesses = source.statements.find(
+    (s): s is ts.FunctionDeclaration => ts.isFunctionDeclaration(s) && s.name?.text === 'realDockerProcesses',
   )
   visit(source, (n) => {
     // this.#options is only ever read through, or set once in the constructor.
@@ -4031,7 +4431,7 @@ function dockerCommandsInSource(text: string): { readonly commands: readonly str
       return
     }
     // node:child_process's functions, and the promisified one: imported,
-    // promisified, declared, and called only by realDockerDriver, forwarding
+    // promisified, declared, and called only by realDockerProcesses, forwarding
     // the argv it was handed (`[...args]`), which the class above built.
     if (ts.isIdentifier(n) && PROCESS.has(n.text)) {
       const p = n.parent
@@ -4045,7 +4445,7 @@ function dockerCommandsInSource(text: string): { readonly commands: readonly str
       const spread = argv !== undefined && ts.isArrayLiteralExpression(argv) ? argv.elements : undefined
       const forwarded =
         ts.isCallExpression(p) && p.expression === n && p.arguments.length === 3 &&
-        realDriver !== undefined && enclosing(p, (x) => x === realDriver) !== undefined &&
+        realProcesses !== undefined && enclosing(p, (x) => x === realProcesses) !== undefined &&
         spread?.length === 1 && spread[0] !== undefined && ts.isSpreadElement(spread[0])
       if (!named && !promisified && !forwarded) unread.push(where(p))
     }
@@ -4075,7 +4475,8 @@ test('the source scan reads a docker command on any path, and refuses a process 
     assert.equal(DOCKER_SOURCE.split(from).length, 2, `docker.ts no longer holds, once, ${JSON.stringify(from)}`)
     return DOCKER_SOURCE.replace(from, to)
   }
-  const sweepCatch = '    } catch {\n      return []\n    }\n'
+  // Each edit below puts its call in place of the sweep's whole catch body.
+  const sweepCatch = '    } catch (e) {\n      if (signal.aborted) return stopped\n      return { domain, swept: [], unlisted: sweepSaid(e), failed: [] }\n    }\n'
   const killCatch = '    } catch {\n      // "No such container" is the normal outcome'
   const pull = "await this.#options.execFile(this.#binary, ['image', 'pull', 'alpine'], { env: this.#env(domain) })"
   // docker.ts's one process import, and the module it names, read from the
@@ -4085,18 +4486,18 @@ test('the source scan reads a docker command on any path, and refuses a process 
   const processModule = /from '([^']+)'/.exec(processImport)?.[1] ?? ''
   assert.ok(processModule.endsWith('child_process'), `docker.ts's process import is not the one this test reads: ${processImport}`)
   const cases: [string, string, Partial<{ commands: string[]; unread: RegExp }>][] = [
-    ['a pull in the sweep\'s catch', edit(sweepCatch, `    } catch {\n      ${pull}\n      return []\n    }\n`), { commands: [...DRIVER_COMMANDS, 'image pull'].sort() }],
+    ['a pull in the sweep\'s catch', edit(sweepCatch, `    } catch (e) {\n      ${pull}\n      return { domain, swept: [], unlisted: sweepSaid(e), failed: [] }\n    }\n`), { commands: [...DRIVER_COMMANDS, 'image pull'].sort() }],
     ['an rm in the kill\'s catch', edit(killCatch, "    } catch {\n      await this.#options.execFile(this.#binary, ['rm', '-f', name], { env: this.#env(domain) })\n      // \"No such container\" is the normal outcome"), { commands: [...DRIVER_COMMANDS, 'rm'].sort() }],
-    ['a management command with no second word', edit(sweepCatch, "    } catch {\n      await this.#options.execFile(this.#binary, ['image', name], { env: this.#env(domain) })\n      return []\n    }\n"), { unread: /\['image', name\]/ }],
-    ['an argv built at run time', edit(sweepCatch, "    } catch {\n      await this.#options.execFile(this.#binary, ['image', 'pull'].slice(), { env: this.#env(domain) })\n      return []\n    }\n"), { unread: /\.slice\(\)/ }],
-    ['another binary', edit(sweepCatch, "    } catch {\n      await this.#options.execFile('/bin/sh', ['ps'], { env: this.#env(domain) })\n      return []\n    }\n"), { unread: /'\/bin\/sh'/ }],
-    ['execFile taken as a value', edit(sweepCatch, "    } catch {\n      const run = this.#options.execFile\n      await run(this.#binary, ['image', 'pull', 'alpine'], { env: this.#env(domain) })\n      return []\n    }\n"), { unread: /run = this\.#options\.execFile/ }],
-    ['#options taken whole', edit(sweepCatch, "    } catch {\n      const { execFile } = this.#options\n      await execFile(this.#binary, ['image', 'pull', 'alpine'], { env: this.#env(domain) })\n      return []\n    }\n"), { unread: /this\.#options/ }],
-    ['child_process called in the class', edit(sweepCatch, "    } catch {\n      await execFileAsync('docker', ['image', 'pull', 'alpine'])\n      return []\n    }\n"), { unread: /execFileAsync\('docker'/ }],
+    ['a management command with no second word', edit(sweepCatch, "    } catch (e) {\n      await this.#options.execFile(this.#binary, ['image', name], { env: this.#env(domain) })\n      return { domain, swept: [], unlisted: sweepSaid(e), failed: [] }\n    }\n"), { unread: /\['image', name\]/ }],
+    ['an argv built at run time', edit(sweepCatch, "    } catch (e) {\n      await this.#options.execFile(this.#binary, ['image', 'pull'].slice(), { env: this.#env(domain) })\n      return { domain, swept: [], unlisted: sweepSaid(e), failed: [] }\n    }\n"), { unread: /\.slice\(\)/ }],
+    ['another binary', edit(sweepCatch, "    } catch (e) {\n      await this.#options.execFile('/bin/sh', ['ps'], { env: this.#env(domain) })\n      return { domain, swept: [], unlisted: sweepSaid(e), failed: [] }\n    }\n"), { unread: /'\/bin\/sh'/ }],
+    ['execFile taken as a value', edit(sweepCatch, "    } catch (e) {\n      const run = this.#options.execFile\n      await run(this.#binary, ['image', 'pull', 'alpine'], { env: this.#env(domain) })\n      return { domain, swept: [], unlisted: sweepSaid(e), failed: [] }\n    }\n"), { unread: /run = this\.#options\.execFile/ }],
+    ['#options taken whole', edit(sweepCatch, "    } catch (e) {\n      const { execFile } = this.#options\n      await execFile(this.#binary, ['image', 'pull', 'alpine'], { env: this.#env(domain) })\n      return { domain, swept: [], unlisted: sweepSaid(e), failed: [] }\n    }\n"), { unread: /this\.#options/ }],
+    ['child_process called in the class', edit(sweepCatch, "    } catch (e) {\n      await execFileAsync('docker', ['image', 'pull', 'alpine'])\n      return { domain, swept: [], unlisted: sweepSaid(e), failed: [] }\n    }\n"), { unread: /execFileAsync\('docker'/ }],
     ['a spawn of an argv not built by buildRunArgs', edit('    const child = this.#options.spawn(this.#binary, args, { env: this.#env(spec.domain) })', "    const child = this.#options.spawn(this.#binary, ['image', 'pull', 'alpine'], { env: this.#env(spec.domain) })"), { unread: /this\.#options\.spawn\(this\.#binary, \['image'/ }],
     ['a third child_process function imported', edit(processImport, processImport.replace('{ execFile, spawn }', '{ exec, execFile, spawn }')), { unread: /import \{ exec, execFile, spawn \}/ }],
     ['child_process imported under an alias', edit(processImport, processImport.replace('spawn }', 'spawn as start }')), { unread: /spawn as start/ }],
-    ['child_process reached by name', edit(sweepCatch, `    } catch {\n      void process.getBuiltinModule('${processModule}')\n      return []\n    }\n`), { unread: /getBuiltinModule\(/ }],
+    ['child_process reached by name', edit(sweepCatch, `    } catch (e) {\n      void process.getBuiltinModule('${processModule}')\n      return { domain, swept: [], unlisted: sweepSaid(e), failed: [] }\n    }\n`), { unread: /getBuiltinModule\(/ }],
     ['buildRunArgs returning another argv', edit('  auditRunArgs(args, home, workspace, input.imageId, channel)\n  return args\n', "  auditRunArgs(args, home, workspace, input.imageId, channel)\n  return ['image', 'pull', spec.image]\n"), { unread: /return \['image', 'pull'/ }],
   ]
   for (const [label, text, expect] of cases) {
@@ -4143,7 +4544,7 @@ async function driveEveryEntry(
   d.failNextSpawn(new Error('spawn E2BIG'))
   assert.throws(() => d.driver.run(spec(f)), /E2BIG/)
   await d.driver.kill(`${CONTAINER_PREFIX}gone`)
-  const swept = await d.driver.sweepOrphans()
+  const swept = (await d.driver.sweepOrphans(sweepOf({ names: [ORPHAN] }))).swept
   // Long enough for a command a catch sends after its refusal to arrive.
   await turns(3)
   return {
@@ -4639,7 +5040,7 @@ test('a container name without the kernel prefix is refused', (t) => {
 
 // ── the stub ───────────────────────────────────────────────────────────────
 
-test('apple-container driver reports unavailable from probe and throws from run and kill', async () => {
+test('apple-container driver reports unavailable from probe and throws from run, kill and sweepOrphans', async () => {
   const driver = new AppleContainerDriver()
   assert.equal(driver.name, 'apple-container')
 
@@ -4670,4 +5071,8 @@ test('apple-container driver reports unavailable from probe and throws from run 
   // as far as doing anything asynchronous, and a throw at the call site is
   // louder than a rejection a caller might not be awaiting.
   assert.throws(() => driver.kill('x'), NotImplementedError)
+  // The orphan sweep too (egress plan W2): a sweep that answered "nothing
+  // left running" would be a plausible answer from code that asked nothing.
+  // Boot reads the throw as a sweep that could not run (kernel-boot.test.ts).
+  assert.throws(() => driver.sweepOrphans(sweepOf({ runIds: ['run_x'] })), (e: unknown) => e instanceof NotImplementedError && e.feature === 'apple-container')
 })

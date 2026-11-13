@@ -31,10 +31,12 @@
 import { chmodSync, mkdirSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
+import { z } from 'zod'
 
 import { VERSION } from './version.js'
 import { log } from './log.js'
 import { ConfigError, PolicyDenied } from './errors.js'
+import { holdDataDir, type DataLock } from './data-lock.js'
 import { bindingKeyProblem, type EgressBinding, type KernelConfig } from './config.js'
 
 import { EventStore } from './events/store.js'
@@ -45,8 +47,8 @@ import { EGRESS_REASON_BYTES } from './events/types.js'
 import { acceptReady } from './egress/ready.js'
 import type { CredentialInjector } from './egress/session.js'
 import { createUpstream, systemUpstreamDeps, type Upstream, type UpstreamDeps, type UpstreamLimits } from './egress/upstream.js'
-import { readAllRows } from './events/chain.js'
-import { isClean, projectRecovery, type Recovery } from './events/projections.js'
+import { readAllRows, type EventRow } from './events/chain.js'
+import { isClean, projectRecovery, sandboxRunIds, type Recovery } from './events/projections.js'
 import { GoalTracker } from './goals/tracker.js'
 import { Delegation } from './runtime/delegate.js'
 import { KernelTools } from './runtime/kernel-tools.js'
@@ -82,7 +84,7 @@ import type { BindingStatus, EgressState } from './runtime/egress.js'
 import { Scheduler } from './runtime/scheduler.js'
 import { AppleContainerDriver } from './sandbox/apple-container.js'
 import { DockerDriver, realDockerDriver, type DockerProcesses } from './sandbox/docker.js'
-import type { ProbeResult as SandboxProbe, SandboxDriver } from './sandbox/driver.js'
+import type { ProbeResult as SandboxProbe, SandboxDriver, SweepRequest, SweepResult } from './sandbox/driver.js'
 import { assertTokenUsable } from './control/auth.js'
 import { ControlServer, type ControlSurface } from './control/server.js'
 import type { HumanActor } from './control/actor.js'
@@ -115,7 +117,7 @@ export const STUBS: readonly { id: string; where: string; how: string }[] = [
   {
     id: 'apple-container-driver',
     where: 'src/sandbox/apple-container.ts',
-    how: 'probe() reports unavailable with a reason so boot degrades; run() and kill() throw NotImplementedError. macOS 15 has no `container` binary',
+    how: 'probe() reports unavailable with a reason so boot degrades; run(), kill(), abandon() and sweepOrphans() throw NotImplementedError. macOS 15 has no `container` binary',
   },
 ]
 
@@ -125,6 +127,256 @@ export const STUBS: readonly { id: string; where: string; how: string }[] = [
  * bound, once connected, is kernel.yaml's egress.limits.idleMs.
  */
 export const EGRESS_CONNECT_TIMEOUT_MS = 10_000
+
+/**
+ * How long boot waits for the sandbox driver's probe (SandboxDriver.probe)
+ * before it marks the sandbox degraded without its answer: as with the sweep
+ * below, a daemon that accepts a connection and never answers `docker
+ * version` or an inspect (a paused VM) must not hold the boot, since the
+ * booted kernel is how an operator reads why. Past it the probe is told to
+ * stop (its signal): DockerDriver asks nothing more and ends the docker CLI
+ * it waits on, by SIGKILL. A test hands its own (BootOptions.probeWaitMs).
+ */
+export const PROBE_WAIT_MS = 30_000
+
+/**
+ * Run `driver`'s probe for boot, and wait `waitMs` at most. Never rejects:
+ * a probe that throws or rejects (a driver breaking its contract) is a
+ * failed probe naming the throw, one that answers with no ProbeResult
+ * (probeVerdict) a failed probe saying so, and one that has not settled
+ * within `waitMs` a failed probe naming the bound, which is then told to
+ * stop (its signal aborted), so a docker CLI a paused VM holds is ended and
+ * an answer that comes late is not read. Exported so a test can hold the
+ * bound without waiting PROBE_WAIT_MS.
+ */
+export async function probeAtBoot(driver: SandboxDriver, waitMs: number = PROBE_WAIT_MS): Promise<SandboxProbe> {
+  const stop = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<SandboxProbe>((resolve) => {
+    timer = setTimeout(() => {
+      stop.abort()
+      resolve({
+        ok: false,
+        why:
+          `the probe did not finish within ${String(waitMs)} ms: a runtime accepted and never answered, and the ` +
+          'probe was told to stop, so the sandbox is not known to work. Check that each VM answers ' +
+          '(scripts/colima-up.sh), then restart the kernel',
+      })
+    }, waitMs)
+  })
+  // Called inside then(): a driver that throws rather than rejecting is caught
+  // too. The catch follows probeVerdict, so a reading of the answer that
+  // throws (a getter, a revoked Proxy) is a failed probe as well.
+  const probed = Promise.resolve()
+    .then(() => driver.probe(stop.signal))
+    .then((answer: unknown): SandboxProbe => probeVerdict(driver.name, answer))
+    .catch((e: unknown): SandboxProbe => ({
+      ok: false,
+      why: recordable(`${driver.name} probe threw: ${e instanceof Error ? e.message : String(e)}`, PROBE_REASON_BYTES),
+    }))
+  try {
+    return await Promise.race([probed, late])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * The most of a failed probe's reason boot records. A driver bounds its own
+ * (DockerDriver's PROBE_ERROR_BYTES for what docker said), so this is wide
+ * of every reason a driver that keeps its contract gives, and it holds the
+ * one a driver that breaks it gives (a throw, a `why` of any size) to a
+ * sandbox.degraded row the store takes.
+ */
+export const PROBE_REASON_BYTES = 4_096
+
+const ProbeAnswer = z.union([
+  z.object({ ok: z.literal(true), version: z.string() }),
+  z.object({ ok: z.literal(false), why: z.string() }),
+])
+
+/**
+ * A probe's answer as boot reads it, parsed: a driver that breaks the
+ * contract by answering with no ProbeResult (null, `{}`, an `ok` that is no
+ * boolean, a failure with no `why`) has failed its probe, since the sandbox
+ * is then not known to work. Boot must neither refuse (reading `.ok` of
+ * null), nor read a truthy `ok` as a working runtime, nor append a
+ * sandbox.degraded row with no reason, which the store refuses. A failure's
+ * reason is redacted and bounded (PROBE_REASON_BYTES).
+ */
+function probeVerdict(driverName: string, answer: unknown): SandboxProbe {
+  const parsed = ProbeAnswer.safeParse(answer)
+  if (!parsed.success) {
+    return {
+      ok: false,
+      why:
+        `${driverName} probe answered with no probe result (ok true with a version, or ok false with a why), ` +
+        'so the sandbox is not known to work',
+    }
+  }
+  const probe = parsed.data
+  return probe.ok ? { ok: true, version: probe.version } : { ok: false, why: recordable(probe.why, PROBE_REASON_BYTES) }
+}
+
+/**
+ * How long boot waits for the orphan sweep (SandboxDriver.sweepOrphans)
+ * before it marks the sandbox subsystem without it: a daemon that accepts a
+ * connection and never answers `docker ps` or `docker kill` (a paused VM)
+ * must not hold the boot, since the booted kernel is how an operator reads
+ * why. Past it the sweep is told to stop (SweepRequest.signal): it lists
+ * nothing more and sends no kill it has not sent. A test hands its own
+ * (BootOptions.sweepWaitMs).
+ */
+export const SWEEP_WAIT_MS = 30_000
+
+/** The most of a sweep's reason boot records: the swept names, or why the sweep did not finish. */
+export const SWEEP_REASON_BYTES = 1_024
+
+/**
+ * What boot's orphan sweep came to: the names it killed by name, and, when it
+ * did not do all it was asked, why (the sandbox is then degraded).
+ */
+export interface SweepOutcome {
+  readonly swept: readonly string[]
+  readonly problem?: string
+}
+
+/** What the boot sweep is to kill, from this boot's log (SweepRequest, less the signal boot adds). */
+export interface SweepTargets {
+  readonly runIds: readonly string[]
+  readonly names: readonly string[]
+}
+
+/**
+ * The boot sweep's targets, from the log as boot read it, before recovery
+ * wrote anything: every run that may have had a container (sandboxRunIds),
+ * and every grant left open's container by name (a canary's included, which
+ * serves no run). Nothing else: a container with the prefix that this log
+ * does not name may be a live kernel's, on another data directory.
+ */
+export function sweepTargets(rows: readonly EventRow[], recovered: Recovery): SweepTargets {
+  const runIds = new Set(sandboxRunIds(rows))
+  for (const grant of recovered.openGrants) if (grant.runId !== null) runIds.add(grant.runId)
+  const names = new Set(recovered.openGrants.map((g) => g.sandbox).filter((name) => name !== ''))
+  return { runIds: [...runIds], names: [...names] }
+}
+
+/** Why a sweep did not finish: a container may still run, and what to do. */
+const SWEEP_LEFT =
+  'so a container a previous kernel left may still be running, past its wallclock. Check that each VM answers ' +
+  '(scripts/colima-up.sh), then restart the kernel to sweep again'
+
+/**
+ * A sweep's problem: `head` (what failed, which may quote a runtime or a
+ * driver) redacted and cut so that SWEEP_LEFT always follows it whole, and
+ * the whole within SWEEP_REASON_BYTES.
+ */
+function sweepProblem(head: string): string {
+  const tail = `, ${SWEEP_LEFT}`
+  return `${recordable(head, SWEEP_REASON_BYTES - Buffer.byteLength(tail))}${tail}`
+}
+
+/**
+ * Run `driver`'s orphan sweep over `targets`, for boot, and wait `waitMs` at
+ * most. Asks the driver nothing when the targets name nothing: a log with no
+ * sandbox run has no container to sweep, and its boot asks no runtime
+ * anything. Never rejects: a sweep that throws (the apple-container stub,
+ * which runs nothing), rejects or answers with no SweepResult (a driver
+ * breaking its contract) is a problem named in the outcome, and so is one
+ * that left a VM unlisted or a kill refused, and one that has not settled
+ * within `waitMs`, which is then told to stop (its signal aborted), so a
+ * listing a VM answers late kills nothing. Exported so a test can hold the
+ * bound without waiting SWEEP_WAIT_MS.
+ */
+export async function sweepAtBoot(driver: SandboxDriver, targets: SweepTargets, waitMs: number = SWEEP_WAIT_MS): Promise<SweepOutcome> {
+  if (targets.runIds.length === 0 && targets.names.length === 0) return { swept: [] }
+  const stop = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<SweepOutcome>((resolve) => {
+    timer = setTimeout(() => {
+      stop.abort()
+      resolve({
+        swept: [],
+        problem:
+          `the orphan sweep did not finish within ${String(waitMs)} ms: a runtime accepted and never answered, ` +
+          `and the sweep was told to stop, ${SWEEP_LEFT}`,
+      })
+    }, waitMs)
+  })
+  const request: SweepRequest = { runIds: targets.runIds, names: targets.names, signal: stop.signal }
+  // Called inside then(): a driver that throws rather than rejecting is caught
+  // too. The catch follows sweepOutcome, not beside it in the same then(), so
+  // an answer sweepOutcome refuses (no SweepResult: `{}`, undefined) is a
+  // named problem as well, and never a rejection that refuses the boot.
+  const swept = Promise.resolve()
+    .then(() => driver.sweepOrphans(request))
+    .then((result: unknown): SweepOutcome => sweepOutcome(result))
+    .catch((e: unknown): SweepOutcome => ({
+      swept: [],
+      problem: sweepProblem(`the orphan sweep failed: ${e instanceof Error ? e.message : String(e)}`),
+    }))
+  try {
+    return await Promise.race([swept, late])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+const SweepDomain = z.enum(['trusted', 'hostile'])
+const SweepAnswer = z.object({
+  swept: z.array(z.string()),
+  unlisted: z.array(z.object({ domain: SweepDomain, why: z.string() })),
+  failed: z.array(z.object({ name: z.string(), domain: SweepDomain, why: z.string() })),
+})
+
+/**
+ * A finished sweep's outcome: a problem naming each VM it could not list and
+ * each kill refused, if any. Throws for an answer that is no SweepResult
+ * (sweepAtBoot names it as the sweep's failure): read as one, a `swept` that
+ * is a string would be its characters, and a missing `failed` a throw.
+ */
+function sweepOutcome(answer: unknown): SweepOutcome {
+  const parsed = SweepAnswer.safeParse(answer)
+  if (!parsed.success) {
+    throw new Error('the driver answered with no sweep result (swept, unlisted and failed, each a list of its own shape)')
+  }
+  const result: SweepResult = parsed.data
+  const swept = Object.freeze([...result.swept])
+  const parts = [
+    ...result.unlisted.map((u) => `the ${u.domain} VM could not be listed (${u.why})`),
+    ...result.failed.map((f) => `${f.name} could not be killed on the ${f.domain} VM (${f.why})`),
+  ]
+  if (parts.length === 0) return { swept }
+  return { swept, problem: sweepProblem(`the orphan sweep did not finish: ${parts.join('; ')}`) }
+}
+
+/**
+ * What the sandbox subsystem's reason says of a sweep that killed
+ * something: how many, and their names as they fit. A name is there only
+ * once its daemon answered the kill by name, or said the container no
+ * longer ran.
+ */
+export function sweptReason(swept: readonly string[]): string {
+  const n = swept.length
+  return recordable(
+    `the orphan sweep killed by name ${String(n)} container${n === 1 ? '' : 's'} a previous kernel left running: ${swept.join(', ')}`,
+    SWEEP_REASON_BYTES,
+  )
+}
+
+/**
+ * What a boot's `proxy.grant.revoked` says of a grant it found issued and
+ * never revoked (egress plan W2). Fixed text, well inside
+ * EGRESS_DETAIL_BYTES, quoting nothing from the log. It names both ways a
+ * grant is left so: the kernel that issued it died first, or it ran on
+ * after the store refused the session's own revocation row (session.ts
+ * logs that and ends the session all the same), which a boot cannot tell
+ * apart.
+ */
+export const GRANT_RECOVERED_DETAIL =
+  'no revocation of this grant was recorded: the kernel that issued it stopped first, or its revocation could not ' +
+  'be appended. Either way nothing is served under it now (the session that served it has ended, and no other ' +
+  'kernel holds this log), and its counts are not in the log'
 
 /**
  * The production upstream's two timeouts, as boot hands them to
@@ -172,6 +424,18 @@ export interface BootOptions {
   readonly env?: NodeJS.ProcessEnv
   /** Injected by tests so no boot spawns docker. */
   readonly sandboxDriver?: SandboxDriver
+  /**
+   * Tests only: how long boot waits for the orphan sweep, in place of
+   * SWEEP_WAIT_MS, so a test can hold a sweep that never settles to its
+   * bound without waiting 30 s.
+   */
+  readonly sweepWaitMs?: number
+  /**
+   * Tests only: how long boot waits for the sandbox probe, in place of
+   * PROBE_WAIT_MS, so a test can hold a probe that never settles to its
+   * bound without waiting 30 s.
+   */
+  readonly probeWaitMs?: number
   /** Injected by tests so no boot opens a socket to a real pmmcp. */
   readonly clientFactory?: ClientFactory
   /**
@@ -221,6 +485,13 @@ export interface Kernel {
    * (liveGrants), held by tests the way the hub and the router are.
    */
   readonly sandboxTools: SandboxTools
+  /**
+   * The kernel's hold on its data directory (src/data-lock.ts), taken before
+   * the log is opened and dropped by shutdown once the log is closed.
+   * Exposed so a test simulating a SIGKILL can drop it as the OS would,
+   * beside the socket and the raw database handle.
+   */
+  readonly lock: DataLock
   status(): StatusResult
   shutdown(reason?: 'requested' | 'signal' | 'error', signal?: string): Promise<void>
 }
@@ -297,17 +568,38 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
   // .npmrc keeps in .aos/npm-cache. So the mode is enforced as it stands.
   keepPrivate(config.dataDir, 0o700)
 
+  // One kernel per log, established before the log is opened, and so before
+  // recovery and the orphan sweep: a second kernel on this data directory
+  // would read the live one's open runs as a dead kernel's, close them, revoke
+  // their grants and kill their containers. Refused here, it writes nothing.
+  // The lock file and its journal are made 0600 by holdDataDir itself.
+  const lock = holdDataDir(config.dataDir)
+
   const dbPath = join(config.dataDir, 'events.db')
-  // The constructor compares every expected trigger's stored DDL against the
-  // canonical text and throws when one is missing or altered, so "the
-  // append-only triggers are intact" is established by the store existing.
-  const store = new EventStore(dbPath, {
-    anchorEvery: config.events.anchorEvery,
-    headFile: join(config.dataDir, 'events.head'),
-  })
-  // SQLite creates the database at the umask's 0644, and its -wal and -shm
-  // with the database's mode, so once the database is 0600 they follow.
-  for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) keepPrivate(file, 0o600)
+  let store: EventStore
+  try {
+    // The constructor compares every expected trigger's stored DDL against the
+    // canonical text and throws when one is missing or altered, so "the
+    // append-only triggers are intact" is established by the store existing.
+    store = new EventStore(dbPath, {
+      anchorEvery: config.events.anchorEvery,
+      headFile: join(config.dataDir, 'events.head'),
+    })
+    try {
+      // SQLite creates the database at the umask's 0644, and its -wal and -shm
+      // with the database's mode, so once the database is 0600 they follow.
+      for (const file of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) keepPrivate(file, 0o600)
+    } catch (e) {
+      store.db.close()
+      throw e
+    }
+  } catch (e) {
+    // A log refused before the boot's own try below (one that is no database,
+    // a trigger altered, a mode that cannot be tightened) holds the data
+    // directory no longer, so a corrected boot in this process may take it.
+    lock.release()
+    throw e
+  }
 
   const subsystems: Partial<Record<SubsystemName, Subsystems[SubsystemName]>> = {}
   const degraded: string[] = []
@@ -390,6 +682,28 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
         },
       })
     }
+    // Grants first: the live kernel revokes an exec's grant inside its tool
+    // call, before its run's terminal row, so a grant left open is closed
+    // before the run it served. `recovered`, with no totals: the counts died
+    // with the kernel that kept them, and zeros would claim nothing crossed.
+    // Nothing can be served under it now: the engine and the container's one
+    // channel were in the dead process, and no live kernel holds this log
+    // (the data directory's lock, taken above, says so). The boot sweep,
+    // below, kills by name the containers this log names that a VM still
+    // runs.
+    for (const grant of recovered.openGrants) {
+      store.append({
+        type: 'proxy.grant.revoked',
+        ...(grant.runId === null ? {} : { runId: grant.runId }),
+        ...(grant.agentId === null ? {} : { agentId: grant.agentId }),
+        payload: {
+          schemaVersion: 1,
+          grantId: grant.grantId,
+          reason: 'recovered',
+          detail: GRANT_RECOVERED_DETAIL,
+        },
+      })
+    }
     for (const run of recovered.orphanRuns) if (childIds.has(run.runId)) closeOrphan(run)
     for (const d of recovered.danglingDelegations) {
       store.append({
@@ -434,6 +748,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
           delegations: recovered.danglingDelegations.map((d) => d.childRunId),
           approvals: recovered.unresolvedApprovals.length,
           holds: recovered.unreleasedHolds.length,
+          grants: recovered.openGrants.map((g) => g.grantId),
         },
         'closed out work left open by a previous process',
       )
@@ -555,25 +870,60 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     // ── sandbox (degradable) ──────────────────────────────────────────────
     const driver = options.sandboxDriver ?? defaultDriver(config, repoRoot)
     // probe() is contracted never to throw, because a missing container runtime
-    // is a degraded boot and not a dead kernel. Guarded anyway: a driver that
-    // breaks that contract must not be able to refuse the boot, which is
-    // exactly what an earlier apple-container stub did.
-    const sandboxProbe = await driver
-      .probe()
-      .catch((e: unknown): SandboxProbe => ({
-        ok: false,
-        why: `${driver.name} probe threw: ${e instanceof Error ? e.message : String(e)}`,
-      }))
+    // is a degraded boot and not a dead kernel. Guarded anyway (probeAtBoot):
+    // a driver that breaks that contract must not be able to refuse the boot,
+    // which is exactly what an earlier apple-container stub did. Bounded
+    // (PROBE_WAIT_MS): a VM that never answers degrades the sandbox rather
+    // than holding the boot, and the probe is then told to stop.
+    //
+    // The orphan sweep (egress plan W2), whatever the probe says, and before
+    // the mark: a kernel that died left its containers running with no
+    // wallclock (the timers were the dead process's), on either VM, and
+    // nothing else will ever end them. Only what this log names (sweepTargets:
+    // every run of its that may have had a container, every grant left open),
+    // so a live kernel's containers on the same VM, another data directory's,
+    // are never this boot's to kill; and none at all, with no runtime asked
+    // anything, for a log with no sandbox run. A sandbox is ok only once the
+    // sweep has done all it was asked, so that ok means no container of this
+    // log's is left running that the sweep could reach. Bounded
+    // (SWEEP_WAIT_MS): a VM that never answers degrades the sandbox rather
+    // than holding the boot, and the sweep is then told to stop.
+    //
+    // The two at once, since neither reads the other: a paused VM holds the
+    // boot one bound, not one per call.
+    const [sandboxProbe, sweep] = await Promise.all([
+      probeAtBoot(driver, options.probeWaitMs ?? PROBE_WAIT_MS),
+      sweepAtBoot(driver, sweepTargets(rowsAtBoot, recovered), options.sweepWaitMs ?? SWEEP_WAIT_MS),
+    ])
     if (!sandboxProbe.ok) {
       store.append({
         type: 'sandbox.degraded',
         payload: { schemaVersion: 1, driver: driver.name, reason: sandboxProbe.why },
       })
     }
+    if (sweep.problem !== undefined) {
+      store.append({
+        type: 'sandbox.degraded',
+        payload: { schemaVersion: 1, driver: driver.name, reason: sweep.problem },
+      })
+      log.warn({ driver: driver.name, reason: sweep.problem, swept: sweep.swept }, 'the orphan sweep did not finish')
+    } else if (sweep.swept.length > 0) {
+      log.warn({ driver: driver.name, swept: sweep.swept }, 'killed by name containers a previous kernel left running')
+    }
+    // Why the sandbox is degraded: the probe's reason, then the sweep's, each
+    // also in a sandbox.degraded row of its own. Both when both failed: the
+    // probe's alone would never tell an operator reading status that a
+    // container this log names may still be running. Each is bounded where it
+    // is made (a driver's probe reason, sweepProblem's SWEEP_REASON_BYTES).
+    const sandboxWhys = [...(sandboxProbe.ok ? [] : [sandboxProbe.why]), ...(sweep.problem === undefined ? [] : [sweep.problem])]
+    const sandboxWhy = sandboxWhys.length === 0 ? undefined : sandboxWhys.join('; ')
+    const sweptNote = sweep.swept.length > 0 ? sweptReason(sweep.swept) : undefined
     mark(
       'sandbox',
-      sandboxProbe.ok ? 'ok' : 'degraded',
-      sandboxProbe.ok ? undefined : `${driver.name}: ${sandboxProbe.why}`,
+      sandboxWhy === undefined ? 'ok' : 'degraded',
+      sandboxWhy === undefined
+        ? sweptNote
+        : `${driver.name}: ${sandboxWhy}${sweptNote === undefined ? '' : `; ${sweptNote}`}`,
     )
 
     // ── credentials: resolved ONCE, here, outside any run scope ───────────
@@ -676,11 +1026,11 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
           'once the worker image is built and pinned (sandbox.imageId), to serve the egress a trusted manifest names',
       })
     }
-    if (!sandboxProbe.ok) {
+    if (sandboxWhy !== undefined) {
       egressFailures.push({
         check: 'sandbox',
         reason:
-          `the sandbox is degraded (${driver.name}: ${sandboxProbe.why}), and egress serves only a container on the ` +
+          `the sandbox is degraded (${driver.name}: ${sandboxWhy}), and egress serves only a container on the ` +
           "trusted domain: fix the sandbox first, as the sandbox subsystem's reason says",
       })
     }
@@ -705,7 +1055,11 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     // W3's seam: the pinned image id as each VM holds it, and a canary on each
     // domain (judged by src/egress/ready.ts's acceptReady), join these checks
     // here, each a failure of its own naming its domain (check 'image' or
-    // 'canary'), and egress is ok only when they pass too.
+    // 'canary'), and egress is ok only when they pass too. Each canary is to
+    // be named uniquely per boot, and that name recorded as its grant's
+    // `sandbox` (plan W3's note): the sweep's kills are left to finish once
+    // boot stops waiting, so one held by a paused VM could end a canary this
+    // boot started under a name an earlier boot's canary used.
     const egressReasons: string[] = []
     for (const failure of egressFailures) {
       // A binding id the log would store censored is recorded as no binding's.
@@ -936,6 +1290,7 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
       quarantine,
       scheduler,
       sandboxTools,
+      lock,
       status: () => surface.status(),
       async shutdown(reason = 'requested', signal) {
         if (stopped) return
@@ -966,6 +1321,9 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
         // matching the log exactly. An explicit writeAnchor() here would write
         // the same anchor twice — one path, not two.
         store.close()
+        // Last: the next kernel may take the data directory once this one
+        // writes nothing more to it.
+        lock.release()
       },
     }
 
@@ -986,6 +1344,8 @@ export async function bootKernel(options: BootOptions): Promise<Kernel> {
     // The handle still has to go: a leak is a lingering lock and a descriptor
     // per restart attempt.
     if (!store.closed) store.db.close()
+    // After the log's handle: a refused boot holds the data directory no longer.
+    lock.release()
     throw e
   }
 }

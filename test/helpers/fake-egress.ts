@@ -36,6 +36,25 @@ export function quietReport(): Uint8Array {
   return Buffer.from(JSON.stringify({ mux: 1, probes, reached: 0 }), 'ascii')
 }
 
+/**
+ * A report the kernel's judge refuses, as a container whose network is not
+ * the --network none the kernel asked for would send it: its probe of
+ * 192.168.5.2:8766 (pmmcp, on the Mac's loopback as a VM sees it) `reached`,
+ * or `timed out` (ETIMEDOUT: a SYN that went somewhere), every other probe
+ * as quietReport gives it.
+ */
+export function refusedReport(how: 'reached' | 'timed out'): Uint8Array {
+  const quiet = JSON.parse(Buffer.from(quietReport()).toString('ascii')) as {
+    mux: 1
+    probes: { probe: string; target: string; reached: boolean; error: string | null }[]
+    reached: number
+  }
+  const [first, ...rest] = quiet.probes
+  if (first?.target !== '192.168.5.2:8766') throw new Error('SELF_TEST no longer starts with 192.168.5.2:8766')
+  const probe = how === 'reached' ? { ...first, reached: true, error: null } : { ...first, error: 'ETIMEDOUT' }
+  return Buffer.from(JSON.stringify({ mux: 1, probes: [probe, ...rest], reached: how === 'reached' ? 1 : 0 }), 'ascii')
+}
+
 /** Real time, for streams to move. */
 export async function until(condition: () => boolean, what: string, ms = 5_000): Promise<void> {
   const deadline = Date.now() + ms

@@ -17,7 +17,7 @@
 // is asked to approve an exec it would then refuse.
 
 import { NotImplementedError } from '../errors.js'
-import type { ProbeResult, RunningSandbox, SandboxDriver, SandboxSpec } from './driver.js'
+import type { ProbeResult, RunningSandbox, SandboxDriver, SandboxSpec, SweepRequest, SweepResult } from './driver.js'
 
 /** Why this driver runs nothing: probe()'s reason, and everyRunRefusal()'s. */
 const STUB_WHY =
@@ -35,9 +35,10 @@ export class AppleContainerDriver implements SandboxDriver {
    * made `sandbox.driver: apple-container` — a value kernel.yaml accepts —
    * refuse the whole boot, which is the opposite of what a stub should do.
    *
-   * `run`, `kill` and `abandon` still throw: asking an absent runtime to
-   * execute something has no degraded answer. `commandRefusal` answers, as
-   * probe does: it is asked before anything is executed.
+   * `run`, `kill`, `abandon` and `sweepOrphans` still throw: asking an
+   * absent runtime to execute something has no degraded answer.
+   * `commandRefusal` answers, as probe does: it is asked before anything is
+   * executed.
    */
   probe(): Promise<ProbeResult> {
     return Promise.resolve({ ok: false, why: STUB_WHY })
@@ -71,6 +72,16 @@ export class AppleContainerDriver implements SandboxDriver {
 
   /** Throws, as kill does, though nothing could reach it: run() never starts anything to give up. */
   abandon(_name: string): Promise<void> {
+    throw new NotImplementedError('apple-container')
+  }
+
+  /**
+   * Throws, as kill does: no runtime answers, and a sweep that reported no
+   * container left running would be a plausible answer from code that asked
+   * nothing. Boot reads the throw as a sweep that could not run, beside a
+   * probe that already reports this driver unavailable.
+   */
+  sweepOrphans(_request: SweepRequest): Promise<SweepResult> {
     throw new NotImplementedError('apple-container')
   }
 }

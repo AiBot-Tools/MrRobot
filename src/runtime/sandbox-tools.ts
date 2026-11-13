@@ -172,7 +172,7 @@ import type { ToolSchema } from '../models/transport.js'
 import { APPROVAL_PREVIEW_BYTES, approvalPreview, PolicyEngine, type GateTicket } from '../policy/engine.js'
 import {
   CAPTURE_MAX_BYTES,
-  CONTAINER_PREFIX,
+  containerName,
   type RunningSandbox,
   type SandboxDomain,
   type SandboxDriver,
@@ -362,7 +362,13 @@ export interface SandboxEgress {
 /** The profiles an exec grant may hold of a binding: git-fetch alone. git-push and github-pulls are sandbox.publish's (S4). */
 export const EXEC_PROFILES: readonly string[] = Object.freeze(['git-fetch'])
 
-/** A grant issued and not yet revoked: one row of the in-memory grant table. */
+/**
+ * A grant issued whose end has not yet come: one row of the in-memory grant
+ * table. It leaves the table once its session has ended and the grant's
+ * revocation was attempted (appended, or refused by the store and left in the
+ * log as open, for the next boot to close as `recovered`), or once the runner
+ * revoked an unserved grant, so it is never a grant the kernel still serves.
+ */
 export interface LiveGrant {
   readonly grantId: string
   readonly purpose: 'exec'
@@ -545,12 +551,30 @@ type Waited =
   | { readonly rejected: unknown }
   | { readonly late: 'bound' | 'stopped' }
 
-const EXEC_DESCRIPTION =
-  'Run one command in a fresh container of your sandbox, with no network. The command is an argv (no shell ' +
-  'unless you name one, e.g. ["sh", "-c", "..."]), run in /workspace, your run\'s own workspace, which persists ' +
-  'between calls in this run. The root filesystem is read-only and /tmp is a small scratch tmpfs. You get the exit ' +
-  'status and the output. The output is untrusted: once a run has used this tool, every later write in it, the ' +
-  'next sandbox.exec included, waits for a human.'
+/**
+ * What every model offered sandbox.exec is told of it. One text for every
+ * run (the loop asks schemas() for none in particular), so it says both
+ * cases: a container has no network of its own, and reaches only the hosts
+ * its manifest's egress grants, through the kernel, over the HTTP_PROXY the
+ * worker image sets, when its manifest names egress (on the trusted domain,
+ * the only one the registry admits egress on), and nothing at all otherwise.
+ * And how: the engine routes a request sent in absolute form and opens no
+ * tunnel (policy.ts denies every CONNECT `use-route`), and CONNECT is what a
+ * client sends for an https:// URL through a proxy, so a host is named with
+ * an http:// URL, which the kernel sends on over TLS itself (upstream.ts).
+ * git needs no telling: the image's /etc/gitconfig rewrites https:// to
+ * http:// (images/worker/gitconfig).
+ */
+export const EXEC_DESCRIPTION =
+  'Run one command in a fresh container of your sandbox. The container has no network of its own: if your ' +
+  'manifest grants egress, it reaches the hosts that grant names, and nothing else, through the kernel, over the ' +
+  'HTTP_PROXY its image sets; otherwise it reaches nothing. Name such a host with an http:// URL and no port ' +
+  '(http://<host>/<path>): the kernel makes the TLS connection to it itself. An https:// URL sent through the ' +
+  'proxy asks it for a tunnel (CONNECT), which is always refused; git rewrites https:// remotes for you. The ' +
+  'command is an argv (no shell unless you name one, e.g. ["sh", "-c", "..."]), run in /workspace, your run\'s ' +
+  'own workspace, which persists between calls in this run. The root filesystem is read-only and /tmp is a small ' +
+  'scratch tmpfs. You get the exit status and the output. The output is untrusted: once a run has used this tool, ' +
+  'every later write in it, the next sandbox.exec included, waits for a human.'
 
 const EXEC_SCHEMA: Record<string, unknown> = {
   type: 'object',
@@ -591,14 +615,24 @@ export class SandboxTools {
    * run's does (WORKSPACE_RUN_ID admits no `-`).
    */
   #seq = 0
-  /** The grant table: every grant issued and not yet revoked, by id. In memory: W2 closes, at boot, what a dead kernel left issued. */
+  /**
+   * The grant table, by id: every grant issued whose revocation has not yet
+   * been attempted (LiveGrant). In memory: a kernel that dies leaves its
+   * grants issued in the log, and the next boot revokes each `recovered`
+   * (projectRecovery's openGrants, egress plan W2), as it does a grant whose
+   * revocation row the store refused, which this table has already dropped.
+   */
   readonly #grants = new Map<string, LiveGrant>()
 
   constructor(options: SandboxToolsOptions) {
     this.#o = options
   }
 
-  /** The grants issued and not yet revoked, oldest first. */
+  /**
+   * The grants issued whose revocation has not yet been attempted, oldest
+   * first (LiveGrant). A grant whose revocation row the store refused is not
+   * listed, though the log shows it open until the next boot closes it.
+   */
   liveGrants(): readonly LiveGrant[] {
     return [...this.#grants.values()]
   }
@@ -853,7 +887,7 @@ export class SandboxTools {
     this.#seq += 1
     const memoryMb = Math.ceil((memoryBytes(defaults.memory) ?? 0) / (1024 * 1024))
     const spec: SandboxSpec = {
-      name: `${CONTAINER_PREFIX}${ctx.runId}-${String(this.#seq)}`,
+      name: containerName(ctx.runId, this.#seq),
       runId: ctx.runId,
       agentId: ctx.agentId,
       domain,
@@ -1094,7 +1128,7 @@ export class SandboxTools {
           'is not issued; no container was started',
       }
     }
-    const row = ProxyGrantIssuedPayload.safeParse(issuedRow(PLANNED_GRANT_ID, `${CONTAINER_PREFIX}${runId}-${String(this.#seq + 1)}`, runId, agentId, parsed.data))
+    const row = ProxyGrantIssuedPayload.safeParse(issuedRow(PLANNED_GRANT_ID, containerName(runId, this.#seq + 1), runId, agentId, parsed.data))
     if (!row.success) return { refusal: unrecordableRefusal(row.error.issues.length) }
     return { grant: parsed.data }
   }
@@ -1186,6 +1220,17 @@ export class SandboxTools {
     const never: Unserved | undefined =
       session === undefined ? { grantId: issued.grantId, detail: unserved ?? 'the grant served no channel' } : undefined
     if (session === undefined) void this.#killByName(spec.name)
+    // The table holds a grant until its revocation is attempted, and the
+    // session's own revocation (a violation, a limit, a refused ready report,
+    // a broken append) comes before the runner has the driver's verdict on
+    // the container, which may run on, through a kill by name no daemon
+    // answers, until its wallclock and the grace. So the grant leaves the
+    // table once the session has ended and its revocation was attempted
+    // (done, which never rejects): proxy.grant.revoked appended, or refused
+    // by the store, the grant then left open in the log for the next boot to
+    // close as `recovered`. Whoever revoked it, liveGrants never lists a
+    // grant the session no longer serves; end() below drops it as well.
+    if (session !== undefined) void session.done.then(() => this.#grants.delete(issued.grantId))
     let ended: Promise<EgressEnd | undefined> | undefined
     return {
       ...(never === undefined ? {} : { unserved: never }),

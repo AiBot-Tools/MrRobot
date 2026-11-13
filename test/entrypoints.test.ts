@@ -37,7 +37,7 @@ import { PassThrough, Writable } from 'node:stream'
 import { closeVerified, withStore } from './helpers/store.js'
 import { EventStore } from '../src/events/store.js'
 import { tmpdir } from './helpers/tmpdir.js'
-import { runEntry, shadowCheckout, spawnEntry, terminalAvailable, TRAP_DOTENV, type ShadowCheckout } from './helpers/checkout.js'
+import { daemonRefusal, fakeDocker, runEntry, shadowCheckout, spawnEntry, terminalAvailable, TRAP_DOTENV, type ShadowCheckout } from './helpers/checkout.js'
 import { CEO_SUITE } from '../src/eval/suite.js'
 import { BOOT_SLACK_MS, lockPath, takeLock, type LockOptions } from '../scripts/install/lock.js'
 import { defectEnding, exitLine, outcomeEnding, refusedEnding, signalEnding, stoppedEnding } from '../scripts/install/ending.js'
@@ -73,6 +73,30 @@ const SHIPPED_PMMCP_TOKEN = '\n      tokenEnv: AOS_PMMCP_TOKEN'
 function offlinePmmcp(shipped: string): string {
   assert.ok(shipped.includes(SHIPPED_PMMCP_URL), 'the shipped pmmcp url moved; update SHIPPED_PMMCP_URL')
   return shipped.replace(SHIPPED_PMMCP_URL, CLOSED_PMMCP_URL)
+}
+
+// The shipped config's docker sockets are the operator's two Colima VMs, and
+// a daemon's boot asks its driver whatever boot asks (the orphan sweep kills
+// by name). Every daemon here runs with its sockets moved under its temp
+// directory, where nothing listens, and a fake docker first on its PATH that
+// reaches no daemon and logs what it is asked (helpers/checkout.ts
+// daemonRefusal holds every spawn of the daemon to both).
+const SHIPPED_DOCKER_HOSTS = /dockerHost: unix:\/\/~\/\.colima\/(trusted|hostile)\/docker\.sock/g
+
+/** `text` with each VM's docker socket moved under `dir`, or a throw when the shipped lines moved. */
+function offVms(text: string, dir: string): string {
+  let moved = 0
+  const out = text.replace(SHIPPED_DOCKER_HOSTS, (_match, domain: string) => {
+    moved += 1
+    return `dockerHost: unix://${join(dir, `${domain}-docker.sock`)}`
+  })
+  assert.equal(moved, 2, 'the shipped dockerHost lines moved; update SHIPPED_DOCKER_HOSTS')
+  return out
+}
+
+/** What a test daemon asked its fake docker, one call's argv per entry. */
+function dockerAsked(log: string): string[] {
+  return existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter((line) => line !== '') : []
 }
 const BOOT = { schemaVersion: 1 as const, version: '0.0.1', configHash: 'h', degraded: [] }
 
@@ -167,15 +191,16 @@ test('npm run dev boots the daemon, serves the CLI over the socket, and shuts do
   const port = 7791
   const configPath = join(dataDir, 'kernel.yaml')
   const shipped = readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8')
-  const config = offlinePmmcp(shipped)
+  const config = offVms(offlinePmmcp(shipped), dataDir)
     .replace(/^dataDir: .*$/m, `dataDir: ${dataDir}`)
     .replace(/^  port: \d+$/m, `  port: ${String(port)}`)
     .replace(/mountRoot: [^\n}]*/g, `mountRoot: ${dataDir}/work `)
   mkdirSync(join(dataDir, 'work'), { recursive: true })
   writeFileSync(configPath, config)
+  const docker = fakeDocker(dataDir)
 
   const env = {
-    PATH: process.env['PATH'] ?? '',
+    PATH: docker.path,
     HOME: process.env['HOME'] ?? '',
     AOS_CONTROL_TOKEN: token,
     AOS_DATA_DIR: dataDir,
@@ -219,6 +244,13 @@ test('npm run dev boots the daemon, serves the CLI over the socket, and shuts do
   // the operator's real one in this repository's root.
   assert.match(log, /credentials: shell only \(no --dotenv\)/)
 
+  // A second daemon on the same data directory, from a process of its own, is
+  // refused before it writes anything: it would read this one's open runs as
+  // a dead kernel's, close them, and kill their containers in its sweep.
+  const second = runEntry(CHECKOUT, 'src/main.ts', ['--config', configPath], { env, timeout: 60_000 })
+  assert.equal(second.status, 1, `${second.stdout}${second.stderr}`)
+  assert.match(`${second.stdout}${second.stderr}`, /another kernel holds .* one kernel per event log/)
+
   // Now the other shell: a real CLI process talking to a real daemon. This is
   // the round trip nothing else in the suite makes.
   const agents = cli(['agents', '--config', configPath], { ...env })
@@ -252,10 +284,18 @@ test('npm run dev boots the daemon, serves the CLI over the socket, and shuts do
     assert.equal(types[0], 'kernel.booted')
     assert.equal(types[types.length - 1], 'kernel.shutdown')
     assert.equal(types.filter((t2) => t2 === 'subsystem.state').length, 8)
+    // One boot: the refused second daemon wrote nothing.
+    assert.equal(types.filter((t2) => t2 === 'kernel.booted').length, 1)
     assert.equal(store.verifyChain(store.readAnchor()).ok, true)
   } finally {
     store.close()
   }
+  // Neither daemon asked docker anything: the shipped config pins no image, so
+  // the probe asks nothing, and a fresh log names no container to sweep. Above
+  // all, no kill was sent.
+  const asked = dockerAsked(docker.log)
+  assert.equal(asked.some((argv) => argv.startsWith('kill')), false, `a test daemon sent docker a kill: ${asked.join(' | ')}`)
+  assert.deepEqual(asked, [])
 
   // And the daemon-less command agrees, from a third process.
   const verify = cli(['verify-chain', '--config', configPath], { ...env })
@@ -263,12 +303,15 @@ test('npm run dev boots the daemon, serves the CLI over the socket, and shuts do
   assert.match(verify.stdout, /^ok\t\d+ events\thead [0-9a-f]{64}\n$/)
 })
 
-test('the checkout these programs run from holds an armed trap .env, so a default-path regression reads nothing real', () => {
+test('the checkout these programs run from holds an armed trap .env, so a default-path regression reads nothing real', (t) => {
   // Pointed at it on purpose, the daemon must refuse it: that refusal is what a
   // regression or mutant that defaults to <repo>/.env would hit here, instead
   // of the operator's real file.
-  const run = runEntry(CHECKOUT, 'src/main.ts', ['--dotenv', '.env'], {
-    env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', HOME: process.env['HOME'] ?? '' },
+  const dataDir = join(tmpdir(t), 'trap')
+  mkdirSync(dataDir, { recursive: true })
+  const docker = fakeDocker(dataDir)
+  const run = runEntry(CHECKOUT, 'src/main.ts', ['--config', daemonConfig(dataDir, 7794), '--dotenv', '.env'], {
+    env: { PATH: docker.path, HOME: process.env['HOME'] ?? '' },
     timeout: 60_000,
   })
   assert.notEqual(run.status, 0)
@@ -276,13 +319,17 @@ test('the checkout these programs run from holds an armed trap .env, so a defaul
   assert.notEqual(ROOT, fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, ''))
 })
 
-test('the daemon will not start on a tree a falsify run has mutated, live or interrupted', () => {
+test('the daemon will not start on a tree a falsify run has mutated, live or interrupted', (t) => {
   const dir = join(ROOT, '.falsify')
   mkdirSync(dir, { recursive: true })
   writeFileSync(join(dir, 'journal.json'), JSON.stringify({ file: 'src/policy/gate.ts', original: '', pid: 1 }))
+  const dataDir = join(tmpdir(t), 'falsified')
+  mkdirSync(dataDir, { recursive: true })
+  const docker = fakeDocker(dataDir)
+  const configArgs = ['--config', daemonConfig(dataDir, 7795)]
   try {
-    const run = runEntry(CHECKOUT, 'src/main.ts', [], {
-      env: { PATH: process.env['PATH'] ?? '/usr/bin:/bin', HOME: process.env['HOME'] ?? '' },
+    const run = runEntry(CHECKOUT, 'src/main.ts', configArgs, {
+      env: { PATH: docker.path, HOME: process.env['HOME'] ?? '' },
       timeout: 60_000,
     })
     assert.equal(run.status, 1)
@@ -292,9 +339,9 @@ test('the daemon will not start on a tree a falsify run has mutated, live or int
     // tree is clean once no journal is left.
     rmSync(join(dir, 'journal.json'))
     const lock = (pid: number): void => writeFileSync(join(dir, 'lock.json'), JSON.stringify({ pid, started: 'x', runId: 'other-run' }))
-    const env = { PATH: process.env['PATH'] ?? '/usr/bin:/bin', HOME: process.env['HOME'] ?? '' }
+    const env = { PATH: docker.path, HOME: process.env['HOME'] ?? '' }
     lock(process.pid)
-    const held = runEntry(CHECKOUT, 'src/main.ts', [], { env, timeout: 60_000 })
+    const held = runEntry(CHECKOUT, 'src/main.ts', configArgs, { env, timeout: 60_000 })
     assert.equal(held.status, 1)
     assert.match(`${held.stdout}${held.stderr}`, new RegExp(`a falsify run \\(pid ${String(process.pid)}\\) holds this tree`))
   } finally {
@@ -480,14 +527,14 @@ test('capture-pmmcp masks its bearer: a server that echoes it into a refusal pri
   assert.equal(existsSync(out), false)
 })
 
-/** A kernel.yaml for a spawned daemon: its own data dir and port, pmmcp offline or at `pmmcpUrl` (a loopback stand-in). */
+/** A kernel.yaml for a spawned daemon: its own data dir and port, its docker sockets under it (offVms), pmmcp offline or at `pmmcpUrl` (a loopback stand-in). */
 function daemonConfig(dataDir: string, port: number, pmmcpUrl?: string): string {
   const path = join(dataDir, 'kernel.yaml')
   const shipped = readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8')
   const offline = offlinePmmcp(shipped)
   writeFileSync(
     path,
-    (pmmcpUrl === undefined ? offline : offline.replace(CLOSED_PMMCP_URL, `url: ${pmmcpUrl}`))
+    offVms(pmmcpUrl === undefined ? offline : offline.replace(CLOSED_PMMCP_URL, `url: ${pmmcpUrl}`), dataDir)
       .replace(/^dataDir: .*$/m, `dataDir: ${dataDir}`)
       .replace(/^  port: \d+$/m, `  port: ${String(port)}`)
       .replace(/mountRoot: [^\n}]*/g, `mountRoot: ${dataDir}/work `),
@@ -540,7 +587,8 @@ test("the daemon and the CLI read AOS_CONTROL_TOKEN, pmmcp's bearer and a provid
   )
 
   // No credential in the environment at all: only the file can supply them.
-  const env = { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '', AOS_DATA_DIR: dataDir }
+  const docker = fakeDocker(dataDir)
+  const env = { PATH: docker.path, HOME: process.env['HOME'] ?? '', AOS_DATA_DIR: dataDir }
   const daemon = spawnEntry(CHECKOUT, 'src/main.ts', ['--config', configPath, '--dotenv', creds], {
     env,
   })
@@ -614,13 +662,50 @@ test("the daemon and the CLI read AOS_CONTROL_TOKEN, pmmcp's bearer and a provid
   } finally {
     store.close()
   }
+  assert.deepEqual(dockerAsked(docker.log), [], 'a test daemon asked docker something')
+})
+
+test('every spawn of the daemon is held off the operator\'s VMs: a fake docker first on its PATH and a --config whose sockets are under no home and no .colima', (t) => {
+  // runEntry and spawnEntry ask daemonRefusal before they start the daemon,
+  // so a test written tomorrow that boots one from the shipped config, or
+  // with the real docker on its PATH, fails here rather than reaching the
+  // VMs the operator's own daemon is running containers on.
+  const dir = tmpdir(t)
+  const docker = fakeDocker(dir)
+  mkdirSync(join(dir, 'ok'), { recursive: true })
+  const good = daemonConfig(join(dir, 'ok'), 7796)
+  const env = { PATH: docker.path, HOME: process.env['HOME'] ?? '' }
+  assert.equal(daemonRefusal(['--config', good], env), undefined)
+  // The daemon's own PATH, its default config, or this process's env.
+  assert.match(daemonRefusal(['--config', good], { ...env, PATH: process.env['PATH'] ?? '' }) ?? '', /does not start with a fake docker/)
+  assert.match(daemonRefusal([], env) ?? '', /no --config, so it boots from the shipped kernel\.yaml/)
+  assert.match(daemonRefusal(['--config', good], undefined) ?? '', /this process's env/)
+  // A config naming the operator's sockets, by ~, by the home directory, or under any .colima.
+  const shipped = offlinePmmcp(readFileSync(join(ROOT, 'config', 'kernel.yaml'), 'utf8'))
+  const named = (text: string, name: string): string => {
+    const path = join(dir, name)
+    writeFileSync(path, text)
+    return path
+  }
+  const home = process.env['HOME'] ?? '/root'
+  for (const [label, text] of [
+    ['shipped', shipped],
+    ['home', offVms(shipped, join(home, 'aos-sock'))],
+    ['colima', offVms(shipped, '/srv/.colima/x')],
+  ] as const) {
+    assert.match(daemonRefusal(['--config', named(text, `${label}.yaml`)], env) ?? '', /may be a VM of the operator's/, label)
+  }
+  // And the spawn itself is refused, before anything starts.
+  assert.throws(() => runEntry(CHECKOUT, 'src/main.ts', ['--config', named(shipped, 'refused.yaml')], { env, timeout: 60_000 }), /may be a VM of the operator's/)
+  assert.throws(() => spawnEntry(CHECKOUT, 'src/main.ts', ['--config', good], { env: { HOME: home } }), /does not start with a fake docker/)
+  assert.deepEqual(dockerAsked(docker.log), [])
 })
 
 test('the daemon refuses a group-readable or non-regular --dotenv before it boots, naming the fix, and creates no log', (t) => {
   const run = (creds: string, dataDir: string): { status: number | null; out: string } => {
     const configPath = daemonConfig(dataDir, 7793)
     const result = runEntry(CHECKOUT, 'src/main.ts', ['--config', configPath, '--dotenv', creds], {
-      env: { PATH: process.env['PATH'] ?? '', HOME: process.env['HOME'] ?? '', AOS_DATA_DIR: dataDir },
+      env: { PATH: fakeDocker(dataDir).path, HOME: process.env['HOME'] ?? '', AOS_DATA_DIR: dataDir },
       timeout: 30_000,
     })
     return { status: result.status, out: `${result.stdout ?? ''}${result.stderr ?? ''}` }

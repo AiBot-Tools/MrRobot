@@ -43,7 +43,13 @@
 // after the container exited: the run then exits on its own, with its
 // scripted exit and no killedBy, and says it overran if the wallclock had
 // fired. test/sandbox-docker.test.ts drives both through the same steps for
-// these. An abandon (SandboxDriver.abandon) ends a hung run as the real
+// these. An orphan sweep (SandboxDriver.sweepOrphans) answers from the
+// names a test says the VMs list (`orphans`), killing and returning only
+// those the request names, as the real driver's does, with the VMs it cannot
+// list (`sweepUnlisted`) and the kills refused (`sweepKillRefused`) in its
+// result, or never settles (`sweepHangs`), as one through a daemon that
+// never answers. Every request is kept (`sweepRequests`). An abandon
+// (SandboxDriver.abandon) ends a hung run as the real
 // driver's SIGKILL of its docker CLI does, on a later macrotask: no exit
 // status, SIGKILL and no killedBy, whatever its script says of kills; it
 // changes nothing for a run that has ended or whose end is already queued,
@@ -127,13 +133,17 @@ import {
   CAPTURE_MAX_BYTES,
   CONTAINER_PREFIX,
   channelRefusal,
+  containerRunId,
   readSpecOnce,
   type ProbeResult,
   type RunningSandbox,
   type SandboxChannel,
+  type SandboxDomain,
   type SandboxDriver,
   type SandboxResult,
   type SandboxSpec,
+  type SweepRequest,
+  type SweepResult,
 } from '../../src/sandbox/driver.js'
 import { commandAuditRefusal } from '../../src/sandbox/docker.js'
 import { imageIdProblem, imageRefusal } from '../../src/sandbox/limits.js'
@@ -166,6 +176,8 @@ export interface ScriptedExit {
 
 export interface FakeSandboxOptions {
   readonly probe?: ProbeResult
+  /** probe() never settles: a daemon that accepts and never answers (a paused VM). */
+  readonly probeHangs?: boolean
   readonly script?: readonly ScriptedExit[]
   /**
    * The pinned image id, as the real driver is handed kernel.yaml's
@@ -179,6 +191,21 @@ export interface FakeSandboxOptions {
    * is refused for naming a home.
    */
   readonly home?: string
+  /**
+   * What the VMs list when sweepOrphans() asks, as `docker ps` prints names:
+   * a previous kernel's containers, a live kernel's, and anyone else's. A
+   * list is the trusted VM's; a record gives each VM its own. The sweep
+   * kills and returns, trusted's first, those the request names (a run's by
+   * containerRunId, or one named outright, with CONTAINER_PREFIX), as the
+   * real driver's does, and records them (FakeSandbox.sweeps). Unset, none.
+   */
+  readonly orphans?: readonly string[] | Readonly<Partial<Record<SandboxDomain, readonly string[]>>>
+  /** sweepOrphans() never settles: a daemon that accepts and never answers. */
+  readonly sweepHangs?: boolean
+  /** VMs the sweep cannot list, as a daemon that refuses `docker ps` (SweepResult.unlisted). */
+  readonly sweepUnlisted?: readonly SandboxDomain[]
+  /** Names whose kill by name the daemon refuses (SweepResult.failed): listed, never swept. */
+  readonly sweepKillRefused?: readonly string[]
 }
 
 /** A channel run's container ends, for a test to play the container with. */
@@ -212,6 +239,12 @@ export interface FakeSandbox extends SandboxDriver {
   readonly kills: string[]
   /** Names passed to abandon(), including repeats. */
   readonly abandons: string[]
+  /** What each sweepOrphans() call killed by name, in call order: one entry per call that settled (none for `sweepHangs`). */
+  readonly sweeps: (readonly string[])[]
+  /** Every request sweepOrphans() was handed, in call order, settled or not: what boot asked, and its signal. */
+  readonly sweepRequests: SweepRequest[]
+  /** The signal each probe() call was handed, in call order (undefined for a call handed none). */
+  readonly probeSignals: (AbortSignal | undefined)[]
   /** End a hanging run as a wallclock overrun would, on a later macrotask. */
   simulateOverrun(name: string): void
   /**
@@ -504,6 +537,9 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
   }
 
   const abandons: string[] = []
+  const sweeps: (readonly string[])[] = []
+  const sweepRequests: SweepRequest[] = []
+  const probeSignals: (AbortSignal | undefined)[] = []
 
   return {
     name: 'fake',
@@ -511,8 +547,13 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
     channels,
     kills,
     abandons,
+    sweeps,
+    sweepRequests,
+    probeSignals,
 
-    async probe(): Promise<ProbeResult> {
+    async probe(signal?: AbortSignal): Promise<ProbeResult> {
+      probeSignals.push(signal)
+      if (options.probeHangs === true) return new Promise<ProbeResult>(() => undefined)
       const probe = options.probe ?? UNAVAILABLE
       // As the real driver: never ok without a pinned id, whatever a daemon
       // would say.
@@ -656,6 +697,57 @@ export function fakeSandbox(options: FakeSandboxOptions = {}): FakeSandbox {
       const hung = pending.get(name)
       if (hung === undefined) return // ended already
       end(hung)
+    },
+
+    sweepOrphans(request: SweepRequest): Promise<SweepResult> {
+      // As the real driver's: only the names the request gives, each killed
+      // by name on the VM that lists it; anyone else's container is left
+      // alone, and a request that names nothing asks no VM. A hung run of
+      // this fake's under such a name ends as a requested kill ends it.
+      sweepRequests.push(request)
+      if (options.sweepHangs === true) return new Promise<SweepResult>(() => undefined)
+      const runIds = new Set(request.runIds)
+      const names = new Set(request.names)
+      const named = (n: string): boolean => {
+        if (!n.startsWith(CONTAINER_PREFIX)) return false
+        if (names.has(n)) return true
+        const runId = containerRunId(n)
+        return runId !== undefined && runIds.has(runId)
+      }
+      const listing = options.orphans ?? []
+      const listed = (domain: SandboxDomain): readonly string[] =>
+        Array.isArray(listing) ? (domain === 'trusted' ? (listing as readonly string[]) : []) : ((listing as Partial<Record<SandboxDomain, readonly string[]>>)[domain] ?? [])
+      const unlisted = new Set(options.sweepUnlisted ?? [])
+      const refused = new Set(options.sweepKillRefused ?? [])
+      const swept: string[] = []
+      const result: { swept: string[]; unlisted: { domain: SandboxDomain; why: string }[]; failed: { name: string; domain: SandboxDomain; why: string }[] } = {
+        swept,
+        unlisted: [],
+        failed: [],
+      }
+      if (runIds.size === 0 && names.size === 0) {
+        sweeps.push(Object.freeze([]))
+        return Promise.resolve(result)
+      }
+      for (const domain of ['trusted', 'hostile'] as const) {
+        if (unlisted.has(domain)) {
+          result.unlisted.push({ domain, why: 'Cannot connect to the Docker daemon' })
+          continue
+        }
+        for (const name of listed(domain).filter(named)) {
+          if (refused.has(name)) {
+            result.failed.push({ name, domain, why: 'Error response from daemon: refused' })
+            continue
+          }
+          swept.push(name)
+          const hung = pending.get(name)
+          if (hung === undefined || hung.scripted.ignoresKill === true) continue
+          hung.killedBy ??= 'requested'
+          end(hung)
+        }
+      }
+      sweeps.push(Object.freeze([...swept]))
+      return Promise.resolve(result)
     },
   }
 }

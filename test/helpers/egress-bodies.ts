@@ -38,22 +38,25 @@
 // branch, title and body among them), and one that is not that call is
 // denied there, before it runs, and fails the body.
 //
-// What the body holds the run to (phase2Exit): it finished ok; the tests
-// passed; the publish says it pushed the branch and opened the pull request;
-// every proxy.decision is the run's, every flow of each of its grants is a
-// decision, every allow is for the bound repository on github.com or
-// api.github.com, and the clone's and the publish's are those requests (a
-// push, a pull request); the direct probe found no route (its stdout the one
-// line ENETUNREACH), and each git request for the Mac's loopback is its
-// grant's one decision, a deny at the policy (not-a-host) that was never
-// resolved or sent; no other request was denied; and the binding's value,
-// and its Basic form (built from the github-git binding's basicUser, as the
-// kernel builds it), are in no row, no spec the driver was handed, no
-// workspace entry's name, link's target or file's contents (a git object
-// inflated), and nothing PID 1, the mux or the command holds, where the
-// kernel's mask showing anything at all is a value found there, as it is in
-// any row of the run (a value a container printed, which the mask kept from
-// the log). The caller is told the run's workspace as soon as run.start
+// What the body holds the run to (phase2Exit): it finished ok; each call but
+// the two git requests for the loopback exited 0 and the kernel reports it
+// ok, those two it reports failed; every grant of the run was revoked at its
+// container's exit (`exited`), never for a violation, a limit, a kill or an
+// error; the tests passed; the publish says it pushed the branch and opened
+// the pull request; every proxy.decision is the run's, every flow of each of
+// its grants is a decision, every allow is for the bound repository on
+// github.com or api.github.com, and the clone's and the publish's are those
+// requests (a push, a pull request); the direct probe found no route (its
+// stdout the one line ENETUNREACH), and each git request for the Mac's
+// loopback is its grant's one decision, a deny at the policy (not-a-host)
+// that was never resolved or sent; no other request was denied; and the
+// binding's value, and its Basic form (built from the github-git binding's
+// basicUser, as the kernel builds it), are in no row, no spec the driver was
+// handed, no workspace entry's name, link's target or file's contents (a git
+// object inflated), and nothing PID 1, the mux or the command holds, where
+// the kernel's mask showing anything at all is a value found there, as it is
+// in any row of the run (a value a container printed, which the mask kept
+// from the log). The caller is told the run's workspace as soon as run.start
 // names the run, so it is removed however the body ends. No failure it
 // reports quotes the value or its Basic form (scrubbed): node:test prints a
 // failure's message and values where the operator copies them.
@@ -840,7 +843,7 @@ function tapStream(tests: readonly TapTest[], printed: readonly string[] = []): 
  *                      kernel kills it by name EXIT_KILL_GRACE_MS after the
  *                      exit frame and revokes its grant `requested`, its
  *                      call not ok as it would be anyway.
- *   clone-offline     the clone writes the fixture's files but fetches
+ *   clone-offline      the clone writes the fixture's files but fetches
  *                      nothing, as a workspace seeded some other way.
  *   clone-refs-only    the clone asks for the bound repository's refs (GET
  *                      info/refs), never for a pack, then writes the

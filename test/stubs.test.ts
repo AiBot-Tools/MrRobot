@@ -379,7 +379,7 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
   assert.equal(Number(skipped), gated, 'the claimed skip count is not the number of gated live tests')
   // The stubs list's live-tests clause says the same in words: how many
   // gated files, and how many tests in them. It said "two files, eight tests"
-  // for a whole phase after L1 and L2 made it four and eighteen, because
+  // through LV and D1, after L1 and L2 made it four and eighteen, because
   // nothing read it; both are read here and held to the gated files.
   const WORDS = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen', 'twenty']
   const clause = /live tests behind `AOS_LIVE_TESTS=1` \(([a-z]+) files?, ([a-z]+) tests?:/.exec(section)

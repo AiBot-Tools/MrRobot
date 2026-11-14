@@ -2363,51 +2363,61 @@ const runner: Suite = {
 const EXIT_BODIES = 'test/helpers/egress-bodies.ts'
 const SANDBOX_BODIES = 'test/helpers/sandbox-bodies.ts'
 
-// The gated live tests' bodies (egress plan L1 and L2): each check a
-// container or a VM can make fail, test/sandbox-bodies.test.ts shows failing
-// offline on what it is there to catch, a container played as a broken VM,
-// image or kernel would have it act (exitActor's ExitFault, the bodies test's
-// Acting), so a check dropped here would pass the live run on the Mac with
-// nothing seen to fail. Among them, no request failed upstream: a container
-// makes one fail by cutting a request short of its Content-Length (exitActor's
-// clone-cut, LB75), so it is no check of the kernel's alone. Not here, since
-// no container can make them fail and they are seen only to pass: the checks
-// of what the kernel or the driver alone decides. For L1, that a channel run
-// has a channel, that a run given up is credited to no kill, that a wallclock
-// kill's exit is 137, and that the canaries' log rows are there once both
-// pass; for the exit, egress ok, every approval given, the run's status, the
-// results and grants counts, the approvals list, the run id of every grant
-// and decision, no decision under no grant, the revoked count, judged ===
-// requests, the allows' host and repository, the spec scan and the chain. A
-// mutant whose why says the body then fails later, not on what it is there
-// to catch, is killed by its row's message: the check is the one that names
-// the fault. A call's exit status is read from its result's head line alone,
-// and node --test's summary from a stdout the kernel shows whole, in the
-// block after its top-level plan, each with a row whose container's or whose
-// tests' own output a looser reading would pass (LB111-LB116, LB126-LB128). A
-// call's stdout is the text under its result's first stdout heading, the
-// kernel's, never one a container prints on its stderr (LB140), and the
-// direct probe's report and the look at PID 1's five lines are read from it,
-// never from stderr, the probe's report as the one line ENETUNREACH (LB6,
-// LB137-LB139). The publish's two lines are read as whole lines (split at \n
-// alone, never a /m regex) of its stdout, each anchored at both ends (LB117,
-// LB129-LB133), and each part of them that a check holds to what was approved
-// has a row of its own, wrong in that part alone: the pushed line's run,
-// branch, repository and host; the opened line's run, branch and base, and
-// its address's host, repository and number, the number it says it opened
-// (LB118-LB120). The probe's parent is held to the mux's argv whole, so a
-// parent that is docker-init or another node program fails (LB102, LB122).
-// The mux's and the command's environments are held as PID 1's is, each
-// (list, kind) cell with a row: the value, its Basic form and the mask in
-// each, and a credential's name (LB123, LB124, LB134-LB136). Four besides are
-// no container's: the Basic form the body looks for is built from the
-// github-git binding's basicUser, as the kernel builds it (LB103); the caller
-// is told the run's workspace as soon as run.start names the run, so a live
-// run that fails still has it removed (LB104); the address's repository is
-// read without case, since GitHub answers in its own spelling (LB121); and
+// The gated live tests' bodies (egress plan L1 and L2): each check a container
+// or a VM can make fail, test/sandbox-bodies.test.ts shows failing offline on
+// what it is there to catch, a container played as a broken VM, image or
+// kernel would have it act (exitActor's ExitFault, the bodies test's Acting),
+// so a check dropped here would pass the live run on the Mac with nothing seen
+// to fail. Among them, no request failed upstream: a container makes one fail
+// by cutting a request short of its Content-Length (exitActor's clone-cut,
+// LB75), so it is no check of the kernel's alone. Not here, since no container
+// can make them fail and they are seen only to pass: the checks of what the
+// kernel or the driver alone decides. For L1, that a channel run has a
+// channel, that a run given up is credited to no kill, that a wallclock kill's
+// exit is 137, and that the canaries' log rows are there once both pass; for
+// the exit, egress ok, every approval given, the run's status, the results and
+// grants counts, the approvals list, the run id of every grant and decision,
+// no decision under no grant, the revoked count, judged === requests, the
+// allows' host and repository, the spec scan and the chain. A mutant whose why
+// says the body then fails later, not on what it is there to catch, is killed
+// by its row's message: the check is the one that names the fault. Past the
+// exit statuses, the body reads what the kernel says of each call and each
+// grant: every call ok but the two git requests for the loopback, never ok,
+// and every grant of the run revoked `exited`, its normal end, never for a
+// violation nor at the kernel's own kill by name, `error` or `requested`
+// (exitActor's exit-then-torn, ls-remote-then-torn, ls-remote-client-lost,
+// ls-remote-lingers, ls-remote-exits-0, LB141-LB145), since a mux that tears a
+// frame after its exit frame has its grant revoked for a violation and its
+// call failed, `exited 0` still on its head line. An exit-status check dropped
+// (LB25, LB27-LB33) falls to the kernel's ok, whose failure says the kernel
+// reported the call failed (its quoted head showing the status), not that the
+// call did not exit 0, so its row's message kills it. A call's exit status is
+// read from its result's head line alone, and node --test's summary from a
+// stdout the kernel shows whole, in the block after its top-level plan, each
+// with a row whose container's or whose tests' own output a looser reading
+// would pass (LB111-LB116, LB126-LB128). A call's stdout is the text under its
+// result's first stdout heading, the kernel's, never one a container prints on
+// its stderr (LB140), and the direct probe's report and the look at PID 1's
+// five lines are read from it, never from stderr, the probe's report as the
+// one line ENETUNREACH (LB6, LB137-LB139). The publish's two lines are read as
+// whole lines (split at \n alone, never a /m regex) of its stdout, each
+// anchored at both ends (LB117, LB129-LB133), and each part of them that a
+// check holds to what was approved has a row of its own, wrong in that part
+// alone: the pushed line's run, branch, repository and host; the opened line's
+// run, branch and base, and its address's host, repository and number, the
+// number it says it opened (LB118-LB120). The probe's parent is held to the
+// mux's argv whole, so a parent that is docker-init or another node program
+// fails (LB102, LB122). The mux's and the command's environments are held as
+// PID 1's is, each (list, kind) cell with a row: the value, its Basic form and
+// the mask in each, and a credential's name (LB123, LB124, LB134-LB136). Four
+// besides are no container's: the Basic form the body looks for is built from
+// the github-git binding's basicUser, as the kernel builds it (LB103); the
+// caller is told the run's workspace as soon as run.start names the run, so a
+// live run that fails still has it removed (LB104); the address's repository
+// is read without case, since GitHub answers in its own spelling (LB121); and
 // the run's workspace is looked for under the trusted domain's mountRoot,
-// which the offline fixture gives a directory apart from the hostile one's,
-// as the Mac does (LB125).
+// which the offline fixture gives a directory apart from the hostile one's, as
+// the Mac does (LB125).
 const liveBodies: Suite = {
   name: 'liveBodies',
   tests: ['test/sandbox-bodies.test.ts'],
@@ -2436,15 +2446,15 @@ const liveBodies: Suite = {
     { id: 'LB22', file: SANDBOX_BODIES, from: "  if (!external.startsWith('external refused ')) problems.push(", to: '  if (false) problems.push(', why: 'a fetch of a host outside a container with no channel that is answered passes' },
     { id: 'LB23', file: SANDBOX_BODIES, from: "    assert.equal(acceptReady(Buffer.from(report, 'utf8')), undefined,", to: '    assert.equal(undefined, undefined,', why: "a VM's self-test report that reached 192.168.5.2:8766, or met a code that does not say there is no route, passes" },
     { id: 'LB24', file: SANDBOX_BODIES, from: '    assert.deepEqual(verdict, { ok: true }, ', to: '    assert.deepEqual({ ok: true }, { ok: true }, ', why: "a canary boot would refuse, closing its domain, passes the canary body" },
-    { id: 'LB25', file: EXIT_BODIES, from: "  exited(0, 0)\n", to: "", why: "a direct probe of 192.168.5.2:8766 that exits other than 0, its report cut short, passes as long as it printed ENETUNREACH" },
+    { id: 'LB25', file: EXIT_BODIES, from: "  exited(0, 0)\n", to: "", why: "a direct probe of 192.168.5.2:8766 that exits other than 0, its report cut short, falls to the kernel's ok, whose failure says the kernel reported call 1 failed (its quoted head showing the status), not that it did not exit 0" },
     { id: 'LB26', file: EXIT_BODIES, from: "  for (const i of [1, 2]) assert.match(said(i), /returned error: 403/,", to: "  for (const i of [1, 2].slice(2)) assert.match(said(i), /returned error: 403/,", why: "a git ls-remote through the proxy that met something other than its 403 (a 502, a reset) passes, so what the kernel answered is never seen to reach git" },
-    { id: 'LB27', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [4, 5, 6, 7, 8, 9]) exited(i, 0)\n", why: "the clone (call 4) may exit other than 0 and the exit passes" },
-    { id: 'LB28', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [3, 5, 6, 7, 8, 9]) exited(i, 0)\n", why: "the edit (call 5) may exit other than 0 and the exit passes" },
-    { id: 'LB29', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [3, 4, 6, 7, 8, 9]) exited(i, 0)\n", why: "git add (call 6) may exit other than 0 and the exit passes" },
-    { id: 'LB30', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [3, 4, 5, 7, 8, 9]) exited(i, 0)\n", why: "the commit (call 7) may exit other than 0 and the exit passes" },
-    { id: 'LB31', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [3, 4, 5, 6, 8, 9]) exited(i, 0)\n", why: "node --test (call 8) may exit other than 0 and the exit passes" },
-    { id: 'LB32', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [3, 4, 5, 6, 7, 9]) exited(i, 0)\n", why: "the look at PID 1 (call 9) may exit other than 0 and the exit passes" },
-    { id: 'LB33', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [3, 4, 5, 6, 7, 8]) exited(i, 0)\n", why: "the publish (call 10) may exit other than 0 and the exit passes" },
+    { id: 'LB27', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [4, 5, 6, 7, 8, 9]) exited(i, 0)\n", why: "the clone (call 4) may exit other than 0 past the exit-status check, falling to the kernel's ok, whose failure says the kernel reported the call failed (its quoted head showing the status), not that it did not exit 0" },
+    { id: 'LB28', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [3, 5, 6, 7, 8, 9]) exited(i, 0)\n", why: "the edit (call 5) may exit other than 0 past the exit-status check, falling to the kernel's ok, whose failure says the kernel reported the call failed (its quoted head showing the status), not that it did not exit 0" },
+    { id: 'LB29', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [3, 4, 6, 7, 8, 9]) exited(i, 0)\n", why: "git add (call 6) may exit other than 0 past the exit-status check, falling to the kernel's ok, whose failure says the kernel reported the call failed (its quoted head showing the status), not that it did not exit 0" },
+    { id: 'LB30', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [3, 4, 5, 7, 8, 9]) exited(i, 0)\n", why: "the commit (call 7) may exit other than 0 past the exit-status check, falling to the kernel's ok, whose failure says the kernel reported the call failed (its quoted head showing the status), not that it did not exit 0" },
+    { id: 'LB31', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [3, 4, 5, 6, 8, 9]) exited(i, 0)\n", why: "node --test (call 8) may exit other than 0 past the exit-status check, falling to the kernel's ok, whose failure says the kernel reported the call failed (its quoted head showing the status), not that it did not exit 0" },
+    { id: 'LB32', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [3, 4, 5, 6, 7, 9]) exited(i, 0)\n", why: "the look at PID 1 (call 9) may exit other than 0 past the exit-status check, falling to the kernel's ok, whose failure says the kernel reported the call failed (its quoted head showing the status), not that it did not exit 0" },
+    { id: 'LB33', file: EXIT_BODIES, from: "  for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)\n", to: "  for (const i of [3, 4, 5, 6, 7, 8]) exited(i, 0)\n", why: "the publish (call 10) may exit other than 0 past the exit-status check, falling to the kernel's ok, whose failure says the kernel reported the call failed (its quoted head showing the status), not that it did not exit 0" },
     { id: 'LB34', file: EXIT_BODIES, from: "  assert.equal(count('fail'), '# fail 0', ", to: "  assert.match(count('fail') ?? '', /^# fail [01]$/, ", why: "a test run that reports a failed test beside the two that passed, and exits 0, passes" },
     { id: 'LB35', file: EXIT_BODIES, from: "  assert.ok(publishLines.some((line) => pushedLine.test(line)), ", to: "  assert.ok(true || publishLines.some((line) => pushedLine.test(line)), ", why: "a publish that does not say it pushed the approved branch passes, so what it says it pushed is never read" },
     { id: 'LB36', file: EXIT_BODIES, from: "  assert.ok(opened, `the publish opened no pull request:", to: "  assert.ok(true || opened, `the publish opened no pull request:", why: "a publish that does not say it opened the pull request passes this check (and the body fails later with a TypeError, not on what it is there to catch)" },
@@ -2551,6 +2561,11 @@ const liveBodies: Suite = {
     { id: 'LB138', file: EXIT_BODIES, from: "  assert.ok(direct === 'ENETUNREACH\\n', ", to: "  assert.ok(direct.split('\\n').includes('ENETUNREACH'), ", why: "a direct probe's stdout is read for an ENETUNREACH line among others, so one that also says `connected` passes as one with no route" },
     { id: 'LB139', file: EXIT_BODIES, from: '  const probed = stdoutOf(resultText(results, 8), quote)\n', to: '  const probed = resultText(results, 8)\n', why: "the look at PID 1 is read from its whole result, so five lines it never printed to its stdout, on its stderr, are taken as its report" },
     { id: 'LB140', file: EXIT_BODIES, from: "  const at = text.indexOf('\\n--- stdout (')\n", to: "  const at = text.lastIndexOf('\\n--- stdout (')\n", why: "a call's stdout is read under the last stdout heading of its result, not the kernel's, so a one-test run whose stderr prints a stdout heading of its own over a two-test stream passes" },
+    { id: 'LB141', file: EXIT_BODIES, from: "    else assert.ok(ok, `the kernel reports call ${String(i + 1)} failed: ${headOf(i)}`)\n", to: '', why: "a call the kernel reports failed though its command exited 0 (its grant revoked for a violation: a frame torn after its exit frame) is not held to ok, and is caught only at its grant's revocation, a failure that does not say the kernel reported the call failed" },
+    { id: 'LB142', file: EXIT_BODIES, from: '    if (i === 1 || i === 2) assert.ok(!ok, ', to: '    if (i === 1 || i === 2) assert.ok(true || !ok, ', why: "a git request for the loopback that the kernel reports ok, its command having exited 0 on the proxy's 403, passes" },
+    { id: 'LB143', file: EXIT_BODIES, from: "    assert.ok(reason === 'exited', ", to: "    assert.ok(true || reason === 'exited', ", why: "a grant of the run revoked for a violation passes when its call ends not ok anyway, so a git request for the loopback whose mux tore a frame after its exit frame passes" },
+    { id: 'LB144', file: EXIT_BODIES, from: "    assert.ok(reason === 'exited', ", to: "    assert.ok(reason !== 'violation', ", why: "a grant of the run revoked other than for a violation passes, so a git request for the loopback whose docker client ended with no exit status, its container killed by name and its grant revoked `error`, passes as a normal end" },
+    { id: 'LB145', file: EXIT_BODIES, from: "    assert.ok(reason === 'exited', ", to: "    assert.ok(reason !== 'violation' && reason !== 'error', ", why: "a grant of the run revoked other than for a violation or with the kernel's own `error` passes, so a git request for the loopback whose container was still running past its command's exit, killed by name and its grant revoked `requested`, passes as a normal end" },
     { id: 'LB104', file: EXIT_BODIES, from: '    started(begun.runId)\n', to: '', why: "the caller is never told the run's workspace, so every live run, a passing one included, leaves the cloned fixture in <repo>/.aos/workspaces/trusted" },
   ],
   control: { id: 'C', file: SANDBOX_BODIES, from: '// ── the hostile wallclock ─', to: '// ── the hostile wallclock (control) ─', why: 'comment only' },

@@ -534,7 +534,6 @@ test('the live node-proxy body, offline: fetches its proxy settings send nowhere
 /** A binding value in no credential shape: only the kernel's own mask keeps it, and its Basic form, out of the log. */
 const BINDING_VALUE = 'offline-binding-value-4f2a9c71e0'
 
-/** GitHub as the fixture repository's two hosts answer the exit's requests: git's smart HTTP, and a pull request opened. */
 /**
  * The repository as GitHub spells it in the addresses it answers with: the
  * operator's own case, where config reads the slug without case
@@ -543,6 +542,7 @@ const BINDING_VALUE = 'offline-binding-value-4f2a9c71e0'
  */
 const GITHUB_SPELLING = 'AiBot-Tools/aos-fixture'
 
+/** GitHub as the fixture repository's two hosts answer the exit's requests: git's smart HTTP, and a pull request opened. */
 function fixtureHost(repo: string): (req: IncomingMessage, res: ServerResponse) => void {
   assert.equal(GITHUB_SPELLING.toLowerCase(), repo, 'the bindings no longer name the fixture repository GITHUB_SPELLING spells')
   return (req, res) => {
@@ -664,7 +664,7 @@ test('the live Phase 2 exit body, offline: clone, change, test, push aos/<runId>
   assert.deepEqual([...new Set(rec.specs.filter((s) => !s.name.startsWith(CANARY_PREFIX)).map((s) => [s.domain, s.runId].join(' ')))], [`trusted ${record.runId}`])
 })
 
-test('the live Phase 2 exit body, offline, fails on each thing a container can make it catch: a route out, or no route said only on stderr or beside a connect, a request never sent, cut short or a flow with none, a call that fails, whatever its output says, a clone that asked for no pack, a failed, missing, extra or nested test, or a test summary read from a test\'s name or output, from above or with no plan line, from stderr (under a stdout heading of its own included) or from a stdout not shown whole, a push elsewhere, unsaid, said on stderr or after words of its own, or said of another branch, run, repository or host (one that only starts as github.com included), a pull request said from another branch or run, after words of its own or with more after them, at an address of another repository, host or number, or into another base, a command line without the mux, a probe whose parent is not the mux (docker-init, or another node program), a variable named like a credential, a password or a secret in PID 1\'s, the mux\'s or the command\'s environment, a look at PID 1 that prints its lines on stderr or that is not JSON, and the binding value or its Basic form in PID 1\'s, the mux\'s or the command\'s environment, PID 1\'s command line, a workspace entry\'s name, a link\'s target or a file\'s contents (a git object included) or the log, masked or not, never quoting it or ten characters of it', { timeout: 180_000 }, async (t) => {
+test('the live Phase 2 exit body, offline, fails on each thing a container can make it catch: a route out, or no route said only on stderr or beside a connect, a request never sent, cut short or a flow with none, a call that fails, whatever its output says, a call the kernel reports failed though its command exited 0 (its grant revoked for a violation), a git request for the loopback the kernel reports ok, or whose grant was revoked for a violation, an error (its docker client ended with no exit status) or as requested (its container still running past its command\'s exit), a clone that asked for no pack, a failed, missing, extra or nested test, or a test summary read from a test\'s name or output, from above or with no plan line, from stderr (under a stdout heading of its own included) or from a stdout not shown whole, a push elsewhere, unsaid, said on stderr or after words of its own, or said of another branch, run, repository or host (one that only starts as github.com included), a pull request said from another branch or run, after words of its own or with more after them, at an address of another repository, host or number, or into another base, a command line without the mux, a probe whose parent is not the mux (docker-init, or another node program), a variable named like a credential, a password or a secret in PID 1\'s, the mux\'s or the command\'s environment, a look at PID 1 that prints its lines on stderr or that is not JSON, and the binding value or its Basic form in PID 1\'s, the mux\'s or the command\'s environment, PID 1\'s command line, a workspace entry\'s name, a link\'s target or a file\'s contents (a git object included) or the log, masked or not, never quoting it or ten characters of it', { timeout: 180_000 }, async (t) => {
   const failing: readonly [ExitFault, RegExp][] = [
     ['direct-connects', /^a direct connect to 192\.168\.5\.2:8766 met something other than no route: its stdout is "connected\\n"$/],
     ['direct-said-on-stderr', /^a direct connect to 192\.168\.5\.2:8766 met something other than no route: its stdout is "connected\\n"$/],
@@ -674,6 +674,13 @@ test('the live Phase 2 exit body, offline, fails on each thing a container can m
     ['ls-remote-silent-name', /the git request for host\.lima\.internal \(call 3\) was not its grant's one deny at the policy/],
     ['ls-remote-other-ip', /git ls-remote through the proxy was not denied \(call 2\)/],
     ['ls-remote-other-name', /git ls-remote through the proxy was not denied \(call 3\)/],
+    ['ls-remote-exits-0', /^the kernel reports call 3 ok, though the proxy denied its one request: aos-run-\S+ on the trusted domain, [^\n]*, exited 0 after \d+ ms\n--- stdout \(0 bytes\) ---$/],
+    // Its call not ok as git ends it anyway, so only its grant's revocation shows the frame it tore.
+    ['ls-remote-then-torn', /^call 2's grant was revoked \(violation\), not at its command's exit: aos-run-\S+ on the trusted domain, [^\n]*, exited 128 after \d+ ms\n\[egress grant \S+ revoked: violation: frame refused \(truncated-header\): the stream ended 3 bytes into a 9-byte header\]$/],
+    // The kernel's own kill by name, its grant revoked `error`: never the container's violation, and never its normal end either.
+    ['ls-remote-client-lost', /^call 2's grant was revoked \(error\), not at its command's exit: aos-run-\S+ on the trusted domain, [^\n]*, exited 128 after \d+ ms; a kill by name was sent to aos-run-\S+, as a docker client with no exit status may leave its container running\n\[egress grant \S+ revoked: error: the kernel killed the container by name, as a docker client with no exit status may leave its container running\]$/],
+    // Its container still running past its command's exit: the kernel's kill by name EXIT_KILL_GRACE_MS later, its grant revoked `requested`.
+    ['ls-remote-lingers', /^call 2's grant was revoked \(requested\), not at its command's exit: aos-run-\S+ on the trusted domain, [^\n]*, was killed by name, still running 10000 ms after its command exited 128 \(exit 137\) after \d+ ms\n\[egress grant \S+ revoked: requested: the command exited, and its container was still running 10000 ms later, so the kernel killed it by name\]$/],
     ['clone-offline', /^the clone asked for no pack of aibot-tools\/aos-fixture:\n$/],
     ['clone-refs-only', /^the clone asked for no pack of aibot-tools\/aos-fixture:\n\{(?=[^\n]*"method":"GET")(?=[^\n]*"path":"\/aibot-tools\/aos-fixture\.git\/info\/refs")(?=[^\n]*"reason":"git-fetch")[^\n]*\}$/],
     ['clone-cut', /^a request the kernel allowed failed upstream: \{(?=[^\n]*"reason":"git-fetch")(?=[^\n]*"refusal":"aborted")(?=[^\n]*"stage":"upstream")/],
@@ -682,6 +689,8 @@ test('the live Phase 2 exit body, offline, fails on each thing a container can m
     ['flow-silent', /: a flow carried no judged request/],
     ['edit-fails', /^call 5 did not exit 0: aos-run-\S+ on the trusted domain, [^\n]*, exited 1 after \d+ ms$/],
     ['edit-prints-exited', /^call 5 did not exit 0: aos-run-\S+ on the trusted domain, [^\n]*, exited 1 after \d+ ms$/],
+    // `exited 0` on the head's first line, the revocation on its second.
+    ['exit-then-torn', /^the kernel reports call 5 failed: aos-run-\S+ on the trusted domain, [^\n]*, exited 0 after \d+ ms\n\[egress grant \S+ revoked: violation: frame refused \(truncated-header\): the stream ended 3 bytes into a 9-byte header\]$/],
     ['edit-unwritten', /the edit wrote no sum-negative\.test\.js/],
     ['edit-other', /sum-negative\.test\.js is not the second test the edit writes/],
     ['add-fails', /^call 6 did not exit 0: aos-run-\S+ on the trusted domain, [^\n]*, exited 128 after \d+ ms$/],

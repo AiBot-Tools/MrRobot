@@ -377,6 +377,44 @@ test('CLAUDE.md Current state names every STUBS entry', () => {
     .reduce((n, f) => n + (readFileSync(`${REPO}/test/${f}`, 'utf8').match(/\bskip\s*:/g) ?? []).length, 0)
   assert.ok(gated >= 2, 'the gated live files hold fewer tests than they did in Phase 0')
   assert.equal(Number(skipped), gated, 'the claimed skip count is not the number of gated live tests')
+  // The stubs list's live-tests clause says the same in words: how many
+  // gated files, and how many tests in them. It said "two files, eight tests"
+  // for a whole phase after L1 and L2 made it four and eighteen, because
+  // nothing read it; both are read here and held to the gated files.
+  const WORDS = ['no', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen', 'twenty']
+  const clause = /live tests behind `AOS_LIVE_TESTS=1` \(([a-z]+) files?, ([a-z]+) tests?:/.exec(section)
+  assert.ok(clause, "CLAUDE.md Current state's live-tests clause does not say '<files> files, <tests> tests' in the checkable form")
+  const liveFiles = readdirSync(`${REPO}/test`).filter((f) => /^live-.*\.test\.ts$/.test(f))
+  const heldTo = (said: string, real: number, what: string, where: string): void => {
+    assert.ok(WORDS.includes(said), `CLAUDE.md's live-tests clause says "${said}" ${what}, a word this test does not read as a number up to twenty`)
+    assert.equal(WORDS.indexOf(said), real, `CLAUDE.md's live-tests clause says ${said} ${what}; ${where} holds ${String(real)}`)
+  }
+  heldTo(clause[1] ?? '', liveFiles.length, 'gated live files', 'test/live-*.test.ts')
+  heldTo(clause[2] ?? '', gated, 'gated live tests', 'test/live-*.test.ts')
+  // And the counts it gives each file as the file is now, read the same way
+  // and held to that file's gated tests (its skip: count), with the tests
+  // that write to pmmcp (those whose skip reason asks for
+  // AOS_LIVE_PMMCP_WRITES=1): a tenth L1 check makes 'eighteen' 'nineteen',
+  // and must make 'nine' 'ten' as well. Not 'the three in
+  // test/live-anthropic.test.ts passed on the Mac on 2026-10-19': a record
+  // of what passed that day, which a test added since must not rewrite; the
+  // total above counts a new one there.
+  const liveText = (file: string): string => {
+    assert.ok(liveFiles.includes(file), `the live-tests clause names test/${file}, which is not a gated live file`)
+    return readFileSync(`${REPO}/test/${file}`, 'utf8')
+  }
+  const skips = (file: string): number => (liveText(file).match(/\bskip\s*:/g) ?? []).length
+  const writers = liveFiles.reduce((n, f) => n + (liveText(f).match(/'set AOS_LIVE_PMMCP_WRITES=1 as well:/g) ?? []).length, 0)
+  const words = section.replace(/\s+/g, ' ')
+  for (const [pattern, real, what, where] of [
+    [/, plus ([a-z]+) Phase 1 runtime checks, /, skips('live-runtime.test.ts'), 'Phase 1 runtime checks', 'test/live-runtime.test.ts'],
+    [/ Phase 2's ([a-z]+) sandbox checks \(`test\/live-sandbox\.test\.ts`, L1,/, skips('live-sandbox.test.ts'), 'sandbox checks', 'test/live-sandbox.test.ts'],
+    [/; the ([a-z]+) that write to pmmcp need `AOS_LIVE_PMMCP_WRITES=1` too/, writers, 'tests that write to pmmcp', 'test/live-*.test.ts'],
+  ] as const) {
+    const found = pattern.exec(words)
+    assert.ok(found, `CLAUDE.md's live-tests clause does not say how many ${what} in the checkable form (${String(pattern)})`)
+    heldTo(found[1] ?? '', real, what, where)
+  }
   // Not asserted against a live run — that would mean running the suite inside
   // itself. Asserted as plausible and monotonic: the number cannot be a stale
   // small one, which is the only drift that has ever actually happened here.

@@ -1358,8 +1358,14 @@ on either domain; an answer from outside the container. For the exit: a direct
 connect that connects, or whose no route is said only on stderr or beside a
 `connected` (the probe's report is its whole stdout, the one line
 `ENETUNREACH`); a call that exits other than 0, whatever its own output says
-(its status is read from the result's head line alone); a git request for
-192.168.5.2 or for host.lima.internal never sent, or answered other than 403; a
+(its status is read from the result's head line alone); a call the kernel
+reports failed though its command exited 0 (its grant revoked for a violation: a
+frame torn after its exit frame, which leaves `exited 0` on the head's first
+line); a grant of the run revoked other than at its command's exit (for a
+violation, or at the kernel's own kill by name: `error`, its docker client
+having ended with no exit status, or `requested`, its container still running
+past its command's exit); a git request for 192.168.5.2 or for
+host.lima.internal never sent, answered other than 403, or reported ok; a
 request never sent, or a flow with none on it; a request cut short of its
 Content-Length, which fails upstream; a clone that asked for no pack; a request
 denied; a push or pull request not made, or not said, or said only on stderr
@@ -1396,9 +1402,9 @@ kill only on one), and that the canaries' log rows are there once both pass; for
 the exit, that egress booted ok, that every approval was given on the control
 plane, that the run finished ok, the results and grants counts, the approvals
 list, every grant and decision recorded under the run, no decision under no
-grant, every grant revoked, each grant's decisions counting its requests, every
-allow for the bound repository on its two hosts, no spec the driver was handed
-holding the token, and the chain verifying.
+grant, every grant revoked (why each was is seen to fail, above), each grant's
+decisions counting its requests, every allow for the bound repository on its two
+hosts, no spec the driver was handed holding the token, and the chain verifying.
 
 | Test | Needs | What only a live run settles |
 |---|---|---|

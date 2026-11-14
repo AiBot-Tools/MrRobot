@@ -2714,6 +2714,25 @@ test("README says which live tests AOS_LIVE_TESTS=1 alone runs, and which checks
   const catalog = flat(read('scripts/falsify/catalog.ts'))
   assert.ok(catalog.includes("Among them, no request failed upstream: a container makes one fail by cutting a request short of its Content-Length (exitActor's clone-cut, LB75)"), "the liveBodies comment does not say a container can make the upstream check fail")
   assert.equal(/no upstream row/.test(catalog), false, 'the liveBodies comment lists the upstream check among the checks seen only to pass')
+  // How the kernel says a call ended, and why each grant ended, are seen to
+  // fail (a frame torn after its exit frame fails both), and why a grant
+  // ended is not always the container's doing: an `error` or a `requested`
+  // is the kernel's own kill by name. Only that every grant was revoked is
+  // seen only to pass.
+  const seenToFail = readme.slice(0, readme.indexOf('Seen only to pass are the checks'))
+  for (const says of [
+    'a call the kernel reports failed though its command exited 0 (its grant revoked for a violation',
+    "a grant of the run revoked other than at its command's exit (for a violation, or at the kernel's own kill by name: `error`, its docker client having ended with no exit status, or `requested`, its container still running past its command's exit)",
+  ]) {
+    assert.ok(seenToFail.includes(says), `README does not list among the checks seen to fail: ${says}`)
+  }
+  assert.ok(readme.includes('every grant revoked (why each was is seen to fail, above)'), 'README does not say why each grant was revoked is seen to fail')
+  assert.ok(catalog.includes("every grant of the run revoked `exited`, its normal end, never for a violation nor at the kernel's own kill by name, `error` or `requested` (exitActor's exit-then-torn, ls-remote-then-torn, ls-remote-client-lost, ls-remote-lingers, ls-remote-exits-0, LB141-LB145)"), "the liveBodies comment does not say the calls' ok and the grants' revocations are read")
+  // A dropped exit-status check falls to the kernel's ok, whose failure
+  // quotes the head and so shows the status: never "does not say how the
+  // call exited".
+  assert.ok(catalog.includes("An exit-status check dropped (LB25, LB27-LB33) falls to the kernel's ok, whose failure says the kernel reported the call failed (its quoted head showing the status), not that the call did not exit 0"), "the liveBodies comment does not say where a dropped exit-status check falls")
+  assert.equal(/does not say how (?:the call|it) exited/.test(catalog), false, "the liveBodies comment or a why still says the kernel's ok does not say how a call exited")
   // live-egress's guard: it admits each answer as it arrives, before the kernel judges it.
   const egress = flat(read('test/live-egress.test.ts'))
   assert.ok(egress.includes('The kernel\'s checkAnswers (src/egress/upstream.ts, over src/egress/addr.ts) then judges each answer unchanged, so an address it refuses is admitted to the guard but never dialled.'), "live-egress's admitting() comment does not say the guard admits first")

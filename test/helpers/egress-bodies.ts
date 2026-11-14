@@ -429,10 +429,10 @@ function resultText(results: readonly Row[], i: number): string {
  * streams: a later one is a container's, printed on its stdout or its
  * stderr, and is never read. The text under it is the container's, so it is
  * read by the heading's count, never up to a line the container could print
- * (a `--- stderr` heading of its own). A stream the
- * kernel shows by a window or cut, or withholds, is no whole stdout: its
- * first line may be the end of a line, so none of it is read as whole
- * lines. A failure shows the heading as `quote` gives it.
+ * (a `--- stderr` heading of its own). A stream the kernel shows by a window
+ * or cut, or withholds, is no whole stdout: its first line may be the end of
+ * a line, so none of it is read as whole lines. A failure shows the heading
+ * as `quote` gives it.
  */
 export function stdoutOf(text: string, quote: (text: string) => string): string {
   const at = text.indexOf('\n--- stdout (')
@@ -539,6 +539,31 @@ export async function phase2Exit(inputs: ExitInputs): Promise<ExitRecord> {
   assert.ok(direct === 'ENETUNREACH\n', `a direct connect to 192.168.5.2:8766 met something other than no route: its stdout is ${JSON.stringify(direct.slice(0, 200))}`)
   for (const i of [1, 2]) assert.match(said(i), /returned error: 403/, `git ls-remote through the proxy was not denied (call ${String(i + 1)})`)
   for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)
+  // How the kernel says each call ended, which its head line alone does not
+  // say: the kernel marks a call ok (tool.result's ok) only when its command
+  // exited 0 and its grant ended with its container's exit. A mux that sends
+  // its exit frame and then tears a frame has its grant revoked for a
+  // violation, and its call marked failed, with `exited 0` still on the
+  // head's first line and the revocation on its second. So every call is
+  // held to ok but the two git requests for the loopback, which the proxy
+  // denies and git ends not ok; and every grant of the run to the revocation
+  // its normal end gives (`exited`), never a violation, a limit, a kill or an
+  // error: the two requests' grants included, whose calls end not ok
+  // whatever their grants met. A failure names the call and the first two
+  // lines of its result, scrubbed.
+  const headOf = (i: number): string => said(i).split('\n').slice(0, 2).join('\n').slice(0, 600)
+  for (const [i, row] of results.entries()) {
+    const ok = row.payload['ok'] === true
+    if (i === 1 || i === 2) assert.ok(!ok, `the kernel reports call ${String(i + 1)} ok, though the proxy denied its one request: ${headOf(i)}`)
+    else assert.ok(ok, `the kernel reports call ${String(i + 1)} failed: ${headOf(i)}`)
+  }
+  const runGrants = all.filter((r) => r.type === 'proxy.grant.issued' && r.payload['purpose'] !== 'canary').map((r) => String(r.payload['grantId']))
+  for (const r of all.filter((each) => each.type === 'proxy.grant.revoked')) {
+    const i = runGrants.indexOf(String(r.payload['grantId']))
+    if (i === -1) continue
+    const reason = String(r.payload['reason'])
+    assert.ok(reason === 'exited', `call ${String(i + 1)}'s grant was revoked (${quote(reason)}), not at its command's exit: ${i < results.length ? headOf(i) : 'the call has no result'}`)
+  }
   // node --test's summary, read from its stdout alone (the reporter writes
   // its whole stream there, so a line on stderr is none of it) and from the
   // block after its top-level plan, the last `1..N` line, unindented. It prints
@@ -792,7 +817,30 @@ function tapStream(tests: readonly TapTest[], printed: readonly string[] = []): 
  *                      git ls-remote for 192.168.5.2 (ip) or for
  *                      host.lima.internal (name) sends its request, which
  *                      the kernel denies, and prints a 502.
- *   clone-offline      the clone writes the fixture's files but fetches
+ *   ls-remote-exits-0  git ls-remote for host.lima.internal sends its
+ *                      request, which the kernel denies, prints the 403,
+ *                      and exits 0.
+ *   ls-remote-then-torn
+ *                      git ls-remote for 192.168.5.2 sends its request,
+ *                      which the kernel denies, prints the 403 and exits
+ *                      128, and its mux then sends three bytes of a frame's
+ *                      header and ends its stream: its grant is revoked for
+ *                      a violation, its call not ok as it would be anyway.
+ *   ls-remote-client-lost
+ *                      git ls-remote for 192.168.5.2 sends its request,
+ *                      which the kernel denies, prints the 403 and exits
+ *                      128, and its docker client then ends with no exit
+ *                      status (SIGKILL, as the OOM killer ends one): the
+ *                      kernel kills the container by name and revokes its
+ *                      grant `error`, its call not ok as it would be anyway.
+ *   ls-remote-lingers  git ls-remote for 192.168.5.2 sends its request,
+ *                      which the kernel denies, prints the 403 and exits
+ *                      128, and its container then never ends, as one a
+ *                      process the command left behind keeps running: the
+ *                      kernel kills it by name EXIT_KILL_GRACE_MS after the
+ *                      exit frame and revokes its grant `requested`, its
+ *                      call not ok as it would be anyway.
+ *   clone-offline     the clone writes the fixture's files but fetches
  *                      nothing, as a workspace seeded some other way.
  *   clone-refs-only    the clone asks for the bound repository's refs (GET
  *                      info/refs), never for a pack, then writes the
@@ -810,6 +858,11 @@ function tapStream(tests: readonly TapTest[], printed: readonly string[] = []): 
  *   edit-prints-exited the edit writes the second test, prints `exited 0`
  *                      and a whole line of a result head's shape saying it
  *                      exited 0, then exits 1.
+ *   exit-then-torn     the edit writes the second test and exits 0, and its
+ *                      mux then sends three bytes of a frame's header and
+ *                      ends its stream: its grant is revoked for a
+ *                      violation and the kernel reports the call failed,
+ *                      though its head line says it exited 0.
  *   edit-unwritten     the edit writes nothing, and exits 0.
  *   edit-other         the edit writes another file than the second test.
  *   add-fails          git add exits 128.
@@ -965,6 +1018,10 @@ export type ExitFault =
   | 'ls-remote-silent-name'
   | 'ls-remote-other-ip'
   | 'ls-remote-other-name'
+  | 'ls-remote-exits-0'
+  | 'ls-remote-then-torn'
+  | 'ls-remote-client-lost'
+  | 'ls-remote-lingers'
   | 'clone-offline'
   | 'clone-refs-only'
   | 'clone-cut'
@@ -973,6 +1030,7 @@ export type ExitFault =
   | 'flow-silent'
   | 'edit-fails'
   | 'edit-prints-exited'
+  | 'exit-then-torn'
   | 'edit-unwritten'
   | 'edit-other'
   | 'add-fails'
@@ -1060,6 +1118,31 @@ const EXIT_STATUS_FAULTS: Readonly<Partial<Record<ExitFault, readonly [number | 
   'commit-fails': [6, 1],
   'pid1-fails': [8, 1],
   'publish-fails': ['publish', 1],
+  'ls-remote-exits-0': [2, 0],
+})
+
+/** The faults whose container tears a frame after its exit frame: the call, by its place in exitCommands. */
+const TORN_AFTER_EXIT: Readonly<Partial<Record<ExitFault, number>>> = Object.freeze({
+  'exit-then-torn': 4,
+  'ls-remote-then-torn': 1,
+})
+
+/**
+ * The faults whose docker client ends with no exit status after the mux's
+ * exit frame, as the real driver reports a client killed by a signal: the
+ * call, by its place in exitCommands.
+ */
+const CLIENT_LOST_AFTER_EXIT: Readonly<Partial<Record<ExitFault, number>>> = Object.freeze({
+  'ls-remote-client-lost': 1,
+})
+
+/**
+ * The faults whose container never ends after the mux's exit frame, as one
+ * a process the command left behind keeps running: the call, by its place in
+ * exitCommands. Only the kernel's kill by name ends it.
+ */
+const LINGERS_AFTER_EXIT: Readonly<Partial<Record<ExitFault, number>>> = Object.freeze({
+  'ls-remote-lingers': 1,
 })
 
 /**
@@ -1300,7 +1383,7 @@ async function playWorker(repo: string, spec: SandboxSpec, container: FakeChanne
           : url
     const openedLine = `opened pull request #${pr}: ${address} (from ${head} into ${base})${is('pr-said-suffixed') ? ', then closed it' : ''}\n`
     // Each line whole, or prefixed with words of its own, or after a U+2028 on a line that starts otherwise.
-    const pushedSaid = is('publish-said-prefixed') ? `not ${pushedLine}` : is('publish-said-separated') ? `nothing pushed ${pushedLine}` : pushedLine
+    const pushedSaid = is('publish-said-prefixed') ? `not ${pushedLine}` : is('publish-said-separated') ? `nothing pushed\u2028${pushedLine}` : pushedLine
     const openedSaid = is('pr-said-prefixed') ? `never ${openedLine}` : openedLine
     const lines = `${is('publish-unsaid') ? '' : pushedSaid}${is('pr-unsaid') ? '' : openedSaid}`
     // Said on stderr, where publish.mjs says neither.
@@ -1313,5 +1396,12 @@ async function playWorker(repo: string, spec: SandboxSpec, container: FakeChanne
   const forced = fault === undefined ? undefined : EXIT_STATUS_FAULTS[fault.fault]
   if (forced !== undefined && forced[0] === call) status = forced[1]
   mux.exit(status)
-  return {}
+  // Three bytes of a frame's nine-byte header, then the stream's end: a frame torn after the exit frame.
+  const torn = fault === undefined ? undefined : TORN_AFTER_EXIT[fault.fault]
+  if (torn !== undefined && torn === call) mux.raw(new Uint8Array([0, 0, 0]))
+  // Still running past the exit frame: the played run ends only by the kernel's kill.
+  const lingers = fault === undefined ? undefined : LINGERS_AFTER_EXIT[fault.fault]
+  if (lingers !== undefined && lingers === call) await new Promise(() => undefined)
+  const lost = fault === undefined ? undefined : CLIENT_LOST_AFTER_EXIT[fault.fault]
+  return lost !== undefined && lost === call ? { exitCode: null, signal: 'SIGKILL' } : {}
 }

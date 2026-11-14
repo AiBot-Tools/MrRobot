@@ -27,6 +27,10 @@
 //   once a kernel dies during its boot.
 //   A grant a dead kernel left open, a run's or a canary's, that the next
 //   boot does not close stays open in the log for ever (egress plan W2).
+//   A canary's grant row that names the trusted domain whatever the canary's
+//   own lets the log take a trusted grant for a container on the hostile
+//   domain, once the check that only the trusted canary asks for a channel
+//   is dropped (EG678 drops that check; EG679 the row's domain).
 //   A Basic binding whose derived value boot does not mask puts base64 of the
 //   credential in a row the moment a host echoes the header it was sent
 //   (egress plan W1): the redaction pass reads no bare base64.
@@ -56,6 +60,7 @@ import {
   CANARY_PREFIX,
   CANARY_WALLCLOCK_MS,
   CANARY_WORKSPACE,
+  canaryGrantRow,
   canaryName,
   canaryNonce,
   runCanary,
@@ -1109,6 +1114,27 @@ test('runCanary refuses a name that is no canary name, or one the log would not 
     )
     assert.deepEqual([base.specs, base.kills, rows], [[], [], []], `${name}: something was run, killed or recorded`)
   }
+})
+
+test("a canary's grant row names the canary's own domain, so a grant for a canary on the hostile domain is refused, never recorded as a trusted one", () => {
+  // runCanary asks for a grant only on the trusted domain, so unmutated the
+  // row is never built for a hostile canary; this is the row's own check,
+  // which holds should that one be dropped (EG678): proxy.grant.issued
+  // admits the trusted domain alone, so the hostile canary fails 'its grant
+  // is not one proxy.grant.issued records' before anything is appended or
+  // spawned, where a row that said trusted would be appended first.
+  const grantId = 'grant_1700000000000_0123456789ab'
+  const trusted = canaryName(1, '0000000000ab', 'trusted')
+  assert.deepEqual(canaryGrantRow(grantId, trusted, 'trusted'), {
+    schemaVersion: 1,
+    grantId,
+    purpose: 'canary',
+    sandbox: trusted,
+    domain: 'trusted',
+    allow: [],
+    routes: [],
+  })
+  assert.equal(canaryGrantRow(grantId, canaryName(1, '0000000000ab', 'hostile'), 'hostile'), undefined)
 })
 
 test("a canary whose row the log refuses fails once its container has ended, whatever its own verdict, and a report that closed its domain still closes it", async (t) => {

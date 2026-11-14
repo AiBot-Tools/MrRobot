@@ -164,6 +164,20 @@ export function canaryNonce(): string {
 }
 
 /**
+ * A canary's proxy.grant.issued row, judged as the store will judge it, or
+ * undefined when the log cannot record it as it is. The row names the
+ * canary's own domain, never the constant: proxy.grant.issued admits the
+ * trusted domain alone, so a grant for a canary on any other is refused
+ * here, before anything is appended or spawned, should the check before it
+ * (only the trusted canary asks for a channel) ever be dropped, and the log
+ * never holds a trusted grant for a container on the hostile domain.
+ */
+export function canaryGrantRow(grantId: string, name: string, domain: SandboxDomain): Readonly<Record<string, unknown>> | undefined {
+  const payload = { schemaVersion: 1, grantId, purpose: 'canary', sandbox: name, domain, allow: [], routes: [] }
+  return ProxyGrantIssuedPayload.safeParse(payload).success && redactString(grantId) === grantId ? payload : undefined
+}
+
+/**
  * What a canary came to. A failed one's `why` is its egress.degraded reason;
  * `closes`, set only when its self-test report was refused (routed), is the
  * sandbox's reason for running no sandbox.exec on that domain at all.
@@ -296,8 +310,8 @@ async function canary(options: CanaryOptions): Promise<CanaryVerdict> {
   // log already holds, and while it is open the sweep names its container.
   const grantId = `grant_${String(Date.now())}_${randomBytes(6).toString('hex')}`
   if (channel) {
-    const payload = { schemaVersion: 1, grantId, purpose: 'canary', sandbox: name, domain: 'trusted', allow: [], routes: [] }
-    if (!ProxyGrantIssuedPayload.safeParse(payload).success || redactString(grantId) !== grantId) {
+    const payload = canaryGrantRow(grantId, name, domain)
+    if (payload === undefined) {
       return failed(options, 'its grant is not one proxy.grant.issued records', FIX_RESTART)
     }
     store.append({ type: 'proxy.grant.issued', payload })

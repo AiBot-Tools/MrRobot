@@ -261,7 +261,7 @@ test("'as Transport' appears only in src/mcp/hub.ts", () => {
   assert.equal(hits(SRC, /\bas Transport\b/).length, 1)
 })
 
-test('node:child_process is imported only by src/sandbox/docker.ts and five test files that need real processes', () => {
+test('node:child_process is imported only by src/sandbox/docker.ts and six test files that need real processes', () => {
   // The only module that may spawn a process is the one that knows what a
   // docker invocation must look like — the argv audit, the two-key environment,
   // the wallclock kill. A second importer is a second way to run something, and
@@ -270,25 +270,31 @@ test('node:child_process is imported only by src/sandbox/docker.ts and five test
   // Matched as an IMPORT rather than a mention, so a comment explaining the rule
   // does not violate it.
   //
-  // Two test files are whitelisted, each for a reason that cannot be met another
-  // way. env.test.ts proves Node's own behaviour (it spawns a node to check a
-  // flag). entrypoints.test.ts runs the CLI and the daemon AS PROGRAMS, which is
-  // the only way to catch a file that is not wired as one — and one was not:
-  // src/cli/index.ts exported runCli and nothing called it. falsify.test.ts
-  // proves the mutation runner's safety properties, and each one is about a
-  // real process: a hung test's whole process GROUP is killed, a runner that is
-  // SIGKILLed mid-mutant is recovered from its journal, and the script refuses
-  // bad input as a program. gitignore.test.ts holds src/gitignore.ts to git's
-  // own `check-ignore`, the only authority on what a .gitignore means, and asks
-  // git's index whether a .env was force-added. helpers/checkout.ts holds
-  // runEntry/spawnEntry, the one way a test runs an entry point, so that the
-  // cwd of every such run is the shadow copy's, set in one place.
+  // Six test files (and helpers/checkout.ts) are whitelisted, each for a reason
+  // that cannot be met another way. env.test.ts proves Node's own behaviour (it
+  // spawns a node to check a flag). entrypoints.test.ts runs the CLI and the
+  // daemon AS PROGRAMS, which is the only way to catch a file that is not wired
+  // as one — and one was not: src/cli/index.ts exported runCli and nothing
+  // called it. falsify.test.ts proves the mutation runner's safety properties,
+  // and each one is about a real process: a hung test's whole process GROUP is
+  // killed, a runner that is SIGKILLed mid-mutant is recovered from its journal,
+  // and the script refuses bad input as a program. gitignore.test.ts holds
+  // src/gitignore.ts to git's own `check-ignore`, the only authority on what a
+  // .gitignore means, and asks git's index whether a .env was force-added.
+  // helpers/checkout.ts holds runEntry/spawnEntry, the one way a test runs an
+  // entry point, so that the cwd of every such run is the shadow copy's, set in
+  // one place.
   // egress-upstream.test.ts proves the upstream's response parser stays
   // strict under --insecure-http-parser, a flag of the node process itself,
   // which only a node started with it can show; it runs one of its own tests
   // again in one, as env.test.ts does for config-files.test.ts.
+  // colima-script.test.ts runs scripts/colima-up.sh, a bash program, as a
+  // program: what it does when colima's answers change is shown only by
+  // running it, against fake colima, limactl and docker on a PATH that holds
+  // nothing else but four linked system tools.
   assert.deepEqual(importersOf([...SRC, ...TEST], 'node:child_process'), [
     'src/sandbox/docker.ts',
+    'test/colima-script.test.ts',
     'test/egress-upstream.test.ts',
     'test/entrypoints.test.ts',
     'test/env.test.ts',

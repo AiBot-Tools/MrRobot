@@ -24,7 +24,7 @@
 //   A grant the driver refused a container for, or one no channel served,
 //   left open (EG666, EG667); a served one never revoked (EG674); every end
 //   revoked as `exited` (EG668).
-//   A hostile manifest that names egress loaded (EG677).
+//   A hostile manifest that names only credential-free hosts loaded (EG677).
 //   A hostile exec planned a grant (EG664); a hostile publish planned one,
 //   its refusal left to what follows the domain check (EG675).
 //   A grant's row naming the trusted domain whatever its container's (EG676).
@@ -83,13 +83,17 @@ const LIMITS = Object.freeze({
 /** One binding of every profile, on the fixture repository; an exec's grant holds its git-fetch alone. */
 const GITHUB = Object.freeze({ host: 'github.com', profiles: ['git-fetch', 'git-push', 'github-pulls'], repos: ['op/fixture'] })
 
+/** The egress a manifest names: none, the default (a credential-free host and a binding), or the lists given. */
+type ManifestEgress = boolean | { readonly allow: readonly string[]; readonly bind: readonly string[] }
+
 /**
  * A worker on `domain` whose manifest names egress (a hostile one only as a
  * forged record, or with `egress` for the registry to refuse). A hostile one
  * also holds sandbox.publish, which the registry admits and the runner
  * refuses there.
  */
-function manifest(domain: 'trusted' | 'hostile', egress: boolean = domain === 'trusted'): string {
+function manifest(domain: 'trusted' | 'hostile', egress: ManifestEgress = domain === 'trusted'): string {
+  const lists = egress === true ? { allow: ['registry.npmjs.org'], bind: ['github'] } : egress === false ? undefined : egress
   return [
     'id: coder',
     'version: 1',
@@ -103,7 +107,7 @@ function manifest(domain: 'trusted' | 'hostile', egress: boolean = domain === 't
     `  allow: [${domain === 'hostile' ? `${EXEC}, ${PUBLISH}` : EXEC}]`,
     'sandbox:',
     `  domain: ${domain}`,
-    ...(egress ? ['egress:', '  allow: [registry.npmjs.org]', '  bind: [github]'] : []),
+    ...(lists === undefined ? [] : ['egress:', `  allow: [${lists.allow.join(', ')}]`, `  bind: [${lists.bind.join(', ')}]`]),
     'memory:',
     '  projectId: aos/agent/coder',
     '',
@@ -369,11 +373,23 @@ test('a grant whose container the driver refused before it started is revoked at
 
 test('a hostile-domain manifest that names egress is refused at load, so only a forged record brings one to the runner', (t) => {
   const store = withStore(t)
-  assert.throws(
-    () => registryOn(store).load(agentsDir(t, manifest('hostile', true))),
-    /coder\/agent\.yaml: coder holds egress.*, but it is sandboxed in the hostile domain\. .*the hostile domain gets no channel and no egress/,
-  )
+  // Any egress at all: a credential-free host and a binding, a credential-free
+  // host alone (no credential, still a way out), or a binding alone.
+  const egresses = [true, { allow: ['registry.npmjs.org'], bind: [] }, { allow: [], bind: ['github'] }] as const
+  for (const egress of egresses) {
+    assert.throws(
+      () => registryOn(store).load(agentsDir(t, manifest('hostile', egress))),
+      /coder\/agent\.yaml: coder holds egress.*, but it is sandboxed in the hostile domain\. .*the hostile domain gets no channel and no egress/,
+      JSON.stringify(egress),
+    )
+  }
   assert.equal(store.query({ type: 'agent.registered' }).length, 0, 'a refused fleet left registrations behind')
+  // Each of the two lists alone is egress a trusted manifest may hold.
+  for (const egress of egresses.slice(1)) {
+    const trusted = registryOn(withStore(t))
+    trusted.load(agentsDir(t, manifest('trusted', egress)))
+    assert.equal(trusted.get('coder')?.manifest.sandbox?.domain, 'trusted', JSON.stringify(egress))
+  }
   // Without its egress, the same manifest loads.
   const loaded = registryOn(store)
   loaded.load(agentsDir(t, manifest('hostile', false)))

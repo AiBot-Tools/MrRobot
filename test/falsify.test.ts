@@ -644,7 +644,7 @@ test("the egress suite holds a mutant for each check egress plan F1 names, names
       'decision-before-dial': ['EG322', 'EG660'],
       'push-ref-prefix': ['EG86', 'EG87', 'EG641', 'EG661'],
       'basic-mask': ['EG662'],
-      'hostile-channel': ['EG565', 'EG663', 'EG664', 'EG673', 'EG675', 'EG676', 'EG677'],
+      'hostile-channel': ['EG565', 'EG663', 'EG664', 'EG673', 'EG675', 'EG676', 'EG677', 'EG678', 'EG679'],
       'grant-before-spawn': ['EG665'],
       'revoke-on-exit': ['EG666', 'EG667', 'EG668', 'EG674'],
       'recovered-revoke': ['EG669', 'EG670'],
@@ -663,11 +663,11 @@ test("the egress suite holds a mutant for each check egress plan F1 names, names
     }
   }
   assert.deepEqual(named.filter((id, i) => named.indexOf(id) !== i), [], 'an id stands for two items')
-  // F1's own mutants (EG657 to EG670, and its reviews' EG673 to EG677) are
+  // F1's own mutants (EG657 to EG670, and its reviews' EG673 to EG679) are
   // all in the suite and each stands for an item: none was added without
   // saying which check it falsifies. (EG671 and EG672 are the publisher's
   // readers, S4's review carried to F1, and stand for no F1 item.)
-  const own = [...Array.from({ length: 14 }, (_, i) => `EG${String(657 + i)}`), 'EG673', 'EG674', 'EG675', 'EG676', 'EG677']
+  const own = [...Array.from({ length: 14 }, (_, i) => `EG${String(657 + i)}`), 'EG673', 'EG674', 'EG675', 'EG676', 'EG677', 'EG678', 'EG679']
   assert.deepEqual(egress.mutants.map((mu) => mu.id).filter((id) => own.includes(id)), own)
   for (const id of own) assert.ok(named.includes(id), `${id} is in the suite and stands for no item`)
   // An item's mutants stand at each place its check is made, not only at a
@@ -677,7 +677,9 @@ test("the egress suite holds a mutant for each check egress plan F1 names, names
   // it (docker.ts), by the runner's exec plan (#planGrant) and its publish
   // plan (#planPublish) and by the row a grant is issued under, which names
   // its container's domain (grantIssuedRow), all in sandbox-tools.ts, and by
-  // the canary (canary.ts); egress on a hostile manifest is refused at load
+  // the canary (canary.ts), which asks for a channel on the trusted domain
+  // alone and whose grant row names its own domain (canaryGrantRow), so that
+  // proxy.grant.issued refuses a hostile one; egress on a hostile manifest is refused at load
   // (registry.ts), so only a forged record brings it to the runner. A grant
   // is revoked when its container ends whether it was served (served.end) or
   // not (revokeUnserved), and a mutant that only renames the end's reason
@@ -707,6 +709,14 @@ test("the egress suite holds a mutant for each check egress plan F1 names, names
   assert.notDeepEqual(hostileIn(bodyOf('\n  #planGrant(', '\n  }\n')), [], 'no hostile-channel mutant stands in the exec plan')
   assert.notDeepEqual(hostileIn(bodyOf('\n  #planPublish(', '\n  }\n')), [], 'no hostile-channel mutant stands in the publish plan')
   assert.notDeepEqual(hostileIn(bodyOf('\nexport function grantIssuedRow(', '\n}\n')), [], "no hostile-channel mutant stands in a grant's row")
+  // And within canary.ts, at the canary's ask for a channel and in its grant's row.
+  const canary = readFileSync(join(REPO_ROOT, 'src/runtime/canary.ts'), 'utf8')
+  const rowStart = canary.indexOf('\nexport function canaryGrantRow(')
+  assert.notEqual(rowStart, -1, 'canary.ts has no canaryGrantRow')
+  const canaryRow = canary.slice(rowStart, canary.indexOf('\n}\n', rowStart))
+  const canaryMutants = (EGRESS_COVERAGE['hostile-channel']?.ids ?? []).map(mutantOf).filter((mu) => mu.file === 'src/runtime/canary.ts')
+  assert.ok(canaryMutants.some((mu) => mu.from === "  const channel = domain === 'trusted'\n"), "no hostile-channel mutant stands at the canary's ask for a channel")
+  assert.ok(canaryMutants.some((mu) => canaryRow.includes(mu.from)), "no hostile-channel mutant stands in a canary's grant row")
   const revokes = (EGRESS_COVERAGE['revoke-on-exit']?.ids ?? []).map(mutantOf)
   assert.ok(
     revokes.some((mu) => mu.from.includes('served.end(endReason(result))') && !mu.to.includes('served.end(')),

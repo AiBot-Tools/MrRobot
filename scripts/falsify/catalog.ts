@@ -1271,7 +1271,9 @@ const egress: Suite = {
   // reads (EG671, EG672); and F1's review round 1's: sandbox-docker.test.ts for the docker builder's own refusal of a
   // hostile channel, and egress-grants.test.ts for a served grant revoked when its container ends (EG673, EG674);
   // and its review round 2's: egress-grants.test.ts for the publish plan's refusal of the hostile domain, a grant's
-  // row naming its container's domain and the registry's refusal of egress on a hostile manifest (EG675 to EG677).
+  // row naming its container's domain and the registry's refusal of egress on a hostile manifest (EG675 to EG677);
+  // and its final review's: egress-boot.test.ts for every canary asking for a channel, the hostile one included, and a
+  // canary's grant row naming the trusted domain whatever its own (EG678, EG679).
   tests: [
     'test/egress-address.test.ts',
     'test/egress-upstream.test.ts',
@@ -1975,10 +1977,10 @@ const egress: Suite = {
     { id: "EG654", file: PUBLISH, from: "    return lstatSync(path).isDirectory() && realParent(path)\n", to: "    return (lstatSync(path).isDirectory() || lstatSync(path).isSymbolicLink()) && realParent(path)\n", why: "the publisher takes a link for a directory of its own, so a workspace whose .git or objects is a link to elsewhere is read as a plain repository" },
     { id: "EG655", file: PUBLISH, from: "{ flag: 'wx', mode: 0o600 }", to: "{ flag: 'w', mode: 0o600 }", why: "the publisher writes over a path that is there already, and through a link at it, where it should write only a file that is not there yet" },
     { id: "EG656", file: PUBLISH, from: "{ flag: 'wx', mode: 0o600 }", to: "{ flag: 'wx' }", why: "a file the publisher makes is readable by other users, not its own alone" },
-    // Egress plan F1 (EG657 to EG670, and EG673 to EG677 below): the items EGRESS_COVERAGE names that no mutant above
+    // Egress plan F1 (EG657 to EG670, and EG673 to EG679 below): the items EGRESS_COVERAGE names that no mutant above
     // stood for, each killed by a test/egress-*.test.ts or test/sandbox-*.test.ts file the suite runs. Where a mutant of
-    // another suite stands at the same check (Y16, Y63, Z170, Z171, Z427, Z432, Z434, Z504, K6), the one here is another
-    // edit of it, so each id still means one mutant.
+    // another suite stands at the same check (Y15, Y16, Y63, Z170, Z171, Z427, Z432, Z434, Z504, K6), the one here is
+    // another edit of it, so each id still means one mutant.
     { id: "EG657", file: ADDR, from: "  ['loopback', ['127.0.0.0/8']],\n", to: "", why: "127.0.0.0/8 is not denied, so a name whose answer is 127.0.0.1, the Mac's own loopback, is dialled" },
     { id: "EG658", file: UPSTREAM, from: "    if (denial !== undefined) {\n      return refused('denied-address'", to: "    if (false) {\n      return refused('denied-address'", why: "the upstream never asks addr.ts of an answer, so a name that resolves to 192.168.5.2, 10.0.0.1 or any address no interface of the Mac holds is dialled" },
     { id: "EG659", file: SESSION, from: "      if (typeof name !== 'string' || name.toLowerCase() !== 'authorization' || typeof given !== 'string' || given === '') return\n", to: "      if (typeof name !== 'string' || typeof given !== 'string' || given === '') return\n", why: "the injector's header name is never read, so a credential closure that sets X-Api-Key or Cookie has its value sent as the request's one Authorization" },
@@ -2005,10 +2007,21 @@ const egress: Suite = {
     // F1's review round 2: the publish plan's own refusal of the hostile domain stood only in the sandbox suite (Z504),
     // as the registry's refusal of egress on a hostile manifest at load stood only in the registry suite (Y15, Y16),
     // each here another edit of the line; and the grant's row named the trusted domain whatever its container's, so a
-    // dropped domain check had the kernel append a trusted grant for a container on the hostile domain.
+    // dropped domain check had the kernel append a trusted grant for a container on the hostile domain. EG677 lets
+    // a hostile manifest through when it binds nothing (C3 of F1's final review): Y15 lets every manifest through
+    // and Y16 every hostile one, so the edit that read `?.domain === undefined` behaved as Y16 did.
     { id: "EG675", file: SANDBOX_TOOLS, from: "    if (manifest.sandbox?.domain !== 'trusted') {\n", to: "    if (manifest.sandbox === undefined) {\n", why: "a hostile-domain publish whose record names egress is planned a grant, refused only by what follows the domain check (its row, or the driver's refusal of a hostile channel), never for the domain that gets no egress" },
     { id: "EG676", file: SANDBOX_TOOLS, from: "    domain: container.domain,\n", to: "    domain: 'trusted' as const,\n", why: "a grant's row names the trusted domain whatever its container's, so a grant for a container on the hostile domain is recorded as a trusted one, and proxy.grant.issued never judges where its container runs" },
-    { id: "EG677", file: REGISTRY, from: "    if (manifest.sandbox?.domain !== 'trusted') {\n", to: "    if (manifest.sandbox?.domain === undefined) {\n", why: "a hostile-domain manifest that names egress loads, so every exec and publish of it reaches the runner with egress, whose own refusals are all that keep the domain that must reach nothing off the kernel's egress engine" },
+    { id: "EG677", file: REGISTRY, from: "    if (manifest.sandbox?.domain !== 'trusted') {\n", to: "    if (manifest.sandbox?.domain !== 'trusted' && bind.length > 0) {\n", why: "a hostile-domain manifest that names only credential-free hosts loads with that egress, as though a way out with no credential in it were no way out, so every exec of it reaches the runner with egress, whose own refusals are all that keep the domain that must reach nothing off the kernel's egress engine" },
+    // C1 of F1's final review: every canary asks for a channel, so the hostile one is issued a grant. EG678 is the
+    // proof of that check, not of the row's domain: test/egress-boot.test.ts kills it whichever domain the row names
+    // (the hostile canary fails at its grant row, or at the driver's refusal of its channel after a trusted row was
+    // appended). Since that review the row names the canary's own domain (canaryGrantRow), which proxy.grant.issued
+    // refuses for a hostile canary before anything is appended or spawned. That is defence in depth: unmutated the
+    // row is built for the trusted canary alone, so no boot shows it; EG679 puts the constant back, killed by
+    // egress-boot's row over the builder itself.
+    { id: "EG678", file: CANARY, from: "  const channel = domain === 'trusted'\n", to: "  const channel = true\n", why: "every canary is issued a grant and asks for a channel, the hostile one included, so the domain that must reach nothing is offered a byte stream to the kernel and the hostile domain's network is never checked" },
+    { id: "EG679", file: CANARY, from: "  const payload = { schemaVersion: 1, grantId, purpose: 'canary', sandbox: name, domain, allow: [], routes: [] }\n", to: "  const payload = { schemaVersion: 1, grantId, purpose: 'canary', sandbox: name, domain: 'trusted', allow: [], routes: [] }\n", why: "a canary's grant row names the trusted domain whatever the canary's own, so were the hostile canary to ask for a channel, the log would take a trusted grant for a container on the hostile domain before the driver refused it" },
   ],
   control: { id: 'C', file: ADDR, from: '// The egress address classifier (egress plan E1).', to: '// The egress address classifier (egress plan E1). (control)', why: 'comment only' },
 }
@@ -2023,7 +2036,7 @@ export interface EgressCoverage {
 /**
  * Egress plan F1: each check the plan names, and the egress suite's mutants
  * that stand for it. A mutant the suite already held is named here, not
- * written again; the rest are F1's own (EG657 to EG670, EG673 to EG677). Every id is a
+ * written again; the rest are F1's own (EG657 to EG670, EG673 to EG679). Every id is a
  * mutant of the egress suite, so `npm run falsify -- egress` runs them all,
  * and each item's are killed by the files named with it (seen on a run of
  * those files alone). test/falsify.test.ts holds this table, and the
@@ -2049,7 +2062,7 @@ export const EGRESS_COVERAGE: Readonly<Record<string, EgressCoverage>> = Object.
   // The hostile domain gets no channel: not from channelRefusal, which both drivers call, not from the docker
   // builder's own call of it, not from the runner's exec plan or its publish plan, not in a grant's row, not for
   // its canary, and no egress from the registry, which refuses it on a hostile manifest at load.
-  'hostile-channel': { ids: ['EG565', 'EG663', 'EG664', 'EG673', 'EG675', 'EG676', 'EG677'], killedBy: ['test/egress-boot.test.ts', 'test/sandbox-docker.test.ts', 'test/egress-grants.test.ts'] },
+  'hostile-channel': { ids: ['EG565', 'EG663', 'EG664', 'EG673', 'EG675', 'EG676', 'EG677', 'EG678', 'EG679'], killedBy: ['test/egress-boot.test.ts', 'test/sandbox-docker.test.ts', 'test/egress-grants.test.ts'] },
   // W1b: the grant is in the log before its container is spawned.
   'grant-before-spawn': { ids: ['EG665'], killedBy: ['test/egress-grants.test.ts'] },
   // W1b: a grant is revoked when its container ends, with the driver's verdict, served or not.

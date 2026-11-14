@@ -251,7 +251,15 @@ test("the live tests read pmmcp's URL as AOS_LIVE_PMMCP_URL, the name README's c
   // old name would skip every pmmcp-connected test on the Mac, where README's
   // commands set only the new one, with a skip reason naming a variable that is
   // set, and the README checklist could record a pass that never ran.
-  const LIVE_FILES = ['live-anthropic.test.ts', 'live-runtime.test.ts']
+  // The pmmcp URL each live file reads: the Phase 0 and 1 files read it,
+  // and the Phase 2 ones (egress plan L1, L2) reach no pmmcp at all.
+  const PMMCP_URLS: Record<string, readonly string[]> = {
+    'live-anthropic.test.ts': ['AOS_LIVE_PMMCP_URL'],
+    'live-egress.test.ts': [],
+    'live-runtime.test.ts': ['AOS_LIVE_PMMCP_URL'],
+    'live-sandbox.test.ts': [],
+  }
+  const LIVE_FILES = Object.keys(PMMCP_URLS).sort()
   const gated = readdirSync(`${REPO}/test`).filter((f) => /^live-.*\.test\.ts$/.test(f)).sort()
   assert.deepEqual(gated, LIVE_FILES, 'a live file was added or renamed: say here which pmmcp URL it reads')
   const blocks = [...README.matchAll(/^```(?:bash|sh|zsh|shell)\n([\s\S]*?)^```/gm)].map((m) => m[1] ?? '')
@@ -266,16 +274,18 @@ test("the live tests read pmmcp's URL as AOS_LIVE_PMMCP_URL, the name README's c
     for (const name of reads) readByLive.add(name)
     // The URL it dials is read under one name, the new one, at every read.
     const urls = [...new Set(reads.filter((n) => /pmmcp/i.test(n) && /url/i.test(n)))].sort()
-    assert.deepEqual(urls, ['AOS_LIVE_PMMCP_URL'], `${file} reads pmmcp's URL as ${urls.join(', ')}`)
+    assert.deepEqual(urls, PMMCP_URLS[file], `${file} reads pmmcp's URL as ${urls.join(', ')}`)
     // Each variable a skip reason tells the operator to set is one the file reads.
     for (const m of source.matchAll(/'set ([A-Z][A-Z0-9_]*)/g)) {
       assert.ok(reads.includes(m[1] ?? ''), `${file} says "set ${m[1] ?? ''}" and never reads it`)
     }
-    // README runs the file, with the URL set on the same command.
+    // README runs the file, with the URL set on the same command where it
+    // reads one, and with every gate it reads set on it.
     const runs = liveCommands.filter((b) => b.includes(`test/${file}`) || /\bnpm test\b/.test(b))
+    const gates = [...new Set(reads.filter((n) => /^AOS_LIVE_/.test(n) && !/URL$/.test(n)))]
     assert.ok(
-      runs.some((b) => set(b).includes('AOS_LIVE_PMMCP_URL')),
-      `no README command runs ${file} with AOS_LIVE_PMMCP_URL set`,
+      runs.some((b) => [...(PMMCP_URLS[file] ?? []), ...gates].every((name) => set(b).includes(name))),
+      `no README command runs ${file} with ${[...(PMMCP_URLS[file] ?? []), ...gates].join(', ')} set`,
     )
   }
   // And every name a README live command sets is one a live file reads: a

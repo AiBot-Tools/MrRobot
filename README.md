@@ -279,7 +279,9 @@ what a write the installer did not finish leaves, so `npm run aos-install`
 refuses such a value as cut short), to reach pmmcp, `AOS_PMMCP_TOKEN` (its bearer
 as client `aos-kernel`, which `npm run aos-install` generates), and, to reach a
 model, `ANTHROPIC_API_KEY`: a key created inside a workspace, because an unscoped
-key needs an `anthropic-workspace-id` header the kernel does not send. All three live
+key needs an `anthropic-workspace-id` header the kernel does not send. A fourth,
+`AOS_GITHUB_TOKEN`, is only for the live egress test ("Live sandbox and egress
+tests" below), which you add or leave out. All of them live
 in **your own `.env` in the repository root**: git-ignored, mode 0600, written by you, or appended by `npm run aos-install`. `.env.example` is the
 committed template: placeholders only, never edited to hold a real value, and it
 does not change when your `.env` does. To make it by hand rather than with the
@@ -295,10 +297,11 @@ npm run dev
 Line by line: the first creates `.env` from the template at mode 0600 and never
 overwrites one that exists; the second sets 0600 anyway, because `cp` keeps an
 existing file's mode; in the editor, replace every `replace-me-...` value
-(`openssl rand -hex 32` makes a token); `npm run dev` then logs
+(`openssl rand -hex 32` makes a token), and delete the `AOS_GITHUB_TOKEN` line
+unless you will run the live egress test; `npm run dev` then logs
 `credentials: .env (AOS_CONTROL_TOKEN, AOS_PMMCP_TOKEN, ANTHROPIC_API_KEY)` (the
-names in the order the file holds them), and `npm run cli -- agents` works from
-a second shell with nothing exported.
+names in the order the file holds them, `AOS_GITHUB_TOKEN` last if you kept it),
+and `npm run cli -- agents` works from a second shell with nothing exported.
 
 `npm run aos-install` never changes a line, so it refuses a `.env` that still
 holds a placeholder, `AOS_PMMCP_TOKEN`'s included, naming the line. For that
@@ -341,7 +344,9 @@ How it is read (`src/secrets/dotenv.ts`, decision D31):
   than 64 KB, a `.env` stored on disk under another case (`.Env`: git judges a
   name as stored, and `.env*` does not cover it with `core.ignorecase=false`), a
   `.gitignore` that stops ignoring it (read with git's own rules,
-  so `!*` or a leading space count), any name but the three above, a value still
+  so `!*` or a leading space count), any name but the four above (the config's
+  own: `AOS_GITHUB_TOKEN` is accepted because `config/kernel.yaml`'s two GitHub
+  bindings name it), a value still
   beginning `replace-me`, a character outside printable ASCII, two lines joined
   into one, a name set twice, a second `--dotenv`. It parses with its own strict
   grammar: Node's built-in `.env` parser gives a whitespace-only value the whole
@@ -618,7 +623,12 @@ reads the set from the last boot that marked its sandbox
 (`closedSandboxDomains`). So reopening one takes a boot with egress enabled
 whose canary there passes. While egress is degraded no run is offered
 `sandbox.exec` for a manifest with egress, and a call of it is refused with
-the egress reason before any human is asked. That reason, which `status`
+the egress reason before any human is asked. Every binding kernel.yaml
+declares is resolved at boot, whichever manifests bind it, the two it ships
+(`github-git` and `github-api`, both `AOS_GITHUB_TOKEN`) included: with
+egress enabled, both must resolve or egress is degraded for every run, one
+whose manifest binds neither included, so hold the token, or remove the two
+bindings from kernel.yaml before you enable egress without it. That reason, which `status`
 shows and each refusal quotes, names the failed checks while they fit 2 KiB
 and counts the rest, each named in its own row. Each binding's value is
 resolved once, at boot, outside any run, through the broker (`secret.accessed` with purpose
@@ -1087,7 +1097,8 @@ The model only, which is cheapest:
 AOS_LIVE_TESTS=1 npm test
 ```
 
-Everything, including pmmcp writes to `aos/agent/aos-live-test`:
+Every Phase 0 and Phase 1 live test, including pmmcp writes to
+`aos/agent/aos-live-test` (the Phase 2 files below also need `AOS_LIVE_DOCKER=1`):
 
 ```bash
 AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_WRITES=1 \
@@ -1097,6 +1108,148 @@ AOS_LIVE_TESTS=1 AOS_LIVE_PMMCP_WRITES=1 \
 Run `npm run capture:pmmcp` first if you can: the goal-tools test will name any
 mismatch either way, but the capture names them all at once without writing
 anything.
+
+## Live sandbox and egress tests
+
+Two gated files run Phase 2 against your VMs (egress plan L1 and L2), and
+neither runs on a plain `npm test`, nor on `AOS_LIVE_TESTS=1 npm test` alone.
+As in Phase 1, every check is a body that `test/sandbox-bodies.test.ts` runs
+offline on every `npm test`, against the fake driver with each container
+played as the worker image acts: `test/helpers/sandbox-bodies.ts` (L1) and
+`test/helpers/egress-bodies.ts` (L2). Every check a container or a VM can make
+fail is seen there to fail on what it is there to catch, a container played as
+a broken VM, image or kernel would have it act, and the `liveBodies` mutation
+suite holds each to it. For L1: a route out (an interface, a route or a route
+table the probe could not read, a target reached, a connect by address or by
+name that timed out or was refused, or a lookup a resolver answered, if only
+with a failure); a network report that leaves a target out or puts them out of
+order; a probe, `cat` or self-test that exits other than 0 or prints no
+report; a byte changed or dropped; a `cat` that never sees its EOF; a
+container that never says it is up; a beat that never moves or never stops; a
+VM whose `docker ps` still lists a container its kill ended; a sweep that
+lists nothing, could not list a VM, or whose kill a daemon refused; a kill
+whose exit is not the CLI's 137; a wallclock run that ends on its own or whose
+kill lands a minute late; an init probe that lists no process, a command as
+PID 1 or a zombie; a self-test that leaves a probe out or that the judge
+refuses; a canary refused, on either domain; an answer from outside the
+container. For the exit: a direct connect that connects; a call that exits
+other than 0; a git request for 192.168.5.2 or for host.lima.internal never
+sent, or answered other than 403; a request never sent, or a flow with none on
+it; a request cut short of its Content-Length, which fails upstream; a clone
+that asked for no pack; a request denied; a push or pull request not made, or
+not said; a push said of another branch, run, repository or host than the
+approved one, or a pull request said to be opened from another branch or run;
+a pull request into another base than `main`; a failed or missing test; an
+edit that wrote no file, or another; a look at PID 1 that prints nothing, or
+that is not JSON, or whose parent is not the mux; a command line without the
+mux; a variable named like a token, a password or a secret, or a credential
+name (`ANTHROPIC_API_KEY`); the token or its Basic form (built from the
+`github-git` binding's `basicUser`, as the kernel builds it) in PID 1's, the
+mux's or the command's own environment, PID 1's command line, a workspace
+entry's name or a link's target, a workspace file (a git object, or one that
+does not inflate, or a pack too large to scan) or the log; the log's mask in a
+row of the run (the token a container printed); and a call the exit does not
+make asked of a human. No failure of the exit quotes the token: each message
+shows log, file and container text, and every workspace path, with the token
+and its Basic form replaced by their names, scrubbed before any cut; the
+offline rows hold each failure free of the token and of any ten characters of
+it. Seen only to pass are the checks of what the kernel or the driver alone
+decides, which no container can make fail: for L1, that a channel run has a
+channel, that a run given up is credited to no kill, that a wallclock kill's
+exit is 137 (the driver credits a kill only on one), and that the canaries'
+log rows are there once both pass; for the exit, that egress booted ok, that
+every approval was given on the control plane, that the run finished ok, the
+results and grants counts, the approvals list, every grant and decision
+recorded under the run, no decision under no grant, every grant revoked, each
+grant's decisions counting its requests, every allow for the bound repository
+on its two hosts, no spec the driver was handed holding the token, and the
+chain verifying.
+
+| Test | Needs | What only a live run settles |
+|---|---|---|
+| `test/live-sandbox.test.ts`: network none has no route to 192.168.5.2, host.lima.internal, the other VM or the internet in either VM | `AOS_LIVE_DOCKER=1` | that a `--network none` container on each VM has `lo` and no other interface that is up or holds an address (a down, addressless fallback device such as `sit0` or `tunl0` is recorded), no route, and meets `ENETUNREACH` by address and no answer by name |
+| the -i channel is binary-safe for 64 MiB | `AOS_LIVE_DOCKER=1` | that `docker -i` through Colima's forwarded socket carries 64 MiB of random bytes each way intact, that the stdin's end ends the container, and how fast (recorded) |
+| killing the docker client then kill-by-name leaves no aos-run- container | `AOS_LIVE_DOCKER=1` | that a beating container, its beat seen to move, is stopped by a SIGKILLed docker client and the kill by name after it on either VM; and that a sweep lists a running `aos-run-` container by name, kills it, and its CLI exits 137 |
+| a kill by name ends a running container with the docker CLI's 137, credited to the kill, in either VM | `AOS_LIVE_DOCKER=1` | the CLI's exit code once its container is killed by name, which the driver's kill credit rests on |
+| a channel run whose input is destroyed: whether its docker CLI ends and its container outlives it is recorded, and a kill by name then a sweep leave nothing | `AOS_LIVE_DOCKER=1` | what the CLI does when the reader of its stdout goes away (recorded), and that a kill by name still ends the container |
+| a hostile wallclock kills on the hostile socket | `AOS_LIVE_DOCKER=1` | that a hostile run's wallclock kill reaches the hostile VM's daemon |
+| a run's PID 1 is docker-init, which reaps what its command orphans | `AOS_LIVE_DOCKER=1` | `--init` on both VMs, and no zombie left |
+| both canaries pass, and each VM's self-test meets only the codes the judge accepts | `AOS_LIVE_DOCKER=1` | boot's canaries on the real image, and the codes each VM gave (recorded) |
+| the image's node reaches nothing through its proxy settings with no channel | `AOS_LIVE_DOCKER=1` | that nothing outside the container answers it, whether the image's Node prints `EnvHttpProxyAgent is experimental`, and whether a request to a server the run itself listens on at 127.0.0.1 goes to the proxy with `NO_PROXY` empty (both recorded) |
+| `test/live-egress.test.ts`: Phase 2 exit: clone, change, test, push aos/<runId>/<branch>, PR opened | `AOS_LIVE_DOCKER=1`, `AOS_LIVE_GITHUB=1`, `AOS_GITHUB_TOKEN` | the exit itself: a tier 3 coder clones the fixture repository through the egress engine, adds a test, runs `node --test`, and `sandbox.publish` pushes `aos/<runId>/phase2-exit` and opens a pull request into `main`; every flow a `proxy.decision` of that run, a direct connect to 192.168.5.2 finding no route, the git requests for 192.168.5.2 and host.lima.internal each its grant's one deny at the policy (`not-a-host`), never resolved or sent, no other request denied, and the token in no row, no container spec, no workspace entry's name or file (`.git` included, each git object inflated: a loose object whole, a pack's streams each), no workspace link's target, and nothing PID 1 holds (what `docker inspect` reports as Env and Cmd), nor the mux's or the command's own environment |
+
+Before either: both VMs up (`scripts/colima-up.sh`), the worker image built
+and loaded on both (`scripts/build-worker-image.sh`, which prints its id), and
+that id set as `sandbox.imageId` in `config/kernel.yaml`. `npm test` on the Mac
+first. Then the sandbox checks:
+
+```bash
+AOS_LIVE_TESTS=1 AOS_LIVE_DOCKER=1 node --expose-gc --import tsx --test test/live-sandbox.test.ts
+```
+
+They need no credential and reach no host: every container is `--network
+none`. A test's own containers are named `aos-run-live_...`, each with its
+workspace under `.aos/workspaces/<domain>`, removed when its test ends; the
+canary test's two are named as boot names its canaries
+(`aos-run-canary-1-<nonce>-<domain>`), and share the canary workspace boot
+uses, `.aos/workspaces/<domain>/aos_canary`, which stays, as boot's does. The TAP
+output's diagnostics record the channel's throughput, each VM's self-test
+codes, what a channel's CLI did when its reader went away, whether the
+image's node warns, and where its loopback request went; copy them into the
+NEEDS VALIDATION rows.
+
+The exit needs the fixture repository and a token for it. Create
+`AiBot-Tools/aos-fixture` on GitHub (the repository the shipped `github-git`
+and `github-api` bindings in `config/kernel.yaml` name, and the one the test
+reads from them), exactly: default branch `main`; a `package.json` of
+`{"name": "aos-fixture", "version": "0.0.0", "private": true, "type": "module", "scripts": {"test": "node --test"}}`
+and no dependencies; `sum.js` exporting `sum(a, b)`; `sum.test.js`
+(`node:test` and `node:assert/strict`) asserting `sum(2, 3) === 5`; no
+`.github` directory. Then make a fine-grained personal access token whose
+resource owner is the `AiBot-Tools` organization (which may have to approve
+it before it works), whose repository access is that one repository only,
+with Contents read and write and Pull requests read and write, and Metadata
+read-only, which GitHub adds to every fine-grained token, and nothing else;
+add it to `.env` as `AOS_GITHUB_TOKEN`, in a plain-text editor, never on a
+command line. Both bindings name that one envVar, and `npm run dev` and `npm
+run cli` accept the name because `config/kernel.yaml` declares it. Once it
+is in `.env`, `npm run dev` loads its value into kernel memory at every
+start (never into `process.env`, and masked in every log line), egress
+enabled or not; while `egress.enabled` is false, as shipped, boot resolves
+neither binding, so no run is given it. With egress enabled both bindings
+must resolve or egress is degraded for every run: hold the token, or remove
+the two bindings from `config/kernel.yaml` before you enable egress without
+it. Then:
+
+```bash
+AOS_LIVE_TESTS=1 AOS_LIVE_DOCKER=1 AOS_LIVE_GITHUB=1 node --expose-gc --import tsx --test test/live-egress.test.ts
+```
+
+It reads `AOS_GITHUB_TOKEN` (a shell export that is not blank, else `.env`)
+only when all three are set, so `AOS_LIVE_TESTS=1 npm test`, where it skips,
+never opens `.env` for it.
+
+The test boots its own kernel on a temp data dir with egress enabled in its
+own copy of the config (the shipped file stays disabled), over your VMs and
+the shipped sandbox section, with a test-only agents dir holding the coder:
+tier 3, because `sandbox.publish` is irreversible and only tier 3 may hold an
+irreversible tool. No shipped manifest binds either binding. The coder's model
+is scripted, so no provider is called and nothing is spent; each of its calls
+still goes through the gate, and the test approves on the control plane, as
+`npm run cli -- approve` does, each one the gate asks a human about only
+while it is the next call of the exit, its tool and its whole preview (the
+publish's branch, title and body among them) exactly the exit's; any other
+it denies there, before it runs, and fails. A scripted model and a test's
+approval in place of a person's are put to you in the egress plan's
+Operator decisions, before this run can stand as the Phase 2 exit's line in
+the checklist. It leaves the branch `aos/<runId>/phase2-exit` and an open
+pull request in the fixture repository, which the kernel has no tool to
+delete or close: close them yourself (the diagnostics line names both). Its
+boot's two canaries run as boot runs them, in the canary workspace under
+each domain's mountRoot, which stays; the run's workspace, under
+`.aos/workspaces/trusted`, is removed when the test ends, however it ends
+once `run.start` has named the run (the body is told the run's id then, not
+once the run has passed).
 
 ---
 
@@ -1117,7 +1270,7 @@ npm run falsify -- --only D13,W3
 npm run falsify -- --list
 ```
 
-In order: every suite (twenty, see `--list`); one suite, or several
+In order: every suite (twenty-one, see `--list`); one suite, or several
 space-separated; named mutants, across suites; the catalog, touching nothing.
 `--recover` restores what an interrupted run left and runs nothing else;
 `--timeout MS` bounds each test run (default 240000).
@@ -1128,7 +1281,7 @@ not a kill (a hang is a test with no bound), and a mutant that leaves the file
 unparseable or stops the test files loading is **invalid**, never a kill.
 
 It edits the working tree, in the files its mutants name: those under `src/`,
-six helpers under `test/helpers/`, and `images/worker/mux.mjs`,
+eight helpers under `test/helpers/`, and `images/worker/mux.mjs`,
 `images/worker/publish.mjs`, `scripts/falsify.ts`, `scripts/falsify/runner.ts`,
 `scripts/worker-image.ts`, `test/config-files.test.ts`,
 `test/egress-address.test.ts`, `test/egress-frame.test.ts` and
@@ -1181,9 +1334,11 @@ upstream, binding routes, decide() and the channel frame codec (`egress`), the
 `.env` loader and the credential checks around it (`dotenv`, and
 `dotenvDefault` for how an entry point picks its file), the `.env` writer
 (`dotenvAppend`), the installer's plan and confirmation gate (`installPlan`),
-the `.gitignore` reading (`gitignore`), or the runner itself (`runner`) — the
-twenty suites — and add a mutant whenever a new test exists to catch a specific
-bug. No test may let a mutant reach your real `.env`: `test/entrypoints.test.ts`
+the `.gitignore` reading (`gitignore`), the runner itself (`runner`), or the
+gated live tests' bodies, each check a container or a VM can make fail seen
+offline to fail on what it catches (`liveBodies`) — the twenty-one suites —
+and add a mutant whenever a new test exists to catch a specific bug. No test
+may let a mutant reach your real `.env`: `test/entrypoints.test.ts`
 runs every entry point from a temporary copy of the checkout holding a trap
 `.env`, through `runEntry` / `spawnEntry`, which set that copy as the cwd
 themselves (and `hygiene.test.ts` reads every test's syntax tree to hold each
@@ -1237,8 +1392,9 @@ AOS_LIVE_TESTS=1 node --import tsx --test test/live-anthropic.test.ts
 
 The passing test prints `costMicroUsd=<N>` as a test diagnostic (`ℹ` in the
 terminal's spec output, `#` in TAP); that is the number recorded below.
-`AOS_LIVE_TESTS=1 npm test` runs the same test plus every other live test, at
-roughly twice the cost.
+`AOS_LIVE_TESTS=1 npm test` runs the same test plus every other Phase 0 and
+Phase 1 live test, at roughly twice the cost (the Phase 2 files skip without
+`AOS_LIVE_DOCKER=1`).
 
 - Result: pass. 2 passed, 1 skipped by design: the exit-criterion test needs `PMMCP_URL` (since renamed `AOS_LIVE_PMMCP_URL`), and line 2 runs it. The rejected-tool-call replay passed against the real Messages API.
 - Date: 2026-10-19
@@ -1517,14 +1673,14 @@ checks on the Mac" above.
 | `node:sqlite` on darwin-arm64: `DatabaseSync` `timeout` runtime behaviour, `errcode 1811` stability, `t.mock.timers` | `npm test` on the Mac; `test/env.test.ts` fails first, with a named reason |
 | pmmcp: Streamable HTTP interop with SDK 1.32.1 (same-origin redirects only, from 1.32.0), idle timeout vs the 240 s heartbeat (the 64 tool names, their input schemas and their output schemas, every one FastMCP's `{result: string}`, are captured in `test/fixtures/pmmcp-listtools.json`, re-taken 2026-10-19) | boot with pmmcp up: `hub.connected` and `hub.tools.classified` list what is really there; checklist line 2 |
 | An Anthropic API key accepted as `Authorization: Bearer` (D20's alternative) | one `npm run cli -- probe anthropic/claude-sonnet-5` with `auth.header: Authorization` |
-| Whether SIGKILL of the docker client leaves its container running, which is why the driver kills by name | Phase 2 live Docker driver tests |
-| What `docker run -i` gives a channel run through Colima's forwarded socket (a spec's `channel`, on the trusted domain only: `buildRunArgs` and `DockerDriver.run` in `src/sandbox/docker.ts`, which add `-i` beside `--init`, never `-t`, and hand the CLI's own stdin and stdout to the caller unread): the bytes carried both ways as they are, the CLI's stdin ending as the container's end of file, and the CLI exiting once its container has, its stdin still open; and what the CLI does when the reader of its stdout goes away (the kernel destroys the channel's input): its next copy of container output is expected to fail with EPIPE rather than kill it by SIGPIPE, as it catches every signal to relay it, and it is expected to exit while its `--rm` container runs on unattached, past its wallclock, which the CLI's exit clears. Check whether the container outlives the CLI, and for how long. Whatever it shows, a caller ends a channel run with `kill(name)`, never by destroying its input (`SandboxChannel` in `src/sandbox/driver.ts`), and the deadline is to stay armed until a kill by name succeeds (the wallclock note in `DockerDriver.run`: open, and owned by no plan task yet; until it is, only the next boot's orphan sweep, plan W2, reaps a container such a kill missed) | Phase 2 live Docker driver tests (egress plan L1), on each VM |
+| Whether SIGKILL of the docker client leaves its container running, which is why the driver kills by name | not by the Phase 2 live Docker driver tests (egress plan L1): the driver gives a run up only by `abandon`, which SIGKILLs the CLI and kills the container by name at once, so `killing the docker client then kill-by-name leaves no aos-run- container` shows that the two together stop it, never what the SIGKILL alone leaves; settling it needs a SIGKILL of the CLI by hand on the Mac (`kill -9` of the `docker run` process, then `docker ps` on its VM) |
+| What `docker run -i` gives a channel run through Colima's forwarded socket (a spec's `channel`, on the trusted domain only: `buildRunArgs` and `DockerDriver.run` in `src/sandbox/docker.ts`, which add `-i` beside `--init`, never `-t`, and hand the CLI's own stdin and stdout to the caller unread): the bytes carried both ways as they are, the CLI's stdin ending as the container's end of file, and the CLI exiting once its container has, its stdin still open; and what the CLI does when the reader of its stdout goes away (the kernel destroys the channel's input): its next copy of container output is expected to fail with EPIPE rather than kill it by SIGPIPE, as it catches every signal to relay it, and it is expected to exit while its `--rm` container runs on unattached, past its wallclock, which the CLI's exit clears. Check whether the container outlives the CLI, and for how long. Whatever it shows, a caller ends a channel run with `kill(name)`, never by destroying its input (`SandboxChannel` in `src/sandbox/driver.ts`), and the deadline is to stay armed until a kill by name succeeds (the wallclock note in `DockerDriver.run`: open, and owned by no plan task yet; until it is, only the next boot's orphan sweep, plan W2, reaps a container such a kill missed) | the Phase 2 live Docker driver tests (egress plan L1), on the trusted VM, the one a channel runs on: `test/live-sandbox.test.ts` 'the -i channel is binary-safe for 64 MiB' (the bytes, and the stdin's end ending the container), and 'a channel run whose input is destroyed: ...', which destroys a beating channel container's input, records whether the CLI ended before any kill and whether the container ran on (its diagnostics line), then kills it by name and sweeps |
 | That docker 29.5.2 runs `docker run --pull=never sha256:<64 hex>` from the image of that id on the VM, under whichever image store the VM uses, and fails with no such image rather than pulling when the VM lacks it; and that `docker save` on the trusted VM and `docker load` on the hostile one keep the id the same, so one `sandbox.imageId` names the image on both; and that `docker image inspect --format {{.Id}} sha256:<64 hex>` prints that same id on a VM that holds the image and fails on one that lacks it, which the probe asks of each VM (`buildRunArgs`, `assertTheImage` and `#imageMissingOn` in `src/sandbox/docker.ts`; kernel.yaml ships no id, so the sandbox is degraded until the image is built, pinned and held by both VMs) | Phase 2 live Docker driver tests (egress plan L1), on each VM, once `scripts/build-worker-image.sh` (plan I1) has built the image |
-| `scripts/build-worker-image.sh` and `images/worker/Dockerfile`, each marked NEEDS VALIDATION on its line 2: that the docker CLI, given only `DOCKER_CONFIG`, `DOCKER_HOST` and `PATH` as the kernel's own calls are, builds through the trusted VM's daemon with whichever builder it finds (the Dockerfile keeps to the classic builder's syntax: no syntax directive, heredoc or `--chmod`); that the base, `node:24-bookworm-slim` by the digest of its index, gives the VMs its arm64 image; that `ENTRYPOINT []` leaves the image with no entrypoint, which the script checks as `{{json .Config.Entrypoint}}` printing `null` or `[]`; and that bookworm's git (2.39), matching `safe.directory = /workspace` exactly, admits a repository cloned into `/workspace` itself and refuses one in a directory under it, which virtiofs shows as the operator's `501:20`; and what the image's `NODE_USE_ENV_PROXY=1` does on its Node (24.22.2): on Node 22.22 every node process started with it, the mux included, every `node --test` child and any Node command an agent runs, prints `[UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental` to stderr, so check whether 24.22.2 still does; and, with `NO_PROXY` empty, a request to a server the run itself listens on at `127.0.0.1` goes to the mux like any other (seen on Node 22.22, on loopback), which the kernel denies, so the Phase 2 exit's fixture repository (egress plan L2) keeps its tests off loopback HTTP; and, before the first build, what `ls -l ~/.colima/docker.sock` shows: nothing there, or a link to `~/.colima/default/docker.sock`, is expected. The build's plan refuses a `dockerHost` that is the same file as that name (`defaultSockets` in `scripts/worker-image.ts`), on the understanding, not checked against Colima 0.10.3, that Colima keeps it for the default profile alone; if it links to the trusted or hostile VM's socket instead, the plan refuses the shipped kernel.yaml as the default profile's, and that check needs changing before the image can be built | the operator runs the script once on the Mac and pins the id it prints as `sandbox.imageId`; then the Phase 2 live Docker driver tests (egress plan L1) |
-| The docker CLI's exit code once its container is killed by name from another client (`docker kill --signal=KILL aos-run-<id>`), with the driver's `--init` and `--rm`: 137 is expected, and the driver credits a kill (`killedBy`, SIGKILL) only on a 137 (`finish()` in `DockerDriver.run`). Any other code would make every kernel kill read as a run that ended on its own, leaving only `overran` to show a wallclock breach | Phase 2 live Docker driver tests, on each VM |
-| `docker ps --filter name=aos-run- --format {{.Names}}` prints one container name per line, which the orphan sweep reads (`#sweepOn` in `src/sandbox/docker.ts`; with `--quiet` the CLI would ignore the format and print IDs, which the sweep would drop) | Phase 2 live Docker driver tests, on each VM, with a container of that prefix running |
+| `scripts/build-worker-image.sh` and `images/worker/Dockerfile`, each marked NEEDS VALIDATION on its line 2: that the docker CLI, given only `DOCKER_CONFIG`, `DOCKER_HOST` and `PATH` as the kernel's own calls are, builds through the trusted VM's daemon with whichever builder it finds (the Dockerfile keeps to the classic builder's syntax: no syntax directive, heredoc or `--chmod`); that the base, `node:24-bookworm-slim` by the digest of its index, gives the VMs its arm64 image; that `ENTRYPOINT []` leaves the image with no entrypoint, which the script checks as `{{json .Config.Entrypoint}}` printing `null` or `[]`; and that bookworm's git (2.39), matching `safe.directory = /workspace` exactly, admits a repository cloned into `/workspace` itself and refuses one in a directory under it, which virtiofs shows as the operator's `501:20`; and what the image's `NODE_USE_ENV_PROXY=1` does on its Node (24.22.2): on Node 22.22 every node process started with it, the mux included, every `node --test` child and any Node command an agent runs, prints `[UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental` to stderr, so check whether 24.22.2 still does; and, with `NO_PROXY` empty, a request to a server the run itself listens on at `127.0.0.1` goes to the mux like any other (seen on Node 22.22, on loopback), which the kernel denies, so the Phase 2 exit's fixture repository (egress plan L2) keeps its tests off loopback HTTP; and, before the first build, what `ls -l ~/.colima/docker.sock` shows: nothing there, or a link to `~/.colima/default/docker.sock`, is expected. The build's plan refuses a `dockerHost` that is the same file as that name (`defaultSockets` in `scripts/worker-image.ts`), on the understanding, not checked against Colima 0.10.3, that Colima keeps it for the default profile alone; if it links to the trusted or hostile VM's socket instead, the plan refuses the shipped kernel.yaml as the default profile's, and that check needs changing before the image can be built | the operator runs the script once on the Mac and pins the id it prints as `sandbox.imageId`; then the Phase 2 live Docker driver tests (egress plan L1), whose 'the image's node reaches nothing through its proxy settings with no channel, ...' records whether node warns and whether a fetch of a server the probe itself listens on at 127.0.0.1 went to the proxy |
+| The docker CLI's exit code once its container is killed by name from another client (`docker kill --signal=KILL aos-run-<id>`), with the driver's `--init` and `--rm`: 137 is expected, and the driver credits a kill (`killedBy`, SIGKILL) only on a 137 (`finish()` in `DockerDriver.run`). Any other code would make every kernel kill read as a run that ended on its own, leaving only `overran` to show a wallclock breach | the Phase 2 live Docker driver tests (egress plan L1), on each VM: 'a kill by name ends a running container with the docker CLI's 137, credited to the kill, in either VM' (the driver's kill), and the sweep step of 'killing the docker client then kill-by-name leaves no aos-run- container' (the sweep's kill, the CLI's 137 with no kill of the driver's) |
+| `docker ps --filter name=aos-run- --format {{.Names}}` prints one container name per line, which the orphan sweep reads (`#sweepOn` in `src/sandbox/docker.ts`; with `--quiet` the CLI would ignore the format and print IDs, which the sweep would drop) | the Phase 2 live Docker driver tests (egress plan L1), on each VM: the sweep step of 'killing the docker client then kill-by-name leaves no aos-run- container' sweeps a beating container by name, which must be named in `swept` and its beat stop |
 | How docker 29 reads the namespace and network modes the run-args audit refuses, all case-sensitively: `--pid HOST` and `--network HOST` no mode (a plain `HOST` names a network called HOST), `--uts`, `--cgroupns` and `--userns container:<id>` refused as no mode they have, and only the key=value `--network name=HOST` lower-cased to host (`sharesNamespace` and `networkMode` in `src/sandbox/docker.ts`; the builder emits none of them, and the audit refuses each whatever docker makes of it) | Phase 2 live Docker driver tests, on each VM |
 | How docker 29's CLI and daemon read the `--security-opt` spellings the run-args audit names by what they widen (`auditRunArgs` in `src/sandbox/docker.ts`; the builder emits none of them): `seccomp=UNCONFINED` and `seccomp=BUILTIN` each read as a profile file of that name on the Mac, `seccomp=builtin` putting docker's built-in profile in place of one set by the daemon's `seccomp-profile`, `no-new-privileges` and `writable-cgroups` values read with Go's `strconv.ParseBool`, and a key in another case (`SECCOMP=unconfined`) refused | Phase 2 live Docker driver tests, on each VM and on a daemon configured with a `seccomp-profile` of its own |
-| `scripts/colima-up.sh`, still marked NEEDS VALIDATION on line 2. On 2026-10-21, on a VM that was running but whose first start never finished, `colima status` failed, `colima start` answered `already running, ignoring`, and the script printed `Done.` without its mounts or sizes applied. Since egress plan C1 it asks `colima status <profile>` again after the start and stops unless that succeeds, then reads the VM's mount table with `colima ssh --profile <profile> -- cat /proc/mounts` and stops unless the VM has one host share (virtiofs, 9p or sshfs), mounted over virtiofs at its domain's `mountRoot` path, before it touches the VM's network or prints `Done.`; its sizes default to the recorded 4 CPUs, 4 GiB and 60 GiB (`test/colima-script.test.ts`, which runs it against fake colima, limactl and docker). It does not check the sizes of a VM that exists already. What the fakes cannot show: that Colima 0.10.3's `colima ssh --profile <profile> -- cat /proc/mounts`, its stdin not a terminal, prints the VM's mount table and nothing else on stdout from any working directory, and that a `--mount <path>:w` share is mounted over virtiofs at that same path. Nor has the share check's awk program run under macOS's `/usr/bin/awk` (BWK's awk): here it has run only under Linux's awk (mawk, which the test links in as `awk`), so the operator's first run on the Mac, of the script or of `npm test` (whose `test/colima-script.test.ts` links `/usr/bin/awk` there), is its first under that dialect. It uses `ENVIRON`, string compares against `"\\040"`, `"\\011"`, `"\\012"` and `"\\134"`, and `exit (expr)`; a dialect that read one of them otherwise would most likely show it as a refusal, perhaps one that wrongly lists `nothing` as shared, rather than as a pass. Not read at all: which directory of the Mac the share mounted there is. /proc/mounts names a virtiofs share by Lima's tag (`mount0`), not by its Mac path, so the script reads where the share is mounted and assumes it is the `mountRoot` its `--mount` named; a profile whose own Colima config mounts another directory, `$HOME` say, at the `mountRoot`'s path would pass | the operator runs `npm test` on the Mac first, which runs the share check under `/usr/bin/awk` against the fakes, then the script once against the two running VMs: it should print where each VM's one share is mounted and change nothing; and reads each profile's `mounts:` in `~/.colima/<profile>/colima.yaml`, which should name that `mountRoot` alone, at no other `mountPoint` |
+| `scripts/colima-up.sh`, still marked NEEDS VALIDATION on line 2. On 2026-10-21, on a VM that was running but whose first start never finished, `colima status` failed, `colima start` answered `already running, ignoring`, and the script printed `Done.` without its mounts or sizes applied. Since egress plan C1 it asks `colima status <profile>` again after the start and stops unless that succeeds, then reads the VM's mount table with `colima ssh --profile <profile> -- cat /proc/mounts` and stops unless the VM has one host share (virtiofs, 9p or sshfs), mounted over virtiofs at its domain's `mountRoot` path, before it touches the VM's network or prints `Done.`; its sizes default to the recorded 4 CPUs, 4 GiB and 60 GiB (`test/colima-script.test.ts`, which runs it against fake colima, limactl and docker). It does not check the sizes of a VM that exists already. What the fakes cannot show: that Colima 0.10.3's `colima ssh --profile <profile> -- cat /proc/mounts`, its stdin not a terminal, prints the VM's mount table and nothing else on stdout from any working directory, and that a `--mount <path>:w` share is mounted over virtiofs at that same path. Nor has the share check's awk program run under macOS's `/usr/bin/awk` (BWK's awk): here it has run only under Linux's awk (mawk, which the test links in as `awk`), so the operator's first run on the Mac, of the script or of `npm test` (whose `test/colima-script.test.ts` links `/usr/bin/awk` there), is its first under that dialect. It uses `ENVIRON`, string compares against `"\\040"`, `"\\011"`, `"\\012"` and `"\\134"`, and `exit (expr)`; an awk that cannot run the program at all (one that cannot parse it exits 2) stops the script with `error: the share check could not run (awk exited N)` and no `colima stop` or `colima delete` fix, since no share was judged (only awk's exit 1 is the share refusal), and a dialect that ran it but read one of them otherwise would most likely show it as a refusal, perhaps one that wrongly lists `nothing` as shared, rather than as a pass: read the shares a refusal lists before following its fix, which stops the VM and may delete it. Not read at all: which directory of the Mac the share mounted there is. /proc/mounts names a virtiofs share by Lima's tag (`mount0`), not by its Mac path, so the script reads where the share is mounted and assumes it is the `mountRoot` its `--mount` named; a profile whose own Colima config mounts another directory, `$HOME` say, at the `mountRoot`'s path would pass | the operator runs `npm test` on the Mac first, which runs the share check under `/usr/bin/awk` against the fakes, then the script once against the two running VMs: it should print where each VM's one share is mounted and change nothing; and reads each profile's `mounts:` in `~/.colima/<profile>/colima.yaml`, which should name that `mountRoot` alone, at no other `mountPoint` |
 | Moonshot base URL, model ids and pricing; OpenRouter `usage.cost` semantics; llama.cpp `include_usage`, named `tool_choice`, `--jinja`, and the `/props.chat_template_caps.supports_tool_calls` key name | `npm run cli -- probe <ref>` per entry, and `GET /v1/models` once keys are in the vault |
 | `@tauri-apps/plugin-websocket` custom-header support — a Phase 3 blocker for invariant 1 | a Phase 3 spike, before any protocol change |

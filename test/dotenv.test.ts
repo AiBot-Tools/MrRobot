@@ -407,22 +407,78 @@ test('an in-repo .env stored under another case is refused by name: git would st
   assert.equal(message.includes(KEY), false)
 })
 
-test('credentialNames on the shipped config is exactly AOS_CONTROL_TOKEN, AOS_PMMCP_TOKEN and ANTHROPIC_API_KEY, and loses the bearer with a config that declares no tokenEnv', () => {
+test('credentialNames on the shipped config is exactly AOS_CONTROL_TOKEN, AOS_PMMCP_TOKEN, ANTHROPIC_API_KEY and AOS_GITHUB_TOKEN, and loses the bearer with a config that declares no tokenEnv', () => {
   const read = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
   const config = parseKernelConfig(read('config/kernel.yaml'), { repoRoot: REPO_ROOT })
   const providers = parseProviders(read('config/providers.yaml'))
-  assert.deepEqual([...credentialNames(config, providers)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN'])
+  assert.deepEqual([...credentialNames(config, providers)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN', 'AOS_GITHUB_TOKEN', 'AOS_PMMCP_TOKEN'])
 
   // The name comes from the declaration, not from a list: without it, it is not accepted.
   const { tokenEnv: _declared, ...pmmcp } = config.mcp.servers['pmmcp']!
   const tokenless = { ...config, mcp: { servers: { pmmcp } } }
-  assert.deepEqual([...credentialNames(tokenless, providers)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN'])
+  assert.deepEqual([...credentialNames(tokenless, providers)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN', 'AOS_GITHUB_TOKEN'])
+  // And the GitHub token from the two bindings that name it, not from a list.
+  const unbound = { ...config, egress: { ...config.egress, bindings: {} } }
+  assert.deepEqual([...credentialNames(unbound, providers)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN'])
+})
+
+test('the shipped kernel.yaml declares AOS_GITHUB_TOKEN, so a .env holding it loads', (t) => {
+  // The operator's .env gains the live egress test's token (README "Live
+  // sandbox and egress tests"). The loader refuses a name no config
+  // declares, so without the two bindings in the shipped kernel.yaml npm run
+  // dev and npm run cli would refuse to start on that file. Into the value
+  // map the kernel boots with, never process.env.
+  t.after(() => SecretMask.clear())
+  const read = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
+  const config = parseKernelConfig(read('config/kernel.yaml'), { repoRoot: REPO_ROOT })
+  const providers = parseProviders(read('config/providers.yaml'))
+  assert.deepEqual(
+    Object.entries(config.egress.bindings).map(([id, b]) => [id, b.envVar]),
+    [['github-git', 'AOS_GITHUB_TOKEN'], ['github-api', 'AOS_GITHUB_TOKEN']],
+  )
+  const repo = tmpdir(t)
+  writeFileSync(join(repo, '.gitignore'), '/.env\n')
+  const text = `AOS_CONTROL_TOKEN=${TOKEN}\nANTHROPIC_API_KEY=${KEY}\nAOS_GITHUB_TOKEN=${TOKEN.split('').reverse().join('')}\n`
+  writeFileSync(join(repo, '.env'), text, { mode: 0o600 })
+  chmodSync(join(repo, '.env'), 0o600)
+  const before = JSON.stringify(Object.entries(process.env).sort())
+
+  // npm run dev: daemonEnv loads every declared name, the GitHub token among them.
+  const daemon = daemonEnv(['--dotenv', '.env'], { repoRoot: repo, config, providers, shell: {} })
+  assert.deepEqual(Object.keys(daemon.loaded?.values ?? {}).sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN', 'AOS_GITHUB_TOKEN'])
+  assert.equal(daemon.env['AOS_GITHUB_TOKEN'], TOKEN.split('').reverse().join(''))
+  // npm run cli: it wants only the control token, and the file's other lines are admitted, not refused.
+  const accepted = credentialNames(config, providers)
+  assert.equal(oneCredential('AOS_CONTROL_TOKEN', join(repo, '.env'), { repoRoot: repo, accepted, shell: {} }), TOKEN)
+  assert.equal(JSON.stringify(Object.entries(process.env).sort()), before, 'the loader wrote process.env')
+
+  // The same file under a config that binds nothing is refused by its line:
+  // the declaration, not the file, is what admits the name.
+  const unbound = { ...config, egress: { ...config.egress, bindings: {} } }
+  const message = refusal(() => daemonEnv(['--dotenv', '.env'], { repoRoot: repo, config: unbound, providers, shell: {} }))
+  assert.match(message, /line 3: a name this kernel does not read/)
+  assert.equal(message.includes(TOKEN) || message.includes(KEY), false)
+
+  // What the operator reads of the token says that: npm run dev holds its
+  // value in kernel memory, egress disabled or not, and boot resolves no
+  // binding while egress is disabled. None says the value is never read.
+  const flat = (file: string): string => readFileSync(join(REPO_ROOT, file), 'utf8').replace(/^[ \t]*# ?/gm, '').replace(/\s+/g, ' ')
+  for (const [file, says] of [
+    ['README.md', '`npm run dev` loads its value into kernel memory at every start (never into `process.env`, and masked in every log line), egress enabled or not; while `egress.enabled` is false, as shipped, boot resolves neither binding'],
+    ['.env.example', 'npm run dev loads its value into kernel memory at every start (never process.env, masked in logs); while egress is disabled boot resolves neither binding'],
+    ['config/kernel.yaml', 'npm run dev loads its value into kernel memory (never process.env, masked in logs); while egress is disabled boot resolves neither binding'],
+  ] as const) {
+    const text = flat(file)
+    assert.ok(text.includes(says), `${file} does not say: ${says}`)
+    assert.doesNotMatch(text, /reads no value of (?:it|either)/, `${file} says the kernel reads no value of the token`)
+  }
 })
 
 test('credentialNames includes every egress binding envVar', () => {
   // A binding's credential is one the operator adds to .env (egress plan E5),
-  // so the loader must accept its name; the shipped config binds nothing, so
-  // the shipped names are unchanged (the test above).
+  // so the loader must accept its name. The shipped config's two bindings
+  // share AOS_GITHUB_TOKEN (the tests above); these are bindings of this
+  // test's own, in their place.
   const read = (p: string): unknown => parseYaml(readFileSync(join(REPO_ROOT, p), 'utf8'))
   const providers = parseProviders(read('config/providers.yaml'))
   const raw = read('config/kernel.yaml') as { egress: { bindings: Record<string, unknown> } }
@@ -448,7 +504,9 @@ test('credentialNames includes every egress binding envVar', () => {
   const text = `AOS_GITHUB_TOKEN=${KEY}\nAOS_GITHUB_API_TOKEN=${TOKEN}\n`
   assert.equal(parseDotenv(text, names).get('AOS_GITHUB_TOKEN')?.value, KEY)
   assert.equal(parseDotenv(text, names).get('AOS_GITHUB_API_TOKEN')?.value, TOKEN)
-  const unbound = credentialNames(parseKernelConfig(read('config/kernel.yaml'), { repoRoot: REPO_ROOT }), providers)
+  const shipped = read('config/kernel.yaml') as { egress: { bindings: Record<string, unknown> } }
+  shipped.egress.bindings = {}
+  const unbound = credentialNames(parseKernelConfig(shipped, { repoRoot: REPO_ROOT }), providers)
   const message = refusal(() => parseDotenv(text, unbound))
   assert.match(message, /line 1: a name this kernel does not read/)
   assert.equal(message.includes(KEY) || message.includes(TOKEN), false)
@@ -521,7 +579,7 @@ test('daemonEnv without --dotenv never opens a trap .env in the repo root and re
   const plain = daemonEnv(['--config', 'x.yaml'], { repoRoot: repo, config, providers, shell })
   assert.equal(plain.loaded, undefined)
   // Exactly the credential names: nothing else from the shell rides along.
-  assert.deepEqual(plain.env, { AOS_CONTROL_TOKEN: undefined, AOS_PMMCP_TOKEN: undefined, ANTHROPIC_API_KEY: 'fromTheShell' })
+  assert.deepEqual(plain.env, { AOS_CONTROL_TOKEN: undefined, AOS_PMMCP_TOKEN: undefined, AOS_GITHUB_TOKEN: undefined, ANTHROPIC_API_KEY: 'fromTheShell' })
 
   // The trap is armed: with the flag, the same file is opened and refused.
   assert.match(

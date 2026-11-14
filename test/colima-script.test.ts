@@ -8,28 +8,28 @@ import './helpers/guard.js'
 // copy in a temporary repository, with HOME a temporary directory, so it makes
 // nothing in this checkout or in a real home.
 //
-// The fakes log every call, one line each (an argument holding a newline
-// carries a call onto the next line, which run() does not count as a call),
-// tab-separated: the tool, docker's
-// DOCKER_HOST, then the arguments; and, in a second log (NUL-separated), the
-// DOCKER_CONFIG and COLIMA_CACHE_HOME each call ran with, which every run
-// holds to the program folder and ~/.colima. A fake colima answers `status <profile>`
-// with the exit codes its state file lists for that profile, one a call (the
-// last repeated), `start` with the exit code its state file names for that
-// profile, 0 unless one is named (as Colima 0.10.3 answers "already running,
-// ignoring" with 0 on a VM whose first start never finished), and
-// `ssh --profile <profile> -- cat /proc/mounts` with the mount table its state
-// file holds for that profile; it refuses status and ssh unless their stdin is
-// /dev/null, and the script runs with stdin a pipe, so a redirect dropped
-// shows. A fake docker keeps each network's Internal flag in a file, prints
-// it for `network inspect --format`, fails that inspect for a network its
-// state file names, and fails `network create` for a network its state file
-// names. Anything else is refused with 64, so a call the script was not
-// expected to make fails the run.
+// The fakes log every call, one line each, tab-separated: the tool, docker's
+// DOCKER_HOST, then the arguments. An argument holding a newline carries a
+// call onto the next line, which stays in run()'s `calls` as an entry whose
+// first field is no tool, and which run()'s footprint check skips. A second
+// log (NUL-separated) holds the DOCKER_CONFIG and COLIMA_CACHE_HOME each call
+// ran with, which every run holds to the program folder and ~/.colima. A fake
+// colima answers `status <profile>` with the exit codes its state file lists
+// for that profile, one a call (the last repeated), `start` with the exit code
+// its state file names for that profile, 0 unless one is named (as Colima
+// 0.10.3 answers "already running, ignoring" with 0 on a VM whose first start
+// never finished), and `ssh --profile <profile> -- cat /proc/mounts` with the
+// mount table its state file holds for that profile; it refuses status and ssh
+// unless their stdin is /dev/null, and the script runs with stdin a pipe, so a
+// redirect dropped shows. A fake docker keeps each network's Internal flag in
+// a file, prints it for `network inspect --format`, fails that inspect for a
+// network its state file names, and fails `network create` for a network its
+// state file names. Anything else is refused with 64, so a call the script was
+// not expected to make fails the run.
 
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 
@@ -503,6 +503,48 @@ test('a mountRoot whose path holds a space, a tab, a newline or a backslash is m
   const r = run(other, { mounts: { trusted: bad } })
   assert.notEqual(r.status, 0, r.stdout)
   assert.ok(r.stderr.includes(`its host shares are mounted at:\n  virtiofs ${other.repo.replace('my aos\\checkout', 'my\\x20aos\\checkout')}/.aos/workspaces/trusted\n`), r.stderr)
+})
+
+test("an awk that is missing, or that cannot run the share check, stops the script with that error, never with the share refusal and its fix, which stops and may delete a healthy VM", (t) => {
+  // No awk on PATH: `need awk` stops the script before any VM is asked
+  // about.
+  const bare = fixture(t)
+  unlinkSync(join(bare.bin, 'awk'))
+  const none = run(bare)
+  assert.notEqual(none.status, 0, `no awk: the script passed\n${none.stdout}`)
+  assert.ok(none.stderr.includes('error: awk is not installed\n'), none.stderr)
+  assert.doesNotMatch(none.stdout, /Done\./)
+  assert.deepEqual(none.calls, [], 'the script ran colima, docker or limactl with no awk to judge a share with')
+
+  // An awk that cannot run the program (a dialect that cannot parse it exits
+  // 2) has judged no share: the script says so, and gives neither the
+  // refusal, which would list `nothing` as shared, nor its stop and delete
+  // fix. On the trusted VM, and on the hostile one after the trusted VM's
+  // whole pass, where the stand-in runs the real awk.
+  const real = systemTool('awk')
+  for (const domain of DOMAINS) {
+    const fx = fixture(t)
+    unlinkSync(join(fx.bin, 'awk'))
+    writeFileSync(
+      join(fx.bin, 'awk'),
+      `#!${BASH}\ncase "\${MOUNT_ROOT:-}" in\n  */${domain}) echo "awk: syntax error at source line 1" >&2; exit 2 ;;\nesac\nexec ${real} "$@"\n`,
+    )
+    chmodSync(join(fx.bin, 'awk'), 0o755)
+    const r = run(fx)
+    assert.notEqual(r.status, 0, `${domain}: the script passed\n${r.stdout}`)
+    assert.doesNotMatch(r.stdout, /Done\./, domain)
+    assert.ok(r.stderr.includes('awk: syntax error at source line 1\n'), `${domain}: ${r.stderr}`)
+    assert.ok(
+      r.stderr.includes(`error: the share check could not run (awk exited 2), so the host shares of colima profile ${domain} were not judged; the VM is left as it is\n`),
+      `${domain}: ${r.stderr}`,
+    )
+    assert.doesNotMatch(r.stderr, /must have one host share|its host shares are mounted at|nothing/, domain)
+    assert.doesNotMatch(r.stderr, /colima delete|colima stop/, domain)
+    assert.doesNotMatch(r.stdout, new RegExp(`colima profile ${domain} has one host share`), domain)
+    // No network call on its VM: status, start, status and the shares, then nothing.
+    const own = [['colima', 'status', domain], startCall(fx, domain, recordedSizes()), ...healthyAfterStart(fx, domain, 'create').slice(0, 2)]
+    assert.deepEqual(r.calls, domain === 'trusted' ? own : [...trustedPass(fx), ...own], domain)
+  }
 })
 
 test('a colima start that fails stops the script there, passing on what colima said, before status is asked again, any share read or network touched, or Done. printed', (t) => {

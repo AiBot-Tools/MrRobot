@@ -723,7 +723,7 @@ test('no test is skipped or todo except test/live-*.test.ts', () => {
   const liveFiles = TEST.filter((f) => /^test\/live-[^/]*\.test\.ts$/.test(f.path))
   assert.deepEqual(
     liveFiles.map((f) => f.path).sort(),
-    ['test/live-anthropic.test.ts', 'test/live-runtime.test.ts'],
+    ['test/live-anthropic.test.ts', 'test/live-egress.test.ts', 'test/live-runtime.test.ts', 'test/live-sandbox.test.ts'],
     'the set of gated live files changed; add the new one here deliberately',
   )
   for (const live of liveFiles) {
@@ -732,13 +732,26 @@ test('no test is skipped or todo except test/live-*.test.ts', () => {
       /const LIVE = process\.env\['AOS_LIVE_TESTS'\] === '1'/,
       `${live.path} does not read its gate from AOS_LIVE_TESTS`,
     )
-    // A second gate, where one exists, obeys the same rule.
-    if (live.text.includes('AOS_LIVE_PMMCP_WRITES')) {
+    // A second gate, where one exists, obeys the same rule: pmmcp writes,
+    // containers on the operator's VMs, and writes to GitHub (egress plan L1, L2).
+    for (const [name, constant, what] of [
+      ['AOS_LIVE_PMMCP_WRITES', 'WRITES', 'pmmcp-writes'],
+      ['AOS_LIVE_DOCKER', 'DOCKER', 'docker'],
+      ['AOS_LIVE_GITHUB', 'GITHUB', 'github'],
+    ] as const) {
+      if (!live.text.includes(name)) continue
       assert.match(
         live.text,
-        /const WRITES = process\.env\['AOS_LIVE_PMMCP_WRITES'\] === '1'/,
-        `${live.path} does not read its pmmcp-writes gate from the environment`,
+        new RegExp(`const ${constant} = process\\.env\\['${name}'\\] === '1'`),
+        `${live.path} does not read its ${what} gate from the environment`,
       )
+    }
+    // A file that runs containers on the operator's VMs is gated by DOCKER at
+    // every test, and one that writes to GitHub by GITHUB too.
+    if (/live-(?:sandbox|egress)\.test\.ts$/.test(live.path)) {
+      const skips = (live.text.match(/\bskip\s*:/g) ?? []).length
+      assert.equal((live.text.match(/: !DOCKER\n/g) ?? []).length, skips, `${live.path} has a test DOCKER does not gate`)
+      if (live.path.endsWith('live-egress.test.ts')) assert.equal((live.text.match(/: !GITHUB\n/g) ?? []).length, skips, `${live.path} has a test GITHUB does not gate`)
     }
   }
   // Every skip states a reason: "skipped" with no reason is indistinguishable
@@ -749,7 +762,10 @@ test('no test is skipped or todo except test/live-*.test.ts', () => {
     const skipLines = live.lines
       .map((text, i) => ({ n: i, text }))
       .filter((l) => /\bskip\s*:/.test(l.text))
-    assert.ok(skipLines.length >= 2, `found ${String(skipLines.length)} skips in ${live.path}`)
+    // Two at least, so a scan that sees nothing fails here; the Phase 2
+    // exit's file holds its one test (egress plan L2).
+    const least = live.path === 'test/live-egress.test.ts' ? 1 : 2
+    assert.ok(skipLines.length >= least, `found ${String(skipLines.length)} skips in ${live.path}`)
     for (const line of skipLines) {
       // The skip EXPRESSION, not a fixed window: from `skip:` to the line that
       // closes it with `false`. A fixed window let one reasonless branch hide
@@ -766,7 +782,7 @@ test('no test is skipped or todo except test/live-*.test.ts', () => {
       assert.ok(reasons.length > 0, `${live.path}:${String(line.n + 1)} skips with no stated reason`)
       // And the reason says what to DO, not merely that something is absent.
       assert.ok(
-        reasons.some((r) => /AOS_LIVE_TESTS|AOS_LIVE_PMMCP_WRITES|ANTHROPIC_API_KEY|PMMCP_/.test(r)),
+        reasons.some((r) => /AOS_LIVE_TESTS|AOS_LIVE_PMMCP_WRITES|AOS_LIVE_DOCKER|AOS_LIVE_GITHUB|ANTHROPIC_API_KEY|AOS_GITHUB_TOKEN|PMMCP_/.test(r)),
         `${live.path}:${String(line.n + 1)} does not name what is missing`,
       )
     }
@@ -3581,8 +3597,18 @@ test('liveCredential is called only in test/live-*.test.ts behind LIVE, or with 
   assert.ok(live.length >= 2, 'the live files no longer take their key through liveCredential')
   for (const call of live) {
     assert.match(call.path, /^test\/live-[^/]+\.test\.ts$/, `${call.path}:${String(call.n)}`)
-    assert.match(call.text, /LIVE \?/, `${call.path}:${String(call.n)} calls liveCredential outside the LIVE gate`)
+    assert.match(call.text, /\bLIVE(?: && [A-Z]+)* \?/, `${call.path}:${String(call.n)} calls liveCredential outside the LIVE gate`)
+    // A file with gates beside LIVE reads a credential only behind them all:
+    // live-egress's token is opened on its own gated run, never on a Phase 0
+    // or 1 run (AOS_LIVE_TESTS=1 alone) that skips the file.
+    const file = TEST.find((f) => f.path === call.path)?.text ?? ''
+    const gates = ['LIVE', ...(['DOCKER', 'GITHUB'] as const).filter((gate) => new RegExp(`^const ${gate} = process\\.env\\[`, 'm').test(file))]
+    assert.match(call.text, new RegExp(`\\b${gates.join(' && ')} \\?`), `${call.path}:${String(call.n)} reads a credential outside its gates ${gates.join(', ')}`)
   }
+  assert.ok(
+    live.some((c) => c.path === 'test/live-egress.test.ts' && c.text.includes("LIVE && DOCKER && GITHUB ? liveCredential('AOS_GITHUB_TOKEN')")),
+    'live-egress no longer reads its token behind all three gates',
+  )
   const unit = calls.filter((c) => c.path === 'test/dotenv.test.ts')
   assert.ok(unit.length >= 3, 'dotenv.test.ts no longer tests liveCredential')
   // A backstop: liveCredential itself refuses the default path outside a live

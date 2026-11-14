@@ -106,10 +106,15 @@ sandbox:
 # its container reaches the hosts the grant names only through the kernel,
 # over its docker -i channel, every request a proxy.decision before any dial.
 # Boot reports egress degraded while this is disabled, naming this key. It
-# ships disabled with no binding, because any binding widens what a run can
-# reach. Every key is strict: a typo is refused at parse, not taken for a
-# setting. Egress serves the trusted domain alone, so there is no domain key:
-# the hostile domain gets no channel and no egress.
+# ships disabled, with the two bindings of the Phase 2 exit's fixture
+# repository below and no shipped manifest binding either, so neither widens
+# what any shipped agent can reach. Enabled, it resolves every binding at
+# boot, these two included: unless both resolve (AOS_GITHUB_TOKEN held in the
+# shell or .env), egress is degraded for every run, one whose manifest binds
+# neither included, so remove them before enabling egress without the token.
+# Every key is strict: a typo is refused at parse, not taken for a setting.
+# Egress serves the trusted domain alone, so there is no domain key: the
+# hostile domain gets no channel and no egress.
 egress:
   enabled: false
   # Where the in-image mux listens, inside the container's own network
@@ -146,16 +151,35 @@ egress:
   # censored as a credential shape. A binding names at most 64 repositories,
   # and the bindings one manifest binds at most 128 between them, what one
   # proxy.grant.issued row records: a manifest past that is refused at load.
-  # Pushes and pull requests land under refs/heads/aos/<runId>/ only. A shape,
-  # for when the operator adds one:
-  #   bindings:
-  #     github-git:
-  #       host: github.com
-  #       scheme: Basic   # user x-access-token unless basicUser names another
-  #       envVar: AOS_GITHUB_TOKEN
-  #       profiles: [git-fetch]
-  #       repos: [owner/fixture]
-  bindings: {}
+  # Pushes and pull requests land under refs/heads/aos/<runId>/ only.
+  #
+  # The two below are the Phase 2 exit's (test/live-egress.test.ts, README
+  # "Live sandbox and egress tests"): the fixture repository, its git half
+  # on github.com and its pull requests on api.github.com, one token for
+  # both. Declared here so that the .env loader accepts AOS_GITHUB_TOKEN (it
+  # refuses a name no config declares) and the operator's daemon starts with
+  # it in <repo>/.env: a fine-grained personal access token for that one
+  # repository, Contents read and write and Pull requests read and write
+  # (and the Metadata read GitHub adds to every one), nothing else, which the
+  # operator adds. Held there, npm run dev loads its value into kernel memory
+  # (never process.env, masked in logs); while egress is disabled boot
+  # resolves neither binding, and no shipped manifest binds either; the live
+  # test's own coder manifest, from a test-only agents dir, binds both.
+  bindings:
+    github-git:
+      host: github.com
+      scheme: Basic   # user x-access-token unless basicUser names another
+      envVar: AOS_GITHUB_TOKEN
+      profiles: [git-fetch, git-push]
+      repos: [AiBot-Tools/aos-fixture]
+    github-api:
+      host: api.github.com
+      # Quoted: unquoted, the word and the line after it read as a bearer
+      # credential to the scan that keeps credentials out of config/.
+      scheme: 'Bearer'
+      envVar: AOS_GITHUB_TOKEN
+      profiles: [github-pulls]
+      repos: [AiBot-Tools/aos-fixture]
 
 # pmmcp goal tools. Every name and argument here matches the operator's live
 # capture of 2026-10-18 (test/fixtures/pmmcp-listtools.json), and every call goes

@@ -937,7 +937,10 @@ test('mintedCredentialNames gives exactly the tokens the AOS mints: AOS_CONTROL_
     raw.mcp.servers['github'] = { url: 'http://127.0.0.1:9911/mcp', tokenEnv: 'GITHUB_MCP_TOKEN' }
   })
   assert.deepEqual([...mintedCredentialNames(both)], ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN'])
-  assert.deepEqual([...credentialNames(both, PROVIDERS)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'GITHUB_MCP_TOKEN'])
+  assert.deepEqual([...credentialNames(both, PROVIDERS)].sort(), ['ANTHROPIC_API_KEY', 'AOS_CONTROL_TOKEN', 'AOS_GITHUB_TOKEN', 'AOS_PMMCP_TOKEN', 'GITHUB_MCP_TOKEN'])
+  // The shipped bindings' token is accepted and never minted: the operator adds it.
+  assert.ok(accepted.has('AOS_GITHUB_TOKEN'))
+  assert.equal(mintedCredentialNames(config).has('AOS_GITHUB_TOKEN'), false)
 })
 
 test('an egress binding envVar is accepted, never minted: mintedCredentialNames leaves it out and the writer will not generate it', (t) => {
@@ -1707,9 +1710,14 @@ test("the by-hand path .env.example and README give for AOS_PMMCP_TOKEN meets th
   assert.match(byHand, /or put in a value of your own \(`openssl rand -hex 32`\), whose digest the installer then stages\./)
 
   const control = randomBytes(32).toString('hex')
+  // AOS_GITHUB_TOKEN is the live egress test's alone, and the template says
+  // what to do with its line when that test is not run: delete it, as a
+  // placeholder left in is refused.
+  assert.match(flat(template), /Not running that test\? Delete this line: a \.env that still holds a placeholder is refused/)
   const filled = template
     .replace(/^AOS_CONTROL_TOKEN=.*$/m, `AOS_CONTROL_TOKEN=${control}`)
     .replace(/^ANTHROPIC_API_KEY=.*$/m, `ANTHROPIC_API_KEY=${KEY}`)
+    .replace(/^AOS_GITHUB_TOKEN=.*\n/m, '')
   const line = filled.split('\n').findIndex((l) => l.startsWith('AOS_PMMCP_TOKEN=')) + 1
   assert.ok(line > 0, '.env.example no longer holds AOS_PMMCP_TOKEN')
   const NAMES = ['AOS_CONTROL_TOKEN', 'AOS_PMMCP_TOKEN', 'ANTHROPIC_API_KEY']

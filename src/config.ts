@@ -390,9 +390,10 @@ const Sandbox = z
 // as data. Boot reads it (kernel.ts: the egress probe, each binding's value
 // resolved once through the broker, and every grant's limits), and so does
 // the .env loader (a binding's envVar is a name it accepts, and the daemon
-// loads that value into kernel memory at boot). It ships disabled with no
-// binding, and every field is strict, because each one decides what a run
-// can reach:
+// loads that value into kernel memory at boot). It ships disabled, with the
+// two Phase 2 exit bindings (github-git, github-api) that no shipped manifest
+// binds, and every field is strict, because each one decides what a run can
+// reach:
 //
 //   A binding is a credential for one host, named by the .env name its value
 //   is read from (never a value, never a vault id: the vault is dormant), the

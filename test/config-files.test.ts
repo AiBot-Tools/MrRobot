@@ -2646,3 +2646,75 @@ test('.dockerignore keeps credentials, the event log and git history out of any 
   for (const entry of ['.env*', '.aos/', '.git/']) assert.ok(lines.includes(entry), `.dockerignore misses ${entry}`)
   assert.equal(lines.some((l) => l.startsWith('!') && l.includes('.env')), false)
 })
+
+test("README's live sandbox and egress section names every gated test of the two files, says what the token needs and where each container and its workspace go, and .env.example and the files' headers say the same", () => {
+  const flat = (text: string): string => text.replace(/^[ \t]*(?:#|\/\/) ?/gm, '').replace(/\s+/g, ' ')
+  const readme = read('README.md')
+  const start = readme.indexOf('## Live sandbox and egress tests\n')
+  assert.notEqual(start, -1, 'README has no live sandbox and egress section')
+  const section = readme.slice(start, readme.indexOf('\n## ', start + 1))
+  // Every gated test has a row, its first cell the test's name or the start of it.
+  const rowsNamed = [...section.matchAll(/^\| (?:`test\/live-[a-z]+\.test\.ts`: )?([^|]+?) \| /gm)].map((m) => m[1] ?? '').filter((n) => n !== 'Test' && !n.startsWith('---'))
+  for (const file of ['test/live-sandbox.test.ts', 'test/live-egress.test.ts']) {
+    const names = [...read(file).matchAll(/^test\(\n {2}(['"])(.+)\1,\n/gm)].map((m) => (m[2] ?? '').replace(/\\'/g, "'"))
+    assert.ok(names.length > 0, `${file} holds no test this scan reads`)
+    for (const name of names) assert.ok(rowsNamed.some((row) => name.startsWith(row)), `README's live section has no row for ${file}: ${name}`)
+  }
+  const text = flat(section)
+  // The token: the organization owns it, and GitHub's Metadata read comes with it.
+  for (const says of [
+    'whose resource owner is the `AiBot-Tools` organization (which may have to approve it before it works)',
+    'and Metadata read-only, which GitHub adds to every fine-grained token, and nothing else',
+  ]) assert.ok(text.includes(says), `README's live section does not say: ${says}`)
+  const example = flat(read('.env.example'))
+  for (const says of ['with the AiBot-Tools organization as its resource owner (the organization may have to approve it)', 'and the Metadata read-only GitHub adds to every fine-grained token, nothing else']) {
+    assert.ok(example.includes(says), `.env.example does not say: ${says}`)
+  }
+  // The containers and workspaces: a test's own, removed; the canaries', named as boot names them, in boot's canary workspace, which stays.
+  for (const says of [
+    'A test\'s own containers are named `aos-run-live_...`',
+    'the canary test\'s two are named as boot names its canaries (`aos-run-canary-1-<nonce>-<domain>`), and share the canary workspace boot uses, `.aos/workspaces/<domain>/aos_canary`, which stays',
+    'in the canary workspace under each domain\'s mountRoot, which stays',
+    'no workspace entry\'s name or file (`.git` included, each git object inflated: a loose object whole, a pack\'s streams each)',
+  ]) assert.ok(text.includes(says), `README's live section does not say: ${says}`)
+  assert.ok(flat(read('test/live-sandbox.test.ts')).includes("are named as boot names its canaries, aos-run-canary-1-<nonce>-<domain>, and share boot's canary workspace, <mountRoot>/aos_canary, which stays"), "live-sandbox's header does not name the canaries and their workspace")
+  assert.ok(flat(read('test/live-egress.test.ts')).includes('in the canary workspace under each domain\'s mountRoot (<mountRoot>/aos_canary), which stays'), "live-egress's header does not say where its canaries' workspace is")
+  // Which the bodies and boot hold to: the canary body names its canaries as boot's first boot would, in boot's own workspace.
+  const bodies = read('test/helpers/sandbox-bodies.ts')
+  assert.ok(bodies.includes('    const workspace = makeWorkspace(domain, ctx.mountRoots[domain], CANARY_WORKSPACE)\n'))
+  assert.ok(bodies.includes('      name: canaryName(1, canaryNonce(), domain),\n'))
+  assert.match(read('src/runtime/canary.ts'), /^export const CANARY_WORKSPACE = 'aos_canary'$/m)
+})
+
+test("README says which live tests AOS_LIVE_TESTS=1 alone runs, and which checks of the live bodies are seen offline only to pass; live-egress says its guard admits what the kernel then judges", () => {
+  const flat = (text: string): string => text.replace(/^[ \t]*(?:#|\/\/|\*) ?/gm, '').replace(/\s+/g, ' ')
+  const readme = flat(read('README.md'))
+  // AOS_LIVE_TESTS=1 alone runs no Phase 2 file: each skips without AOS_LIVE_DOCKER=1.
+  for (const says of [
+    'Every Phase 0 and Phase 1 live test, including pmmcp writes to `aos/agent/aos-live-test` (the Phase 2 files below also need `AOS_LIVE_DOCKER=1`):',
+    '`AOS_LIVE_TESTS=1 npm test` runs the same test plus every other Phase 0 and Phase 1 live test, at roughly twice the cost (the Phase 2 files skip without `AOS_LIVE_DOCKER=1`).',
+  ]) assert.ok(readme.includes(says), `README does not say: ${says}`)
+  assert.equal(/\bEverything, including pmmcp writes\b|plus every other live test\b/.test(readme), false, 'README says AOS_LIVE_TESTS=1 runs every live test')
+  // The bodies: what is seen to fail, and what only to pass, named.
+  for (const says of [
+    'Every check a container or a VM can make fail is seen there to fail on what it is there to catch',
+    'Seen only to pass are the checks of what the kernel or the driver alone decides, which no container can make fail',
+    'No failure of the exit quotes the token',
+    'each check a container or a VM can make fail seen offline to fail on what it catches (`liveBodies`)',
+  ]) assert.ok(readme.includes(says), `README does not say: ${says}`)
+  assert.equal(/Each check is seen there to fail|Two are seen only to pass|each check of which is seen offline to fail/.test(readme), false, 'README still says every check of the live bodies is seen to fail')
+  assert.equal(/each check of which/.test(read('scripts/falsify/catalog.ts')), false, "the liveBodies comment still says every check is seen to fail")
+  // A request that failed upstream is one a container can cause (a request
+  // cut short of its Content-Length, exitActor's clone-cut): seen to fail,
+  // never listed among the checks seen only to pass.
+  assert.ok(readme.includes('a request cut short of its Content-Length, which fails upstream;'), 'README does not list a request cut short among the checks seen to fail')
+  const passOnly = readme.slice(readme.indexOf('Seen only to pass are the checks'))
+  assert.equal(/failed upstream|upstream row/.test(passOnly.slice(0, passOnly.indexOf('the chain verifying'))), false, 'README lists the upstream check among the checks seen only to pass')
+  const catalog = flat(read('scripts/falsify/catalog.ts'))
+  assert.ok(catalog.includes("Among them, no request failed upstream: a container makes one fail by cutting a request short of its Content-Length (exitActor's clone-cut, LB75)"), "the liveBodies comment does not say a container can make the upstream check fail")
+  assert.equal(/no upstream row/.test(catalog), false, 'the liveBodies comment lists the upstream check among the checks seen only to pass')
+  // live-egress's guard: it admits each answer as it arrives, before the kernel judges it.
+  const egress = flat(read('test/live-egress.test.ts'))
+  assert.ok(egress.includes('The kernel\'s checkAnswers (src/egress/upstream.ts, over src/egress/addr.ts) then judges each answer unchanged, so an address it refuses is admitted to the guard but never dialled.'), "live-egress's admitting() comment does not say the guard admits first")
+  assert.equal(egress.includes('run first, unchanged'), false, "live-egress's admitting() comment says the kernel's checks run first")
+})

@@ -38,9 +38,10 @@ import { lockHolder } from '../../src/falsify-hold.js'
 
 /**
  * Credentials never reach an offline test. Any name a provider key, the
- * control token or the pmmcp bearer would use is removed from this test
- * process's environment at import — so a key the operator exported in the
- * shell that runs `npm test` cannot be picked up, logged or sent by accident.
+ * control token, the pmmcp bearer or the egress bindings' token would use
+ * is removed from this test process's environment at import — so a key the
+ * operator exported in the shell that runs `npm test` cannot be picked up,
+ * logged or sent by accident.
  *
  * The one exception is a test/live-*.test.ts file on the gated live run
  * (AOS_LIVE_TESTS=1). The gate alone is not enough: `AOS_LIVE_TESTS=1 npm
@@ -49,7 +50,7 @@ import { lockHolder } from '../../src/falsify-hold.js'
  * [node, file]; anything else — an -e script, or --test-isolation=none, where
  * one process runs every file listed — is scrubbed.
  */
-export const CREDENTIAL_NAME = /^(ANTHROPIC|OPENAI|OPENROUTER|MOONSHOT)_|_API_KEY$|^AOS_CONTROL_TOKEN$|^AOS_PMMCP_TOKEN$|^PMMCP_TOKEN$/
+export const CREDENTIAL_NAME = /^(ANTHROPIC|OPENAI|OPENROUTER|MOONSHOT)_|_API_KEY$|^AOS_CONTROL_TOKEN$|^AOS_PMMCP_TOKEN$|^AOS_GITHUB_TOKEN$|^PMMCP_TOKEN$/
 
 const LIVE_FILE = /[/\\]test[/\\]live-[^/\\]+\.test\.ts$/
 

@@ -282,6 +282,32 @@ export class FakeMux {
     return Buffer.concat(flow.chunks).toString('latin1')
   }
 
+  /**
+   * A request cut short: `raw` sent on a flow of its own, then the worker's
+   * end, as a worker killed mid-request, its body short of its
+   * Content-Length; what the kernel answered, once it closed the flow.
+   */
+  async cutShort(raw: string): Promise<string> {
+    const id = this.#codec.flowsOpened + 1
+    const flow: Flow = { chunks: [], kernelClosed: false, muxEnded: false, muxClosed: false }
+    this.#flows.set(id, flow)
+    this.send({ type: 'open', flow: id, payload: EMPTY })
+    this.send({ type: 'data', flow: id, payload: Buffer.from(raw, 'latin1') })
+    this.#end(id, flow)
+    await until(() => flow.kernelClosed, `the kernel's close of flow ${String(id)}`)
+    return Buffer.concat(flow.chunks).toString('latin1')
+  }
+
+  /** A flow opened and hung up with no request on it, as a worker that connects to its proxy and sends nothing; resolves once the kernel closed it. */
+  async silentFlow(): Promise<void> {
+    const id = this.#codec.flowsOpened + 1
+    const flow: Flow = { chunks: [], kernelClosed: false, muxEnded: false, muxClosed: false }
+    this.#flows.set(id, flow)
+    this.send({ type: 'open', flow: id, payload: EMPTY })
+    this.#end(id, flow)
+    await until(() => flow.kernelClosed, `the kernel's close of flow ${String(id)}`)
+  }
+
   stdout(text: string): void {
     this.send({ type: 'stdout', flow: 0, payload: Buffer.from(text, 'utf8') })
   }

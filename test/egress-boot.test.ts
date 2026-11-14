@@ -1135,6 +1135,22 @@ test("a canary's grant row names the canary's own domain, so a grant for a canar
     routes: [],
   })
   assert.equal(canaryGrantRow(grantId, canaryName(1, '0000000000ab', 'hostile'), 'hostile'), undefined)
+
+  // And the canary builds its row with its own domain. Unmutated, only the
+  // trusted canary builds one, so no boot tells `domain` at the call from
+  // the literal 'trusted' (a mutant there survives this file): read from the
+  // source instead. One call, in canary(), whose `domain` is the one it read
+  // from its options and asked its channel for.
+  const source = readFileSync(join(REPO_ROOT, 'src/runtime/canary.ts'), 'utf8')
+  const calls = [...source.matchAll(/(?<!function )\bcanaryGrantRow\(([^)]*)\)/g)].map((m) => m[1])
+  assert.deepEqual(calls, ['grantId, name, domain'], 'canary.ts builds a canary grant row with something other than its own domain')
+  const start = source.indexOf('\nasync function canary(options: CanaryOptions): Promise<CanaryVerdict> {\n')
+  assert.notEqual(start, -1, 'canary.ts has no canary(options)')
+  const body = source.slice(start, source.indexOf('\n}\n', start))
+  assert.ok(body.includes('  const { driver, store, domain, name } = options\n'), "canary() no longer reads domain from its options")
+  assert.ok(body.includes("  const channel = domain === 'trusted'\n"), 'canary() no longer asks for its channel by that domain')
+  assert.ok(body.includes('    const payload = canaryGrantRow(grantId, name, domain)\n'), "canary()'s grant row is not built with that domain")
+  assert.equal([...body.matchAll(/\bdomain\s*=(?!=)/g)].length, 0, 'canary() assigns domain after reading it')
 })
 
 test("a canary whose row the log refuses fails once its container has ended, whatever its own verdict, and a report that closed its domain still closes it", async (t) => {

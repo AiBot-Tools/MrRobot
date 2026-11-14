@@ -102,16 +102,24 @@ END { exit (shares == 1 && own == 1 ? 0 : 1) }
 '
 
 # Fails the script unless the profile's VM has one host share, mounted over
-# virtiofs at its mountRoot, naming where each share it has is mounted.
+# virtiofs at its mountRoot, naming where each share it has is mounted. Only
+# awk's exit 1 is the refusal: any other failure (an awk that cannot parse
+# SHARES_AWK exits 2) means the shares were never judged, and its fix is not
+# the refusal's, which stops and may delete the VM.
 one_share_at_root() {
-  local profile="$1" mount="$2" mounts found
+  local profile="$1" mount="$2" mounts found code=0
   if ! mounts="$(colima ssh --profile "${profile}" -- cat /proc/mounts </dev/null)"; then
     echo "error: could not read /proc/mounts in colima profile ${profile}: colima ssh --profile ${profile} failed" >&2
     exit 1
   fi
-  if found="$(printf '%s\n' "${mounts}" | MOUNT_ROOT="${mount}" LC_ALL=C awk "${SHARES_AWK}")"; then
+  found="$(printf '%s\n' "${mounts}" | MOUNT_ROOT="${mount}" LC_ALL=C awk "${SHARES_AWK}")" || code=$?
+  if [[ "${code}" -eq 0 ]]; then
     echo "colima profile ${profile} has one host share, mounted at ${mount} (virtiofs)"
     return 0
+  fi
+  if [[ "${code}" -ne 1 ]]; then
+    echo "error: the share check could not run (awk exited ${code}), so the host shares of colima profile ${profile} were not judged; the VM is left as it is" >&2
+    exit 1
   fi
   echo "error: colima profile ${profile} must have one host share, mounted over virtiofs at its mountRoot, ${mount}; its host shares are mounted at:" >&2
   printf '%s\n' "${found:-  nothing}" >&2

@@ -24,7 +24,7 @@ import './helpers/guard.js'
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
-import { parse as parseYaml } from 'yaml'
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml'
 import { WebSocket } from 'ws'
 import { createServer, type IncomingHttpHeaders } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -2645,6 +2645,43 @@ test('with no container runtime, egress is degraded and names the sandbox reason
       .map((r) => JSON.parse(r.payload) as { subsystem: string; state: string })
       .filter((p) => p.subsystem === 'egress')
     assert.deepEqual(states.map((p) => p.state), ['degraded'])
+  }
+})
+
+test("kernel.yaml's shipped bindings, with egress enabled and AOS_GITHUB_TOKEN held nowhere, leave egress degraded for every run, one whose manifest binds neither included, as kernel.yaml, README and .env.example say", async (t) => {
+  // The shipped egress section as written, enabled: its two bindings, and a
+  // worker whose manifest has egress but binds neither (a credential-free host).
+  const shippedEgress = (parseYaml(readFileSync(join(REPO_ROOT, 'config', 'kernel.yaml'), 'utf8')) as { egress: Record<string, unknown> }).egress
+  const { kernel, fx } = await withKernel(t, {
+    kernelYaml: pinned(`\n${stringifyYaml({ egress: { ...shippedEgress, enabled: true } })}`),
+    sandboxDriver: answering(),
+    agentsDir: testFleet(t, { reacher: egressWorker('reacher', ['  allow: [registry.npmjs.org]']) }),
+  })
+  assert.equal(kernel.status().subsystems.sandbox.state, 'ok')
+  assert.equal(kernel.status().subsystems.egress.state, 'degraded')
+  // Each shipped binding failed, by name, and nothing else did: the canaries passed.
+  assert.deepEqual(
+    egressRows(fx.dbPath).map((r) => [r['check'], r['bindingId']]),
+    [
+      ['binding', 'github-git'],
+      ['binding', 'github-api'],
+    ],
+  )
+  // So the worker that binds neither is refused sandbox.exec, before any human is asked, for the bindings it never named.
+  assert.match(
+    kernel.sandboxTools.egressRefusal('sandbox.exec', 'reacher') ?? '',
+    /^egress is degraded: egress binding github-git \(envVar AOS_GITHUB_TOKEN\) did not resolve: AOS_GITHUB_TOKEN is not set[^;]*; egress binding github-api \(envVar AOS_GITHUB_TOKEN\) did not resolve: AOS_GITHUB_TOKEN is not set[^;]*; no container was started$/,
+  )
+  // What the operator reads before enabling egress says so, in each place
+  // that names the bindings; flattened, a comment's leading `#` dropped.
+  const flat = (file: string): string => readFileSync(join(REPO_ROOT, file), 'utf8').replace(/^[ \t]*# ?/gm, '').replace(/\s+/g, ' ')
+  for (const [file, says] of [
+    ['config/kernel.yaml', 'unless both resolve (AOS_GITHUB_TOKEN held in the shell or .env), egress is degraded for every run, one whose manifest binds neither included, so remove them before enabling egress without the token'],
+    ['README.md', 'with egress enabled, both must resolve or egress is degraded for every run, one whose manifest binds neither included, so hold the token, or remove the two bindings from kernel.yaml before you enable egress without it'],
+    ['README.md', 'With egress enabled both bindings must resolve or egress is degraded for every run: hold the token, or remove the two bindings from `config/kernel.yaml` before you enable egress without it'],
+    ['.env.example', 'with egress enabled both must resolve or egress is degraded for every run'],
+  ] as const) {
+    assert.ok(flat(file).includes(says), `${file} does not say: ${says}`)
   }
 })
 

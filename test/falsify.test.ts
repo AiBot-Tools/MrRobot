@@ -517,6 +517,7 @@ test('test processes get no live-test flag and no credential from the runner, an
       OPENROUTER_API_KEY: 'k',
       AOS_CONTROL_TOKEN: 't',
       AOS_PMMCP_TOKEN: 't',
+      AOS_GITHUB_TOKEN: 't',
       PMMCP_TOKEN: 't',
       NODE_OPTIONS: '--inspect',
       NODE_TEST_CONTEXT: 'child',
@@ -644,7 +645,7 @@ test("the egress suite holds a mutant for each check egress plan F1 names, names
       'decision-before-dial': ['EG322', 'EG660'],
       'push-ref-prefix': ['EG86', 'EG87', 'EG641', 'EG661'],
       'basic-mask': ['EG662'],
-      'hostile-channel': ['EG565', 'EG663', 'EG664', 'EG673', 'EG675', 'EG676', 'EG677', 'EG678', 'EG679'],
+      'hostile-channel': ['EG565', 'EG663', 'EG664', 'EG673', 'EG675', 'EG676', 'EG677', 'EG678', 'EG679', 'EG680'],
       'grant-before-spawn': ['EG665'],
       'revoke-on-exit': ['EG666', 'EG667', 'EG668', 'EG674'],
       'recovered-revoke': ['EG669', 'EG670'],
@@ -667,7 +668,7 @@ test("the egress suite holds a mutant for each check egress plan F1 names, names
   // all in the suite and each stands for an item: none was added without
   // saying which check it falsifies. (EG671 and EG672 are the publisher's
   // readers, S4's review carried to F1, and stand for no F1 item.)
-  const own = [...Array.from({ length: 14 }, (_, i) => `EG${String(657 + i)}`), 'EG673', 'EG674', 'EG675', 'EG676', 'EG677', 'EG678', 'EG679']
+  const own = [...Array.from({ length: 14 }, (_, i) => `EG${String(657 + i)}`), 'EG673', 'EG674', 'EG675', 'EG676', 'EG677', 'EG678', 'EG679', 'EG680']
   assert.deepEqual(egress.mutants.map((mu) => mu.id).filter((id) => own.includes(id)), own)
   for (const id of own) assert.ok(named.includes(id), `${id} is in the suite and stands for no item`)
   // An item's mutants stand at each place its check is made, not only at a
@@ -799,7 +800,7 @@ test('npm run falsify is a program: bad input and unknown options are refused wi
   const bogus = run(['no-such-suite'])
   assert.equal(bogus.status, 2, bogus.stderr)
   assert.match(bogus.stderr, /unknown suite: no-such-suite/)
-  assert.match(bogus.stderr, /suites: delegation, recovery, replay, namespace, goals, anchor, eval, integrity, redaction, schedule, registry, restart, sandbox, egress, dotenv, dotenvDefault, dotenvAppend, installPlan, gitignore, runner/)
+  assert.match(bogus.stderr, /suites: delegation, recovery, replay, namespace, goals, anchor, eval, integrity, redaction, schedule, registry, restart, sandbox, egress, dotenv, dotenvDefault, dotenvAppend, installPlan, gitignore, runner, liveBodies/)
 
   const badOnly = run(['--only', 'D99'])
   assert.equal(badOnly.status, 2)

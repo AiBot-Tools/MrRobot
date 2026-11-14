@@ -874,20 +874,33 @@ function invalid(fn: () => unknown, label: string): string {
 }
 
 test('egress is strict, ships disabled, and refuses a non-EgressHost binding host, a PMMCP_ envVar, a hostile entry and a DENY_KEYS-named key', () => {
-  // The shipped file: disabled, no binding, the plan's limits and mux port,
-  // and exactly the plan's four keys (no domain: egress serves the trusted
-  // domain alone). No binding ships, because any binding widens what a run
-  // can reach.
+  // The shipped file: disabled, the plan's limits and mux port, exactly the
+  // plan's four keys (no domain: egress serves the trusted domain alone),
+  // and the two bindings of the Phase 2 exit's fixture repository, one token
+  // for both, so that a .env holding it loads (test/live-egress.test.ts). No
+  // shipped manifest binds either (config-files.test.ts), and while egress
+  // is disabled boot resolves neither binding (kernel-boot.test.ts).
   const shipped = parse(parseYaml(readFileSync(join(REPO_ROOT, 'config', 'kernel.yaml'), 'utf8')))
+  // And src/config.ts's account of the section says it ships them.
+  const comment = readFileSync(join(REPO_ROOT, 'src', 'config.ts'), 'utf8').replace(/^[ \t]*\/\/ ?/gm, '').replace(/\s+/g, ' ')
+  assert.ok(comment.includes('It ships disabled, with the two Phase 2 exit bindings (github-git, github-api) that no shipped manifest binds'), "src/config.ts's egress comment does not say what kernel.yaml ships")
+  assert.doesNotMatch(comment, /ships disabled with no binding/)
+  // kernel.yaml spells the repository AiBot-Tools/aos-fixture; a slug is read without case.
+  const fixtureRepo = { envVar: 'AOS_GITHUB_TOKEN', header: 'Authorization', pushPrefix: 'aos/', repos: ['aibot-tools/aos-fixture'] }
   assert.deepEqual(shipped.egress, {
     enabled: false,
     muxPort: 3128,
     limits: { frameMaxBytes: 65_536, maxFlows: 16, maxHeaderBytes: 16_384, maxRequests: 2_000, maxBytes: 536_870_912, maxDenied: 20, idleMs: 60_000 },
-    bindings: {},
+    bindings: {
+      'github-git': { host: 'github.com', scheme: 'Basic', basicUser: 'x-access-token', profiles: ['git-fetch', 'git-push'], ...fixtureRepo },
+      'github-api': { host: 'api.github.com', scheme: 'Bearer', profiles: ['github-pulls'], ...fixtureRepo },
+    },
   })
-  // No egress section at all is the same section: every field has its safe default.
-  assert.deepEqual(parse(withEgress()).egress, shipped.egress)
-  assert.deepEqual(parse(fixture('minimal.yaml')).egress, shipped.egress)
+  // No egress section at all is the same section with no binding: every
+  // field has its safe default.
+  const unbound = { ...shipped.egress, bindings: {} }
+  assert.deepEqual(parse(withEgress()).egress, unbound)
+  assert.deepEqual(parse(fixture('minimal.yaml')).egress, unbound)
 
   // Strict at every level, both schemes' bindings included: a typo or a
   // stale key is refused, never taken for a setting or silently dropped.

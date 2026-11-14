@@ -535,11 +535,20 @@ test('the live node-proxy body, offline: fetches its proxy settings send nowhere
 const BINDING_VALUE = 'offline-binding-value-4f2a9c71e0'
 
 /** GitHub as the fixture repository's two hosts answer the exit's requests: git's smart HTTP, and a pull request opened. */
+/**
+ * The repository as GitHub spells it in the addresses it answers with: the
+ * operator's own case, where config reads the slug without case
+ * (aibot-tools/aos-fixture), so the body must read an address's repository
+ * without case too.
+ */
+const GITHUB_SPELLING = 'AiBot-Tools/aos-fixture'
+
 function fixtureHost(repo: string): (req: IncomingMessage, res: ServerResponse) => void {
+  assert.equal(GITHUB_SPELLING.toLowerCase(), repo, 'the bindings no longer name the fixture repository GITHUB_SPELLING spells')
   return (req, res) => {
     const url = req.url ?? ''
     if (url === `/repos/${repo}/pulls` && req.method === 'POST') {
-      res.writeHead(201, { 'content-type': 'application/json' }).end(JSON.stringify({ number: 7, html_url: `https://github.com/${repo}/pull/7` }))
+      res.writeHead(201, { 'content-type': 'application/json' }).end(JSON.stringify({ number: 7, html_url: `https://github.com/${GITHUB_SPELLING}/pull/7` }))
       return
     }
     for (const service of ['git-upload-pack', 'git-receive-pack']) {
@@ -556,7 +565,10 @@ function fixtureHost(repo: string): (req: IncomingMessage, res: ServerResponse) 
  * A kernel booted for the exit offline, its containers played by exitActor
  * (with `fault`, one acting as that fault names), its model scripted by
  * `script`, and with `basicUser`, the github-git binding naming that user
- * for its Basic credential in place of GitHub's default.
+ * for its Basic credential in place of GitHub's default. The hostile
+ * domain's mountRoot is a directory of its own, as on the Mac (the
+ * fixture's base gives both domains one), so a body that took the hostile
+ * root for the run's workspace is seen to.
  */
 async function offlineExit(
   t: TestContext,
@@ -564,9 +576,12 @@ async function offlineExit(
 ) {
   SecretMask.clear()
   t.after(() => SecretMask.clear())
-  const yaml = exitKernelYaml(pinnedSandbox(IMAGE))
+  const yaml = (base: string): string => apartRoots(exitKernelYaml(pinnedSandbox(IMAGE))(base))
   const user = options.basicUser
   const fx = fixture(t, { kernelYaml: user === undefined ? yaml : (base) => withBasicUser(yaml(base), user) })
+  const roots = fx.config.sandbox.domains
+  assert.notEqual(roots.hostile.mountRoot, roots.trusted.mountRoot, 'the exit fixture gives both domains one mountRoot')
+  mkdirSync(roots.hostile.mountRoot, { recursive: true })
   writeProbeRecord(fx.dataDir, freshProbe(EXIT_REF))
   // The shipped bindings' repository, read from them.
   const repo = boundRepo(fx)
@@ -595,6 +610,13 @@ async function offlineExit(
   }
 }
 
+/** `yaml` with the hostile domain's mountRoot a sibling of the trusted one's, `<trusted>-hostile`: the line the fixture's base writes for it. */
+function apartRoots(yaml: string): string {
+  const line = /^ {4}hostile: \{ (.*), mountRoot: (\S+) \}$/m.exec(yaml)
+  assert.ok(line !== null, 'the exit kernel.yaml no longer writes the hostile domain as this reads it')
+  return yaml.replace(line[0], `    hostile: { ${line[1] ?? ''}, mountRoot: ${line[2] ?? ''}-hostile }`)
+}
+
 /** `yaml` with the github-git binding's Basic credential naming `user`: the line after its scheme, as stringify writes the shipped section. */
 function withBasicUser(yaml: string, user: string): string {
   const at = yaml.indexOf('    github-git:\n')
@@ -608,7 +630,8 @@ test('the live Phase 2 exit body, offline: clone, change, test, push aos/<runId>
   const { repo, up, rec, fx, basic: basicForm, made, exit } = await offlineExit(t)
   assert.equal(repo, 'aibot-tools/aos-fixture')
   const record = await exit()
-  assert.equal(record.pullRequest, `https://github.com/${repo}/pull/7`)
+  // The address as the host gave it, in GitHub's own spelling of the repository.
+  assert.equal(record.pullRequest, `https://github.com/${GITHUB_SPELLING}/pull/7`)
   assert.deepEqual(record.approvals, [...exitApprovals(repo).map((a) => a.toolRef)])
   // The run's workspace, told the caller once, to remove.
   assert.deepEqual(made, [join(fx.config.sandbox.domains.trusted.mountRoot, record.runId)])
@@ -641,10 +664,12 @@ test('the live Phase 2 exit body, offline: clone, change, test, push aos/<runId>
   assert.deepEqual([...new Set(rec.specs.filter((s) => !s.name.startsWith(CANARY_PREFIX)).map((s) => [s.domain, s.runId].join(' ')))], [`trusted ${record.runId}`])
 })
 
-test('the live Phase 2 exit body, offline, fails on each thing a container can make it catch: a route out, a request never sent, cut short or a flow with none, a call that fails, a clone that asked for no pack, a failed or missing test, a push elsewhere, unsaid or said of another branch, run, repository or host, a pull request said from another branch or run, or into another base, a command line without the mux, a probe whose parent is not the mux, a variable named like a credential, a password or a secret, a look at PID 1 that is not JSON, and the binding value or its Basic form in PID 1\'s, the mux\'s or the command\'s environment, PID 1\'s command line, a workspace entry\'s name, a link\'s target or a file\'s contents (a git object included) or the log, masked or not, never quoting it or ten characters of it', { timeout: 180_000 }, async (t) => {
+test('the live Phase 2 exit body, offline, fails on each thing a container can make it catch: a route out, or no route said only on stderr or beside a connect, a request never sent, cut short or a flow with none, a call that fails, whatever its output says, a clone that asked for no pack, a failed, missing, extra or nested test, or a test summary read from a test\'s name or output, from above or with no plan line, from stderr (under a stdout heading of its own included) or from a stdout not shown whole, a push elsewhere, unsaid, said on stderr or after words of its own, or said of another branch, run, repository or host (one that only starts as github.com included), a pull request said from another branch or run, after words of its own or with more after them, at an address of another repository, host or number, or into another base, a command line without the mux, a probe whose parent is not the mux (docker-init, or another node program), a variable named like a credential, a password or a secret in PID 1\'s, the mux\'s or the command\'s environment, a look at PID 1 that prints its lines on stderr or that is not JSON, and the binding value or its Basic form in PID 1\'s, the mux\'s or the command\'s environment, PID 1\'s command line, a workspace entry\'s name, a link\'s target or a file\'s contents (a git object included) or the log, masked or not, never quoting it or ten characters of it', { timeout: 180_000 }, async (t) => {
   const failing: readonly [ExitFault, RegExp][] = [
-    ['direct-connects', /a direct connect to 192\.168\.5\.2:8766 met something other than no route/],
-    ['direct-fails', /^call 1$/],
+    ['direct-connects', /^a direct connect to 192\.168\.5\.2:8766 met something other than no route: its stdout is "connected\\n"$/],
+    ['direct-said-on-stderr', /^a direct connect to 192\.168\.5\.2:8766 met something other than no route: its stdout is "connected\\n"$/],
+    ['direct-said-both', /^a direct connect to 192\.168\.5\.2:8766 met something other than no route: its stdout is "ENETUNREACH\\nconnected\\n"$/],
+    ['direct-fails', /^call 1 did not exit 0: aos-run-\S+ on the trusted domain, [^\n]*, exited 1 after \d+ ms$/],
     ['ls-remote-silent-ip', /the git request for 192\.168\.5\.2 \(call 2\) was not its grant's one deny at the policy/],
     ['ls-remote-silent-name', /the git request for host\.lima\.internal \(call 3\) was not its grant's one deny at the policy/],
     ['ls-remote-other-ip', /git ls-remote through the proxy was not denied \(call 2\)/],
@@ -652,20 +677,32 @@ test('the live Phase 2 exit body, offline, fails on each thing a container can m
     ['clone-offline', /^the clone asked for no pack of aibot-tools\/aos-fixture:\n$/],
     ['clone-refs-only', /^the clone asked for no pack of aibot-tools\/aos-fixture:\n\{(?=[^\n]*"method":"GET")(?=[^\n]*"path":"\/aibot-tools\/aos-fixture\.git\/info\/refs")(?=[^\n]*"reason":"git-fetch")[^\n]*\}$/],
     ['clone-cut', /^a request the kernel allowed failed upstream: \{(?=[^\n]*"reason":"git-fetch")(?=[^\n]*"refusal":"aborted")(?=[^\n]*"stage":"upstream")/],
-    ['clone-fails', /^call 4$/],
+    ['clone-fails', /^call 4 did not exit 0: aos-run-\S+ on the trusted domain, [^\n]*, exited 128 after \d+ ms$/],
     ['extra-request', /a request of the run besides the two for the loopback was denied/],
     ['flow-silent', /: a flow carried no judged request/],
-    ['edit-fails', /^call 5$/],
+    ['edit-fails', /^call 5 did not exit 0: aos-run-\S+ on the trusted domain, [^\n]*, exited 1 after \d+ ms$/],
+    ['edit-prints-exited', /^call 5 did not exit 0: aos-run-\S+ on the trusted domain, [^\n]*, exited 1 after \d+ ms$/],
     ['edit-unwritten', /the edit wrote no sum-negative\.test\.js/],
     ['edit-other', /sum-negative\.test\.js is not the second test the edit writes/],
-    ['add-fails', /^call 6$/],
-    ['commit-fails', /^call 7$/],
-    ['tests-fail', /^call 8$/],
+    ['add-fails', /^call 6 did not exit 0: aos-run-\S+ on the trusted domain, [^\n]*, exited 128 after \d+ ms$/],
+    ['commit-fails', /^call 7 did not exit 0: aos-run-\S+ on the trusted domain, [^\n]*, exited 1 after \d+ ms$/],
+    ['tests-fail', /^call 8 did not exit 0: aos-run-\S+ on the trusted domain, [^\n]*, exited 1 after \d+ ms$/],
     ['one-test', /node --test did not pass both tests/],
     ['fail-reported', /node --test reported a failed test/],
+    ['pass-named', /^node --test did not pass both tests\n/],
+    ['fail-named', /^node --test reported a failed test\n/],
+    ['tests-extra', /^node --test did not run exactly the two tests$/],
+    ['tests-nested', /^node --test did not run exactly the two tests$/],
+    ['summary-printed', /^node --test did not pass both tests\n/],
+    ['tap-unplanned', /^node --test did not pass both tests\n/],
+    ['summary-on-stderr', /^node --test did not pass both tests\n/],
+    // The summary read is the one-test stream under the kernel's own heading.
+    ['tap-heading-on-stderr', /^node --test did not pass both tests\n[\s\S]*'# pass 1'/],
+    ['tap-windowed', /^the result does not show its stdout whole, so no line of it is read: --- stdout \(its end, redacted: \d+ bytes, of the \d+ bytes it printed\) ---$/],
     ['quoted-unmasked', /node --test did not pass both tests/],
-    ['pid1-fails', /^call 9$/],
-    ['pid1-silent', /^no @\/proc\/1\/environ  line in:\n/],
+    ['pid1-fails', /^call 9 did not exit 0: aos-run-\S+ on the trusted domain, [^\n]*, exited 1 after \d+ ms$/],
+    ['pid1-silent', /^no @\/proc\/1\/environ  line in:\n$/],
+    ['pid1-on-stderr', /^no @\/proc\/1\/environ  line in:\n$/],
     ['pid1-garbled', /^the @\/proc\/1\/environ line is not JSON: @\/proc\/1\/environ \["PATH=[^"\n]*",<the binding value>\]$/],
     ['cmdline-bare', /PID 1's command line holds no \/opt\/aos\/mux\.mjs/],
     ['cmdline-value', /^PID 1's command line holds the kernel's mask \(\[REDACTED\]: a credential the log masked\) in argument \d+\n/],
@@ -676,6 +713,13 @@ test('the live Phase 2 exit body, offline, fails on each thing a container can m
     ['mux-environ-value', /^the mux's environment holds the kernel's mask \(\[REDACTED\]: a credential the log masked\) in GIT_HTTP_EXTRA \(entry 6\)\n/],
     ['command-environ-value', /^the command's environment holds the kernel's mask \(\[REDACTED\]: a credential the log masked\) in GIT_HTTP_EXTRA \(entry 6\)\n/],
     ['mux-not-parent', /^the probe's parent is not the mux: it runs \/sbin\/docker-init -- node \/opt\/aos\/mux\.mjs -- node -e /],
+    ['mux-parent-other-node', /^the probe's parent is not the mux: it runs node \/opt\/aos\/publish\.mjs -- node -e /],
+    ['mux-environ-token-name', /^the mux's environment holds GH_TOKEN\n/],
+    ['command-environ-token-name', /^the command's environment holds GH_TOKEN\n/],
+    ['mux-environ-unmasked', /^the mux's environment holds the binding value in GIT_HTTP_EXTRA \(entry 6\)\n/],
+    ['command-environ-unmasked', /^the command's environment holds the binding value in GIT_HTTP_EXTRA \(entry 6\)\n/],
+    ['mux-environ-basic-unmasked', /^the mux's environment holds its Basic form in GIT_HTTP_EXTRA \(entry 6\)\n/],
+    ['command-environ-basic-unmasked', /^the command's environment holds its Basic form in GIT_HTTP_EXTRA \(entry 6\)\n/],
     ['environ-token-name', /^PID 1's environment holds GH_TOKEN\n/],
     ['environ-key-name', /^PID 1's environment holds ANTHROPIC_API_KEY\n/],
     ['environ-password-name', /^PID 1's environment holds GIT_PASSWORD\n/],
@@ -689,10 +733,19 @@ test('the live Phase 2 exit body, offline, fails on each thing a container can m
     ['publish-said-other-run', /^the publish does not say it pushed the approved branch$/],
     ['publish-said-other-repo', /^the publish does not say it pushed the approved branch$/],
     ['publish-said-other-host', /^the publish does not say it pushed the approved branch$/],
+    ['publish-said-host-suffix', /^the publish does not say it pushed the approved branch$/],
+    ['publish-said-prefixed', /^the publish does not say it pushed the approved branch$/],
+    ['publish-said-separated', /^the publish does not say it pushed the approved branch$/],
+    ['publish-said-on-stderr', /^the publish does not say it pushed the approved branch$/],
     ['pr-said-elsewhere', /^the publish opened no pull request:\n[\s\S]*\nopened pull request #7: https:\/\/github\.com\/\S+\/pull\/7 \(from aos\/\S+\/other into main\)\n/],
     ['pr-said-other-run', /^the publish opened no pull request:\n[\s\S]*\nopened pull request #7: https:\/\/github\.com\/\S+\/pull\/7 \(from aos\/live_other_\w+\/phase2-exit into main\)\n/],
+    ['pr-said-other-repo', /^the publish says it opened its pull request in aibot-tools\/aos-other, not aibot-tools\/aos-fixture\n/],
+    ['pr-said-other-host', /^the publish opened no pull request:\n[\s\S]*\nopened pull request #7: https:\/\/gitlab\.com\/AiBot-Tools\/aos-fixture\/pull\/7 \(from aos\/\S+\/phase2-exit into main\)\n/],
+    ['pr-said-other-number', /^the publish says it opened pull request #7 at the address of #8\n/],
+    ['pr-said-prefixed', /^the publish opened no pull request:\n[\s\S]*\nnever opened pull request #7: https:\/\/github\.com\/AiBot-Tools\/aos-fixture\/pull\/7 \(from aos\/\S+\/phase2-exit into main\)\n/],
+    ['pr-said-suffixed', /^the publish opened no pull request:\n[\s\S]*\nopened pull request #7: https:\/\/github\.com\/AiBot-Tools\/aos-fixture\/pull\/7 \(from aos\/\S+\/phase2-exit into main\), then closed it\n/],
     ['pr-unsaid', /the publish opened no pull request:\n[^\n]* exited 0 after \d+ ms\n--- stdout \(\d+ bytes\) ---\npushed c{40} to refs\/heads\/aos\/[^\n]*\n\n--- stderr/],
-    ['publish-fails', /^call 10$/],
+    ['publish-fails', /^call 10 did not exit 0: aos-run-\S+ on the trusted domain, [^\n]*, exited 1 after \d+ ms$/],
     ['workspace-file', /[/]\.git[/]config holds the binding value\n/],
     ['workspace-name', /^the workspace entry \.git[/]refs[/]heads[/]<the binding value> is named with the binding value\n/],
     ['workspace-name-basic', /^the workspace entry \.git[/]refs[/]tags[/]<its Basic form> is named with its Basic form\n/],

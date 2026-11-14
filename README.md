@@ -549,98 +549,11 @@ the CLI, and kernel boot.
 | `apple-container-driver` | `src/sandbox/apple-container.ts` | `probe()` reports unavailable with a reason so boot degrades; `run()`, `kill()`, `abandon()` and `sweepOrphans()` throw `NotImplementedError`. macOS 15 has no `container` binary |
 
 **Egress: built, and never yet run live.** The kernel's own egress engine
-(`src/egress/`) is the one way a container reaches anything (egress plan W1,
-the operator's design of 2026-11-09). It runs in the kernel's process: nothing
-listens for it, nothing stands between a worker and the kernel but the run's
-own `docker -i` channel and the image's mux, and no credential is in any VM.
-A run on the trusted domain whose manifest names egress (`egress.allow`,
-`egress.bind`) is issued a grant before its container starts
-(`proxy.grant.issued`, naming the run, the agent, the container, its
-credential-free hosts and, of each binding, git-fetch alone: an exec grant
-never holds `git-push` or `github-pulls`), and every request its container
-sends is a `proxy.decision` row of that run before anything is resolved or
-dialled. The grant is revoked (`proxy.grant.revoked`, with its totals) when the
-container exits, meets its wallclock, breaks the channel's protocol or a
-per-grant limit, or the run is stopped; the kernel ends a container only by
-killing it by name on its own domain, never by closing its stdin. A container
-still running 10 s after its command's exit status arrived (a flow held open
-by what the command left behind, a `setsid` child say) is killed by name, and
-its grant revoked `requested`, saying so; one whose docker client ended with
-no exit status or 125, its own failure, is killed by name and its grant
-revoked `error`, the kernel's verdict, never read as the container breaking
-the protocol. A grant whose host, repository, binding id, run id or agent id
-the event log would store censored is not issued, and the exec is refused
-naming the field; so is one naming more repositories across its bindings
-than one `proxy.grant.issued` row records (128), which the registry refuses
-in a manifest at load. Each refusal is made when the run is offered tools and
-again before the gate, so no human is asked to approve an exec that would be
-refused, but the run id's, which is judged before the gate only: the offer
-is judged without a run, so a run whose id the event log would store
-censored is shown the tool, and its exec is denied at the gate, with no
-human asked and nothing run. The hostile domain gets no channel and no
-grant, whatever its manifest says.
-
-Boot reports egress `ok` or `degraded`, never absent: degraded appends one
-`egress.degraded` row per failed check, naming what failed and the key or
-command that fixes it (`egress.enabled: false`, which kernel.yaml ships; a VM
-whose `docker image inspect --format {{.Id}}` of `sandbox.imageId`, asked on
-that domain's own socket, does not print the pin or cannot be asked, check
-`image`, naming the domain, which degrades the sandbox too; a sandbox that
-cannot run a container for any other reason; a binding whose value did not
-resolve, named with its envVar, never its value; a canary that did not pass,
-check `canary`, naming the domain). The canaries (egress plan W3,
-`src/runtime/canary.ts`) run at every boot while egress is enabled and the
-sandbox probe and the orphan sweep have passed, whatever the bindings say:
-one container on each domain, run as any other is (the pinned image by id,
-`--pull=never`, `--network none`, a wallclock of 20 s or
-`sandbox.defaults.wallclockMs` if that is lower, and none run under a cap
-below 15 s), named uniquely to the boot
-(`aos-run-canary-<seq>-<nonce>-<domain>`, `<seq>` that boot's
-`kernel.booted` row) and recorded under no run. Each runs the worker image's
-mux, whose self-test must fail every direct connect (192.168.5.2:8766 and
-:7777, `host.lima.internal` and `host.docker.internal` on 8766, 1.1.1.1:443)
-and the lookup of `example.com`, each with a code that says there is no
-route, judged by the same `acceptReady` every exec's ready is (a probe that
-timed out went somewhere, and is refused). The trusted one (`--canary`) also
-sends one request over its channel, for `http://192.168.5.2:8766/mcp`, which
-its session, under a `canary` grant that reaches nothing, denies and records
-as a `proxy.decision` row the log must hold; its exit frame must say it read
-the 403. The hostile one (`--self-test`), which gets no channel, writes its
-report as one line on stdout. Egress is ok only when both pass; a failed one
-is named with the probe and the code it met, or what else failed, and what
-fixes it (a rebuilt image, a VM that honours `--network none`). A canary
-whose self-test report is refused also closes its domain to `sandbox.exec`,
-egress or none, since a run with no channel has no self-test of its own: one
-`sandbox.degraded` row names the domain (`closes`), the sandbox is degraded,
-and no run on that domain is offered the tool or has a call of it run
-(refused before any human is asked); the other domain runs as before (W3's
-review, round 2: put to the operator to keep or narrow). The closure lasts
-across restarts, until a boot whose canary on that domain passes: every
-boot that runs none there that passes (egress disabled, a probe or a sweep
-that failed, a canary that failed for any other reason) records the domain
-closed again, with the reason the closing canary gave, and the next boot
-reads the set from the last boot that marked its sandbox
-(`closedSandboxDomains`). So reopening one takes a boot with egress enabled
-whose canary there passes. While egress is degraded no run is offered
-`sandbox.exec` for a manifest with egress, and a call of it is refused with
-the egress reason before any human is asked. Every binding kernel.yaml
-declares is resolved at boot, whichever manifests bind it, the two it ships
-(`github-git` and `github-api`, both `AOS_GITHUB_TOKEN`) included: with
-egress enabled, both must resolve or egress is degraded for every run, one
-whose manifest binds neither included, so hold the token, or remove the two
-bindings from kernel.yaml before you enable egress without it. That reason, which `status`
-shows and each refusal quotes, names the failed checks while they fit 2 KiB
-and counts the rest, each named in its own row. Each binding's value is
-resolved once, at boot, outside any run, through the broker (`secret.accessed` with purpose
-`egress credential for <host>`), checked as a bearer, and, for a Basic
-binding, its derived value (base64 of `<basicUser>:<value>`) masked before
-anything can quote it; a binding whose envVar is a provider's key refuses the
-boot. Of `egress.limits`, `maxRequests` counts the flows a container opens, not
-only the requests judged (a flow carries at most one request, and one whose
-head never completes costs one too). An upstream 401 or 403 (`challenged`), and
-an answer whose head the kernel will not write to the worker
-(`response-head`), are recorded as upstream `proxy.decision` rows, sent, and
-answered 502, so git never prompts.
+(`src/egress/`) is the one way a container reaches anything, over its run's
+own `docker -i` channel: it ships disabled, boot reports it `ok` or
+`degraded`, never absent, and the hostile domain gets no channel and no grant.
+Egress, below, has its topology, its boot states and what fixes each, how to
+set it up, what it logs, and what an agent can and cannot reach through it.
 
 Not a stub, but not a tool either: **ephemeral spawning** (`spawnEphemeral` in the
 registry) exists only as a registry capability. No tool mints a new agent;
@@ -836,19 +749,19 @@ every namespace by accident.
 Tier is checked at load as well as at call time: a manifest naming a tool whose
 risk exceeds its tier is refused with the file named. Budgets are checked at
 load too — a manifest may only lower a kernel ceiling. So is egress, which the
-kernel's egress engine serves to a trusted run (above): an `egress.allow` host
-must be a DNS name, kept in one spelling (never an IP literal, a port, a
-wildcard or a special-use name like `host.lima.internal`), an `egress.bind` id
-must name a binding in kernel.yaml's `egress.bindings`, no allow host may be a
-binding's host, and only a tier 2 or higher worker sandboxed in the trusted
-domain may hold either; a spawned child keeps a subset of its template's hosts
-and bindings, and only at tier 2 or more. No shipped manifest holds egress.
-Neither agent declares a `sandbox:` (a worker with one at tier 2 or more that
-lists `sandbox.exec` has its commands run in containers since egress plan W1a,
-and a shipped manifest that does waits on the Phase 2 exit, as egress does), an
-`egress.allow` host (egress has never yet run live), or a `schedule:` (the only
-routable model is a frontier one, and an unattended run that can reach it can
-empty an envelope).
+kernel's egress engine serves to a trusted run (Egress, below): an
+`egress.allow` host must be a DNS name, kept in one spelling (never an IP
+literal, a port, a wildcard or a special-use name like `host.lima.internal`),
+an `egress.bind` id must name a binding in kernel.yaml's `egress.bindings`, no
+allow host may be a binding's host, and only a tier 2 or higher worker
+sandboxed in the trusted domain may hold either; a spawned child keeps a subset
+of its template's hosts and bindings, and only at tier 2 or more. No shipped
+manifest holds egress. Neither agent declares a `sandbox:` (a worker with one
+at tier 2 or more that lists `sandbox.exec` has its commands run in containers
+since egress plan W1a, and a shipped manifest that does waits on the Phase 2
+exit, as egress does), an `egress.allow` host (egress has never yet run live),
+or a `schedule:` (the only routable model is a frontier one, and an unattended
+run that can reach it can empty an envelope).
 
 Both carry `tools.allow: []`, which is the honest state and not an oversight:
 `tool-views.yaml` exposes no pmmcp tool to agents, `sandbox.exec` needs the
@@ -862,62 +775,60 @@ Sandbox tools are checked at load as egress is (egress plan S3). `sandbox.exec`,
 command in one container of the caller's own sandbox domain: the pinned image by
 id, `--network none`, with a channel to the kernel's egress engine only for a
 run on the trusted domain whose manifest has egress, served under a grant
-issued before its container starts (above), and none on the hostile domain,
-the run's own workspace `<mountRoot>/<runId>` at `/workspace`, and a hard
-wallclock of what is left of the run's budget, at most
+issued before its container starts (Egress, below), and none on the hostile
+domain, the run's own workspace `<mountRoot>/<runId>` at `/workspace`, and a
+hard wallclock of what is left of the run's budget, at most
 `sandbox.defaults.wallclockMs` (itself at most 2^31 - 1 ms, a timer's limit).
 It logs `sandbox.started` and `sandbox.killed` between `tool.call` and
 `tool.result`, and kills the container by name before that end when the docker
 client ended with no exit status or with 125 (its own failure, a lost daemon
-connection among them), since such a client may leave its container running;
-it waits 10 s at most for that kill, so that kill never holds the run. The
+connection among them), since such a client may leave its container running; it
+waits 10 s at most for that kill, so that kill never holds the run. The
 driver's own result is awaited for the container's wallclock and 30 s more at
 most, and once the run is stopped (`aos kill`, or a shutdown), whose kill by
 name goes out then, for 30 s from the stop at most: the docker CLI holds it
 until it closes, and the container's wallclock is a kill by name through the
 same daemon, so a daemon that accepts and never answers (a paused Colima VM)
 would hold the call, and the run, for good. Past that bound the runner gives
-the container up: the driver ends the docker
-client it spawned (SIGKILL, the one process it signals) and kills the
-container by name on its own domain, waited on for 10 s at most, and
-`sandbox.killed` records `error`, the result saying the driver never
-answered. Its output taints the run, so every exec after the first in a run,
-and every other write, waits for a human. An exec
+the container up: the driver ends the docker client it spawned (SIGKILL, the
+one process it signals) and kills the container by name on its own domain,
+waited on for 10 s at most, and `sandbox.killed` records `error`, the result
+saying the driver never answered. Its output taints the run, so every exec
+after the first in a run, and every other write, waits for a human. An exec
 whose arguments the approval preview would cut (500 bytes of their canonical
-JSON), would redact (a span shaped like a credential is shown as
-`[REDACTED]`, and the PEM pattern hides everything between its markers), or
-would show with a character a screen hides or reorders text by (a bidi, format
-or C1 control, a line separator, or another default-ignorable code point: a
-Hangul filler, a variation selector, so an emoji written with VS16 too), or
-whose command the driver's own audit refuses (a `-v`, `--volume`, `--mount` or
-`--device` anywhere in it, the docker socket, or an argument that is the
-operator's home or a path under it, in either spelling) never
-runs, and no human is asked to approve it: the run loop asks the runner's own
-check of the arguments before the gate, and the gate denies the call, its
-`tool.gate` row giving the runner's refusal as the reason. The same holds
-for every exec on a kernel whose `sandbox.imageId` is unset or is no image id,
-which can build no container, or whose `sandbox.driver` is `apple-container`,
-a stub that runs nothing: no run on it is offered the tool, and the gate
-denies a call of it before any human is asked. `aos approvals`
-does not show what an approval would run (protocol v1's `ApprovalItem` carries
-no preview, and adding one is a protocol version bump for the operator), so
-before `aos approve` on an exec or a publish, read what it was shown in its
-`approval.requested` row (an exec's command; a publish's branch, title and
-body): `npm run cli -- search --type approval.requested --run <runId>
---limit 1`. Each output stream keeps its own share of the result, counted in
-the bytes it takes in the log's JSON. Of each stream the
-runner reads and redacts at most 74 KiB (the largest share and 16 KiB more):
-all of a shorter one, the end of a longer one, and the start of one the driver
-capped at 1 MiB, since `redact.ts`'s PEM pattern takes time quadratic in BEGIN
-lines with no END (a MiB of them would hold the daemon's event loop some 11 s;
-a window of them, some 60 ms). The window bounds that pattern's cost and no
-other's: the JWT pattern's is quadratic in a run of `-ey`, some 2 s over one
-window, so a window holding a run of letters, digits, `-` and `_` in which it
-starts at more than 16 places is withheld before any redaction reads it, the
-stream's byte count (what its capture kept, for one the driver capped) said in
-its place. A window is never shown on the side its cut is on, as that cut, like
-the driver's, is made before redaction and may split a credential: not the 16
-KiB there, nor anything past a private key block's marker whose other marker the
+JSON), would redact (a span shaped like a credential is shown as `[REDACTED]`,
+and the PEM pattern hides everything between its markers), or would show with a
+character a screen hides or reorders text by (a bidi, format or C1 control, a
+line separator, or another default-ignorable code point: a Hangul filler, a
+variation selector, so an emoji written with VS16 too), or whose command the
+driver's own audit refuses (a `-v`, `--volume`, `--mount` or `--device`
+anywhere in it, the docker socket, or an argument that is the operator's home
+or a path under it, in either spelling) never runs, and no human is asked to
+approve it: the run loop asks the runner's own check of the arguments before
+the gate, and the gate denies the call, its `tool.gate` row giving the runner's
+refusal as the reason. The same holds for every exec on a kernel whose
+`sandbox.imageId` is unset or is no image id, which can build no container, or
+whose `sandbox.driver` is `apple-container`, a stub that runs nothing: no run
+on it is offered the tool, and the gate denies a call of it before any human is
+asked. `aos approvals` does not show what an approval would run (protocol v1's
+`ApprovalItem` carries no preview, and adding one is a protocol version bump
+for the operator), so before `aos approve` on an exec or a publish, read what
+it was shown in its `approval.requested` row (an exec's command; a publish's
+branch, title and body): `npm run cli -- search --type approval.requested --run
+<runId> --limit 1`. Each output stream keeps its own share of the result,
+counted in the bytes it takes in the log's JSON. Of each stream the runner
+reads and redacts at most 74 KiB (the largest share and 16 KiB more): all of a
+shorter one, the end of a longer one, and the start of one the driver capped at
+1 MiB, since `redact.ts`'s PEM pattern takes time quadratic in BEGIN lines with
+no END (a MiB of them would hold the daemon's event loop some 11 s; a window of
+them, some 60 ms). The window bounds that pattern's cost and no other's: the
+JWT pattern's is quadratic in a run of `-ey`, some 2 s over one window, so a
+window holding a run of letters, digits, `-` and `_` in which it starts at more
+than 16 places is withheld before any redaction reads it, the stream's byte
+count (what its capture kept, for one the driver capped) said in its place. A
+window is never shown on the side its cut is on, as that cut, like the
+driver's, is made before redaction and may split a credential: not the 16 KiB
+there, nor anything past a private key block's marker whose other marker the
 cut left out. An end window is read from its cut, or, when a token's match may
 hold the character before it, from the first character past it that none may
 hold, none of what that skips shown: no token pattern's match runs across where
@@ -943,12 +854,12 @@ spawned child, and no MCP server may be named `sandbox` or `kernel`. The runner
 (`src/runtime/sandbox-tools.ts`) is wired into the daemon (egress plan W1a):
 every `sandbox.*` call goes to it, never to the hub, and the run loop offers
 `sandbox.exec` only to a run whose agent's manifest, read from the registry,
-may hold it and lists it, on a kernel that pins an image id and names a
-driver that runs one. Any other run that names it is denied it before the
-gate asks anyone, its `tool.gate` row giving the reason, and one whose agent
-the registry stops admitting while a human is asked (archived, say) is denied
-it once approved, with a `tool.result` saying so. No shipped manifest lists it,
-so no shipped agent is offered it.
+may hold it and lists it, on a kernel that pins an image id and names a driver
+that runs one. Any other run that names it is denied it before the gate asks
+anyone, its `tool.gate` row giving the reason, and one whose agent the registry
+stops admitting while a human is asked (archived, say) is denied it once
+approved, with a `tool.result` saying so. No shipped manifest lists it, so no
+shipped agent is offered it.
 
 `sandbox.publish` (egress plan S4), on the same server, as `irreversible`, takes
 `{branch, title, body}` and runs no command of the caller's: its container runs
@@ -1109,61 +1020,385 @@ Run `npm run capture:pmmcp` first if you can: the goal-tools test will name any
 mismatch either way, but the capture names them all at once without writing
 anything.
 
+## Egress
+
+Built and tested offline, never yet run live, and shipped disabled
+(`egress.enabled: false` in `config/kernel.yaml`). This is the operator's
+design of 2026-11-09 (the egress plan): how a sandboxed run reaches anything
+outside its container, what boot reports, how to set it up, what the log
+records, and what an agent can and cannot reach. The plan's decisions still
+open with the operator, on which the code is built, eleven as their
+recommendation says and three not, close the section.
+
+### Topology
+
+- **One way out.** Every container runs `--network none`: a loopback of its
+  own and no route anywhere. Its one way out is the kernel's own egress engine
+  (`src/egress/`), which runs in the kernel's process. Nothing listens for it,
+  on the Mac or in a VM, nothing stands between a worker and the kernel but
+  the run's own `docker -i` channel and the image's mux, and no credential is
+  in any VM.
+- **The mux.** A channel run's container runs the worker image's mux around
+  the agent's argv (`node /opt/aos/mux.mjs -- <command>`, under `--init`, so
+  docker-init is PID 1). The mux, Node's standard library only, listens on the
+  container's own `127.0.0.1:3128`, which the image names as `HTTP_PROXY` and
+  `HTTPS_PROXY` (with `NO_PROXY` empty and `NODE_USE_ENV_PROXY=1`), and frames
+  each TCP flow onto the channel; the image's git config sends `https://` as
+  `http://`, so every request reaches the kernel in absolute form over plain
+  HTTP. Before it starts the command the mux tries to reach 192.168.5.2:8766
+  and :7777, `host.lima.internal` and `host.docker.internal` on 8766 and
+  1.1.1.1:443 directly, and to look up `example.com`, and reports what each
+  met in its ready frame, which the kernel judges (`acceptReady`): if one
+  connected, or met a code that does not say there is no route, the kernel
+  never tells the mux to go, so the command never runs, and the grant is
+  revoked `violation`. The mux is no trust boundary: the kernel reads every
+  frame through a strict codec with size caps, and a frame that breaks it
+  kills the container by name and revokes its grant (`violation`).
+- **Route mode only.** For each request the kernel normalises the host and
+  decides allow or deny from the grant alone (`decide()`, which no model
+  reads or steers); appends a `proxy.decision` row; and only then, for an
+  allowed name, resolves it through `node:dns` (no `/etc/hosts`, no mDNS),
+  refuses the request if any answer is not global unicast or is one of the
+  Mac's own interface addresses, and dials the exact address it checked over
+  TLS (the host as servername, certificate verification on, no pooling, no
+  redirect followed). It strips the worker's authorization, cookie,
+  hop-by-hop and forwarding headers, and injects exactly one, the binding's
+  credential, set from the broker's value in the kernel. A CONNECT is never
+  served (`use-route`): a container's HTTPS is the kernel's TLS, never its
+  own.
+- **One container, one grant.** A grant names its run, agent and container,
+  and is issued before the container starts; every decision under it is
+  attributed by the channel it came in on, never by anything the container
+  says.
+- **The hostile domain gets no channel and no grant**, whatever its manifest
+  says, so a hostile container reaches nothing at all.
+
+### Grants, and how each ends
+
+A run on the trusted domain whose manifest names egress (`egress.allow`,
+`egress.bind`) is issued a grant before its container starts
+(`proxy.grant.issued`, naming the run, the agent, the container, its
+credential-free hosts and, of each binding, git-fetch alone: an exec grant
+never holds `git-push` or `github-pulls`), and every request its container
+sends is a `proxy.decision` row of that run before anything is resolved or
+dialled. The grant is revoked (`proxy.grant.revoked`, with its totals) when the
+container exits, meets its wallclock, breaks the channel's protocol or a
+per-grant limit, or the run is stopped; the kernel ends a container only by
+killing it by name on its own domain, never by closing its stdin. A container
+still running 10 s after its command's exit status arrived (a flow held open
+by what the command left behind, a `setsid` child say) is killed by name, and
+its grant revoked `requested`, saying so; one whose docker client ended with
+no exit status or 125, its own failure, is killed by name and its grant
+revoked `error`, the kernel's verdict, never read as the container breaking
+the protocol. A grant whose host, repository, binding id, run id or agent id
+the event log would store censored is not issued, and the exec is refused
+naming the field; so is one naming more repositories across its bindings
+than one `proxy.grant.issued` row records (128), which the registry refuses
+in a manifest at load. Each refusal is made when the run is offered tools and
+again before the gate, so no human is asked to approve an exec that would be
+refused, but the run id's, which is judged before the gate only: the offer
+is judged without a run, so a run whose id the event log would store
+censored is shown the tool, and its exec is denied at the gate, with no
+human asked and nothing run. `sandbox.publish`'s grant (purpose `publish`)
+is the only one that holds `git-push` or `github-pulls`, and only inside a
+call a human approved (The fleet, above). A grant a kernel died leaving open
+is revoked `recovered` at the next boot, and that boot's orphan sweep kills
+its container by name.
+
+Of `egress.limits`, per grant: `frameMaxBytes` (65536 as shipped, at most 1
+MiB), `maxFlows` (16 open at once, at most 256), `maxHeaderBytes` (16384, at
+most 64 KiB), `maxRequests` (2000), `maxBytes` (512 MiB), `maxDenied` (20) and
+`idleMs` (60000). A grant past any of them is revoked `limit`, naming it.
+`maxRequests` counts the flows a container opens, not only the requests
+judged (a flow carries at most one request, and one whose head never
+completes costs one too). An upstream 401 or 403 (`challenged`), and an
+answer whose head the kernel will not write to the worker (`response-head`),
+are recorded as upstream `proxy.decision` rows, sent, and answered 502, so
+git never prompts.
+
+### Boot states
+
+Boot reports egress `ok` or `degraded`, never absent. It is `ok` only when
+every check below passes; otherwise boot appends one `egress.degraded` row per
+failed check, naming what failed and the key or command that fixes it, and
+the subsystem's reason, which `status` shows and each refusal quotes, names
+the failed checks while they fit 2 KiB and counts the rest, each named in its
+own row. The daemon's boot line lists every degraded subsystem, and
+`npm run cli -- search --type egress.degraded --limit 10` reads the reasons
+with no daemon. While egress is degraded no run is offered `sandbox.exec` for a
+manifest with egress, and a call of it is refused with the egress reason
+before any human is asked; `sandbox.publish` likewise. A run whose manifest
+names no egress is not affected: its container runs, with no channel, as
+before.
+
+| Check | What failed | What fixes it |
+|---|---|---|
+| `config` | `egress.enabled` is false, as shipped | set `egress.enabled: true` once the worker image is built and pinned (`sandbox.imageId`), then restart the kernel |
+| `image`, naming the domain | that VM's `docker image inspect --format {{.Id}}` of `sandbox.imageId`, asked on that domain's own socket, did not print the pin, or could not be asked; the sandbox is degraded too | do as the probe's words say (build and load the image with `scripts/build-worker-image.sh`, pin the id it prints), then restart the kernel |
+| `sandbox` | the sandbox cannot run a container for any other reason: its probe failed, or the boot's orphan sweep did not finish | fix the sandbox first, as the sandbox subsystem's reason says (often `scripts/colima-up.sh`), then restart the kernel |
+| `binding`, naming the binding | its value did not resolve: its envVar in neither the shell nor `.env`, a value the broker refuses as a bearer, `secrets.source` other than `env`, or a Basic value that could not be masked; the reason names the envVar, never the value | put the value in `.env` under that name, in a plain-text editor and never on a command line, or remove the binding from `config/kernel.yaml`; then restart the kernel |
+| `canary`, naming the domain | that domain's canary did not pass (below): a self-test that reached something or met a code that does not say no route, a mux that does not know `--canary` or `--self-test`, no ready report, a round trip the log does not hold, a canary the driver refused or that did not end, or `sandbox.defaults.wallclockMs` below 15000 | a VM whose Docker honours `--network none`; a rebuilt image (`scripts/build-worker-image.sh`), pinned again; the VM answering (`scripts/colima-up.sh`); or `sandbox.defaults.wallclockMs` raised to 15000 or more; then restart the kernel |
+
+Two failures refuse the boot instead of degrading it: a binding whose envVar
+is a provider's key (`ANTHROPIC_API_KEY`, or any `auth.envVar` in
+`config/providers.yaml`), which the kernel would otherwise send to the
+binding's host, and a `config/kernel.yaml` that does not parse (a binding
+host, repository or id the event log would store censored among the ways).
+Every binding kernel.yaml declares is resolved at boot, whichever manifests
+bind it, the two it ships (`github-git` and `github-api`, both
+`AOS_GITHUB_TOKEN`) included: with egress enabled, both must resolve or
+egress is degraded for every run, one whose manifest binds neither included,
+so hold the token, or remove the two bindings from kernel.yaml before you
+enable egress without it. Each binding's value is resolved once, at boot,
+outside any run, through the broker (`secret.accessed` with purpose `egress
+credential for <host>`), checked as a bearer, and, for a Basic binding, its
+derived value (base64 of `<basicUser>:<value>`) masked before anything can
+quote it.
+
+**The canaries** (egress plan W3, `src/runtime/canary.ts`) run at every boot
+while egress is enabled and the sandbox probe and the orphan sweep have
+passed, whatever the bindings say: one container on each domain, run as any
+other is (the pinned image by id, `--pull=never`, `--network none`, a
+wallclock of 20 s or `sandbox.defaults.wallclockMs` if that is lower, and
+none run under a cap below 15 s), named uniquely to the boot
+(`aos-run-canary-<seq>-<nonce>-<domain>`, `<seq>` that boot's
+`kernel.booted` row) and recorded under no run. Each runs the worker image's
+mux, whose self-test must fail every direct connect (192.168.5.2:8766 and
+:7777, `host.lima.internal` and `host.docker.internal` on 8766, 1.1.1.1:443)
+and the lookup of `example.com`, each with a code that says there is no
+route, judged by the same `acceptReady` every exec's ready is (a probe that
+timed out went somewhere, and is refused). The trusted one (`--canary`) also
+sends one request over its channel, for `http://192.168.5.2:8766/mcp`, which
+its session, under a `canary` grant that reaches nothing, denies and records
+as a `proxy.decision` row the log must hold; its exit frame must say it read
+the 403. The hostile one (`--self-test`), which gets no channel, writes its
+report as one line on stdout. Egress is ok only when both pass.
+
+A canary whose self-test report is refused also closes its domain to
+`sandbox.exec`, egress or none, since a run with no channel has no self-test
+of its own: one `sandbox.degraded` row names the domain (`closes`), the
+sandbox is degraded, and no run on that domain is offered the tool or has a
+call of it run (refused before any human is asked); the other domain runs as
+before. The closure lasts across restarts, until a boot whose canary on that
+domain passes: every boot that runs none there that passes (egress disabled,
+a probe or a sweep that failed, a canary that failed for any other reason)
+records the domain closed again, with the reason the closing canary gave,
+and the next boot reads the set from the last boot that marked its sandbox
+(`closedSandboxDomains`). So reopening one takes a boot with egress enabled
+whose canary there passes.
+
+### Setting it up
+
+On the Mac, in this order. None of it is done for you, and none of it has
+been run yet ("Still needs validation", below, has what each step settles).
+
+1. `npm test`, on the Mac, first: parts of the scripts below have run only
+   under Linux here.
+2. Both VMs up: `scripts/colima-up.sh`, which makes the `trusted` and
+   `hostile` Colima profiles (never Colima's `default`, which shares `$HOME`
+   writable) and stops unless each VM has one host share, mounted over
+   virtiofs at its domain's mountRoot, and its `aos-<domain>` network is
+   internal.
+3. The worker image: `scripts/build-worker-image.sh` builds
+   `images/worker/Dockerfile` (`node:24-bookworm-slim` by digest, git and
+   ca-certificates, the mux and the publisher under `/opt/aos`, user
+   65534:65534, no credential and no credential helper) on the trusted VM,
+   copies it into the hostile one with `docker save` and `docker load`,
+   checks that both hold it under one id, and prints that id.
+4. Pin it: `sandbox.imageId: "sha256:<64 hex>"` in `config/kernel.yaml`. The
+   driver runs the image only by that id, with `--pull=never`, so no VM ever
+   pulls one.
+5. Switch pmmcp's bearer gate from warn to enforce before the first live
+   egress run: pmmcp's own change, which the installer does not make
+   ("pmmcp's bearer runs in warn mode", below). The engine denies the Mac's
+   loopback to every container, but an escape from a container into its VM
+   would reach pmmcp at 192.168.5.2:8766, where warn mode serves anyone.
+6. Each binding's value in `.env` under its envVar, in a plain-text editor:
+   for the two shipped bindings, `AOS_GITHUB_TOKEN`, the fine-grained token
+   "Live sandbox and egress tests" below describes.
+7. `egress.enabled: true` in `config/kernel.yaml`, then `npm run dev`. Boot
+   runs the canaries; `egress` is missing from the boot line's degraded list
+   once every check passes.
+8. A manifest that names egress: a worker at tier 2 or more, sandboxed in
+   the trusted domain (`sandbox: { domain: trusted }`), listing
+   `sandbox.exec` (and, at tier 3 only, `sandbox.publish`), with
+   `egress.allow` (credential-free hosts) or `egress.bind` (binding ids). No
+   shipped manifest does: the first one waits on the Phase 2 exit, below.
+
+`test/live-sandbox.test.ts` and then `test/live-egress.test.ts` check the
+result on your VMs ("Live sandbox and egress tests", below).
+
+### What the log records
+
+Every row is redacted, canonicalized, hashed and chained like any other.
+
+- `proxy.grant.issued`, before the container starts: the grant id, its
+  purpose (`exec`, `publish`, or `canary`, which serves no run), its run,
+  agent and container, its domain, its credential-free hosts, and each
+  binding's route (the binding, its host, its profiles, its repositories).
+- `proxy.decision`, for every request, appended before anything is resolved
+  or dialled: the grant, the verdict, the stage (`policy`, or `upstream` for
+  an allowed request the upstream refused or that failed once sent), the
+  reason, and what the kernel read of the request: its method, host,
+  binding, repository and path, never a query (git's `service=` is stored as
+  `service`, and how many bytes the path and the query held as numbers). A
+  deny names a host only where the policy read one: a target that names an
+  address literal or a special-use name is recorded as `not-a-host` with why
+  in `hostRefusal`, never its text. Denies are coalesced, at most 16 distinct
+  rows a grant a second, the rest counted on overflow rows, so a container
+  cannot flood the chain; every allow is a row of its own.
+- `proxy.grant.revoked`, once per grant: why (`exited`, `wallclock`,
+  `requested`, `error`, `violation`, `limit` with the limit named, or
+  `recovered`), and its totals: flows, requests, allowed, denied, refused,
+  failed, bytes each way and duration (a recovered grant's totals died with
+  the kernel that kept them).
+- `egress.degraded`, one per failed boot check (Boot states, above).
+- `secret.accessed`, once per binding at boot, purpose `egress credential for
+  <host>`, and `sandbox.started` and `sandbox.killed` around each container,
+  as for any exec.
+
+Never recorded: a credential, or any function of one (no header value, digest
+or length of headers), a request or response body, or a query string.
+
+### What an agent can and cannot reach
+
+Only a worker at tier 2 or more, sandboxed in the trusted domain, whose
+manifest names egress, reaches anything, and only through `sandbox.exec` and
+`sandbox.publish`, each call through the gate. Through its grant it can
+reach:
+
+- each credential-free host its manifest's `egress.allow` names, on port 443,
+  with `GET` and `HEAD` and no body, on any path the normaliser admits;
+- for each binding its manifest's `egress.bind` names, on that binding's host
+  and repositories alone, `git-fetch`: `info/refs?service=git-upload-pack`
+  and `git-upload-pack`;
+- inside one `sandbox.publish` a human approved, and nowhere else: a push
+  (`git-push`) to `refs/heads/aos/<runId>/<branch>` of the one repository the
+  manifest's bindings name, with no delete, no `Content-Encoding` and a
+  command list of at most 64 KiB, and one pull request (`github-pulls`, `POST
+  /repos/<owner>/<name>/pulls`) from that branch, with the approved title and
+  body and no other field.
+
+It cannot reach:
+
+- anything at all from the hostile domain, or from a manifest without
+  egress;
+- a host no grant names; an address literal in any notation; a port other
+  than 443; userinfo, a wildcard or a second host; a special-use name
+  (`localhost`, `*.local`, `*.internal`, among them `host.lima.internal` and
+  `host.docker.internal`); a CONNECT tunnel;
+- a name that resolves to any address that is not global unicast (loopback,
+  RFC 1918 and with it `192.168.5.0/24`, where `192.168.5.2` is the Mac's
+  loopback, CGNAT, link-local, unique-local, or an IPv6 form that carries
+  one of them: IPv4-mapped, NAT64, 6to4, Teredo), or to one of the Mac's own
+  interface addresses;
+- a path that hides another (`%2f`, `%2e`, `..`, `//`), a header that names
+  another method or path than the request line, or a repository no binding
+  names; a ref outside `refs/heads/aos/<runId>/`, a delete, a second pull
+  request, or any endpoint no profile names (one that returns a token among
+  them);
+- the credential: it is never in the container, its spec, its environment
+  or its workspace; the worker's own `Authorization` and cookies are
+  stripped; a redirect is never followed.
+
+Not detected, and so still reachable by a name that resolves to it: another
+address in an on-link prefix of the Mac's interfaces (on an IPv6 network,
+every LAN peer's global address in the Mac's /64, the router's LAN side among
+them), the router's WAN address, and a network-specific NAT64 or 6rd prefix.
+Certificate verification bounds a dial to one of them to a TCP connect and a
+ClientHello naming the allowed host; denying every on-link prefix is open
+with the operator (below).
+
+### Open decisions the code is built on
+
+The egress plan's Operator decisions entries still open. Each is built as its
+recommendation says until the operator answers, except the three last, whose
+recommendation is not built.
+
+| Decision | As built |
+|---|---|
+| A credential-free host admits `GET` and `HEAD` with no body, and nothing else | yes: any other method is denied `method`, a declared body `body` |
+| An upstream 401 or 403 is recorded as an upstream row, `refusal: challenged`, sent, counted failed | yes, and answered 502 |
+| An answer whose head the kernel will not write to the worker is recorded as `refusal: response-head` | yes, and answered 502 |
+| `egress.limits.maxRequests` counts the flows a container opens, not the requests judged | yes |
+| A canary whose self-test is refused closes its domain to `sandbox.exec`, across restarts, until a boot whose canary there passes | yes (Boot states, above) |
+| The Phase 2 exit's coding agent is tier 3, not CLAUDE.md's "T2", since `sandbox.publish` is irreversible | yes: L2's coder is tier 3; CLAUDE.md's wording is the operator's to change |
+| `sandbox.publish` publishes only where the manifest's bindings make one repository, under a grant narrowed to it | yes |
+| A second spawner in the worker image: the publisher starts `/usr/bin/git` | yes |
+| A publish's branch, title and body fit the approval preview, 466 bytes of plain text together | yes |
+| A publish grant is held, in the egress engine, to what the human approved; the pull request's base and the pushed commit are left to the publisher | yes |
+| The Phase 2 exit's live run uses a scripted model, the test approving each call the gate asks about | yes: the checklist's line 1 says so (Phase 2 exit-criterion checklist, below) |
+| Deny every address in an on-link prefix of the Mac's interfaces, not only its own addresses | no: built as accepted, the Mac's own addresses only (above) |
+| Make redaction's JWT pattern linear, and drop the exec's withholding of `-ey` runs | no: redaction is unchanged, and the withholding stays |
+| Give the hard wallclock's kill a retry, rather than leave a missed kill to the next boot's orphan sweep | no: one kill, the sweep the backstop |
+
 ## Live sandbox and egress tests
 
 Two gated files run Phase 2 against your VMs (egress plan L1 and L2), and
-neither runs on a plain `npm test`, nor on `AOS_LIVE_TESTS=1 npm test` alone.
-As in Phase 1, every check is a body that `test/sandbox-bodies.test.ts` runs
-offline on every `npm test`, against the fake driver with each container
-played as the worker image acts: `test/helpers/sandbox-bodies.ts` (L1) and
+neither runs on a plain `npm test`, nor on `AOS_LIVE_TESTS=1 npm test` alone. As
+in Phase 1, every check is a body that `test/sandbox-bodies.test.ts` runs
+offline on every `npm test`, against the fake driver with each container played
+as the worker image acts: `test/helpers/sandbox-bodies.ts` (L1) and
 `test/helpers/egress-bodies.ts` (L2). Every check a container or a VM can make
-fail is seen there to fail on what it is there to catch, a container played as
-a broken VM, image or kernel would have it act, and the `liveBodies` mutation
+fail is seen there to fail on what it is there to catch, a container played as a
+broken VM, image or kernel would have it act, and the `liveBodies` mutation
 suite holds each to it. For L1: a route out (an interface, a route or a route
 table the probe could not read, a target reached, a connect by address or by
 name that timed out or was refused, or a lookup a resolver answered, if only
 with a failure); a network report that leaves a target out or puts them out of
-order; a probe, `cat` or self-test that exits other than 0 or prints no
-report; a byte changed or dropped; a `cat` that never sees its EOF; a
-container that never says it is up; a beat that never moves or never stops; a
-VM whose `docker ps` still lists a container its kill ended; a sweep that
-lists nothing, could not list a VM, or whose kill a daemon refused; a kill
-whose exit is not the CLI's 137; a wallclock run that ends on its own or whose
-kill lands a minute late; an init probe that lists no process, a command as
-PID 1 or a zombie; a self-test that leaves a probe out or that the judge
-refuses; a canary refused, on either domain; an answer from outside the
-container. For the exit: a direct connect that connects; a call that exits
-other than 0; a git request for 192.168.5.2 or for host.lima.internal never
-sent, or answered other than 403; a request never sent, or a flow with none on
-it; a request cut short of its Content-Length, which fails upstream; a clone
-that asked for no pack; a request denied; a push or pull request not made, or
-not said; a push said of another branch, run, repository or host than the
-approved one, or a pull request said to be opened from another branch or run;
-a pull request into another base than `main`; a failed or missing test; an
-edit that wrote no file, or another; a look at PID 1 that prints nothing, or
-that is not JSON, or whose parent is not the mux; a command line without the
-mux; a variable named like a token, a password or a secret, or a credential
-name (`ANTHROPIC_API_KEY`); the token or its Basic form (built from the
-`github-git` binding's `basicUser`, as the kernel builds it) in PID 1's, the
-mux's or the command's own environment, PID 1's command line, a workspace
-entry's name or a link's target, a workspace file (a git object, or one that
-does not inflate, or a pack too large to scan) or the log; the log's mask in a
-row of the run (the token a container printed); and a call the exit does not
-make asked of a human. No failure of the exit quotes the token: each message
-shows log, file and container text, and every workspace path, with the token
-and its Basic form replaced by their names, scrubbed before any cut; the
-offline rows hold each failure free of the token and of any ten characters of
-it. Seen only to pass are the checks of what the kernel or the driver alone
-decides, which no container can make fail: for L1, that a channel run has a
-channel, that a run given up is credited to no kill, that a wallclock kill's
-exit is 137 (the driver credits a kill only on one), and that the canaries'
-log rows are there once both pass; for the exit, that egress booted ok, that
-every approval was given on the control plane, that the run finished ok, the
-results and grants counts, the approvals list, every grant and decision
-recorded under the run, no decision under no grant, every grant revoked, each
-grant's decisions counting its requests, every allow for the bound repository
-on its two hosts, no spec the driver was handed holding the token, and the
-chain verifying.
+order; a probe, `cat` or self-test that exits other than 0 or prints no report;
+a byte changed or dropped; a `cat` that never sees its EOF; a container that
+never says it is up; a beat that never moves or never stops; a VM whose `docker
+ps` still lists a container its kill ended; a sweep that lists nothing, could
+not list a VM, or whose kill a daemon refused; a kill whose exit is not the
+CLI's 137; a wallclock run that ends on its own or whose kill lands a minute
+late; an init probe that lists no process, a command as PID 1 or a zombie; a
+self-test that leaves a probe out or that the judge refuses; a canary refused,
+on either domain; an answer from outside the container. For the exit: a direct
+connect that connects, or whose no route is said only on stderr or beside a
+`connected` (the probe's report is its whole stdout, the one line
+`ENETUNREACH`); a call that exits other than 0, whatever its own output says
+(its status is read from the result's head line alone); a git request for
+192.168.5.2 or for host.lima.internal never sent, or answered other than 403; a
+request never sent, or a flow with none on it; a request cut short of its
+Content-Length, which fails upstream; a clone that asked for no pack; a request
+denied; a push or pull request not made, or not said, or said only on stderr
+(where the publisher says neither) or on a line that starts with words of its
+own (`not pushed`) or goes on past what was approved; a push said of another
+branch, run, repository or host than the approved one (a host whose name only
+starts as `github.com`'s included), or a pull request said to be opened from
+another branch or run, or at an address of another repository, host or number
+than the one it says it opened; a pull request into another base than `main`; a
+failed, missing, extra or nested test, or a test summary read from anywhere but
+the lines after node's top-level plan (from a test's own name or output, which
+the reporter writes above that plan, or from a stdout with no plan line), from
+stderr (a stdout heading of its own printed there included: a call's stdout is
+read under the kernel's heading alone) or from a stdout the kernel does not show
+whole; an edit that wrote no file, or another; a look at PID 1 that prints
+nothing on its stdout (its lines on stderr are not its report), or that is not
+JSON, or whose parent is not the mux (docker-init, or another node program); a
+command line without the mux; a variable named like a token, a password or a
+secret, or a credential name (`ANTHROPIC_API_KEY`), in PID 1's, the mux's or the
+command's environment; the token or its Basic form (built from the `github-git`
+binding's `basicUser`, as the kernel builds it) in PID 1's, the mux's or the
+command's own environment, PID 1's command line, a workspace entry's name or a
+link's target, a workspace file (a git object, or one that does not inflate, or
+a pack too large to scan) or the log; the log's mask in a row of the run (the
+token a container printed); and a call the exit does not make asked of a human.
+No failure of the exit quotes the token: each message shows log, file and
+container text, and every workspace path, with the token and its Basic form
+replaced by their names, scrubbed before any cut; the offline rows hold each
+failure free of the token and of any ten characters of it. Seen only to pass are
+the checks of what the kernel or the driver alone decides, which no container
+can make fail: for L1, that a channel run has a channel, that a run given up is
+credited to no kill, that a wallclock kill's exit is 137 (the driver credits a
+kill only on one), and that the canaries' log rows are there once both pass; for
+the exit, that egress booted ok, that every approval was given on the control
+plane, that the run finished ok, the results and grants counts, the approvals
+list, every grant and decision recorded under the run, no decision under no
+grant, every grant revoked, each grant's decisions counting its requests, every
+allow for the bound repository on its two hosts, no spec the driver was handed
+holding the token, and the chain verifying.
 
 | Test | Needs | What only a live run settles |
 |---|---|---|
@@ -1176,7 +1411,7 @@ chain verifying.
 | a run's PID 1 is docker-init, which reaps what its command orphans | `AOS_LIVE_DOCKER=1` | `--init` on both VMs, and no zombie left |
 | both canaries pass, and each VM's self-test meets only the codes the judge accepts | `AOS_LIVE_DOCKER=1` | boot's canaries on the real image, and the codes each VM gave (recorded) |
 | the image's node reaches nothing through its proxy settings with no channel | `AOS_LIVE_DOCKER=1` | that nothing outside the container answers it, whether the image's Node prints `EnvHttpProxyAgent is experimental`, and whether a request to a server the run itself listens on at 127.0.0.1 goes to the proxy with `NO_PROXY` empty (both recorded) |
-| `test/live-egress.test.ts`: Phase 2 exit: clone, change, test, push aos/<runId>/<branch>, PR opened | `AOS_LIVE_DOCKER=1`, `AOS_LIVE_GITHUB=1`, `AOS_GITHUB_TOKEN` | the exit itself: a tier 3 coder clones the fixture repository through the egress engine, adds a test, runs `node --test`, and `sandbox.publish` pushes `aos/<runId>/phase2-exit` and opens a pull request into `main`; every flow a `proxy.decision` of that run, a direct connect to 192.168.5.2 finding no route, the git requests for 192.168.5.2 and host.lima.internal each its grant's one deny at the policy (`not-a-host`), never resolved or sent, no other request denied, and the token in no row, no container spec, no workspace entry's name or file (`.git` included, each git object inflated: a loose object whole, a pack's streams each), no workspace link's target, and nothing PID 1 holds (what `docker inspect` reports as Env and Cmd), nor the mux's or the command's own environment |
+| `test/live-egress.test.ts`: Phase 2 exit: clone, change, test, push aos/<runId>/<branch>, PR opened | `AOS_LIVE_DOCKER=1`, `AOS_LIVE_GITHUB=1`, `AOS_GITHUB_TOKEN` | the exit's isolation check (Phase 2 checklist line 1): a tier 3 coder from a test-only agents dir, its model scripted, clones the fixture repository through the egress engine, adds a test, runs `node --test`, and `sandbox.publish` pushes `aos/<runId>/phase2-exit` and opens a pull request into `main`; every flow a `proxy.decision` of that run, a direct connect to 192.168.5.2 finding no route, the git requests for 192.168.5.2 and host.lima.internal each its grant's one deny at the policy (`not-a-host`), never resolved or sent, no other request denied, and the token in no row, no container spec, no workspace entry's name or file (`.git` included, each git object inflated: a loose object whole, a pack's streams each), no workspace link's target, and nothing PID 1 holds (what `docker inspect` reports as Env and Cmd), nor the mux's or the command's own environment |
 
 Before either: both VMs up (`scripts/colima-up.sh`), the worker image built
 and loaded on both (`scripts/build-worker-image.sh`, which prints its id), and
@@ -1229,27 +1464,27 @@ It reads `AOS_GITHUB_TOKEN` (a shell export that is not blank, else `.env`)
 only when all three are set, so `AOS_LIVE_TESTS=1 npm test`, where it skips,
 never opens `.env` for it.
 
-The test boots its own kernel on a temp data dir with egress enabled in its
-own copy of the config (the shipped file stays disabled), over your VMs and
-the shipped sandbox section, with a test-only agents dir holding the coder:
-tier 3, because `sandbox.publish` is irreversible and only tier 3 may hold an
+The test boots its own kernel on a temp data dir with egress enabled in its own
+copy of the config (the shipped file stays disabled), over your VMs and the
+shipped sandbox section, with a test-only agents dir holding the coder: tier 3,
+because `sandbox.publish` is irreversible and only tier 3 may hold an
 irreversible tool. No shipped manifest binds either binding. The coder's model
 is scripted, so no provider is called and nothing is spent; each of its calls
 still goes through the gate, and the test approves on the control plane, as
-`npm run cli -- approve` does, each one the gate asks a human about only
-while it is the next call of the exit, its tool and its whole preview (the
-publish's branch, title and body among them) exactly the exit's; any other
-it denies there, before it runs, and fails. A scripted model and a test's
-approval in place of a person's are put to you in the egress plan's
-Operator decisions, before this run can stand as the Phase 2 exit's line in
-the checklist. It leaves the branch `aos/<runId>/phase2-exit` and an open
-pull request in the fixture repository, which the kernel has no tool to
-delete or close: close them yourself (the diagnostics line names both). Its
-boot's two canaries run as boot runs them, in the canary workspace under
-each domain's mountRoot, which stays; the run's workspace, under
-`.aos/workspaces/trusted`, is removed when the test ends, however it ends
-once `run.start` has named the run (the body is told the run's id then, not
-once the run has passed).
+`npm run cli -- approve` does, each one the gate asks a human about only while
+it is the next call of the exit, its tool and its whole preview (the publish's
+branch, title and body among them) exactly the exit's; any other it denies
+there, before it runs, and fails. A scripted model and a test's approval in
+place of a person's are put to you in the egress plan's Operator decisions: a
+pass is line 1 of the Phase 2 exit-criterion checklist, the isolation check,
+and never its line 2, the exit itself. It leaves the branch
+`aos/<runId>/phase2-exit` and an open pull request in the fixture repository,
+which the kernel has no tool to delete or close: close them yourself (the
+diagnostics line names both). Its boot's two canaries run as boot runs them, in
+the canary workspace under each domain's mountRoot, which stays; the run's
+workspace, under `.aos/workspaces/trusted`, is removed when the test ends,
+however it ends once `run.start` has named the run (the body is told the run's
+id then, not once the run has passed).
 
 ---
 
@@ -1503,6 +1738,54 @@ eval harness's gates against real accounting.
 - Result: pass. 3 passed: the goal tools match the server and a tree round-trips; the orchestrator's plan survives the strict parser into the test namespace; the eval harness's gates hold against real accounting (`ceo-inline-small-objective`: gates failed [], score 1, did not run 10). The whole file: 5 passed, 0 failed, 178 s.
 - Date: 2026-10-20 (operator local; 06:30 UTC on 2026-10-21)
 - Commit: d73c485
+
+---
+
+## Phase 2 exit-criterion checklist
+
+CLAUDE.md's Phase 2 exit is: *"a T2 coding agent clones a repo, changes it,
+runs tests, opens a PR, with every network call visible as a proxy decision
+and zero credentials in the container."* Phase 2 ends only when line 2
+passes on the Mac and is recorded here. Line 1, the egress plan's L2 run,
+checks the isolation the exit asks for and nothing more: its model is
+scripted and its approvals are the test's, so a pass shows what a run of the
+two sandbox tools could reach, not that an agent can do the work or that a
+person read the publish. Its coder is tier 3, not T2, since only tier 3 may
+hold `sandbox.publish`, which is irreversible. Both, and taking line 1 as the
+exit's isolation check, are open with the operator (Egress, "Open decisions
+the code is built on", above).
+
+**1. The isolation check: scripted model, the test's approvals.**
+`test/live-egress.test.ts`, 'Phase 2 exit: clone, change, test, push aos/<runId>/<branch>, PR opened':
+a coder from a test-only agents dir, its model scripted, clones the fixture
+repository through the egress engine, adds a test, runs the tests and
+publishes, while the test approves on the control plane each call the gate
+asks about, only while it is the next call of the exit. Set up as "Live
+sandbox and egress tests" says, then:
+
+```bash
+AOS_LIVE_TESTS=1 AOS_LIVE_DOCKER=1 AOS_LIVE_GITHUB=1 node --expose-gc --import tsx --test test/live-egress.test.ts
+```
+
+Its diagnostic line (`runId=… branch=… pullRequest=…`) is what is recorded
+below; the branch and the pull request are yours to close.
+
+- Result: _not yet run_
+- Date:
+- Commit:
+- `runId`:
+- `pullRequest`:
+
+**2. The exit itself.** A coding agent on a real model that `npm run cli --
+probe` reports `toolCalling: true` for, and you approving each call it asks
+for with `npm run cli -- approve`. No test drives it yet, and its form waits
+on the decisions above.
+
+- Result: _not yet run_
+- Date:
+- Commit:
+- `runId`:
+- `pullRequest`:
 
 ---
 

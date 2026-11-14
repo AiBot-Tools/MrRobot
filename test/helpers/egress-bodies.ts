@@ -43,20 +43,20 @@
 // every proxy.decision is the run's, every flow of each of its grants is a
 // decision, every allow is for the bound repository on github.com or
 // api.github.com, and the clone's and the publish's are those requests (a
-// push, a pull request); the direct probe found no route, and each git
-// request for the Mac's loopback is its grant's one decision, a deny at the
-// policy (not-a-host) that was never resolved or sent; no other request was
-// denied; and the binding's value, and its Basic form (built from the
-// github-git binding's basicUser, as the kernel builds it), are in no row, no
-// spec the driver was handed, no workspace entry's name, link's target or
-// file's contents (a git object inflated), and nothing PID 1, the mux or the
-// command holds, where the kernel's mask showing anything at all is a value
-// found there, as it is in any row of the run (a value a container printed,
-// which the mask kept from the log). The caller is told the run's workspace
-// as soon as run.start names the run, so it is removed however the body
-// ends. No failure it reports quotes the value or its Basic form (scrubbed):
-// node:test prints a failure's message and values where the operator copies
-// them.
+// push, a pull request); the direct probe found no route (its stdout the one
+// line ENETUNREACH), and each git request for the Mac's loopback is its
+// grant's one decision, a deny at the policy (not-a-host) that was never
+// resolved or sent; no other request was denied; and the binding's value,
+// and its Basic form (built from the github-git binding's basicUser, as the
+// kernel builds it), are in no row, no spec the driver was handed, no
+// workspace entry's name, link's target or file's contents (a git object
+// inflated), and nothing PID 1, the mux or the command holds, where the
+// kernel's mask showing anything at all is a value found there, as it is in
+// any row of the run (a value a container printed, which the mask kept from
+// the log). The caller is told the run's workspace as soon as run.start
+// names the run, so it is removed however the body ends. No failure it
+// reports quotes the value or its Basic form (scrubbed): node:test prints a
+// failure's message and values where the operator copies them.
 
 import './guard.js'
 
@@ -71,7 +71,7 @@ import { connectControl } from '../../src/cli/client.js'
 import { CENSOR, SecretMask } from '../../src/events/redact.js'
 import type { Kernel } from '../../src/kernel.js'
 import { approvalPreview } from '../../src/policy/engine.js'
-import { MUX_ARGV, PUBLISH_ARGV } from '../../src/runtime/sandbox-tools.js'
+import { MUX_ARGV, PUBLISH_ARGV, STREAM_WINDOW_BYTES } from '../../src/runtime/sandbox-tools.js'
 import { CANARY_PREFIX } from '../../src/runtime/canary.js'
 import { readSpecOnce, type SandboxDriver, type SandboxSpec } from '../../src/sandbox/driver.js'
 import { canaryPlayer, FakeMux } from './fake-egress.js'
@@ -422,6 +422,28 @@ function resultText(results: readonly Row[], i: number): string {
 }
 
 /**
+ * The stdout a call's result shows whole: the text under its `--- stdout (N
+ * bytes) ---` heading, N bytes of it, read from the result as the kernel
+ * wrote it (a scrub changes the count). The heading is the kernel's, the
+ * first after the result's head lines, which the kernel writes above both
+ * streams: a later one is a container's, printed on its stdout or its
+ * stderr, and is never read. The text under it is the container's, so it is
+ * read by the heading's count, never up to a line the container could print
+ * (a `--- stderr` heading of its own). A stream the
+ * kernel shows by a window or cut, or withholds, is no whole stdout: its
+ * first line may be the end of a line, so none of it is read as whole
+ * lines. A failure shows the heading as `quote` gives it.
+ */
+export function stdoutOf(text: string, quote: (text: string) => string): string {
+  const at = text.indexOf('\n--- stdout (')
+  const heading = at === -1 ? null : /^\n--- stdout \((\d+) bytes\) ---\n/.exec(text.slice(at))
+  const shown = at === -1 ? 'none' : (text.slice(at + 1).split('\n')[0] ?? '')
+  assert.ok(heading !== null, `the result does not show its stdout whole, so no line of it is read: ${quote(shown).slice(0, 300)}`)
+  const from = Buffer.byteLength(text.slice(0, at + heading[0].length))
+  return Buffer.from(text, 'utf8').subarray(from, from + Number(heading[1])).toString('utf8')
+}
+
+/**
  * The JSON on the line of `text` that starts with `marker`; a failure shows
  * `text` as `quote` gives it. A line that is not JSON fails with the line
  * scrubbed, never with JSON.parse's own error, which quotes the raw text
@@ -500,26 +522,65 @@ export async function phase2Exit(inputs: ExitInputs): Promise<ExitRecord> {
   const results = all.filter((r) => r.type === 'tool.result')
   assert.equal(results.length, commands.length + 1, quotedHeads(results.map((r) => String(r.payload['text'])), quote))
   const said = (i: number): string => quote(resultText(results, i))
-  const exited = (i: number, code: number): void => assert.match(said(i), new RegExp(`\\bexited ${String(code)}\\b`), `call ${String(i + 1)}`)
+  // How a call ended, read from its head line alone: the result's first
+  // line, the kernel's (`<name> on the trusted domain, <network>, exited N
+  // after M ms`). What the container printed follows it, and may say
+  // anything, `exited 0` or a whole line of a head's shape included.
+  const exited = (i: number, code: number): void => {
+    const head = said(i).split('\n')[0] ?? ''
+    assert.match(head, new RegExp(`^aos-run-\\S+ on the trusted domain, [^\\n]*, exited ${String(code)} after \\d+ ms$`), `call ${String(i + 1)} did not exit ${String(code)}: ${head.slice(0, 300)}`)
+  }
   // No route to the Mac's loopback as a VM sees it, and the proxy denies both names.
   exited(0, 0)
-  assert.match(said(0), /\nENETUNREACH\n/, 'a direct connect to 192.168.5.2:8766 met something other than no route')
+  // What the direct probe met, read as its whole stdout, where DIRECT_PROBE
+  // prints the one code it met (console.log): ENETUNREACH alone. A line on
+  // stderr is none of its report, and a `connected` beside it is a route.
+  const direct = quote(stdoutOf(resultText(results, 0), quote))
+  assert.ok(direct === 'ENETUNREACH\n', `a direct connect to 192.168.5.2:8766 met something other than no route: its stdout is ${JSON.stringify(direct.slice(0, 200))}`)
   for (const i of [1, 2]) assert.match(said(i), /returned error: 403/, `git ls-remote through the proxy was not denied (call ${String(i + 1)})`)
   for (const i of [3, 4, 5, 6, 7, 8, 9]) exited(i, 0)
-  assert.match(said(7), /# pass 2\b/, 'node --test did not pass both tests')
-  assert.match(said(7), /# fail 0\b/, 'node --test reported a failed test')
+  // node --test's summary, read from its stdout alone (the reporter writes
+  // its whole stream there, so a line on stderr is none of it) and from the
+  // block after its top-level plan, the last `1..N` line, unindented. It prints
+  // all a test writes, to its stdout or its stderr, above that plan as whole
+  // `# <line>` lines, a subtest's plan indented, and a test's name escaped
+  // (`\#`), so no test's name or output can make a line of the block (Node
+  // 22.22.0, checked 2026-11-14). A line is what ends at a \n: never a /m
+  // regex, which also ends a line at a \r, U+2028 or U+2029, the last two of
+  // which the reporter passes through raw (a \r it escapes, or splits at).
+  const tap = quote(stdoutOf(resultText(results, 7), quote)).split('\n')
+  const plan = tap.map((line) => /^1\.\.\d+$/.test(line)).lastIndexOf(true)
+  const summary = plan === -1 ? [] : tap.slice(plan + 1)
+  const count = (what: string): string | undefined => summary.find((line) => line.startsWith(`# ${what} `))
+  assert.equal(count('pass'), '# pass 2', 'node --test did not pass both tests')
+  assert.equal(count('fail'), '# fail 0', 'node --test reported a failed test')
+  assert.ok(tap[plan] === '1..2' && count('tests') === '# tests 2', 'node --test did not run exactly the two tests')
+  // What the publisher says it did, as whole lines of its stdout, where
+  // publish.mjs writes both (a line on stderr, or one that starts with words
+  // of its own, `not pushed`, is not it saying so), each held whole to what
+  // was approved: the pushed line to its end (a host that only starts
+  // github.com is another host), the opened line's address to the bound
+  // repository, on github.com, under the number it says it opened.
   const publish = said(9)
-  assert.match(publish, new RegExp(`pushed [0-9a-f]{40} to refs/heads/aos/${runId}/${EXIT_PUBLISH.branch} of ${repo} on github\\.com`), 'the publish does not say it pushed the approved branch')
-  const opened = new RegExp(`opened pull request #(\\d+): (https://github\\.com/\\S+/pull/\\d+) \\(from aos/${runId}/${EXIT_PUBLISH.branch} into main\\)`).exec(publish)
+  const publishLines = quote(stdoutOf(resultText(results, 9), quote)).split('\n')
+  const pushedLine = new RegExp(`^pushed [0-9a-f]{40} to refs/heads/aos/${runId}/${EXIT_PUBLISH.branch} of ${repo} on github\\.com$`)
+  assert.ok(publishLines.some((line) => pushedLine.test(line)), 'the publish does not say it pushed the approved branch')
+  const openedLine = new RegExp(`^opened pull request #(\\d+): (https://github\\.com/([^/\\s]+/[^/\\s]+)/pull/(\\d+)) \\(from aos/${runId}/${EXIT_PUBLISH.branch} into main\\)$`)
+  const opened = publishLines.map((line) => openedLine.exec(line)).find((m) => m !== null) ?? null
   assert.ok(opened, `the publish opened no pull request:\n${publish.slice(0, 2_000)}`)
+  // GitHub spells the repository in its own case (AiBot-Tools); config reads it without case.
+  assert.equal(opened[3]?.toLowerCase(), repo, `the publish says it opened its pull request in ${String(opened[3])}, not ${repo}`)
+  assert.equal(opened[4], opened[1], `the publish says it opened pull request #${String(opened[1])} at the address of #${String(opened[4])}`)
 
   // What PID 1 holds, as `docker inspect` reports Env and Cmd, and what the
   // mux and the command run with: no credential in any. Read from the log,
   // where the kernel's mask stands in for a registered value (the binding's,
   // its Basic form) or a credential shape: the mask showing in any list is
   // such a value found there. A failure names the variable, or the
-  // argument's place, and what it holds, never the entry.
-  const probed = resultText(results, 8)
+  // argument's place, and what it holds, never the entry. Each marked line
+  // is read from the probe's whole stdout, where PID1_PROBE prints all five
+  // (console.log): a line on stderr is none of its report.
+  const probed = stdoutOf(resultText(results, 8), quote)
   const environ = marked(probed, '@/proc/1/environ ', quote) as string[]
   const cmdline = marked(probed, '@/proc/1/cmdline ', quote) as string[]
   const muxEnviron = marked(probed, '@/proc/ppid/environ ', quote) as string[]
@@ -667,6 +728,48 @@ function gitPost(url: string, service: string, body: string): string {
 const pkt = (payload: string): string => (payload.length + 4).toString(16).padStart(4, '0') + payload
 const OID = 'c'.repeat(40)
 
+/** A test of a node --test run: its name, whether it passed or was skipped, and its subtests. */
+interface TapTest {
+  readonly name: string
+  readonly ok: boolean
+  readonly skipped?: boolean
+  readonly subtests?: readonly TapTest[]
+}
+
+/** The fixture's two tests, and the second test's, as node --test names them. */
+const FIRST: TapTest = { name: 'sum(2, 3) is 5', ok: true }
+const SECOND: TapTest = { name: 'sum(-2, 2) is 0', ok: true }
+
+/**
+ * node --test's TAP stream as its reporter writes it to stdout (Node
+ * 22.22.0, checked 2026-11-14): `printed`, the lines the tests wrote to
+ * their stdout or stderr, each as `# <line>`, above the first test; each
+ * test's `# Subtest:` line, its subtests four spaces in under a plan of
+ * their own, its `ok` or `not ok` line and YAML block; then the top-level
+ * plan, unindented, and the summary. A name is escaped as the reporter
+ * escapes it (`#` as `\#`).
+ */
+function tapStream(tests: readonly TapTest[], printed: readonly string[] = []): string {
+  const lines = ['TAP version 13', ...printed.map((line) => `# ${line}`)]
+  const write = (list: readonly TapTest[], indent: string): void => {
+    for (const [i, test] of list.entries()) {
+      const name = test.name.replace(/\\/g, '\\\\').replace(/#/g, '\\#')
+      lines.push(`${indent}# Subtest: ${name}`)
+      if (test.subtests !== undefined) write(test.subtests, `${indent}    `)
+      lines.push(`${indent}${test.ok ? 'ok' : 'not ok'} ${String(i + 1)} - ${name}${test.skipped === true ? ' # SKIP' : ''}`)
+      lines.push(`${indent}  ---`, `${indent}  duration_ms: 0.5`, `${indent}  type: 'test'`, `${indent}  ...`)
+    }
+    lines.push(`${indent}1..${String(list.length)}`)
+  }
+  write(tests, '')
+  const every = (list: readonly TapTest[]): TapTest[] => list.flatMap((test) => [test, ...every(test.subtests ?? [])])
+  const all = every(tests)
+  const n = (keep: (test: TapTest) => boolean): string => String(all.filter(keep).length)
+  lines.push(`# tests ${String(all.length)}`, '# suites 0', `# pass ${n((t) => t.ok && t.skipped !== true)}`, `# fail ${n((t) => !t.ok)}`)
+  lines.push('# cancelled 0', `# skipped ${n((t) => t.skipped === true)}`, '# todo 0', '# duration_ms 76.8')
+  return `${lines.join('\n')}\n`
+}
+
 /**
  * What a container of the exit does wrong, offline, so that each check of
  * phase2Exit a container can make fail is seen to fail on what it is there
@@ -674,6 +777,11 @@ const OID = 'c'.repeat(40)
  * would have it act:
  *
  *   direct-connects    the direct probe of 192.168.5.2:8766 connects.
+ *   direct-said-on-stderr
+ *                      the direct probe connects, prints `connected` on its
+ *                      stdout, and ENETUNREACH on its stderr.
+ *   direct-said-both   the direct probe prints ENETUNREACH, then
+ *                      `connected`, both on its stdout.
  *   direct-fails       the direct probe prints ENETUNREACH and exits 1.
  *   ls-remote-silent-ip, ls-remote-silent-name
  *                      git ls-remote for 192.168.5.2 (ip) or for
@@ -699,6 +807,9 @@ const OID = 'c'.repeat(40)
  *   flow-silent        the clone also opens a flow through the mux and hangs
  *                      it up with no request on it.
  *   edit-fails         the edit writes the second test, then exits 1.
+ *   edit-prints-exited the edit writes the second test, prints `exited 0`
+ *                      and a whole line of a result head's shape saying it
+ *                      exited 0, then exits 1.
  *   edit-unwritten     the edit writes nothing, and exits 0.
  *   edit-other         the edit writes another file than the second test.
  *   add-fails          git add exits 128.
@@ -707,11 +818,37 @@ const OID = 'c'.repeat(40)
  *   one-test           node --test passes, but ran one test: the edit added none.
  *   fail-reported      node --test reports two passed and one failed, and
  *                      exits 0.
+ *   pass-named         node --test passes, but ran one test, whose name is
+ *                      `# pass 2` (its line `ok 1 - \# pass 2`).
+ *   fail-named         node --test reports two passed and one failed, the
+ *                      failed one named `# fail 0`, and exits 0.
+ *   tests-extra        node --test reports two passed, none failed, and a
+ *                      third test, a subtest of the first, skipped: its plan
+ *                      says two, but three ran.
+ *   tests-nested       node --test passes two tests, one of them a subtest
+ *                      of the other: its plan says one, the second file ran
+ *                      nothing.
+ *   summary-printed    node --test passes, but ran one test, which printed
+ *                      `pass 2` and `tests 2`: the reporter writes them as
+ *                      whole lines `# pass 2` and `# tests 2` above its plan.
+ *   tap-unplanned      node --test prints a two-test summary with no plan
+ *                      line above it, as no TAP reporter writes one.
+ *   summary-on-stderr  node --test passes, but ran one test, and its stderr
+ *                      holds a two-test plan and summary.
+ *   tap-heading-on-stderr
+ *                      node --test passes, but ran one test, and its stderr
+ *                      prints a stdout heading of its own, `--- stdout (N
+ *                      bytes) ---`, over a two-test stream of N bytes.
+ *   tap-windowed       node --test passes both tests, after more output than
+ *                      the kernel shows whole, so its stdout is shown by its
+ *                      end.
  *   quoted-unmasked    the kernel's mask forgets the value (SecretMask.clear)
  *                      before node --test, which prints it and passes one
  *                      test: the check that fails quotes what it printed.
  *   pid1-fails         the look at PID 1 prints what it read, then exits 1.
  *   pid1-silent        the look at PID 1 prints nothing.
+ *   pid1-on-stderr     the look at PID 1 prints its five lines on its stderr,
+ *                      nothing on its stdout.
  *   pid1-garbled       the kernel's mask forgets the value (SecretMask.clear)
  *                      before the look at PID 1, which prints its environment
  *                      line with the value in it bare, not JSON.
@@ -730,6 +867,19 @@ const OID = 'c'.repeat(40)
  *   mux-not-parent     the probe's parent runs docker-init's command line,
  *                      not the mux's: what is read as the mux's environment
  *                      is not.
+ *   mux-parent-other-node
+ *                      the probe's parent is another node program (the
+ *                      publisher's argv), not the mux, its argv[0] the
+ *                      mux's own.
+ *   mux-environ-token-name, command-environ-token-name
+ *                      the mux's environment, or the command's own, holds
+ *                      GH_TOKEN, empty, PID 1's and the other clean.
+ *   mux-environ-unmasked, command-environ-unmasked,
+ *   mux-environ-basic-unmasked, command-environ-basic-unmasked
+ *                      the kernel's mask forgets the value (SecretMask.clear)
+ *                      before the look at PID 1; the mux's environment, or
+ *                      the command's own, holds the value, or its Basic
+ *                      form, PID 1's and the other clean.
  *   environ-unmasked   the kernel's mask forgets the value (SecretMask.clear)
  *                      before the look at PID 1, whose environment holds it
  *                      under a name no credential pattern reads.
@@ -758,10 +908,29 @@ const OID = 'c'.repeat(40)
  *                      (aos/<runId>/other), the approved branch of another
  *                      run (aos/<another run>/<branch>), to another
  *                      repository, or to another host, each alone.
+ *   publish-said-host-suffix
+ *                      the same, and it says it pushed to a host whose name
+ *                      only starts as github.com's (github.com.example).
+ *   publish-said-prefixed, publish-said-separated
+ *                      the same, and its pushed line starts with words of
+ *                      its own (`not pushed ...`), or follows them after a
+ *                      U+2028 on one line (`nothing pushed<U+2028>pushed
+ *                      ...`).
+ *   publish-said-on-stderr
+ *                      the same, and it says both lines on stderr, nothing
+ *                      on stdout.
  *   pr-said-elsewhere, pr-said-other-run
  *                      the same, and it says it opened the pull request
  *                      from another branch, or from the approved branch of
  *                      another run.
+ *   pr-said-other-repo, pr-said-other-host, pr-said-other-number
+ *                      the same, and the address it says it opened names
+ *                      another repository, another host (gitlab.com), or
+ *                      another number than the one it says it opened.
+ *   pr-said-prefixed, pr-said-suffixed
+ *                      the same, and its opened line starts with words of
+ *                      its own (`never opened ...`), or goes on past what
+ *                      was approved (`..., then closed it`).
  *   pr-unsaid          the publisher pushes and opens the pull request, and
  *                      says only that it pushed.
  *   publish-fails      the publisher pushes, opens the pull request, says
@@ -789,6 +958,8 @@ const OID = 'c'.repeat(40)
  */
 export type ExitFault =
   | 'direct-connects'
+  | 'direct-said-on-stderr'
+  | 'direct-said-both'
   | 'direct-fails'
   | 'ls-remote-silent-ip'
   | 'ls-remote-silent-name'
@@ -801,6 +972,7 @@ export type ExitFault =
   | 'extra-request'
   | 'flow-silent'
   | 'edit-fails'
+  | 'edit-prints-exited'
   | 'edit-unwritten'
   | 'edit-other'
   | 'add-fails'
@@ -808,9 +980,19 @@ export type ExitFault =
   | 'tests-fail'
   | 'one-test'
   | 'fail-reported'
+  | 'pass-named'
+  | 'fail-named'
+  | 'tests-extra'
+  | 'summary-on-stderr'
+  | 'tap-heading-on-stderr'
+  | 'tap-windowed'
+  | 'tests-nested'
+  | 'summary-printed'
+  | 'tap-unplanned'
   | 'quoted-unmasked'
   | 'pid1-fails'
   | 'pid1-silent'
+  | 'pid1-on-stderr'
   | 'pid1-garbled'
   | 'cmdline-bare'
   | 'cmdline-value'
@@ -819,6 +1001,13 @@ export type ExitFault =
   | 'mux-environ-value'
   | 'command-environ-value'
   | 'mux-not-parent'
+  | 'mux-parent-other-node'
+  | 'mux-environ-token-name'
+  | 'command-environ-token-name'
+  | 'mux-environ-unmasked'
+  | 'command-environ-basic-unmasked'
+  | 'command-environ-unmasked'
+  | 'mux-environ-basic-unmasked'
   | 'environ-unmasked'
   | 'environ-basic-unmasked'
   | 'environ-token-name'
@@ -834,8 +1023,17 @@ export type ExitFault =
   | 'publish-said-other-run'
   | 'publish-said-other-repo'
   | 'publish-said-other-host'
+  | 'publish-said-host-suffix'
+  | 'publish-said-prefixed'
+  | 'publish-said-separated'
+  | 'publish-said-on-stderr'
   | 'pr-said-elsewhere'
   | 'pr-said-other-run'
+  | 'pr-said-other-repo'
+  | 'pr-said-other-host'
+  | 'pr-said-other-number'
+  | 'pr-said-prefixed'
+  | 'pr-said-suffixed'
   | 'pr-unsaid'
   | 'publish-fails'
   | 'workspace-file'
@@ -857,6 +1055,7 @@ const EXIT_STATUS_FAULTS: Readonly<Partial<Record<ExitFault, readonly [number | 
   'direct-fails': [0, 1],
   'clone-fails': [3, 128],
   'edit-fails': [4, 1],
+  'edit-prints-exited': [4, 1],
   'add-fails': [5, 128],
   'commit-fails': [6, 1],
   'pid1-fails': [8, 1],
@@ -920,8 +1119,11 @@ async function playWorker(repo: string, spec: SandboxSpec, container: FakeChanne
   const basic = fault?.basic ?? ''
   const call = argv[1] === PUBLISH_ARGV[1] ? 'publish' : commands.findIndex((c) => same(argv, c))
   let status = 0
-  if (call === 0) mux.stdout(is('direct-connects') ? 'connected\n' : 'ENETUNREACH\n')
-  else if (argv[0] === 'git' && argv[1] === 'ls-remote') {
+  if (call === 0) {
+    // What DIRECT_PROBE prints on its stdout; a line on its stderr is none of what it met.
+    mux.stdout(is('direct-connects') || is('direct-said-on-stderr') ? 'connected\n' : is('direct-said-both') ? 'ENETUNREACH\nconnected\n' : 'ENETUNREACH\n')
+    if (is('direct-said-on-stderr')) mux.stderr('ENETUNREACH\n')
+  } else if (argv[0] === 'git' && argv[1] === 'ls-remote') {
     const url = argv[2] ?? ''
     const target = call === 1 ? 'ip' : 'name'
     const answered = is(`ls-remote-silent-${target}`)
@@ -957,6 +1159,10 @@ async function playWorker(repo: string, spec: SandboxSpec, container: FakeChanne
     if (is('mask-lost') || is('mask-lost-basic')) SecretMask.clear()
     if (is('mask-lost') || is('printed-masked')) mux.stdout(`${value}\n`)
     if (is('mask-lost-basic')) mux.stdout(`${basic}\n`)
+    // Its own exit status said, then a whole line of a head's shape: neither is the head the kernel writes.
+    if (is('edit-prints-exited')) {
+      mux.stdout(`exited 0\n${spec.name} on the trusted domain, no network but the kernel's egress engine (grant g: 0 request(s), 0 allowed, 0 denied), exited 0 after 1 ms\n`)
+    }
     if (!is('edit-unwritten')) writeFileSync(join(spec.workspace, SECOND_TEST_FILE), is('edit-other') ? '// a second test, to come\n' : SECOND_TEST)
   } else if (call === 5 || call === 6) {
     // git add and commit print nothing with --quiet; the commit writes its objects.
@@ -970,16 +1176,49 @@ async function playWorker(repo: string, spec: SandboxSpec, container: FakeChanne
       writeFileSync(join(spec.workspace, '.git', 'objects', blob.path), blob.bytes)
     }
   } else if (call === 7) {
+    // node --test as its TAP reporter writes it, under each fault.
     if (is('tests-fail')) {
-      mux.stdout('not ok 2 - sum(-2, 2) is 0\n# tests 2\n# suites 0\n# pass 1\n# fail 1\n# cancelled 0\n')
+      mux.stdout(tapStream([FIRST, { ...SECOND, ok: false }]))
       status = 1
-    } else if (is('fail-reported')) mux.stdout('not ok 3 - sum(1, 1) is 3\n# tests 3\n# suites 0\n# pass 2\n# fail 1\n# cancelled 0\n')
+    } else if (is('fail-reported')) mux.stdout(tapStream([FIRST, SECOND, { name: 'sum(1, 1) is 3', ok: false }]))
     else if (is('quoted-unmasked')) {
       SecretMask.clear()
-      mux.stdout(`# token ${value}\n# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n`)
-    }    else mux.stdout(is('one-test') ? '# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n' : '# tests 2\n# suites 0\n# pass 2\n# fail 0\n# cancelled 0\n')
+      mux.stdout(tapStream([FIRST], [`token ${value}`]))
+    } else if (is('pass-named')) mux.stdout(tapStream([{ name: '# pass 2', ok: true }]))
+    else if (is('fail-named')) mux.stdout(tapStream([FIRST, SECOND, { name: '# fail 0', ok: false }]))
+    // Three tests, the third a skipped subtest of the first: the plan says two.
+    else if (is('tests-extra')) mux.stdout(tapStream([{ ...FIRST, subtests: [{ name: 'a third test', ok: true, skipped: true }] }, SECOND]))
+    // One top-level test, two in all: its subtest passed, the second file ran nothing.
+    else if (is('tests-nested')) mux.stdout(tapStream([{ ...FIRST, subtests: [{ name: 'a subtest', ok: true }] }]))
+    // A one-test run whose test printed `pass 2` and `tests 2`, which the reporter writes as whole `# ` lines.
+    else if (is('summary-printed')) mux.stdout(tapStream([FIRST], ['pass 2', 'tests 2']))
+    // A two-test summary with no plan line above it, as no TAP reporter writes it.
+    else if (is('tap-unplanned')) mux.stdout('# tests 2\n# suites 0\n# pass 2\n# fail 0\n# cancelled 0\n')
+    else if (is('summary-on-stderr')) {
+      mux.stdout(tapStream([FIRST]))
+      mux.stderr('1..2\n# tests 2\n# suites 0\n# pass 2\n# fail 0\n')
+    } else if (is('tap-heading-on-stderr')) {
+      // A heading of the kernel's shape, printed by the container under its stderr's.
+      const forged = tapStream([FIRST, SECOND])
+      mux.stdout(tapStream([FIRST]))
+      mux.stderr(`\n--- stdout (${String(Buffer.byteLength(forged))} bytes) ---\n${forged}`)
+    } else if (is('tap-windowed')) {
+      // A frame at a time (frameMaxBytes): more than the kernel shows whole, then the stream.
+      for (let left = STREAM_WINDOW_BYTES + 160; left > 0; left -= 16_000) mux.stdout('# padding\n'.repeat(1_600))
+      mux.stdout(tapStream([FIRST, SECOND]))
+    } else mux.stdout(tapStream(is('one-test') ? [FIRST] : [FIRST, SECOND]))
   } else if (call === 8) {
-    if (is('environ-unmasked') || is('environ-basic-unmasked') || is('cmdline-unmasked') || is('pid1-garbled')) SecretMask.clear()
+    const unmasked: readonly ExitFault[] = [
+      'environ-unmasked',
+      'environ-basic-unmasked',
+      'command-environ-unmasked',
+      'command-environ-basic-unmasked',
+      'mux-environ-unmasked',
+      'mux-environ-basic-unmasked',
+      'cmdline-unmasked',
+      'pid1-garbled',
+    ]
+    if (unmasked.some(is)) SecretMask.clear()
     const extra = is('environ-value') || is('environ-unmasked')
       ? [`GIT_HTTP_EXTRA=${value}`]
       : is('environ-basic-unmasked')
@@ -996,12 +1235,25 @@ async function playWorker(repo: string, spec: SandboxSpec, container: FakeChanne
     // The image's environment, which docker-init hands the mux and the mux the command.
     const image = ['PATH=/usr/local/bin:/usr/bin:/bin', 'HOME=/tmp', 'HTTP_PROXY=http://127.0.0.1:3128', 'NO_PROXY=', 'NODE_USE_ENV_PROXY=1', 'GIT_TERMINAL_PROMPT=0']
     const environ = [...image, ...extra]
-    const muxEnviron = is('mux-environ-value') ? [...image, `GIT_HTTP_EXTRA=${value}`] : environ
-    const ownEnviron = is('command-environ-value') ? [...image, `GIT_HTTP_EXTRA=${value}`] : environ
+    // The mux's and the command's own: each fault adds to one list alone.
+    const own = (whose: 'mux' | 'command'): string[] =>
+      is(`${whose}-environ-value`) || is(`${whose}-environ-unmasked`)
+        ? [...image, `GIT_HTTP_EXTRA=${value}`]
+        : is(`${whose}-environ-basic-unmasked`)
+          ? [...image, `GIT_HTTP_EXTRA=${basic}`]
+          : is(`${whose}-environ-token-name`)
+            ? [...image, 'GH_TOKEN=']
+            : environ
+    const muxEnviron = own('mux')
+    const ownEnviron = own('command')
     const leaked = is('cmdline-value') || is('cmdline-unmasked') ? [value] : []
     const cmdline = is('cmdline-bare') ? ['/sbin/docker-init', '--', ...argv] : ['/sbin/docker-init', '--', ...spec.command, ...leaked]
     // The mux, the probe's parent, runs the container's command; docker-init's, were the probe its child.
-    const muxCmdline = is('mux-not-parent') ? ['/sbin/docker-init', '--', ...spec.command] : [...spec.command]
+    const muxCmdline = is('mux-not-parent')
+      ? ['/sbin/docker-init', '--', ...spec.command]
+      : is('mux-parent-other-node')
+        ? [...PUBLISH_ARGV, '--', ...argv]
+        : [...spec.command]
     // Garbled: the value bare in the list, as a probe that printed raw bytes would.
     const environLine = is('pid1-garbled') ? `[${JSON.stringify(environ[0])},${value}]` : JSON.stringify(environ)
     const lines = [
@@ -1011,7 +1263,8 @@ async function playWorker(repo: string, spec: SandboxSpec, container: FakeChanne
       `@/proc/ppid/cmdline ${JSON.stringify(muxCmdline)}`,
       `@/proc/self/environ ${JSON.stringify(ownEnviron)}`,
     ]
-    if (!is('pid1-silent')) mux.stdout(`${lines.join('\n')}\n`)
+    if (is('pid1-on-stderr')) mux.stderr(`${lines.join('\n')}\n`)
+    else if (!is('pid1-silent')) mux.stdout(`${lines.join('\n')}\n`)
   } else if (call === 'publish') {
     const flag = (name: string): string => argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3) ?? ''
     const branch = `aos/${flag('run')}/${flag('branch')}`
@@ -1029,15 +1282,30 @@ async function playWorker(repo: string, spec: SandboxSpec, container: FakeChanne
             `Content-Length: ${String(Buffer.byteLength(body))}\r\nAccept: application/vnd.github+json\r\nUser-Agent: aos-publish\r\nConnection: close\r\n\r\n${body}`,
         )
     const pr = /"number":(\d+)/.exec(answer)?.[1] ?? '0'
+    // The address as the host answered it (GitHub spells the repository in its own case).
+    const url = /"html_url":"([^"]+)"/.exec(answer)?.[1] ?? `https://github.com/${repo}/pull/${pr}`
     // What it says it did, each part alone wrong under its fault.
     const otherRun = `aos/live_other_${flag('run').slice(-6)}/${flag('branch')}`
     const said = is('publish-said-elsewhere') ? `aos/${flag('run')}/other` : is('publish-said-other-run') ? otherRun : branch
     const saidRepo = is('publish-said-other-repo') ? 'aibot-tools/aos-other' : repo
-    const saidHost = is('publish-said-other-host') ? 'gitlab.com' : 'github.com'
+    const saidHost = is('publish-said-other-host') ? 'gitlab.com' : is('publish-said-host-suffix') ? 'github.com.example' : 'github.com'
     const head = is('pr-said-elsewhere') ? `aos/${flag('run')}/other` : is('pr-said-other-run') ? otherRun : branch
     const pushedLine = `pushed ${OID} to refs/heads/${said} of ${saidRepo} on ${saidHost}\n`
-    const openedLine = `opened pull request #${pr}: https://github.com/${repo}/pull/${pr} (from ${head} into ${base})\n`
-    mux.stdout(`${is('publish-unsaid') ? '' : pushedLine}${is('pr-unsaid') ? '' : openedLine}`)
+    const address = is('pr-said-other-repo')
+      ? url.replace(/^https:\/\/github\.com\/[^/]+\/[^/]+\//, 'https://github.com/aibot-tools/aos-other/')
+      : is('pr-said-other-host')
+        ? url.replace(/^https:\/\/github\.com\//, 'https://gitlab.com/')
+        : is('pr-said-other-number')
+          ? url.replace(/\/pull\/\d+$/, `/pull/${String(Number(pr) + 1)}`)
+          : url
+    const openedLine = `opened pull request #${pr}: ${address} (from ${head} into ${base})${is('pr-said-suffixed') ? ', then closed it' : ''}\n`
+    // Each line whole, or prefixed with words of its own, or after a U+2028 on a line that starts otherwise.
+    const pushedSaid = is('publish-said-prefixed') ? `not ${pushedLine}` : is('publish-said-separated') ? `nothing pushed ${pushedLine}` : pushedLine
+    const openedSaid = is('pr-said-prefixed') ? `never ${openedLine}` : openedLine
+    const lines = `${is('publish-unsaid') ? '' : pushedSaid}${is('pr-unsaid') ? '' : openedSaid}`
+    // Said on stderr, where publish.mjs says neither.
+    if (is('publish-said-on-stderr')) mux.stderr(lines)
+    else mux.stdout(lines)
   } else {
     mux.stderr(`no such command in the exit: ${argv.join(' ')}\n`)
     status = 127

@@ -75,6 +75,7 @@ import {
 } from '../scripts/worker-image.js'
 import { credentialNames, gitignoresDotenv, parseDotenv, PLACEHOLDER_PREFIX } from '../src/secrets/dotenv.js'
 import { ConfigError } from '../src/errors.js'
+import { EGRESS_CHECKS } from '../src/events/types.js'
 import { CREDENTIAL_NAME } from './helpers/guard.js'
 import { withStore } from './helpers/store.js'
 
@@ -2717,4 +2718,93 @@ test("README says which live tests AOS_LIVE_TESTS=1 alone runs, and which checks
   const egress = flat(read('test/live-egress.test.ts'))
   assert.ok(egress.includes('The kernel\'s checkAnswers (src/egress/upstream.ts, over src/egress/addr.ts) then judges each answer unchanged, so an address it refuses is admitted to the guard but never dialled.'), "live-egress's admitting() comment does not say the guard admits first")
   assert.equal(egress.includes('run first, unchanged'), false, "live-egress's admitting() comment says the kernel's checks run first")
+})
+
+test("README's Phase 2 exit checklist names test/live-egress.test.ts's exit test by its exact title, unchecked, and says what that run is: a scripted model and the test's approvals, never a coding agent or a human approval", () => {
+  // The egress plan's Operator decisions entry on the Phase 2 exit's live run:
+  // a scripted model is no agent and a test's approval is no person's, so the
+  // line its pass fills says what ran, and the exit's own line stays apart,
+  // waiting on a run no test drives. A title edited on one side only would
+  // leave the operator recording a pass of a test the line does not name.
+  const readme = read('README.md')
+  const titles = [...read('test/live-egress.test.ts').matchAll(/^test\(\n {2}(['"])(.+)\1,\n/gm)].map((m) => (m[2] ?? '').replace(/\\'/g, "'"))
+  assert.equal(titles.length, 1, 'test/live-egress.test.ts holds other than one test this scan reads')
+  const title = titles[0] ?? ''
+  assert.equal(title, 'Phase 2 exit: clone, change, test, push aos/<runId>/<branch>, PR opened')
+
+  const start = readme.indexOf('## Phase 2 exit-criterion checklist\n')
+  assert.notEqual(start, -1, 'README has no Phase 2 exit-criterion checklist')
+  const end = readme.indexOf('\n## ', start + 1)
+  const section = readme.slice(start, end === -1 ? undefined : end)
+  const one = section.indexOf('**1. ')
+  const two = section.indexOf('**2. ')
+  assert.ok(one !== -1 && two > one, 'the Phase 2 checklist has no line 1 before a line 2')
+  const line1 = section.slice(one, two)
+  const line2 = section.slice(two)
+
+  // Line 1 names the file and the test's title exactly, and runs that file with its three gates.
+  assert.ok(line1.startsWith("**1. The isolation check: scripted model, the test's approvals.**\n"), line1.slice(0, 200))
+  assert.ok(line1.includes(`\`test/live-egress.test.ts\`, '${title}'`), `line 1 does not name test/live-egress.test.ts's test as '${title}'`)
+  assert.ok(
+    line1.includes('```bash\nAOS_LIVE_TESTS=1 AOS_LIVE_DOCKER=1 AOS_LIVE_GITHUB=1 node --expose-gc --import tsx --test test/live-egress.test.ts\n```'),
+    'line 1 does not give the command that runs the file with its three gates',
+  )
+  assert.doesNotMatch(line1, /coding agent|human approval|a person approv/i, 'line 1 calls the scripted run an agent, or its approvals a person\'s')
+
+  // Unchecked, both lines, every field empty: nothing is recorded before the Mac runs it.
+  const record = /\n- Result: (.*)\n- Date:(.*)\n- Commit:(.*)\n- `runId`:(.*)\n- `pullRequest`:(.*)\n/
+  for (const [label, line] of [['line 1', line1], ['line 2', line2]] as const) {
+    const fields = record.exec(line)
+    assert.ok(fields, `${label} of the Phase 2 checklist has no Result, Date, Commit, runId and pullRequest fields`)
+    assert.equal(fields[1], '_not yet run_', `${label} is checked`)
+    assert.deepEqual(fields.slice(2).map((f) => f.trim()), ['', '', '', ''], `${label} is unrun but carries a value`)
+  }
+  // Line 2 is the exit itself: a real, probed model and the operator's own approvals.
+  assert.ok(line2.startsWith('**2. The exit itself.**'), line2.slice(0, 200))
+  for (const says of ['`npm run cli -- approve`', 'No test drives it yet']) {
+    assert.ok(line2.replace(/\s+/g, ' ').includes(says), `line 2 does not say: ${says}`)
+  }
+  // And nothing claims the exit while both lines are unrun.
+  for (const [file, text] of [['README.md', readme], ['CLAUDE.md', read('CLAUDE.md')]] as const) {
+    assert.doesNotMatch(text, /Phase 2(?:'s exit(?: criterion)?)? (?:is |has )?(?:complete|exited|met|passed)\b/i, `${file} claims Phase 2 is exited before its checklist records it`)
+  }
+})
+
+test("README's Egress section names every check boot's egress probe runs, each in a row of its own that names its fix, and the boot failures that refuse rather than degrade", () => {
+  // egress.degraded's `check` is the closed list EGRESS_CHECKS: a check
+  // added to it that README's table does not name is a degraded reason an
+  // operator meets with no fix written down, and a row for a check the
+  // kernel no longer runs sends them after one that cannot fail.
+  const readme = read('README.md')
+  const start = readme.indexOf('\n## Egress\n')
+  assert.notEqual(start, -1, 'README has no Egress section')
+  const section = readme.slice(start, readme.indexOf('\n## ', start + 1))
+  const boot = section.slice(section.indexOf('\n### Boot states\n'), section.indexOf('\n### ', section.indexOf('\n### Boot states\n') + 1))
+  assert.ok(boot.length > 200, 'the Egress section has no Boot states subsection')
+  const rows = [...boot.matchAll(/^\| `([a-z]+)`(?:, naming the (?:domain|binding))? \| ([^|]+) \| ([^|]+) \|$/gm)]
+  // In the order boot runs them, which EGRESS_CHECKS does not keep: each
+  // once, as src/kernel.ts's egress block pushes its failures (each check a
+  // `check: '<name>'` literal there), read from the source, so a reordering
+  // of the checks there leaves README out of order here.
+  const kernel = read('src/kernel.ts')
+  const blockAt = kernel.indexOf('\n    // ── egress (degradable)')
+  const blockEnd = kernel.indexOf('\n    // ── lanes', blockAt)
+  assert.ok(blockAt !== -1 && blockEnd > blockAt, "src/kernel.ts has no egress block between its '// ── egress' and '// ── lanes' markers")
+  const order = [...kernel.slice(blockAt, blockEnd).matchAll(/\bcheck: '([a-z]+)'/g)].map((m) => m[1] ?? '')
+  assert.deepEqual([...order].sort(), [...EGRESS_CHECKS].sort(), "src/kernel.ts's egress block does not push each check egress.degraded can carry, once")
+  const named = rows.map((r) => r[1] ?? '')
+  assert.deepEqual(named, order, 'the Boot states table does not name the checks in the order boot runs them')
+  assert.deepEqual([...named].sort(), [...EGRESS_CHECKS].sort(), 'the Boot states table does not name each check egress.degraded can carry, once')
+  for (const row of rows) assert.match(row[3] ?? '', /restart the kernel/, `the ${row[1] ?? ''} row names no fix that ends in a restart`)
+  const flat = boot.replace(/\s+/g, ' ')
+  for (const says of [
+    'Boot reports egress `ok` or `degraded`, never absent.',
+    'Two failures refuse the boot instead of degrading it: a binding whose envVar is a provider\'s key',
+    'A run whose manifest names no egress is not affected',
+  ]) assert.ok(flat.includes(says), `README's Boot states does not say: ${says}`)
+  // The section's other parts are there, in order.
+  const parts = ['### Topology', '### Grants, and how each ends', '### Boot states', '### Setting it up', '### What the log records', '### What an agent can and cannot reach', '### Open decisions the code is built on']
+  const at = parts.map((part) => section.indexOf(`\n${part}\n`))
+  assert.ok(at.every((i) => i !== -1), `the Egress section lacks: ${parts.filter((_, i) => at[i] === -1).join(', ')}`)
+  assert.deepEqual([...at].sort((a, b) => a - b), at, 'the Egress section\'s parts are out of order')
 })
